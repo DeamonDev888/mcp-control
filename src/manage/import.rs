@@ -25,6 +25,10 @@ pub(super) fn entry_to_server(id: String, name: &str, entry: &Value) -> Option<S
                 .collect()
         })
         .unwrap_or_default();
+    // env du bloc mcpServers (`"env": {"CLÉ": "valeur"}`) : atteint le process
+    // lancé via StartCmd.env → spawn_process/probe_stdio (lot 3, audit 03
+    // constat 5 — la clé d'API ne doit plus être jetée à l'import).
+    let env: Vec<(String, String)> = env_from_json(entry);
     if let Some(cmd) = command {
         let workdir = entry.get("cwd").and_then(|x| x.as_str()).map(String::from);
         return Some(Server {
@@ -32,6 +36,7 @@ pub(super) fn entry_to_server(id: String, name: &str, entry: &Value) -> Option<S
                 program: cmd.to_string(),
                 args: args.clone(),
                 workdir: workdir.clone(),
+                env: env.clone(),
             }),
             id,
             label: name.to_string(),
@@ -39,6 +44,7 @@ pub(super) fn entry_to_server(id: String, name: &str, entry: &Value) -> Option<S
                 program: cmd.to_string(),
                 args,
                 workdir,
+                env,
             },
             origin: Origin::Manual,
             enabled: true,
@@ -132,6 +138,7 @@ pub fn import_mcp_text(state: &Arc<AppState>, raw: &str) -> Value {
         match parse_servers_doc(text) {
             Ok(entries) if !entries.is_empty() => {
                 let mut added = 0usize;
+                let mut skipped: Vec<Value> = Vec::new();
                 for (name, entry) in entries {
                     let id = format!("store-{}", name);
                     let mut servers = lockv(&state.servers);
@@ -148,12 +155,35 @@ pub fn import_mcp_text(state: &Arc<AppState>, raw: &str) -> Value {
                             &format!("[boutique] import JSON : {}", label),
                         );
                         added += 1;
+                    } else {
+                        // (lot 3, audit 03 constat 6) une entrée {"url":"https://…"}
+                        // était écartée EN SILENCE (le `?` de parse_url_parts
+                        // renvoie None) et la réponse restait ok:true. Chaque
+                        // entrée écartée est désormais listée avec son motif —
+                        // même message que le collage d'une URL https directe.
+                        let est_https = entry
+                            .get("url")
+                            .and_then(|u| u.as_str())
+                            .map(|u| u.starts_with("https"))
+                            .unwrap_or(false);
+                        let motif = if est_https {
+                            "TLS non supporté : MCP Control ne sonde que du http:// (passez par un tunnel http local pour un endpoint https)".to_string()
+                        } else {
+                            "entrée non reconnue (ni commande stdio, ni URL http://)".to_string()
+                        };
+                        add_log(
+                            state,
+                            "warn",
+                            &format!("[boutique] import JSON : {} écarté ({})", name, motif),
+                        );
+                        skipped.push(json!({"name": name, "reason": motif}));
+                        drop(servers);
                     }
                 }
                 if added > 0 {
                     save_config(state);
                 }
-                return json!({"ok": true, "added": added, "source": "json"});
+                return json!({"ok": true, "added": added, "source": "json", "skipped": skipped});
             }
             Ok(_) => { /* json vide → continuer sur les autres pistes */ }
             Err(e) => return json!({"ok": false, "error": e}),
@@ -261,6 +291,7 @@ pub(super) fn push_imported(
             program: program.clone(),
             args: args.clone(),
             workdir: None,
+            env: Vec::new(),
         }),
         id: id.clone(),
         label: name.clone(),
@@ -268,6 +299,7 @@ pub(super) fn push_imported(
             program,
             args,
             workdir: None,
+            env: Vec::new(),
         },
         origin: Origin::Manual,
         enabled: true,

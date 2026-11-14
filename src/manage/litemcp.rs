@@ -2,8 +2,6 @@
 // (split v0.7.20 : manage.rs reste la racine — API stable via réexport)
 use super::*;
 
-const POLL_WIDTH: usize = 8;
-
 /// Lit une annonce du registre litemcp (`%TEMP%/litemcp-registry/<nom>.json`).
 /// Écrites par les serveurs litemcp intégrés (ex : moltbook) au bind réussi —
 /// contient exe/args/cwd/port : tout pour Start/Stop natifs sans scan ni
@@ -86,6 +84,7 @@ pub(super) fn apply_announcement(state: &Arc<AppState>, ann: &Value) -> bool {
                     program: exe.to_string(),
                     args,
                     workdir,
+                    env: Vec::new(),
                 });
                 // un discovered n'est pas persisté : promotion en manual pour
                 // que la commande adoptée survive au redémarrage
@@ -153,6 +152,7 @@ pub(super) fn apply_announcement(state: &Arc<AppState>, ann: &Value) -> bool {
                     program: exe.to_string(),
                     args,
                     workdir,
+                    env: Vec::new(),
                 }),
                 auto_restart: true,
                 favorite: false,
@@ -178,6 +178,109 @@ pub fn import_litemcp_registry(state: &Arc<AppState>) {
     }
 }
 
+// ---------- pool de sondes persistant (audit 03, constat 2) ----------
+
+use std::collections::VecDeque;
+use std::sync::mpsc;
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// Nombre de workers du pool de sondes (persistant). Chaque poll_one est borné
+/// par ses propres timeouts ; 12 workers en parallèle couvrent largement les
+/// installations typiques, sans recréer de threads à chaque cycle. Un serveur
+/// lent, muet ou en cours de démarrage retarde au plus SON worker — jamais les
+/// autres serveurs ni le cycle suivant (l'ancien découpage en paquets de 8
+/// joints par `thread::scope` imposait une barrière par paquet : le serveur le
+/// plus lent du paquet retardait tous les suivants, et la re-sonde de 30 s
+/// après un spawn bloquait le cycle entier — périodes mesurées à 48-90 s).
+const POLL_WORKERS: usize = 12;
+/// Garde-fou anti-blocage : les sondes sont toutes timeout-bornées (~20 s au
+/// pire), si un cycle dépassait quand même ce délai l'attente s'abandonne pour
+/// ne jamais figer la supervision.
+const CYCLE_MAX_SECS: u64 = 120;
+
+/// Un travail de sondage : état applicatif + id de serveur + accusé de fin.
+struct Travail {
+    state: Arc<AppState>,
+    id: String,
+    fait: mpsc::Sender<()>,
+}
+
+static FILE_TRAVAIL: OnceLock<Mutex<VecDeque<Travail>>> = OnceLock::new();
+static FILE_SIGNAL: OnceLock<Condvar> = OnceLock::new();
+static POOL_DEMARRE: OnceLock<()> = OnceLock::new();
+
+fn file_travail() -> (&'static Mutex<VecDeque<Travail>>, &'static Condvar) {
+    (
+        FILE_TRAVAIL.get_or_init(|| Mutex::new(VecDeque::new())),
+        FILE_SIGNAL.get_or_init(Condvar::new),
+    )
+}
+
+/// Worker persistant : prend un travail, l'exécute, accuse réception, recommence.
+/// poll_one ne doit jamais tuer le worker : catch_unwind en filet (un panic
+/// serait déjà anormal — lib.rs en journalise un au niveau du cycle entier).
+fn worker_sondes() {
+    let (file, signal) = file_travail();
+    loop {
+        let travail = {
+            let mut q = lockv(file);
+            loop {
+                if let Some(t) = q.pop_front() {
+                    break t;
+                }
+                q = match signal.wait(q) {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+            }
+        };
+        let Travail { state, id, fait } = travail;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            poll_one(&state, &id);
+        }));
+        let _ = fait.send(());
+    }
+}
+
+/// Cycle de sondage via le pool : tous les serveurs partent en parallèle,
+/// l'attente de fin est plafonnée (un cycle ne peut plus être prolongé au-delà
+/// de CYCLE_MAX_SECS quoi qu'il arrive).
+fn cycle_via_pool(state: &Arc<AppState>, ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let (file, signal) = file_travail();
+    POOL_DEMARRE.get_or_init(|| {
+        for i in 0..POLL_WORKERS {
+            let _ = std::thread::Builder::new()
+                .name(format!("mcc-poll-{i}"))
+                .spawn(worker_sondes);
+        }
+    });
+    let (tx, rx) = mpsc::channel();
+    {
+        let mut q = lockv(file);
+        for id in ids {
+            q.push_back(Travail {
+                state: state.clone(),
+                id: id.clone(),
+                fait: tx.clone(),
+            });
+        }
+    }
+    signal.notify_all();
+    let echeance = Instant::now() + Duration::from_secs(CYCLE_MAX_SECS);
+    let mut restants = ids.len();
+    while restants > 0 {
+        let reste = echeance.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(reste) {
+            Ok(()) => restants -= 1,
+            Err(_) => break, // timeout : on ne fige jamais le poller
+        }
+    }
+}
+
 pub fn poll_all(state: &Arc<AppState>) {
     // Import natif des serveurs litemcp (moltbook) : l'annonce écrite au bind
     // fournit exe/args/cwd/port — gestion Start/Stop/autoboot native, même
@@ -188,16 +291,9 @@ pub fn poll_all(state: &Arc<AppState>) {
     let order = lockv(&state.settings).server_order.clone();
     let mut ids: Vec<String> = lockv(&state.servers).iter().map(|s| s.id.clone()).collect();
     ids.sort_by_key(|id| order.iter().position(|x| x == id).unwrap_or(usize::MAX));
-    // Sondes en parallèle par paquets de POLL_WIDTH. Chaque poll_one prend ses
+    // Sondes en parallèle via le pool persistant. Chaque poll_one prend ses
     // verrous brièvement et relâche avant d'écrire au journal ; les spawns
-    // concurrents restent protégés par `state.spawning`. Résultat : un cycle
-    // tient dans le refresh même avec des serveurs distants lents.
-    for paquet in ids.chunks(POLL_WIDTH) {
-        std::thread::scope(|scope| {
-            for id in paquet {
-                scope.spawn(move || poll_one(state, id.as_str()));
-            }
-        });
-    }
+    // concurrents restent protégés par `state.spawning`.
+    cycle_via_pool(state, &ids);
     save_cache(state);
 }

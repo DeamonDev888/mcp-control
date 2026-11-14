@@ -46,6 +46,11 @@ pub enum Transport {
         program: String,
         args: Vec<String>,
         workdir: Option<String>,
+        /// Variables d'environnement additionnelles du process lancé (clé, valeur),
+        /// importées du bloc mcpServers (`"env": {"CLÉ": "valeur"}`). Les VALEURS
+        /// ne sortent jamais par /api/state, /api/detail, le gateway ni le journal
+        /// — seulement les noms (voir `env_names`).
+        env: Vec<(String, String)>,
     },
 }
 
@@ -96,6 +101,16 @@ pub struct StartCmd {
     pub program: String,
     pub args: Vec<String>,
     pub workdir: Option<String>,
+    /// Variables d'environnement passées au process lancé (clé, valeur) —
+    /// provient de l'import mcpServers (`"env"`). Valeurs jamais exposées
+    /// par l'API ni journalisées (noms seulement via `env_names`).
+    pub env: Vec<(String, String)>,
+}
+
+/// Noms des variables d'environnement (JAMAIS les valeurs) — la surface
+/// API/journal ne montre que ces noms (lot 3, audit 03 constat 5).
+pub fn env_names(env: &[(String, String)]) -> Vec<String> {
+    env.iter().map(|(k, _)| k.clone()).collect()
 }
 
 #[derive(Clone, Debug)]

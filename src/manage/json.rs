@@ -15,10 +15,12 @@ pub fn start_cmd_for(srv: &Server) -> Option<StartCmd> {
             program,
             args,
             workdir,
+            env,
         } => Some(StartCmd {
             program: program.clone(),
             args: args.clone(),
             workdir: workdir.clone(),
+            env: env.clone(),
         }),
         Transport::Http { .. } => srv.start_cmd.clone(),
     }
@@ -35,10 +37,14 @@ pub(super) fn server_json(s: &Server, managed: bool) -> Value {
             program,
             args,
             workdir,
+            env,
         } => (
             "stdio",
             json!({
                 "program": program, "args": args, "workdir": workdir,
+                // noms SEULS (lot 3) : les valeurs d'env ne sortent jamais par
+                // /api/state ni /api/detail.
+                "env": crate::types::env_names(env),
             }),
         ),
     };
@@ -62,6 +68,8 @@ pub(super) fn server_json(s: &Server, managed: bool) -> Value {
         // commande de lancement (Start/Stop) — panneau Démarrage de l'UI
         "start_cmd": s.start_cmd.as_ref().map(|c| json!({
             "program": c.program, "args": c.args, "workdir": c.workdir,
+            // noms SEULS (lot 3) : les valeurs d'env ne sortent jamais par l'API.
+            "env": crate::types::env_names(&c.env),
         })),
     })
 }
@@ -154,8 +162,11 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
                 })).collect::<Vec<_>>(),
                 // config des notifications (toast/webhook) : l'UI locale en a
                 // besoin pour son panneau Réglages → Notifications. JAMAIS
-                // exposée au gateway MCP (l'URL peut porter un Authorization).
-                "notify": crate::notify::to_json(&settings.notify),
+                // exposée au gateway MCP, et les en-têtes ne sortent JAMAIS
+                // ici (ils peuvent porter un Authorization) : seul un booléen
+                // `headers_set` est rendu (audit 05 #5 : /api/state était
+                // lisible sans code en loopback).
+                "notify": crate::notify::to_api_json(&settings.notify),
             }),
         )
     };

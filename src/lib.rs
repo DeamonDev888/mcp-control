@@ -14,18 +14,31 @@ pub mod ui;
 pub mod validate;
 
 use crate::types::{lockv, AppState};
+use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Corps de requête max (anti-DoS : l'ancien code suivait un Content-Length
 /// choisi par le client sans plafond → gonflement mémoire infini).
 const MAX_BODY: usize = 2 * 1024 * 1024;
-/// Connexions simultanées max (un thread par connexion : au-delà on refuse net).
+/// Connexions simultanées max (au-delà : refus EXPLICITE en 503, cf. admit_conn).
 const MAX_CONNS: usize = 64;
+/// Part de MAX_CONNS réservée aux connexions LOCALES : le LAN ne peut jamais
+/// occuper plus de MAX_CONNS − LOOPBACK_RESERVE slots, la fenêtre locale
+/// (desktop, navigateur de la machine) reste joignable quoi qu'il arrive
+/// (audit 05 #1 : 64 sockets muettes du LAN coupaient tout, y compris local).
+const LOOPBACK_RESERVE: usize = 16;
+/// Connexions simultanées max par adresse IP HORS loopback : une seule machine
+/// du LAN ne peut plus, à elle seule, saturer la part non réservée.
+const MAX_CONNS_PER_ADDR: usize = 16;
+/// Échéance TOTALE d'une requête (en-têtes PUIS corps) : au-delà, la connexion
+/// est fermée. L'ancien read timeout de 30 s se réarmait à chaque octet reçu —
+/// un client muet-lent monopolisait un thread indéfiniment (slowloris).
+const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 /// CSP de la page UI (servie en en-tête HTTP par CE serveur — le webview Tauri
 /// charge une URL externe, la config `csp` de tauri.conf.json ne s'y applique
 /// pas). Depuis le split en assets servis (v0.7.19), scripts et styles sont
@@ -41,11 +54,152 @@ const UI_CSP: &str = "default-src 'none'; script-src 'self' 'unsafe-inline'; sty
 pub const LITEMCP_PROTOCOL: &str = "2026-07-28";
 
 static OPEN_CONNS: AtomicUsize = AtomicUsize::new(0);
+/// Connexions simultanées ouvertes par des clients HORS loopback — comparé à
+/// MAX_CONNS − LOOPBACK_RESERVE pour que le LAN ne prenne jamais la part locale.
+static OPEN_LAN_CONNS: AtomicUsize = AtomicUsize::new(0);
 
-struct ConnGuard;
+/// Connexions ouvertes par adresse IP (hors loopback uniquement).
+fn per_addr_slot() -> &'static Mutex<HashMap<IpAddr, usize>> {
+    static SLOT: std::sync::OnceLock<Mutex<HashMap<IpAddr, usize>>> = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Garde de connexion : relâche TOUTES les réservations (total, hors-loopback,
+/// par adresse) quand la connexion se termine — y compris sur panic du handler.
+struct ConnGuard {
+    lan: bool,
+    addr: Option<IpAddr>,
+}
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         OPEN_CONNS.fetch_sub(1, Ordering::SeqCst);
+        if self.lan {
+            OPEN_LAN_CONNS.fetch_sub(1, Ordering::SeqCst);
+            if let Some(addr) = self.addr.take() {
+                let mut m = per_addr_slot().lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(c) = m.get_mut(&addr) {
+                    *c -= 1;
+                    if *c == 0 {
+                        m.remove(&addr);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Décision d'admission d'une connexion TCP entrante (pure, testable). Les
+/// compteurs incluent DÉJÀ la connexion candidate :
+/// - total > MAX_CONNS → saturation ;
+/// - hors loopback : part locale réservée — le LAN s'arrête à
+///   MAX_CONNS − LOOPBACK_RESERVE (la fenêtre locale reste joignable) ;
+/// - hors loopback : plafond par adresse ; le loopback est exempté du plafond
+///   par adresse et de la réserve (machine de confiance, même utilisateur).
+pub(crate) fn conn_admission(
+    total_open: usize,
+    lan_open: usize,
+    addr_open: usize,
+    peer_loopback: bool,
+) -> Result<(), &'static str> {
+    if total_open > MAX_CONNS {
+        return Err(
+            "serveur saturé (plafond de connexions simultanées) — réessayez dans un instant",
+        );
+    }
+    if peer_loopback {
+        return Ok(());
+    }
+    if lan_open > MAX_CONNS - LOOPBACK_RESERVE {
+        return Err(
+            "plafond de connexions hors loopback atteint (part réservée aux clients locaux)",
+        );
+    }
+    if addr_open > MAX_CONNS_PER_ADDR {
+        return Err("trop de connexions simultanées depuis votre adresse");
+    }
+    Ok(())
+}
+
+/// Réservation comptable puis décision : chaque plafond est vérifié au fur et
+/// à mesure, avec annulation propre des réservations déjà prises en cas de
+/// refus. La réservation totale est atomique (pas de course entre threads).
+fn admit_conn(peer_ip: Option<IpAddr>) -> Result<ConnGuard, &'static str> {
+    let peer_loopback = peer_ip.is_none_or(|ip| ip.is_loopback());
+    let total = OPEN_CONNS.fetch_add(1, Ordering::SeqCst) + 1;
+    if let Err(r) = conn_admission(total, 0, 0, peer_loopback) {
+        OPEN_CONNS.fetch_sub(1, Ordering::SeqCst);
+        return Err(r);
+    }
+    if peer_loopback {
+        return Ok(ConnGuard {
+            lan: false,
+            addr: None,
+        });
+    }
+    let Some(addr) = peer_ip else {
+        OPEN_CONNS.fetch_sub(1, Ordering::SeqCst);
+        return Err("adresse client indéterminable");
+    };
+    let lan = OPEN_LAN_CONNS.fetch_add(1, Ordering::SeqCst) + 1;
+    if let Err(r) = conn_admission(total, lan, 0, false) {
+        OPEN_LAN_CONNS.fetch_sub(1, Ordering::SeqCst);
+        OPEN_CONNS.fetch_sub(1, Ordering::SeqCst);
+        return Err(r);
+    }
+    let after_addr = {
+        let mut m = per_addr_slot().lock().unwrap_or_else(|p| p.into_inner());
+        let c = m.entry(addr).or_insert(0);
+        *c += 1;
+        *c
+    };
+    if let Err(r) = conn_admission(total, lan, after_addr, false) {
+        {
+            let mut m = per_addr_slot().lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(c) = m.get_mut(&addr) {
+                *c -= 1;
+                if *c == 0 {
+                    m.remove(&addr);
+                }
+            }
+        }
+        OPEN_LAN_CONNS.fetch_sub(1, Ordering::SeqCst);
+        OPEN_CONNS.fetch_sub(1, Ordering::SeqCst);
+        return Err(r);
+    }
+    Ok(ConnGuard {
+        lan: true,
+        addr: Some(addr),
+    })
+}
+
+/// Réponse de refus explicite (503) écrite directement par la boucle d'accept,
+/// sans thread dédié — plus de fermeture muette : le client voit POURQUOI.
+fn write_conn_rejected(mut stream: TcpStream, status: u16, message: &str) {
+    let j = serde_json::json!({"ok": false, "error": message}).to_string();
+    let resp = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status,
+        reason_phrase(status),
+        j.len(),
+        j
+    );
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.flush();
+    // Drain NON bloquant des octets de requête déjà arrivés : fermer avec des
+    // données non lues dans le tampon de réception fait émettre un RST par
+    // Windows — le client voit alors « connection reset » AU LIEU du 503
+    // (constaté avec curl pendant le lot 5). En avalant ce qui est déjà là,
+    // la fermeture reste un FIN propre et le 503 est lisible. Borne 16×4 KiB :
+    // ni blocage de la boucle d'accept, ni lecture illimitée d'un client
+    // hostile (au-delà, le RST résiduel reste acceptable).
+    let _ = stream.set_nonblocking(true);
+    let mut poubelle = [0u8; 4096];
+    for _ in 0..16 {
+        match stream.read(&mut poubelle) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => continue,
+        }
     }
 }
 
@@ -130,7 +284,8 @@ fn generate_access() -> String {
 // (HMAC-SHA256, cf. crypto.rs). Le pair vérifie la signature avec SA copie du
 // code : un observateur réseau ne récupère qu'une preuve morte après usage.
 
-/// Nonces émis par GET /api/hello → expiration (usage unique + TTL court).
+/// Nonces émis par GET /api/hello → date d'ÉMISSION (l'échéance est
+/// émission + HELLO_NONCE_TTL ; usage unique conservé via la consommation).
 fn hello_nonces_slot() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
     static SLOT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
         std::sync::OnceLock::new();
@@ -139,19 +294,78 @@ fn hello_nonces_slot() -> &'static std::sync::Mutex<std::collections::HashMap<St
 
 const HELLO_NONCE_TTL: u64 = 120;
 const HELLO_NONCE_MAX: usize = 1024;
+/// Limiteur de débit /api/hello par adresse (hors loopback) : sans lui, une
+/// adresse peut à elle seule remplir la table et noyer les nonces des pairs
+/// (audit 05 #6 : 1 100 requêtes en 1,1 s invalidaient toutes les preuves).
+const HELLO_RATE_MAX: usize = 30;
+/// Fenêtre glissante du limiteur de débit (secondes).
+const HELLO_RATE_WINDOW_SECS: u64 = 60;
 
 fn issue_hello_nonce() -> String {
     let mut slot = hello_nonces_slot()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let now = crate::types::now_ts();
-    slot.retain(|_, exp| *exp > now);
+    slot.retain(|_, issued| *issued + HELLO_NONCE_TTL > now);
     if slot.len() >= HELLO_NONCE_MAX {
-        slot.clear(); // inondation : on repart à zéro (les preuves en vol expireront)
+        // Inondation : on évince les plus ANCIENTS au lieu de vider la table
+        // (l'ancien slot.clear() invalidait TOUTES les preuves en vol) — les
+        // preuves récentes des autres adresses restent valables.
+        evict_oldest_nonces(&mut slot, HELLO_NONCE_MAX - 1);
     }
     let nonce = random_hex(4);
-    slot.insert(nonce.clone(), now + HELLO_NONCE_TTL);
+    slot.insert(nonce.clone(), now);
     nonce
+}
+
+/// Évince les nonces émis le plus anciennement jusqu'à repasser sous `max`.
+/// Renvoie le nombre d'entrées évincées (pur, testable sans état global).
+fn evict_oldest_nonces(map: &mut HashMap<String, u64>, max: usize) -> usize {
+    let mut evicted = 0;
+    while map.len() > max {
+        let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, issued)| **issued)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        map.remove(&oldest);
+        evicted += 1;
+    }
+    evicted
+}
+
+fn hello_rate_slot() -> &'static Mutex<HashMap<IpAddr, Vec<u64>>> {
+    static SLOT: std::sync::OnceLock<Mutex<HashMap<IpAddr, Vec<u64>>>> = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Décision pure du limiteur de débit : à partir des horodatages précédents,
+/// renvoie (décision, liste à conserver). La liste est d'abord purgée des
+/// timestamps hors fenêtre, puis comparée à HELLO_RATE_MAX.
+fn hello_rate_decide(now: u64, prior: &[u64]) -> (Result<(), ()>, Vec<u64>) {
+    let vivants: Vec<u64> = prior
+        .iter()
+        .copied()
+        .filter(|t| now.saturating_sub(*t) < HELLO_RATE_WINDOW_SECS)
+        .collect();
+    if vivants.len() >= HELLO_RATE_MAX {
+        return (Err(()), vivants);
+    }
+    let mut next = vivants;
+    next.push(now);
+    (Ok(()), next)
+}
+
+/// Limiteur de débit /api/hello par adresse : true = requête admise (et
+/// comptabilisée), false = au-delà de HELLO_RATE_MAX requêtes dans la fenêtre.
+fn hello_rate_ok(ip: IpAddr) -> bool {
+    let now = crate::types::now_ts();
+    let mut slot = hello_rate_slot().lock().unwrap_or_else(|p| p.into_inner());
+    let (decision, next) = hello_rate_decide(now, slot.get(&ip).map(Vec::as_slice).unwrap_or(&[]));
+    slot.insert(ip, next);
+    decision.is_ok()
 }
 
 /// Vérifie une preuve de pair : le nonce doit avoir été émis par NOUS (et pas
@@ -239,6 +453,13 @@ pub fn check_access(
     if method == "OPTIONS" {
         return Err((403, "Forbidden"));
     }
+    // HTTP/1.1 sans en-tête Host → 400 : sinon le contrôle anti DNS-rebinding
+    // ci-dessous est sauté par une requête qui omet simplement Host (audit 05
+    // #8). La fenêtre desktop, le harnais e2e et les sondes de pairs envoient
+    // tous Host (vérifié au passage du lot 5).
+    if !headers.iter().any(|(n, _)| n == "host") {
+        return Err((400, "Bad Request"));
+    }
     if let Some((_, h)) = headers.iter().find(|(n, _)| n == "host") {
         let host_only = host_only_of(h);
         if !allowed_hosts
@@ -310,6 +531,7 @@ fn reason_phrase(status: u16) -> &'static str {
         406 => "Not Acceptable",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
+        429 => "Too Many Requests",
         503 => "Service Unavailable",
         500 => "Internal Server Error",
         _ => "Bad Request",
@@ -335,6 +557,10 @@ pub fn run_headless() -> RunOutcome {
             .with_file_name("mcc.log")
             .to_string_lossy()
             .to_string();
+        // JOURNAL webhook (audit 05 #4) : send_webhook trace chaque envoi
+        // (cible + résultat) dans mcc.log — il n'a pas d'AppState, le chemin
+        // lui est branché ici, au seul endroit qui le connaît.
+        crate::notify::set_webhook_log_path(&log_file);
         std::panic::set_hook(Box::new(move |info| {
             let ts = crate::types::iso_utc(crate::types::now_ts());
             let payload = info
@@ -511,6 +737,10 @@ pub fn run_headless() -> RunOutcome {
         *lockv(&state.allowed_origins) = origins;
         *lockv(&state.allowed_hosts) = hosts;
     }
+    // SÉCURITÉ (audit 05 #4) : enregistre les points d'écoute de CETTE instance
+    // (port UI réel après repli +1..+9, IP locales, bind) — une URL de webhook
+    // qui les vise est refusée à l'enregistrement comme à l'envoi.
+    crate::notify::note_self_listen(ui_port, &local_ips_list, &ui_bind);
     if generated {
         manage::save_config(&state);
         manage::add_log(
@@ -650,8 +880,16 @@ pub fn run_headless() -> RunOutcome {
         for stream in listener.incoming() {
             match stream {
                 Ok(s) => {
-                    let st = state.clone();
-                    thread::spawn(move || handle_conn(s, st));
+                    // admission AVANT tout thread dédié : les refus (503
+                    // explicite) sont écrits ici, sans spawn — une tempête de
+                    // connexions ne crée plus un thread par rejet.
+                    match admit_conn(s.peer_addr().ok().map(|a| a.ip())) {
+                        Ok(guard) => {
+                            let st = state.clone();
+                            thread::spawn(move || handle_conn(s, st, guard));
+                        }
+                        Err(raison) => write_conn_rejected(s, 503, raison),
+                    }
                 }
                 Err(e) => eprintln!("[accept] {}", e),
             }
@@ -677,19 +915,20 @@ pub fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-pub fn handle_conn(mut stream: TcpStream, state: Arc<AppState>) {
-    // garde de charge : au-delà de MAX_CONNS connexions simultanées, on refuse net
-    // (un thread par connexion — sinon épuisement trivial depuis le LAN)
-    if OPEN_CONNS.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
-        OPEN_CONNS.fetch_sub(1, Ordering::SeqCst);
-        return;
-    }
-    let _guard = ConnGuard;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+pub(crate) fn handle_conn(mut stream: TcpStream, state: Arc<AppState>, guard: ConnGuard) {
+    let _guard = guard;
+    // échéance TOTALE de la requête (en-têtes puis corps) : un client muet ou
+    // lent monopolise au plus REQUEST_DEADLINE — l'ancien read timeout de 30 s
+    // se réarmait à chaque octet reçu (slowloris infini).
+    let deadline = Instant::now() + REQUEST_DEADLINE;
     let mut buf = Vec::new();
     let mut tmp = [0u8; 16384];
     let mut head_end = None;
     loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let _ = stream.set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())));
         match stream.read(&mut tmp) {
             Ok(0) => break,
             Ok(n) => {
@@ -729,6 +968,10 @@ pub fn handle_conn(mut stream: TcpStream, state: Arc<AppState>) {
     }
     let mut body = buf[head_end + 4..].to_vec();
     while body.len() < content_length {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let _ = stream.set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())));
         match stream.read(&mut tmp) {
             Ok(0) => break,
             Ok(n) => {
@@ -758,10 +1001,8 @@ pub fn handle_conn(mut stream: TcpStream, state: Arc<AppState>) {
         (is_loopback_bind(&st.ui_bind), st.api_access.clone())
     };
     // client local (fenêtre desktop, navigateur de la machine) → jamais de code
-    let peer_is_loopback = stream
-        .peer_addr()
-        .map(|a| a.ip().is_loopback())
-        .unwrap_or(false);
+    let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
+    let peer_is_loopback = peer_ip.map(|ip| ip.is_loopback()).unwrap_or(false);
     let (allowed_hosts, allowed_origins) = (
         lockv(&state.allowed_hosts).clone(),
         lockv(&state.allowed_origins).clone(),
@@ -792,11 +1033,34 @@ pub fn handle_conn(mut stream: TcpStream, state: Arc<AppState>) {
         &headers,
         proof_ok,
     );
+    // limiteur de débit /api/hello (audit 05 #6) : hors loopback, une adresse
+    // ne peut plus remplir la table de nonces à outrance. Le loopback est
+    // exempté : la fenêtre locale et le harnais e2e sondent /api/hello en rafale.
+    let hello_throttled = {
+        let bare = path.split('?').next().unwrap_or("");
+        bare == "/api/hello"
+            && method == "GET"
+            && !peer_is_loopback
+            && match peer_ip {
+                Some(ip) => !hello_rate_ok(ip),
+                None => false,
+            }
+    };
     let (status, ctype, payload) = match gated {
         Err((code, reason)) => {
             let j = serde_json::json!({"ok": false, "error": reason}).to_string();
             (code, "application/json", j.into_bytes())
         }
+        Ok(()) if hello_throttled => (
+            429,
+            "application/json",
+            serde_json::json!({
+                "ok": false,
+                "error": "taux de /api/hello dépassé pour cette adresse — réessayez plus tard"
+            })
+            .to_string()
+            .into_bytes(),
+        ),
         // Gateway MCP : la console elle-même est un serveur MCP — POST /mcp
         // (émule le transport Streamable HTTP stateless de LiteMCP sur notre
         // socket déjà durci ; cf. gateway::serve)
@@ -1481,5 +1745,115 @@ mod tests {
         assert_eq!(st2, 200);
         let v2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
         assert_eq!(v2["id"], serde_json::json!(expected_id));
+    }
+
+    // ---------- lot 5 : sécurité HTTP ----------
+
+    #[test]
+    fn admission_connexions_plafonds_et_reserve_loopback() {
+        use super::{conn_admission, MAX_CONNS, MAX_CONNS_PER_ADDR};
+        // sous les plafonds : admis
+        assert!(conn_admission(10, 5, 3, false).is_ok());
+        // 64e connexion totale : encore admise ; 65e : saturation
+        assert!(conn_admission(MAX_CONNS, 0, 0, true).is_ok());
+        assert_eq!(
+            conn_admission(MAX_CONNS + 1, 0, 0, true),
+            Err("serveur saturé (plafond de connexions simultanées) — réessayez dans un instant")
+        );
+        // hors loopback : 48 = part LAN exactement pleine (48e LAN admis) ;
+        // 49e LAN → refus, même si le total est loin du plafond global
+        assert!(conn_admission(48, 48, 1, false).is_ok());
+        assert_eq!(
+            conn_admission(49, 49, 1, false),
+            Err("plafond de connexions hors loopback atteint (part réservée aux clients locaux)")
+        );
+        // le loopback IGNORE la réserve : 48 LAN + 1 local = le local passe
+        assert!(conn_admission(49, 48, 1, true).is_ok());
+        // plafond par adresse, hors loopback uniquement — le compteur inclut
+        // DÉJÀ la connexion candidate (admit_conn incrémente avant de décider)
+        // : la 16e passe, la 17e est refusée
+        assert!(conn_admission(20, 10, MAX_CONNS_PER_ADDR, false).is_ok());
+        assert_eq!(
+            conn_admission(20, 10, MAX_CONNS_PER_ADDR + 1, false),
+            Err("trop de connexions simultanées depuis votre adresse")
+        );
+        assert!(conn_admission(20, 10, MAX_CONNS_PER_ADDR - 1, false).is_ok());
+        // le loopback n'a pas de plafond par adresse
+        assert!(conn_admission(20, 0, usize::MAX, true).is_ok());
+    }
+
+    #[test]
+    fn check_access_sans_host_rejete_en_400() {
+        // audit 05 #8 : sans en-tête Host, le contrôle anti DNS-rebinding était
+        // sauté (requête acceptée) — désormais 400, même en loopback
+        let hosts = vec!["127.0.0.1".to_string()];
+        for (meth, chemin) in [
+            ("GET", "/api/state"),
+            ("GET", "/api/hello"),
+            ("GET", "/"),
+            ("POST", "/api/action"),
+        ] {
+            let r = check_access(false, None, &hosts, &[], meth, chemin, &hs(&[]), false);
+            assert_eq!(r, Err((400, "Bad Request")), "{meth} {chemin} sans Host");
+        }
+        // avec Host présent : comportements inchangés
+        assert!(check_access(
+            false,
+            None,
+            &hosts,
+            &[],
+            "GET",
+            "/api/state",
+            &hs(&[("host", "127.0.0.1:5090")]),
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn eviction_hello_garde_les_plus_recents() {
+        use super::evict_oldest_nonces;
+        let mut m: HashMap<String, u64> = HashMap::new();
+        for i in 0..8u64 {
+            m.insert(format!("n{i:03}"), 1000 + i); // n000 le plus ancien
+        }
+        // table déjà sous le max : rien à évincer
+        assert_eq!(evict_oldest_nonces(&mut m, 8), 0);
+        // max 5 : les 3 plus anciens sortent, les récents restent
+        assert_eq!(evict_oldest_nonces(&mut m, 5), 3);
+        assert!(!m.contains_key("n000"));
+        assert!(!m.contains_key("n002"));
+        assert!(m.contains_key("n007"), "le plus récent reste valide");
+        assert_eq!(m.len(), 5);
+        // max 0 : vidage propre, pas de boucle infinie
+        assert_eq!(evict_oldest_nonces(&mut m, 0), 5);
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn limiteur_debit_hello_fenetre_glissante() {
+        use super::{hello_rate_decide, HELLO_RATE_MAX, HELLO_RATE_WINDOW_SECS};
+        let mut hist: Vec<u64> = Vec::new();
+        for _ in 0..HELLO_RATE_MAX {
+            let (d, next) = hello_rate_decide(1000, &hist);
+            assert!(
+                d.is_ok(),
+                "les {} premières requêtes passent",
+                HELLO_RATE_MAX
+            );
+            hist = next;
+        }
+        // au-delà du plafond → refus, l'historique reste conservé pour la fenêtre
+        let (d, next) = hello_rate_decide(1000, &hist);
+        assert!(
+            d.is_err(),
+            "la requête {} doit être refusée",
+            HELLO_RATE_MAX + 1
+        );
+        assert_eq!(next.len(), HELLO_RATE_MAX);
+        // timestamps sortis de la fenêtre : purgés → de nouveau admis
+        let (d2, next2) = hello_rate_decide(1000 + HELLO_RATE_WINDOW_SECS, &hist);
+        assert!(d2.is_ok(), "fenêtre purgée : requête de nouveau admise");
+        assert_eq!(next2, vec![1000 + HELLO_RATE_WINDOW_SECS]);
     }
 }

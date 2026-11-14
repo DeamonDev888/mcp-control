@@ -30,11 +30,11 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
           title="Oublier le code d'accès enregistré dans ce navigateur"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='4.5' y='10.5' width='15' height='10' rx='2'/><path d='M8 10.5V7a4 4 0 0 1 8 0v3.5'/></svg></button>
   <span class="tb-spacer" data-tauri-drag-region></span>
   <div class="tb-actions">
-    <button class="primary" onclick="doScan()" title="Balayer les ports locaux pour d&eacute;couvrir les serveurs MCP"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='11' cy='11' r='7'/><path d='m21 21-4.3-4.3'/></svg>Scanner les ports</button>
-    <button onclick="doScanNet()" title="Balayer le r&eacute;seau local pour d&eacute;couvrir les serveurs MCP distants"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='8.5'/><path d='M3.5 12h17M12 3.5c2.4 2.4 3.8 5.3 3.8 8.5s-1.4 6.1-3.8 8.5c-2.4-2.4-3.8-5.3-3.8-8.5s1.4-6.1 3.8-8.5Z'/></svg>Scanner le r&eacute;seau</button>
-    <button onclick="openMachineDlg()" title="Machines distantes (SSH) et d&eacute;tection des moteurs MCP Control du LAN"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='2.5' y='4' width='19' height='13' rx='2'/><path d='M8 21h8M12 17v4'/></svg>Machines</button>
-    <button onclick="openStore()" title="Catalogue de serveurs MCP pr&ecirc;ts &agrave; installer"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='9' cy='20' r='1.4'/><circle cx='17' cy='20' r='1.4'/><path d='M2.5 3.5h2.2l2.5 11.5h10.3l2-8H6'/></svg>Boutique</button>
-    <button onclick="openSettingsDlg()" title="R&eacute;glages du client"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='3.1'/><path d='M12 2.8v2.6M12 18.6v2.6M2.8 12h2.6M18.6 12h2.6M5.5 5.5l1.9 1.9M16.6 16.6l1.9 1.9M18.5 5.5l-1.9 1.9M7.4 16.6l-1.9 1.9'/></svg>R&eacute;glages</button>
+    <button class="primary" onclick="doScan()" title="Balayer les ports locaux pour d&eacute;couvrir les serveurs MCP"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='11' cy='11' r='7'/><path d='m21 21-4.3-4.3'/></svg><span class="tb-lbl">Scanner les ports</span></button>
+    <button onclick="doScanNet()" title="Balayer le r&eacute;seau local pour d&eacute;couvrir les serveurs MCP distants"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='8.5'/><path d='M3.5 12h17M12 3.5c2.4 2.4 3.8 5.3 3.8 8.5s-1.4 6.1-3.8 8.5c-2.4-2.4-3.8-5.3-3.8-8.5s1.4-6.1 3.8-8.5Z'/></svg><span class="tb-lbl">Scanner le r&eacute;seau</span></button>
+    <button onclick="openMachineDlg()" title="Machines distantes (SSH) et d&eacute;tection des moteurs MCP Control du LAN"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='2.5' y='4' width='19' height='13' rx='2'/><path d='M8 21h8M12 17v4'/></svg><span class="tb-lbl">Machines</span></button>
+    <button onclick="openStore()" title="Catalogue de serveurs MCP pr&ecirc;ts &agrave; installer"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='9' cy='20' r='1.4'/><circle cx='17' cy='20' r='1.4'/><path d='M2.5 3.5h2.2l2.5 11.5h10.3l2-8H6'/></svg><span class="tb-lbl">Boutique</span></button>
+    <button onclick="openSettingsDlg()" title="R&eacute;glages du client"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='3.1'/><path d='M12 2.8v2.6M12 18.6v2.6M2.8 12h2.6M18.6 12h2.6M5.5 5.5l1.9 1.9M16.6 16.6l1.9 1.9M18.5 5.5l-1.9 1.9M7.4 16.6l-1.9 1.9'/></svg><span class="tb-lbl">R&eacute;glages</span></button>
     <button onclick="refreshAll()" title="Re-sonder tous les serveurs connus et d&eacute;couvrir les nouveaux (tous ports en &eacute;coute)"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M21 12a9 9 0 1 1-2.6-6.4L21 8'/><path d='M21 3v5h-5'/></svg></button>
   </div>
   <div id="winCtrls">
@@ -43,6 +43,8 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     <button class="wbtn wclose" id="wClose" title="Fermer">&#x2715;</button>
   </div>
 </div>
+
+<div id="deadBanner" hidden></div>
 
 <div id="main">
   <aside id="explorer">
@@ -138,6 +140,14 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
       <div class="row row-end">
         <button type="button" onclick="dlg.close()">Annuler</button>
         <button type="submit" class="primary">Ajouter &amp; sonder</button>
+      </div>
+      <div class="dlg-import">
+        <label>Coller un bloc mcpServers ou une URL</label>
+        <textarea id="fImport" rows="4" placeholder='{"mcpServers": {"nom": {"command": "npx", "args": ["-y", "paquet"]}}} &#8212; ou http://127.0.0.1:3099/mcp &#8212; ou claude mcp add nom npx paquet'></textarea>
+        <div class="row row-end">
+          <button type="button" class="primary" onclick="importMcp()">Importer</button>
+        </div>
+        <div id="importMsg" class="machine-msg"></div>
       </div>
     </form>
   </div>
@@ -660,6 +670,218 @@ mod tests {
             APP_BOOT_JS.len() < 400,
             "app-boot.js gonfle le chemin critique : {} octets",
             APP_BOOT_JS.len()
+        );
+    }
+
+    // ---------- Lot 4 GUI (audit 04, constats 2-8, 10, 11) -----------------
+    // Contrats de présence : chaque correctif GUI a son marqueur dans la
+    // coquille, le script ou la feuille de style. Le comportement réel
+    // (arrêt/relance du moteur) est vérifié hors CI, moteur relancé sur un
+    // port privé.
+
+    /// Corps d'une fonction JS de la page : de sa signature à la première
+    /// accolade fermante de colonne 0 (convention du fichier : aucun bloc
+    /// interne ne ferme en colonne 0). Fins de ligne normalisées en LF.
+    fn fn_body(src: &str, name: &str) -> String {
+        let src = src.replace("\r\n", "\n");
+        let start = src
+            .find(&format!("function {name}("))
+            .unwrap_or_else(|| panic!("fonction JS absente : {name}"));
+        let rest = &src[start..];
+        let end = rest.find("\n}").unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    #[test]
+    fn lot4_bandeau_moteur_injoignable_est_cable() {
+        // #2/#3 : bandeau dans la coquille, échecs de poll comptés, bandeau
+        // armé dès le premier échec quand rien n'a jamais chargé (boot), et
+        // après 2 échecs consécutifs quand l'état affiché est périmé ; il est
+        // levé dès la première réponse. Le grisage des compteurs a son CSS.
+        assert!(
+            INDEX_HTML.contains(r#"id="deadBanner" hidden"#),
+            "bandeau « moteur injoignable » absent de la coquille"
+        );
+        assert!(
+            APP_JS.contains("moteur injoignable, nouvel essai"),
+            "libellé boot « moteur injoignable, nouvel essai… » absent"
+        );
+        let load = fn_body(APP_JS, "load");
+        assert!(
+            load.contains("pollFails"),
+            "load() doit compter les échecs consécutifs"
+        );
+        assert!(
+            load.contains("setDead(true"),
+            "load() doit armer le bandeau à l'échec"
+        );
+        assert!(
+            load.contains("setDead(false"),
+            "load() doit lever le bandeau dès que le moteur répond"
+        );
+        assert!(
+            APP_JS.contains("pollFails >= 2"),
+            "le bandeau ne doit apparaître qu'après 2 échecs consécutifs"
+        );
+        let dead = fn_body(APP_JS, "setDead");
+        assert!(
+            dead.contains("classList.toggle('dead'"),
+            "setDead doit marquer body.dead (compteurs grisés)"
+        );
+        assert!(APP_CSS.contains("#deadBanner"), "CSS du bandeau absent");
+        assert!(
+            APP_CSS.contains("body.dead"),
+            "règle de grisage des compteurs absente"
+        );
+        // #2 : l'intervalle est armé au boot, indépendamment du premier load()
+        let js = APP_JS.replace("\r\n", "\n");
+        assert!(
+            js.contains("load();\narmPolling();"),
+            "le polling doit être armé au démarrage, pas seulement après un render()"
+        );
+    }
+
+    #[test]
+    fn lot4_import_mcp_a_un_point_d_entree() {
+        // #4 : le dialog « Ajouter » expose la zone de texte d'import et
+        // envoie {action:"import_mcp", text} ; le handler est défini (contrat
+        // « tout bouton est câblé » ci-dessus) et l'action est connue du
+        // dispatcher (contrat actions ci-dessus).
+        assert!(
+            INDEX_HTML.contains(r#"id="fImport""#),
+            "zone de texte d'import absente du dialog « Ajouter un serveur »"
+        );
+        assert!(
+            INDEX_HTML.contains("Coller un bloc mcpServers"),
+            "libellé de la zone d'import absent"
+        );
+        let h = fn_body(APP_JS, "importMcp");
+        assert!(
+            h.contains("action: 'import_mcp'"),
+            "l'UI doit envoyer l'action import_mcp"
+        );
+        assert!(
+            h.contains("text"),
+            "le texte collé doit partir dans req.text"
+        );
+        assert!(
+            h.contains("added"),
+            "le nombre ajouté doit être affiché en résultat"
+        );
+        assert!(
+            h.contains("skipped"),
+            "les entrées écartées (avec leur motif) doivent être affichées si la réponse les porte"
+        );
+    }
+
+    #[test]
+    fn lot4_urls_ipv6_entourees_de_crochets() {
+        // #5 : un seul helper, utilisé par les DEUX constructeurs d'URL
+        // (« Conf agent » srvUrl et « Copier l'URL »/texte d'info ctxUrl).
+        let uses = APP_JS.matches("hostForUrl").count();
+        assert!(
+            uses >= 3,
+            "hostForUrl doit être défini et appelé par srvUrl et ctxUrl (déf + 2 appels), trouvé : {uses}"
+        );
+        assert!(
+            !APP_JS.contains("'http://' + h + ':'"),
+            "srvUrl construit encore une URL sans crochets IPv6"
+        );
+        assert!(
+            !APP_JS.contains("'http://' + (ti.host || '127.0.0.1')"),
+            "ctxUrl construit encore une URL sans crochets IPv6"
+        );
+    }
+
+    #[test]
+    fn lot4_hosts_loopback_classes_locaux() {
+        // #6 : 127.0.0.1 / ::1 / localhost = CETTE machine — plus de groupe
+        // « Machines distantes » ni de formulaire de commande supprimé.
+        let uses = APP_JS.matches("isLoopbackHost").count();
+        assert!(
+            uses >= 3,
+            "isLoopbackHost doit servir hostOf ET startCmdForm (déf + 2 appels), trouvé : {uses}"
+        );
+        for h in ["'127.0.0.1'", "'::1'", "'localhost'"] {
+            assert!(
+                APP_JS.contains(h),
+                "hôte loopback manquant dans la liste : {h}"
+            );
+        }
+        let f = fn_body(APP_JS, "startCmdForm");
+        assert!(
+            f.contains("isLoopbackHost"),
+            "le formulaire de commande de lancement doit revenir pour un hôte loopback"
+        );
+    }
+
+    #[test]
+    fn lot4_refus_moteur_toaste_sur_setfavorite_setauto_scan() {
+        // #7/#10 : un refus du moteur (j.ok=false) ne peut plus être
+        // silencieux — j.error est affiché en toast d'erreur. Le scan rend le
+        // bouton occupé puis toast le nombre trouvé (champ found, consommé
+        // s'il existe — le lot 3 l'ajoutera).
+        for name in ["setAuto", "setFavorite", "doScan"] {
+            let f = fn_body(APP_JS, name);
+            assert!(
+                f.contains("j.ok"),
+                "{name} doit lire j.ok (refus moteur silencieux sinon)"
+            );
+            assert!(
+                f.contains("j.error"),
+                "{name} doit afficher j.error en toast d'erreur"
+            );
+        }
+        let scan = fn_body(APP_JS, "doScan");
+        assert!(
+            scan.contains("found"),
+            "le scan doit toast le nombre trouvé (champ found s'il existe)"
+        );
+        assert!(
+            scan.contains("disabled = true"),
+            "le bouton de scan doit être occupé pendant le scan"
+        );
+    }
+
+    #[test]
+    fn lot4_barre_de_titre_repli_et_controles_de_fenetre() {
+        // #8 : sous ~1120 px les libellés s'effacent (icônes seules +
+        // infobulle) ; #winCtrls ne se comprime jamais — visible à toute
+        // largeur, y compris la fenêtre desktop minimale (940 px).
+        assert!(
+            APP_CSS.contains(".tb-lbl"),
+            "CSS de repli des libellés de la barre de titre absent"
+        );
+        assert!(
+            APP_CSS.contains("@media (max-width:1120px)"),
+            "breakpoint de repli (libellés masqués) absent"
+        );
+        assert!(
+            APP_CSS.contains(".logo,.tb-actions,#winCtrls{flex-shrink:0}"),
+            "#winCtrls doit être non compressible (visible à toute largeur)"
+        );
+        for lbl in [
+            "Scanner les ports",
+            "Scanner le r&eacute;seau",
+            "Machines",
+            "Boutique",
+            "R&eacute;glages",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!(r#"<span class="tb-lbl">{lbl}</span>"#)),
+                "libellé de la barre de titre non encapsulé pour le repli : {lbl}"
+            );
+        }
+    }
+
+    #[test]
+    fn lot4_copy_conf_reuse_copy_text() {
+        // #11 : le bouton « copier » de « Conf agent » passe par copyText —
+        // le repli execCommand (copyFallback) couvre un refus du presse-papiers.
+        let f = fn_body(APP_JS, "copyConf");
+        assert!(
+            f.contains("copyText("),
+            "copyConf doit réutiliser copyText (repli copyFallback)"
         );
     }
 }

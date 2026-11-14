@@ -2,6 +2,13 @@
 // (split v0.7.20 : manage.rs reste la racine — API stable via réexport)
 use super::*;
 
+/// Fenêtre accordée à un démarrage (spawn réussi → UP réellement observé).
+/// Un lanceur qui construit avant d'écouter (bin/launch.cjs fait `npm run
+/// build`) a ce délai ; passé l'échéance sans UP, le démarrage compte comme
+/// un échec (note_spawn_failure). Vérifié aux CYCLES suivants, jamais en
+/// bloquant le cycle (audit 03, constats 2 et 3).
+const START_WINDOW_SECS: u64 = 30;
+
 #[allow(unused_must_use)]
 pub fn poll_one(state: &Arc<AppState>, id: &str) {
     let (transport, enabled) = {
@@ -52,28 +59,69 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
             // Auto-start : serveur HTTP LOCAL éteint + commande de lancement configurée
             // (jamais pour un serveur distant, host.is_none() gate)
             if !res.mcp_up && host.is_none() {
-                let (can_auto, child_alive) = {
-                    let servers = lockv(&state.servers);
+                // État du process lancé par nous, s'il existe : vivant ? code de sortie ?
+                let (child_alive, exit_code) = {
                     let mut children = lockv(&state.children);
-                    let alive = match children.get_mut(id) {
-                        Some(h) => h.child.try_wait().ok().flatten().is_none(),
-                        None => false,
+                    match children.get_mut(id) {
+                        Some(h) => match h.child.try_wait() {
+                            Ok(Some(st)) => (false, st.code()),
+                            Ok(None) => (true, None),
+                            Err(_) => (true, None),
+                        },
+                        None => (false, None),
+                    }
+                };
+                // ÉCHEC DE DÉMARRAGE (audit 03, constat 3) : `start-ok` n'est plus
+                // journalisé au spawn — un démarrage ne compte comme succès que
+                // lorsqu'un UP est réellement observé (branche UP ci-dessous).
+                // Un process sorti sans avoir répondu MCP, ou une échéance de
+                // démarrage dépassée, comptent un échec via note_spawn_failure
+                // (compteur persisté, backoff croissant, abandon à MAX_ATTEMPTS) :
+                // la relance n'est plus infinie.
+                let now = crate::types::now_ts();
+                let echec_demarrage = {
+                    let mut rt = lockv(&state.runtime);
+                    let entry = rt.entry(id.to_string()).or_default();
+                    let echeance = entry.starting_until;
+                    if echeance != 0 && (!child_alive || now >= echeance) {
+                        entry.starting_until = 0;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if echec_demarrage {
+                    let motif = if child_alive {
+                        format!(
+                            "échéance de démarrage ({} s) dépassée sans réponse MCP",
+                            START_WINDOW_SECS
+                        )
+                    } else {
+                        format!(
+                            "process sorti sans avoir répondu MCP{}",
+                            exit_code
+                                .map(|c| format!(" (code de sortie {c})"))
+                                .unwrap_or_default()
+                        )
                     };
-                    let can = servers
+                    add_log(state, "warn", &format!("[{id}] démarrage KO : {motif}"));
+                    note_spawn_failure(state, id);
+                }
+                // can_auto relu APRÈS le comptage d'échec : le 5ᵉ échec désactive
+                // l'auto-restart (note_spawn_failure) et doit empêcher le spawn
+                // qui suivrait dans le même cycle.
+                let (can_auto, backoff_ok) = {
+                    let can = lockv(&state.servers)
                         .iter()
                         .find(|s| s.id == id)
                         .map(|s| s.start_cmd.is_some() && s.auto_restart)
                         .unwrap_or(false);
-                    (can, alive)
-                };
-                // BACKOFF : après un échec, on attend (5 s, 10 s, 20 s…) avant la
-                // prochaine tentative — et l'état est PERSISTÉ (le compteur
-                // d'échecs survit au redémarrage de l'app).
-                let now = crate::types::now_ts();
-                let backoff_ok = {
-                    let mut rt = lockv(&state.runtime);
-                    let entry = rt.entry(id.to_string()).or_default();
-                    entry.can_attempt(now)
+                    let now = crate::types::now_ts();
+                    let ok = {
+                        let mut rt = lockv(&state.runtime);
+                        rt.entry(id.to_string()).or_default().can_attempt(now)
+                    };
+                    (can, ok)
                 };
                 if can_auto
                     && !child_alive
@@ -90,8 +138,12 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
                             .and_then(|s| s.start_cmd.clone())
                     };
                     if let Some(cmd) = cmd {
-                        match probe::spawn_process(&cmd.program, &cmd.args, cmd.workdir.as_deref())
-                        {
+                        match probe::spawn_process(
+                            &cmd.program,
+                            &cmd.args,
+                            cmd.workdir.as_deref(),
+                            &cmd.env,
+                        ) {
                             Ok(h) => {
                                 let pid = h.child.id();
                                 lockv(&state.children).insert(id.to_string(), h);
@@ -107,16 +159,21 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
                                     "info",
                                     &format!("[{}] http démarré (pid {}) — re-sonde", id, pid),
                                 );
-                                runtime_event(state, id, "start-ok", &format!("pid {}", pid));
-                                // Re-probe borné : le launcher peut builder avant d'écouter
-                                // (bin/launch.cjs fait `npm run build`), jusqu'à 30 s.
-                                let mut res2 = probe::probe_http(port, &path, 2000);
-                                let deadline =
-                                    std::time::Instant::now() + std::time::Duration::from_secs(30);
-                                while !res2.mcp_up && std::time::Instant::now() < deadline {
-                                    std::thread::sleep(std::time::Duration::from_millis(1000));
-                                    res2 = probe::probe_http(port, &path, 2000);
+                                // Marqueur « démarrage en cours » avec échéance :
+                                // les cycles suivants re-vérifient l'état du serveur
+                                // (UP réel → start-ok ; process sorti ou échéance
+                                // dépassée → échec) au lieu de bloquer ici.
+                                {
+                                    let mut rt = lockv(&state.runtime);
+                                    rt.entry(id.to_string()).or_default().starting_until =
+                                        crate::types::now_ts() + START_WINDOW_SECS;
                                 }
+                                // Re-sonde UNIQUE et courte : un lanceur qui
+                                // construit avant d'écouter est revérifié aux
+                                // cycles suivants — le cycle n'attend plus 30 s
+                                // (audit 03, constat 2 : c'était la cause principale
+                                // des périodes mesurées à 48-90 s).
+                                let mut res2 = probe::probe_http(port, &path, 2000);
                                 if res2.mcp_up && res2.pid.is_none() {
                                     res2.pid = Some(pid);
                                 }
@@ -136,6 +193,25 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
                     lockv(&state.spawning).remove(id);
                 }
             }
+            // UP RÉELLEMENT OBSERVÉ : le seul endroit où le compteur d'échecs
+            // retombe à zéro (runtime_event start-ok/recovered). Consommé AVANT
+            // le verrou servers — note_spawn_failure prend servers sous runtime,
+            // l'ordre inverse ici déboucherait sur un interblocage.
+            let (etait_en_demarrage, avait_echecs, en_demarrage) = if res.mcp_up {
+                let mut rt = lockv(&state.runtime);
+                let entry = rt.entry(id.to_string()).or_default();
+                let etait = entry.starting_until != 0;
+                entry.starting_until = 0;
+                (etait, entry.fails > 0, 0)
+            } else {
+                // marqueur lu (et relâché) AVANT le verrou servers : jamais
+                // runtime sous servers ici non plus
+                let en_cours = {
+                    let rt = lockv(&state.runtime);
+                    rt.get(id).map(|e| e.starting_until).unwrap_or(0)
+                };
+                (false, false, en_cours)
+            };
             let mut log_event: Option<(&'static str, String)> = None;
             {
                 let mut servers = lockv(&state.servers);
@@ -173,37 +249,59 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
                             ));
                         }
                     } else {
-                        let was_up = srv.state == SState::Up;
-                        // port fermé = DOWN ; port ouvert sans MCP = PORT-ONLY (zombie)
-                        srv.state = if res.port_open {
-                            SState::PortOnly
+                        // Démarrage en cours (marqueur posé au spawn, échéance non
+                        // atteinte) : ni DOWN ni PORT-ONLY, pas d'incident, pid
+                        // conservé — le serveur est revérifié aux cycles suivants.
+                        if en_demarrage > crate::types::now_ts() {
+                            srv.last_error = Some("démarrage en cours…".to_string());
                         } else {
-                            SState::Down
-                        };
-                        srv.last_error = res.error.clone();
-                        srv.latency_ms = None;
-                        if !res.port_open && host.is_none() {
-                            srv.pid = None;
-                        }
-                        if was_up {
-                            let st_lbl = if res.port_open { "PORT-ONLY" } else { "DOWN" };
-                            log_event = Some((
-                                "warn",
-                                format!(
-                                    "[{}] {} : {}",
-                                    srv.label,
-                                    st_lbl,
-                                    res.error.as_deref().unwrap_or("?")
-                                ),
-                            ));
-                            // NOTIFICATION d'incident (desktop + webhook) :
-                            // déclenchée une seule fois, à la transition.
-                            let lbl = srv.label.clone();
-                            let det = res.error.clone().unwrap_or_else(|| "?".to_string());
-                            notify_incident(state, &lbl, st_lbl, &det);
+                            let was_up = srv.state == SState::Up;
+                            // port fermé = DOWN ; port ouvert sans MCP = PORT-ONLY (zombie)
+                            srv.state = if res.port_open {
+                                SState::PortOnly
+                            } else {
+                                SState::Down
+                            };
+                            srv.last_error = res.error.clone();
+                            srv.latency_ms = None;
+                            if !res.port_open && host.is_none() {
+                                srv.pid = None;
+                            }
+                            if was_up {
+                                let st_lbl = if res.port_open { "PORT-ONLY" } else { "DOWN" };
+                                log_event = Some((
+                                    "warn",
+                                    format!(
+                                        "[{}] {} : {}",
+                                        srv.label,
+                                        st_lbl,
+                                        res.error.as_deref().unwrap_or("?")
+                                    ),
+                                ));
+                                // NOTIFICATION d'incident (desktop + webhook) :
+                                // déclenchée une seule fois, à la transition.
+                                let lbl = srv.label.clone();
+                                let det = res.error.clone().unwrap_or_else(|| "?".to_string());
+                                notify_incident(state, &lbl, st_lbl, &det);
+                            }
                         }
                     }
                 }
+            }
+            if etait_en_demarrage {
+                runtime_event(
+                    state,
+                    id,
+                    "start-ok",
+                    &format!(
+                        "pid {}",
+                        res.pid
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "?".to_string())
+                    ),
+                );
+            } else if avait_echecs {
+                runtime_event(state, id, "recovered", "UP observé après échec(s)");
             }
             if let Some((lvl, msg)) = log_event {
                 add_log(state, lvl, &msg);
@@ -273,6 +371,7 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
                         cmd.workdir.as_deref(),
                         15000,
                         true,
+                        &cmd.env,
                     ) {
                         Ok((p, handle)) => {
                             if let Some(h) = handle {
@@ -336,29 +435,105 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
 
 // ---------- scan / découverte ----------
 
+/// Plafond du scan par plage (lot 3, audit 03 constat 10) : au-delà, le
+/// handler refuse une plage explicite et le scan tronque défensivement une
+/// plage issue des réglages — un balayage synchrone séquentiel de plage large
+/// figeait l'API (~313 ms/port mesurés, soit 5 min pour 1 000 ports).
+pub const SCAN_MAX_PORTS: usize = 512;
+
+/// Taille du pool std éphémère du balayage. Le pool PERSISTANT du cycle de vie
+/// (poll_one) reste inchangé — ici un pool est créé et joint à chaque scan.
+const SCAN_WORKERS: usize = 32;
+
+/// Plafonne une plage de scan à SCAN_MAX_PORTS ports. Pur et testé.
+pub(super) fn scan_plafonne(from: u16, to: u16) -> (u16, u16) {
+    if (to as u32 - from as u32) < SCAN_MAX_PORTS as u32 {
+        return (from, to);
+    }
+    let head = from as u32 + SCAN_MAX_PORTS as u32 - 1;
+    if head <= u16::MAX as u32 {
+        (from, head as u16)
+    } else {
+        // en haut de l'espace u16, on garde 512 ports collés à la borne haute
+        ((u16::MAX as u32 - SCAN_MAX_PORTS as u32 + 1) as u16, to)
+    }
+}
+
 #[allow(unused_must_use)]
-pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) {
-    let (from, to) = match range {
+pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) -> u32 {
+    let brut = match range {
         Some(r) => r,
         None => {
             let s = lockv(&state.settings);
             (s.scan_from, s.scan_to)
         }
     };
+    if brut.0 > brut.1 {
+        add_log(
+            state,
+            "info",
+            &format!("scan {}..{} vide : rien à faire", brut.0, brut.1),
+        );
+        return 0;
+    }
+    let (from, to) = scan_plafonne(brut.0, brut.1);
+    if (from, to) != brut {
+        add_log(
+            state,
+            "warn",
+            &format!(
+                "scan {}..{} tronqué à {} ports ({}..{}) — réglez scan_from/scan_to",
+                brut.0, brut.1, SCAN_MAX_PORTS, from, to
+            ),
+        );
+    }
     add_log(
         state,
         "info",
-        &format!("scan {}..{} sur [::1]/127.0.0.1…", from, to),
+        &format!(
+            "scan {}..{} sur [::1]/127.0.0.1 ({} sondes parallèles)…",
+            from, to, SCAN_WORKERS
+        ),
     );
-    let mut found = 0u32;
-    let mut open: Vec<(u16, String)> = Vec::new();
-    for port in from..=to {
-        if probe::port_open("::1", port, std::time::Duration::from_millis(150)) {
-            open.push((port, "::1".into()));
-        } else if probe::port_open("127.0.0.1", port, std::time::Duration::from_millis(150)) {
-            open.push((port, "127.0.0.1".into()));
+    // BALAYAGE PARALLÈLE (pool std éphémère par segments contigus) : avant, le
+    // balayage séquentiel coûtait le budget complet 2 × 150 ms par port mesuré
+    // (~313 s pour 1 000 ports) et figeait le handler HTTP. Chaque thread sonde
+    // son segment, les résultats arrivent par canal — même approche std que le
+    // reste du dépôt, sans toucher au pool persistant du cycle.
+    let total = (to - from + 1) as usize;
+    let workers = SCAN_WORKERS.min(total).max(1);
+    let chunk = total.div_ceil(workers);
+    let (rtx, rrx) = std::sync::mpsc::channel::<(u16, String)>();
+    std::thread::scope(|scope| {
+        let mut start = from as u32;
+        let mut rest = total;
+        for _ in 0..workers {
+            let count = chunk.min(rest);
+            if count == 0 {
+                break;
+            }
+            let seg_start = start as u16;
+            let seg_end = (start + count as u32 - 1) as u16;
+            let rtx = rtx.clone();
+            scope.spawn(move || {
+                for port in seg_start..=seg_end {
+                    if probe::port_open("::1", port, std::time::Duration::from_millis(150)) {
+                        let _ = rtx.send((port, "::1".into()));
+                    } else if probe::port_open(
+                        "127.0.0.1",
+                        port,
+                        std::time::Duration::from_millis(150),
+                    ) {
+                        let _ = rtx.send((port, "127.0.0.1".into()));
+                    }
+                }
+            });
+            start += count as u32;
+            rest -= count;
         }
-    }
+    });
+    drop(rtx);
+    let mut open: Vec<(u16, String)> = rrx.into_iter().collect();
     open.sort();
     open.dedup();
     let own_ui = lockv(&state.settings).ui_port;
@@ -373,65 +548,84 @@ pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) {
             _ => None,
         })
         .collect();
-    for (port, host) in open {
-        if port == own_ui || known.contains(&port) {
-            continue;
+    // sondes MCP PARALLÈLES (même approche std que scan_listening) : un port
+    // muet coûte 4 s — en séquentiel sur plusieurs ports ouverts, le handler
+    // refigeait. Insertion sérialisée ensuite (verrou servers), triée par port
+    // pour un ordre d'insertion déterministe (comportement d'avant conservé).
+    let mut found = 0u32;
+    let candidats: Vec<(u16, String)> = open
+        .into_iter()
+        .filter(|(p, _)| *p != own_ui && !known.contains(p))
+        .collect();
+    let (mtx, mrx) = std::sync::mpsc::channel::<(u16, String, &'static str, probe::McpProbe)>();
+    std::thread::scope(|scope| {
+        for (port, host) in candidats {
+            let mtx = mtx.clone();
+            scope.spawn(move || {
+                if let Some((path, p)) = probe::probe_mcp_any_path(port, 4000) {
+                    let _ = mtx.send((port, host, path, p));
+                }
+            });
         }
-        if let Some((path, p)) = probe::probe_mcp_any_path(port, 4000) {
-            let id = format!("disc-{}", port);
-            let label = p.name.clone().unwrap_or_else(|| format!("port-{}", port));
-            let mut servers = lockv(&state.servers);
-            if !servers.iter().any(|s| {
-                s.id == id
-                    || matches!(&s.transport,
+    });
+    drop(mtx);
+    let mut decouverts: Vec<(u16, String, &'static str, probe::McpProbe)> =
+        mrx.into_iter().collect();
+    decouverts.sort_by_key(|(p, _, _, _)| *p);
+    for (port, host, path, p) in decouverts {
+        let id = format!("disc-{}", port);
+        let label = p.name.clone().unwrap_or_else(|| format!("port-{}", port));
+        let mut servers = lockv(&state.servers);
+        if !servers.iter().any(|s| {
+            s.id == id
+                || matches!(&s.transport,
                         Transport::Http { host, port: sp, .. }
                         if *sp == port
                             && host.as_deref().map(crate::is_loopback_bind).unwrap_or(true))
-            }) {
-                found += 1;
-                servers.push(Server {
-                    id: id.clone(),
-                    label,
-                    transport: Transport::Http {
-                        host: None,
-                        port,
-                        path: path.to_string(),
-                    },
-                    origin: Origin::Discovered,
-                    enabled: true,
-                    state: SState::Up,
-                    auto_restart: true,
-                    favorite: false,
-                    pid: p.pid,
-                    bound_host: p.host.clone().or(Some(host)),
-                    server_name: p.name.clone(),
-                    version: p.version.clone(),
-                    protocol: p.protocol.clone(),
-                    sse: p.sse,
-                    sse_endpoint: p.sse_endpoint,
-                    ws: p.ws,
-                    lang: p.lang.clone(),
-                    framework: p.framework.clone(),
-                    via_ssh: false,
-                    tools: p.tools,
-                    latency_ms: Some(p.latency_ms),
-                    last_seen_ts: Some(crate::types::now_ts()),
-                    last_error: None,
-                    start_cmd: None,
-                    tools_disabled: vec![],
-                });
-                drop(servers);
-                add_log(
-                    state,
-                    "info",
-                    &format!(
-                        "[scan] serveur MCP découvert sur port {} : {} v{}",
-                        port,
-                        p.name.as_deref().unwrap_or("?"),
-                        p.version.as_deref().unwrap_or("?")
-                    ),
-                );
-            }
+        }) {
+            found += 1;
+            servers.push(Server {
+                id: id.clone(),
+                label,
+                transport: Transport::Http {
+                    host: None,
+                    port,
+                    path: path.to_string(),
+                },
+                origin: Origin::Discovered,
+                enabled: true,
+                state: SState::Up,
+                auto_restart: true,
+                favorite: false,
+                pid: p.pid,
+                bound_host: p.host.clone().or(Some(host)),
+                server_name: p.name.clone(),
+                version: p.version.clone(),
+                protocol: p.protocol.clone(),
+                sse: p.sse,
+                sse_endpoint: p.sse_endpoint,
+                ws: p.ws,
+                lang: p.lang.clone(),
+                framework: p.framework.clone(),
+                via_ssh: false,
+                tools: p.tools,
+                latency_ms: Some(p.latency_ms),
+                last_seen_ts: Some(crate::types::now_ts()),
+                last_error: None,
+                start_cmd: None,
+                tools_disabled: vec![],
+            });
+            drop(servers);
+            add_log(
+                state,
+                "info",
+                &format!(
+                    "[scan] serveur MCP découvert sur port {} : {} v{}",
+                    port,
+                    p.name.as_deref().unwrap_or("?"),
+                    p.version.as_deref().unwrap_or("?")
+                ),
+            );
         }
     }
     add_log(
@@ -439,6 +633,7 @@ pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) {
         "info",
         &format!("scan terminé : {} nouveaux serveurs MCP", found),
     );
+    found
 }
 
 /// Découverte locale — candidats = ports en écoute MOINS les serveurs locaux
@@ -934,4 +1129,358 @@ pub fn scan_network_range(
         found.load(Ordering::Relaxed),
         tested.load(Ordering::Relaxed),
     )
+}
+
+// ---------- tests : cycle de démarrage, relances, échéance (lot 2) ----------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::RuntimeLog;
+    use crate::types::{AppState, Origin, SState, Server, Settings, StartCmd, Transport};
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    fn serveur_local(id: &str, port: u16, cmd: Option<(String, Vec<String>)>) -> Server {
+        Server {
+            id: id.to_string(),
+            label: id.to_string(),
+            transport: Transport::Http {
+                host: None,
+                port,
+                path: "/mcp".into(),
+            },
+            origin: Origin::Manual,
+            enabled: true,
+            state: SState::Down,
+            pid: None,
+            bound_host: None,
+            server_name: None,
+            version: None,
+            protocol: None,
+            sse: false,
+            sse_endpoint: false,
+            ws: false,
+            lang: None,
+            framework: None,
+            via_ssh: false,
+            tools: vec![],
+            latency_ms: None,
+            last_seen_ts: None,
+            last_error: None,
+            start_cmd: cmd.map(|(program, args)| StartCmd {
+                program,
+                args,
+                workdir: None,
+                env: Vec::new(),
+            }),
+            auto_restart: true,
+            favorite: false,
+            tools_disabled: vec![],
+        }
+    }
+
+    fn etat_test(servers: Vec<Server>) -> Arc<AppState> {
+        Arc::new(AppState {
+            servers: Mutex::new(servers),
+            log: Mutex::new(VecDeque::new()),
+            settings: Mutex::new(Settings::default()),
+            children: Mutex::new(HashMap::new()),
+            // config_path vide : save_config ne doit JAMAIS écrire un fichier
+            // (cf. manage/tests.rs — la garde vide est testée)
+            config_path: String::new(),
+            peers: Mutex::new(HashMap::new()),
+            allowed_origins: Mutex::new(Vec::new()),
+            allowed_hosts: Mutex::new(Vec::new()),
+            spawn_fails: Mutex::new(HashMap::new()),
+            runtime: Mutex::new(RuntimeLog::new()),
+            spawning: Mutex::new(HashSet::new()),
+            update_latest: Mutex::new(None),
+            lan_ok: Mutex::new(None),
+        })
+    }
+
+    /// Commande qui meurt aussitôt (code de sortie 1) — cross-platform.
+    fn commande_exit_immediat() -> (String, Vec<String>) {
+        #[cfg(windows)]
+        {
+            (
+                "cmd.exe".to_string(),
+                vec!["/C".to_string(), "exit".to_string(), "1".to_string()],
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            (
+                "sh".to_string(),
+                vec!["-c".to_string(), "exit 1".to_string()],
+            )
+        }
+    }
+
+    /// Commande qui vit une quinzaine de secondes (pour tester l'échéance
+    /// avec un process encore vivant malgré la charge parallèle des tests)
+    /// — cross-platform.
+    fn commande_vit_quelques_secondes() -> (String, Vec<String>) {
+        #[cfg(windows)]
+        {
+            (
+                "cmd.exe".to_string(),
+                vec![
+                    "/C".to_string(),
+                    "ping".to_string(),
+                    "-n".to_string(),
+                    "15".to_string(),
+                    "127.0.0.1".to_string(),
+                ],
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            (
+                "sh".to_string(),
+                vec!["-c".to_string(), "sleep 15".to_string()],
+            )
+        }
+    }
+
+    fn port_libre() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind 127.0.0.1:0")
+            .local_addr()
+            .expect("local_addr")
+            .port()
+    }
+
+    fn runtime_de(state: &AppState, id: &str) -> crate::runtime::RuntimeState {
+        lockv(&state.runtime).get(id).cloned().unwrap_or_default()
+    }
+
+    fn journal(state: &AppState) -> Vec<String> {
+        lockv(&state.log).iter().map(|e| e.msg.clone()).collect()
+    }
+
+    /// Faux serveur MCP local (initialize valide pour toute requête) — sert
+    /// aux tests d'UP réellement observé.
+    fn fixture_mcp() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let port = listener.local_addr().expect("local_addr fixture").port();
+        std::thread::spawn(move || {
+            let reponse =
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"serverInfo\":{\"name\":\"test-mcp\",\"version\":\"1.0\"}}}";
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { return };
+                let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 8192];
+                // lecture bornée : la requête de sonde tient dans quelques blocs
+                for _ in 0..8 {
+                    match s.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    continue; // sonde de port (TCP nu) : rien à répondre
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reponse.len()
+                );
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(reponse.as_bytes());
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn spawn_sans_up_ne_remet_pas_le_compteur_a_zero() {
+        // Régression audit 03 constat 3 : au spawn, plus aucun `start-ok` —
+        // le compteur d'échecs ne peut plus être remis à zéro par un simple
+        // lancement de process. Un marqueur de démarrage avec échéance est
+        // posé à la place, et l'état reste « démarrage en cours ».
+        let port = port_libre();
+        let (prog, args) = commande_exit_immediat();
+        let state = etat_test(vec![serveur_local("crash-x", port, Some((prog, args)))]);
+        poll_one(&state, "crash-x");
+        let rt = runtime_de(&state, "crash-x");
+        assert_eq!(rt.fails, 0, "aucun échec au spawn : {rt:?}");
+        assert!(
+            rt.starting_until > crate::types::now_ts(),
+            "marqueur de démarrage posé avec échéance : {rt:?}"
+        );
+        assert!(
+            rt.events.iter().all(|e| e.kind != "start-ok"),
+            "plus de start-ok au spawn : {:?}",
+            rt.events
+        );
+        let servers = lockv(&state.servers);
+        let srv = servers.iter().find(|s| s.id == "crash-x").unwrap();
+        assert!(srv.pid.is_some(), "pid conservé pendant le démarrage");
+        assert_eq!(srv.state, SState::Down, "pas de fausse remontée UP");
+        assert_eq!(
+            srv.last_error.as_deref(),
+            Some("démarrage en cours…"),
+            "motif d'attente posé : {:?}",
+            srv.last_error
+        );
+    }
+
+    #[test]
+    fn mort_immediate_compte_un_echec_puis_abandon_a_cinq() {
+        // Régression audit 03 constat 3 : un serveur qui sort aussitôt compte
+        // UN échec par tentative (note_spawn_failure), le backoff croît et à
+        // MAX_ATTEMPTS l'auto-restart est désactivé — la relance n'est plus
+        // infinie.
+        let port = port_libre();
+        let (prog, args) = commande_exit_immediat();
+        let state = etat_test(vec![serveur_local("crash-y", port, Some((prog, args)))]);
+        let mut backoffs = Vec::new();
+        for _ in 0..crate::runtime::MAX_ATTEMPTS {
+            poll_one(&state, "crash-y"); // spawn (ou tentative) — marqueur posé
+            poll_one(&state, "crash-y"); // process sorti → échec compté
+            let rt = runtime_de(&state, "crash-y");
+            backoffs.push(rt.backoff_secs());
+            // on neutralise le backoff pour enchaîner les tentatives du test
+            lockv(&state.runtime)
+                .entry("crash-y".to_string())
+                .or_default()
+                .last_attempt_ts = 0;
+        }
+        let rt = runtime_de(&state, "crash-y");
+        assert_eq!(rt.fails, crate::runtime::MAX_ATTEMPTS, "fails = 5 : {rt:?}");
+        for fen in backoffs.windows(2) {
+            assert!(fen[1] > fen[0], "backoff croissant : {backoffs:?}");
+        }
+        assert_eq!(backoffs[0], crate::runtime::BASE_BACKOFF_SECS);
+        assert_eq!(
+            rt.events.iter().filter(|e| e.kind == "start-fail").count(),
+            crate::runtime::MAX_ATTEMPTS as usize
+        );
+        assert!(
+            rt.events.iter().all(|e| e.kind != "start-ok"),
+            "aucun start-ok sur une série d'échecs : {:?}",
+            rt.events
+        );
+        let servers = lockv(&state.servers);
+        let srv = servers.iter().find(|s| s.id == "crash-y").unwrap();
+        assert!(!srv.auto_restart, "auto-restart désactivé à 5 échecs");
+        drop(servers);
+        assert!(
+            journal(&state)
+                .iter()
+                .any(|m| m.contains("auto-restart désactivé après 5 échecs")),
+            "ligne de journal d'abandon claire : {:?}",
+            journal(&state)
+        );
+        // APRÈS abandon : plus aucun spawn — le marqueur ne repose pas, le
+        // compteur n'évolue plus (la relance infinie est corrigée).
+        let enfants_avant = lockv(&state.children).len();
+        poll_one(&state, "crash-y");
+        poll_one(&state, "crash-y");
+        let rt2 = runtime_de(&state, "crash-y");
+        assert_eq!(
+            rt2.fails,
+            crate::runtime::MAX_ATTEMPTS,
+            "plus d'échec compté après abandon"
+        );
+        assert_eq!(rt2.starting_until, 0, "aucun nouveau marqueur posé");
+        assert_eq!(
+            lockv(&state.children).len(),
+            enfants_avant,
+            "aucun spawn après abandon"
+        );
+        assert!(
+            lockv(&state.spawning).is_empty(),
+            "garde anti-doublon relâchée"
+        );
+    }
+
+    #[test]
+    fn echeance_depassee_compte_un_echec_meme_process_vivant() {
+        // Un lanceur qui ne rend jamais la main (build interminable, process
+        // bloqué) est déclaré en échec à l'échéance de la fenêtre de démarrage.
+        let port = port_libre();
+        let (prog, args) = commande_vit_quelques_secondes();
+        let state = etat_test(vec![serveur_local("lent", port, None)]);
+        let h = probe::spawn_process(&prog, &args, None, &[]).expect("spawn process vivant");
+        lockv(&state.children).insert("lent".to_string(), h);
+        {
+            let mut rt = lockv(&state.runtime);
+            let entry = rt.entry("lent".to_string()).or_default();
+            entry.starting_until = crate::types::now_ts().saturating_sub(1);
+        }
+        poll_one(&state, "lent");
+        let rt = runtime_de(&state, "lent");
+        assert_eq!(rt.fails, 1, "échec compté à l'échéance : {rt:?}");
+        assert_eq!(rt.starting_until, 0, "marqueur consommé");
+        assert!(
+            journal(&state)
+                .iter()
+                .any(|m| m.contains("échéance de démarrage")),
+            "motif d'échéance dans le journal : {:?}",
+            journal(&state)
+        );
+        let servers = lockv(&state.servers);
+        let srv = servers.iter().find(|s| s.id == "lent").unwrap();
+        assert!(srv.auto_restart, "un seul échec n'abandonne pas");
+        drop(servers);
+        // nettoyage : tue le process encore vivant
+        let mut restant = lockv(&state.children).remove("lent");
+        if let Some(mut h) = restant.take() {
+            let _ = h.child.kill();
+            let _ = h.child.wait();
+        }
+    }
+
+    #[test]
+    fn up_observe_remet_le_compteur_a_zero() {
+        // Le compteur ne retombe à zéro QUE sur un UP réellement observé :
+        // start-ok est journalisé à cette occasion (plus au spawn).
+        let port = fixture_mcp();
+        let state = etat_test(vec![serveur_local("revient", port, None)]);
+        {
+            let mut rt = lockv(&state.runtime);
+            let entry = rt.entry("revient".to_string()).or_default();
+            entry.fails = 3;
+            entry.starting_until = crate::types::now_ts() + 30;
+        }
+        poll_one(&state, "revient");
+        let rt = runtime_de(&state, "revient");
+        assert_eq!(rt.fails, 0, "UP observé → compteur remis à zéro : {rt:?}");
+        assert_eq!(rt.starting_until, 0, "marqueur consommé");
+        assert_eq!(rt.last_success_ts, crate::types::now_ts());
+        assert!(
+            rt.events.iter().any(|e| e.kind == "start-ok"),
+            "start-ok journalisé à l'UP réel : {:?}",
+            rt.events
+        );
+        let servers = lockv(&state.servers);
+        let srv = servers.iter().find(|s| s.id == "revient").unwrap();
+        assert_eq!(srv.state, SState::Up);
+        assert_eq!(srv.last_error, None);
+    }
+
+    #[test]
+    fn up_apres_echecs_emet_recovered() {
+        // UP sans marqueur de démarrage mais après des échecs comptés :
+        // événement `recovered` (compteur remis à zéro, redémarrage compté).
+        let port = fixture_mcp();
+        let state = etat_test(vec![serveur_local("retabli", port, None)]);
+        {
+            let mut rt = lockv(&state.runtime);
+            let entry = rt.entry("retabli".to_string()).or_default();
+            entry.fails = 3;
+        }
+        poll_one(&state, "retabli");
+        let rt = runtime_de(&state, "retabli");
+        assert_eq!(rt.fails, 0, "{rt:?}");
+        assert_eq!(rt.restarts, 1, "recovered compte un redémarrage : {rt:?}");
+        assert!(rt.events.iter().any(|e| e.kind == "recovered"));
+    }
 }

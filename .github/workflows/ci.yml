@@ -38,3 +38,11 @@ jobs:
 
       - name: Clippy (strict, tous les targets)
         run: cargo clippy --all-targets -- -D warnings
+
+      # Le binaire CLI en release n'est compilé par aucun autre check du job :
+      # une régression de visibilité (E0603, audit 01 constats 1 et 5) ne serait
+      # vue que par cargo test. Le crate desktop n'est PAS ajouté ici : son job
+      # release.yml installe au préalable les dépendances système WebKitGTK
+      # (Linux) que ce job n'installe pas.
+      - name: Build release (binaire CLI)
+        run: cargo build --release -p mcp-control

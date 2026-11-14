@@ -1,6 +1,43 @@
 // Chargement/sauvegarde de config.json, parsing des serveurs et réglages, serveurs par défaut.
 // (split v0.7.20 : manage.rs reste la racine — API stable via réexport)
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+/// Parse le champ `"env": {"CLÉ": "valeur", …}` d'une entrée (config.json ou
+/// import mcpServers). Seules les valeurs STRING sont retenues ; champ absent →
+/// vide (compat config v0.7.20 — CRITÈRE de non-régression du lot 3).
+pub fn env_from_json(s: &Value) -> Vec<(String, String)> {
+    s.get("env")
+        .and_then(|x| x.as_object())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Ligne de boot dans mcc.log (à côté du config.json) : `load_config` tourne
+/// AVANT la création de l'AppState — sans fichier, aucun support possible pour
+/// un config.json corrompu renommé (lot 3, audit 03 constat 8).
+fn journal_boot(config_path: &str, msg: &str) {
+    use std::io::Write;
+    println!("[config] {msg}");
+    let p = std::path::Path::new(config_path).with_file_name("mcc.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&p)
+    {
+        let _ = writeln!(
+            f,
+            "[{}] [warn] {}",
+            crate::types::iso_utc(crate::types::now_ts()),
+            msg
+        );
+    }
+}
 
 pub(super) fn default_servers() -> Vec<Server> {
     // Commandes de lancement réelles (launcher MCP MONITOR v7.3) : chaque serveur
@@ -50,6 +87,7 @@ pub(super) fn default_servers() -> Vec<Server> {
                 program: "node".to_string(),
                 args: vec![format!("{}/bin/launch.cjs", wd)],
                 workdir: Some(wd.clone()),
+                env: Vec::new(),
             }),
             tools_disabled: vec![],
         }
@@ -117,6 +155,7 @@ pub(super) fn default_servers() -> Vec<Server> {
                     .to_string(),
                 args: vec![],
                 workdir: Some("C:/Users/Deamon/Desktop/litemcp".to_string()),
+                env: Vec::new(),
             }),
             tools_disabled: vec![],
         },
@@ -202,7 +241,30 @@ pub fn load_config(path: &str) -> (Vec<Server>, crate::types::Settings) {
     };
     let v: Value = match serde_json::from_str(&file) {
         Ok(v) => v,
-        Err(_) => return (defaults, settings),
+        Err(_) => {
+            // (lot 3, audit 03 constat 8) config.json ILLISIBLE (JSON invalide,
+            // vide, BOM PowerShell…) : le repli silencieux sur les seeds
+            // écrasait la config à la première sauvegarde sans laisser de
+            // trace. On renomme le fichier (horodatage au format sûr Windows,
+            // sans « : »), on journalise, puis on repart des défauts. Un
+            // fichier ABSENT reste un premier boot normal : aucun renommage.
+            let dest = format!("{}.corrompu-{}", path, crate::types::now_ts());
+            let msg = match std::fs::rename(path, &dest) {
+                Ok(()) => format!(
+                    "config illisible (JSON invalide ou vide, {} octets) — renommé en {} — redémarrage sur les serveurs par défaut",
+                    file.len(),
+                    dest
+                ),
+                Err(e) => format!(
+                    "config illisible (JSON invalide ou vide, {} octets) — renommage en {} impossible ({}) — redémarrage sur les serveurs par défaut",
+                    file.len(),
+                    dest,
+                    e
+                ),
+            };
+            journal_boot(path, &msg);
+            return (defaults, settings);
+        }
     };
     let mut servers = defaults;
     if let Some(arr) = v.get("servers").and_then(|x| x.as_array()) {
@@ -230,6 +292,7 @@ pub fn load_config(path: &str) -> (Vec<Server>, crate::types::Settings) {
                 program,
                 args,
                 workdir,
+                env,
             } = s.transport.clone()
             {
                 if !program.is_empty() {
@@ -237,6 +300,7 @@ pub fn load_config(path: &str) -> (Vec<Server>, crate::types::Settings) {
                         program,
                         args,
                         workdir,
+                        env,
                     });
                 }
             }
@@ -288,6 +352,7 @@ pub(super) fn apply_json(srv: &mut Server, s: &Value) {
                     .to_string(),
                 args,
                 workdir: s.get("workdir").and_then(|x| x.as_str()).map(String::from),
+                env: env_from_json(s),
             };
         }
     }
@@ -307,6 +372,7 @@ pub(super) fn apply_json(srv: &mut Server, s: &Value) {
                 program: program.to_string(),
                 args,
                 workdir: s.get("workdir").and_then(|x| x.as_str()).map(String::from),
+                env: env_from_json(s),
             });
         }
     }
@@ -345,6 +411,7 @@ pub(super) fn from_json(s: &Value) -> Option<Server> {
                 })
                 .unwrap_or_default(),
             workdir: s.get("workdir").and_then(|x| x.as_str()).map(String::from),
+            env: env_from_json(s),
         },
         _ => Transport::Http {
             host: s.get("host").and_then(|x| x.as_str()).map(String::from),
@@ -386,6 +453,7 @@ pub(super) fn from_json(s: &Value) -> Option<Server> {
                     })
                     .unwrap_or_default(),
                 workdir: s.get("workdir").and_then(|x| x.as_str()).map(String::from),
+                env: env_from_json(s),
             })
         }
     };
@@ -503,11 +571,25 @@ pub(super) fn parse_settings(v: &Value, mut st: crate::types::Settings) -> crate
     st
 }
 
+/// Verrou global d'écriture de config.json (lot 3, audit 03 constat 7) :
+/// sérialise clone→écriture pour qu'un snapshot ancien n'écrase jamais un plus
+/// récent. Aucun autre chemin ne prend ce verrou, et save_config est appelée
+/// hors de tout verrou state (elle re-prend servers/settings/runtime dessous),
+/// donc aucun ordre de verrous nouveau.
+static SAVE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+/// Séquence pour un fichier temporaire UNIQUE par écriture.
+static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn save_lock() -> &'static Mutex<()> {
+    SAVE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
 #[allow(unused_must_use)]
 pub fn save_config(state: &AppState) {
     if state.config_path.is_empty() {
         return;
     }
+    let _garde = lockv(save_lock());
     let servers = lockv(&state.servers).clone();
     let settings = lockv(&state.settings).clone();
     let mut arr = Vec::new();
@@ -553,18 +635,32 @@ pub fn save_config(state: &AppState) {
                     if let Some(w) = &c.workdir {
                         o.insert("workdir".into(), json!(w));
                     }
+                    if !c.env.is_empty() {
+                        let m: Map<String, Value> =
+                            c.env.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+                        o.insert("env".into(), Value::Object(m));
+                    }
                 }
             }
             Transport::Stdio {
                 program,
                 args,
                 workdir,
+                env,
             } => {
                 o.insert("transport".into(), json!("stdio"));
                 o.insert("program".into(), json!(program));
                 o.insert("args".into(), json!(args));
                 if let Some(w) = workdir {
                     o.insert("workdir".into(), json!(w));
+                }
+                // env de l'import mcpServers : les VALEURS restent dans ce fichier
+                // local (le process en a besoin au boot) — jamais dans l'API ni
+                // le journal (noms seulement, cf. json.rs::server_json).
+                if !env.is_empty() {
+                    let m: Map<String, Value> =
+                        env.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+                    o.insert("env".into(), Value::Object(m));
                 }
             }
         }
@@ -596,7 +692,15 @@ pub fn save_config(state: &AppState) {
         "runtime": crate::runtime::to_json(&lockv(&state.runtime)),
     });
     let pretty = serde_json::to_string_pretty(&doc).unwrap_or_default();
-    let tmp = format!("{}.tmp", state.config_path);
+    // tmp UNIQUE par écriture (pid + séquence) : même sous le verrou global,
+    // deux écritures ne partagent plus jamais le même chemin — un crash pendant
+    // une écriture ne laisse pas de .tmp réutilisé par la suivante.
+    let tmp = format!(
+        "{}.{}.{}.tmp",
+        state.config_path,
+        std::process::id(),
+        SAVE_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
     // Écriture atomique tmp+rename — les erreurs sont LOGUÉES (une écriture ratée
     // silencieuse = ajout perdu au reboot sans aucun indice).
     if let Err(e) = std::fs::write(&tmp, &pretty) {
@@ -616,5 +720,18 @@ pub fn save_config(state: &AppState) {
                 state.config_path, e
             ),
         );
+    } else {
+        #[cfg(unix)]
+        {
+            // (lot 3, audit 05 constat 10) config.json contient api_access et
+            // les valeurs env en clair : droits 0600 à l'écriture sous Unix
+            // (std::os::unix, PermissionsExt). Sur Windows : no-op volontaire
+            // (ACL héritées — comportement inchangé), noté au rapport lot 3.
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &state.config_path,
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
     }
 }

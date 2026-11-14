@@ -14,6 +14,9 @@ pub(crate) use log::*;
 // config : déplacé vers manage/config.rs (v0.7.20) — réexport pour API stable.
 mod config;
 pub(crate) use config::*;
+// Appelée par le binaire racine (src/main.rs) : le réexport doit être pub
+// (E0603 du split v0.7.20, audit 01 constat 1).
+pub use config::resolve_config_path;
 
 // store : déplacé vers manage/store.rs (v0.7.20) — réexport pour API stable.
 mod store;
@@ -55,14 +58,6 @@ fn filesystem_dossier_manquant(args: &[String]) -> bool {
             .unwrap_or(true)
 }
 
-/// Compte un échec de spawn auto pour l'id ; à partir de 3 échecs consécutifs,
-/// désactive l'auto-restart (sinon boucle infinie d'essais + warnings sur une
-/// machine cliente où les chemins des seeds n'existent pas).
-/// Enregistre un événement runtime (crash, redémarrage, succès…) et le
-/// persiste — l'historique survit au redémarrage de l'application.
-/// NOTIFICATION d'incident : déclenchée sur une transition UP → DOWN/PORT-ONLY.
-/// Deux canaux : toast desktop (Windows) et webhook HTTP. Le délai minimum
-/// (`min_interval_secs`) évite le spam quand un serveur oscille.
 // events : déplacé vers manage/events.rs (v0.7.20) — réexport pour API stable.
 mod events;
 pub(crate) use events::*;

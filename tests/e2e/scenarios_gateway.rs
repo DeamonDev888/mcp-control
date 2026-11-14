@@ -553,6 +553,29 @@ fn gateway_transport_regles_litemcp() {
     );
     assert_eq!(resp.status, 406);
 
+    // Accept: */* (défaut de curl — exemple curl du README) → 200 JSON
+    let resp = mcp_with(
+        &eng,
+        &[("Accept", "*/*")],
+        &json!({"jsonrpc": "2.0", "id": 4, "method": "ping"}),
+    );
+    assert_eq!(resp.status, 200, "Accept */* doit passer (défaut curl)");
+    assert!(
+        resp.header("content-type")
+            .unwrap_or_default()
+            .starts_with("application/json"),
+        "*/* doit être servi en JSON : {:?}",
+        resp.headers
+    );
+
+    // Accept: application/xml → toujours 406
+    let resp = mcp_with(
+        &eng,
+        &[("Accept", "application/xml")],
+        &json!({"jsonrpc": "2.0", "id": 5, "method": "ping"}),
+    );
+    assert_eq!(resp.status, 406, "application/xml doit rester refusé");
+
     // client SSE-only → réponse text/event-stream mono-événement
     let resp = mcp_with(
         &eng,
@@ -595,6 +618,86 @@ fn gateway_transport_regles_litemcp() {
     );
     let resp = eng.raw(brut.as_bytes(), 0);
     assert_eq!(resp.status, 400, "Mcp-Method dupliqué doit donner 400");
+}
+
+/// L'injection d'`action` dans les arguments d'un tool d'action est refusée
+/// par le schéma (-32602) SANS toucher aux réglages ni au serveur visé
+/// (audit 02-gateway constat 2) ; `program:null` de set_start_command passe
+/// la validation — nullable (audit constat 5, la suite appartient au
+/// dispatcher).
+#[test]
+fn gateway_injection_action_refusee_et_program_null_nullable() {
+    let _garde = serial_guard();
+    let eng = moteur();
+    let fx = Fixture::spawn_mcp();
+    let rep = ajoute_http(&eng, fx.port(), "e2e-gw-injection");
+    let id = rep["id"].as_str().expect("add sans id").to_string();
+
+    // réglages avant injection (le harnais démarre avec ses propres
+    // réglages — on compare, on ne devine pas les défauts)
+    let reglages_avant = structured(
+        mcp(&eng, &rpc_call("get_settings", json!({}), 9)),
+        "get_settings avant",
+    );
+
+    // toggle_server + injection de l'action interdite + payload → -32602
+    let rep = mcp(
+        &eng,
+        &rpc_call(
+            "toggle_server",
+            json!({ "id": id, "action": "set_settings", "refresh_secs": 1234 }),
+            10,
+        ),
+    );
+    assert_eq!(
+        rep["error"]["code"], -32602,
+        "l'injection d'action doit être refusée par le schéma : {rep}"
+    );
+
+    // le serveur visé n'a pas bougé et les réglages non plus
+    assert_eq!(
+        serveur_par_port(&eng, fx.port()).unwrap()["enabled"],
+        json!(true),
+        "toggle_server ne doit pas s'être exécuté"
+    );
+    let reglages_apres = structured(
+        mcp(&eng, &rpc_call("get_settings", json!({}), 11)),
+        "get_settings après",
+    );
+    assert_eq!(
+        reglages_avant, reglages_apres,
+        "aucun réglage ne doit avoir bougé (refresh_secs=1234, ui_bind=0.0.0.0, autostart)",
+    );
+
+    // même refus sur un autre tool d'action, avec la clé racine réservée `id`
+    let rep = mcp(
+        &eng,
+        &rpc_call(
+            "scan_ports",
+            json!({ "from": 1, "to": 2, "id": id, "action": "reset_runtime" }),
+            12,
+        ),
+    );
+    assert_eq!(
+        rep["error"]["code"], -32602,
+        "champ hors schéma doit être refusé : {rep}"
+    );
+
+    // audit constat 5 : program:null n'est PLUS refusé par le schéma
+    // (nullable) — la réponse qui suit appartient au dispatcher, jamais
+    // une erreur JSON-RPC -32602
+    let rep = mcp(
+        &eng,
+        &rpc_call(
+            "set_start_command",
+            json!({ "id": id, "program": null }),
+            13,
+        ),
+    );
+    assert!(
+        rep.get("error").is_none(),
+        "program:null ne doit pas être refusé par le schéma : {rep}"
+    );
 }
 
 /// L'auth du gateway hérite du sas /api/* : loopback jamais de code, LAN

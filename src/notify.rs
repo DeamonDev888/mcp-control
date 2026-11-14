@@ -13,6 +13,69 @@
 //! jamais faire tomber le poller.
 
 use serde_json::{json, Value};
+use std::net::IpAddr;
+
+// ---------- identité de CETTE instance (audit 05 #4) ----------
+
+/// Points d'écoute de cette instance : (port UI réel, IP locales de la machine).
+/// Enregistré par run_headless au boot ; une URL de webhook qui vise l'un de
+/// ces points est CETTE instance → refusée à l'enregistrement comme à l'envoi.
+static SELF_LISTEN: std::sync::OnceLock<(u16, Vec<String>)> = std::sync::OnceLock::new();
+
+/// Chemin du journal mcc.log, branché par run_headless : send_webhook n'a pas
+/// d'AppState mais doit tracer chaque envoi (cible + résultat).
+static WEBHOOK_LOG_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Branche le chemin du journal (mcc.log) pour la journalisation des envois
+/// webhook. Idempotent : le premier appel gagne (le boot ne s'exécute qu'une
+/// fois par processus ; en tests unitaires sans boot, aucun fichier écrit).
+pub fn set_webhook_log_path(path: &str) {
+    let _ = WEBHOOK_LOG_PATH.set(path.to_string());
+}
+
+/// Enregistre le port UI réel (après repli +1..+9) et les IP locales de la
+/// machine. Idempotent : le premier appel gagne (le boot ne s'exécute qu'une
+/// fois par processus).
+pub fn note_self_listen(ui_port: u16, local_ips: &[String], ui_bind: &str) {
+    let mut hosts: Vec<String> = Vec::new();
+    if !matches!(ui_bind.trim(), "" | "0.0.0.0" | "*" | "::") {
+        hosts.push(ui_bind.trim().to_ascii_lowercase());
+    }
+    for ip in local_ips {
+        hosts.push(ip.trim().to_ascii_lowercase());
+    }
+    let _ = SELF_LISTEN.set((ui_port, hosts));
+}
+
+/// Hôte d'URL normalisé (crochets IPv6 retirés, minuscules).
+fn url_host_only(h: &str) -> String {
+    let h = h.trim();
+    let h = h.strip_prefix('[').unwrap_or(h);
+    let h = h.split(']').next().unwrap_or(h);
+    h.to_ascii_lowercase()
+}
+
+/// Cette URL (hôte:port) vise-t-elle cette instance elle-même ? Uniquement si
+/// le port correspond au port UI réel, et que l'hôte est de boucle
+/// (127.x, ::1), localhost, 0.0.0.0, ou une des IP locales de la machine.
+fn is_own_instance(host: &str, port: u16) -> bool {
+    let Some((self_port, hosts)) = SELF_LISTEN.get() else {
+        return false;
+    };
+    if *self_port != port {
+        return false;
+    }
+    let h = url_host_only(host);
+    if h.is_empty() || h == "localhost" || h == "0.0.0.0" {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<IpAddr>() {
+        if ip.is_loopback() {
+            return true;
+        }
+    }
+    hosts.contains(&h)
+}
 
 /// Configuration des notifications (persistée dans config.json).
 #[derive(Clone, Debug)]
@@ -106,7 +169,23 @@ pub fn from_json(v: &Value) -> NotifyConfig {
     c
 }
 
-/// Sérialise la config de notification.
+/// Sérialise la config de notification pour L'EXPOSITION API (/api/state) :
+/// les en-têtes ne sortent JAMAIS en clair (ils peuvent porter un
+/// Authorization, lisible sans code en loopback — audit 05 #5) ; un booléen
+/// `headers_set` suffit à l'UI (« champ vide = inchangé »).
+pub fn to_api_json(c: &NotifyConfig) -> Value {
+    json!({
+        "desktop": c.desktop,
+        "webhook_url": c.webhook_url,
+        "method": c.method,
+        "headers_set": !c.headers.trim().is_empty(),
+        "states": c.states,
+        "min_interval_secs": c.min_interval_secs,
+    })
+}
+
+/// Sérialise la config de notification (PERSISTANCE config.json uniquement —
+/// l'exposition API passe par `to_api_json`, qui masque les en-têtes).
 pub fn to_json(c: &NotifyConfig) -> Value {
     json!({
         "desktop": c.desktop,
@@ -131,13 +210,47 @@ pub fn webhook_body(server: &str, state: &str, detail: &str) -> Value {
     })
 }
 
-/// Valide une URL de webhook (http/https seulement, longueur bornée).
-pub fn valid_webhook_url(url: &str) -> bool {
+/// Raison PRÉCISE du refus d'une URL de webhook — None = acceptée. Appliquée
+/// à l'enregistrement (set_notify → valid_webhook_url) comme à l'envoi
+/// (send_webhook). Règles :
+/// - https:// REFUSÉ : l'app n'embarque aucune pile TLS (Cargo.toml =
+///   serde_json + litemcp) — l'ancien comportement acceptait l'URL puis
+///   partait en HTTP brut sur le port 443, sans jamais aboutir (audit 05 #4) ;
+/// - une URL qui vise cette instance elle-même est refusée (boucle sur soi) ;
+/// - les AUTRES cibles locales ou privées restent AUTORISÉES : un webhook vers
+///   un service du LAN est un usage normal.
+pub fn webhook_url_reject_reason(url: &str) -> Option<String> {
     let u = url.trim();
-    if u.is_empty() || u.len() > 2000 {
-        return false;
+    if u.is_empty() {
+        return Some("URL vide".to_string());
     }
-    u.starts_with("http://") || u.starts_with("https://")
+    if u.len() > 2000 {
+        return Some("URL trop longue (max 2000 caractères)".to_string());
+    }
+    if u.starts_with("https://") {
+        return Some("https:// non pris en charge : l'app n'embarque aucune pile TLS, l'envoi partait en HTTP brut sur le port 443 et n'aboutissait jamais — utilisez une URL http://".to_string());
+    }
+    if !u.starts_with("http://") {
+        return Some("URL de webhook invalide (http:// attendu)".to_string());
+    }
+    match split_url(u) {
+        Ok((host, port, _path)) => {
+            if is_own_instance(&host, port) {
+                Some(format!(
+                    "cette URL vise cette instance elle-même (port UI {port}) : boucle interdite"
+                ))
+            } else {
+                None
+            }
+        }
+        Err(e) => Some(e),
+    }
+}
+
+/// Valide une URL de webhook (http:// seul, longueur bornée, pas cette
+/// instance). Le message PRÉCIS du refus est dans `webhook_url_reject_reason`.
+pub fn valid_webhook_url(url: &str) -> bool {
+    webhook_url_reject_reason(url).is_none()
 }
 
 /// Envoie le webhook (HTTP brut, sans dépendance : on réutilise le client
@@ -151,8 +264,10 @@ pub fn send_webhook(
     if cfg.webhook_url.trim().is_empty() {
         return Err("aucune URL de webhook configurée".to_string());
     }
-    if !valid_webhook_url(&cfg.webhook_url) {
-        return Err("URL de webhook invalide (http:// ou https:// attendu)".to_string());
+    // mêmes règles qu'à l'enregistrement, avec le message précis — un ancien
+    // https:// persisté dans config.json est refusé ici aussi
+    if let Some(raison) = webhook_url_reject_reason(&cfg.webhook_url) {
+        return Err(format!("webhook refusé : {raison}"));
     }
     let body = webhook_body(server, state, detail).to_string();
     let (host, port, path) = split_url(&cfg.webhook_url)?;
@@ -163,9 +278,57 @@ pub fn send_webhook(
     for (k, v) in &pairs {
         headers.push((k.as_str(), v.as_str()));
     }
-    crate::probe::http_post_raw(&host, port, &path, &body, &headers, &cfg.method, 8000)
-        .map(|_| ())
-        .map_err(|e| format!("webhook : {e}"))
+    let cible = format!("http://{host}:{port}{path}");
+    let resultat =
+        crate::probe::http_post_raw(&host, port, &path, &body, &headers, &cfg.method, 8000);
+    // JOURNAL (audit 05 #4) : chaque envoi trace sa cible et son résultat —
+    // le webhook embarque des données d'incident vers l'extérieur.
+    let (ok, outcome) = match &resultat {
+        Ok(()) => (true, "ok".to_string()),
+        Err(e) => (false, format!("erreur : {e}")),
+    };
+    append_webhook_log(&webhook_log_line(
+        server, state, detail, &cible, ok, &outcome,
+    ));
+    resultat.map(|_| ()).map_err(|e| format!("webhook : {e}"))
+}
+
+/// Ligne de journal d'un envoi de webhook (pure, testable) — format aligné sur
+/// le journal disque : "[ISO] [niveau] message".
+fn webhook_log_line(
+    server: &str,
+    state: &str,
+    detail: &str,
+    cible: &str,
+    ok: bool,
+    outcome: &str,
+) -> String {
+    format!(
+        "[{}] [{}] [webhook] envoi vers {} — serveur « {} » → {} ({}) : {}",
+        crate::types::iso_utc(crate::types::now_ts()),
+        if ok { "info" } else { "warn" },
+        cible,
+        server,
+        state,
+        detail,
+        outcome
+    )
+}
+
+/// Écrit la ligne dans mcc.log si le chemin a été branché au boot (tests
+/// unitaires sans boot : aucun fichier écrit). Volume négligeable — la
+/// rotation 512 Ko du journal reste assurée par `write_log_file`.
+fn append_webhook_log(line: &str) {
+    if let Some(path) = WEBHOOK_LOG_PATH.get() {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{line}");
+        }
+    }
 }
 
 /// Découpe une URL en (hôte, port, chemin) — le client maison n'accepte pas
@@ -200,35 +363,38 @@ fn split_url(url: &str) -> Result<(String, u16, String), String> {
     Ok((host, port, path.to_string()))
 }
 
+/// Script PowerShell FIXE du toast : aucune donnée n'y est concaténée — le
+/// titre et le message arrivent par les variables d'environnement
+/// ($env:MCC_TOAST_TITLE / $env:MCC_TOAST_TEXT). L'ancien code passait
+/// `-Command` trois fois (PowerShell échouait toujours : canal desktop mort,
+/// audit 05 #7) et assemblait le script par concaténation : une apostrophe
+/// dans un label de serveur injectait du PowerShell.
+const TOAST_SCRIPT: &str = "\
+[void][System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms');
+[void][System.Reflection.Assembly]::LoadWithPartialName('System.Drawing');
+$n = New-Object System.Windows.Forms.NotifyIcon;
+$n.Icon = [System.Drawing.SystemIcons]::Warning;
+$n.BalloonTipTitle = $env:MCC_TOAST_TITLE;
+$n.BalloonTipText = $env:MCC_TOAST_TEXT;
+$n.Visible = $true;
+Start-Sleep -Milliseconds 50;
+$n.ShowBalloonTip(8000);
+Start-Sleep -Seconds 9;
+$n.Dispose()";
+
 /// Toast desktop Windows. Silencieux si indisponible (le poller ne doit pas
-/// tomber). Le canal Windows natif (`msg`) est utilisé en repli : la
-/// notification apparaît dans le centre de maintenance.
+/// tomber). Titre et message transmis PAR L'ENVIRONNEMENT, jamais dans le
+/// script : apostrophes et guillemets sont inertes (aucune concaténation).
 pub fn desktop_toast(title: &str, message: &str) -> Result<(), String> {
     if !cfg!(windows) {
         return Err("notifications desktop : non supporté hors Windows".to_string());
     }
     let mut c = std::process::Command::new("powershell");
-    c.args(["-NoProfile", "-NonInteractive", "-Command", "-Command"]);
-    // NOTE : construction par assemblage — un message contenant un guillemet
-    // casserait la commande PowerShell.
-    let script = format!(
-        "[void][System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms');\
-         $n = New-Object System.Windows.Forms.NotifyIcon;\
-         $n.Icon = [System.Drawing.SystemIcons]::Warning;\
-         $n.BalloonTipTitle = '{}';\
-         $n.BalloonTipText = '{}';\
-         $n.Visible = $true;\
-         Start-Sleep -Milliseconds 50;\
-         $n.ShowBalloonTip(8000);\
-         Start-Sleep -Seconds 9;\
-         $n.Dispose()",
-        title.replace('"', "'"),
-        message.replace('"', "'")
-    );
-    let out = c
-        .args(["-Command", &script])
-        .output()
-        .map_err(|e| format!("toast desktop : {e}"))?;
+    // UN SEUL -Command, script constant.
+    c.args(["-NoProfile", "-NonInteractive", "-Command", TOAST_SCRIPT]);
+    c.env("MCC_TOAST_TITLE", title);
+    c.env("MCC_TOAST_TEXT", message);
+    let out = c.output().map_err(|e| format!("toast desktop : {e}"))?;
     if !out.status.success() {
         return Err("toast desktop : PowerShell a échoué".to_string());
     }
@@ -285,12 +451,42 @@ mod tests {
     }
 
     #[test]
-    fn url_valide_est_verifiee() {
-        assert!(valid_webhook_url("https://example.com/x"));
+    fn url_webhook_https_refusee_message_tls() {
+        // audit 05 #4 : https:// partait en HTTP brut sur le port 443 (aucune
+        // pile TLS) — refusé, avec un message qui explique pourquoi
+        let r = webhook_url_reject_reason("https://example.com/x").unwrap();
+        assert!(r.contains("TLS"), "message TLS attendu, obtenu : {r}");
+        assert!(!valid_webhook_url("https://example.com/x"));
+        assert!(webhook_url_reject_reason("ftp://example.com").is_some());
+        assert!(webhook_url_reject_reason("example.com").is_some());
+        assert!(webhook_url_reject_reason("").is_some());
+        // les autres cibles locales ou privées restent un usage NORMAL
         assert!(valid_webhook_url("http://192.168.1.5:8080/hook"));
-        assert!(!valid_webhook_url("ftp://example.com"));
-        assert!(!valid_webhook_url("example.com"));
-        assert!(!valid_webhook_url(""));
+        assert!(valid_webhook_url("http://10.0.0.7/hook"));
+        // un service local SUR UN AUTRE PORT que le nôtre : usage normal aussi
+        assert!(webhook_url_reject_reason("http://127.0.0.1:57596/hook").is_none());
+    }
+
+    #[test]
+    fn url_webhook_vise_soi_meme_refusee() {
+        // canon du processus de tests (port fixe, TEST-NET) : idempotent,
+        // le premier appel gagne — tous les tests unitaires partagent la valeur
+        note_self_listen(
+            57595,
+            &["203.0.113.5".to_string(), "198.51.100.5".to_string()],
+            "0.0.0.0",
+        );
+        for h in ["127.0.0.1", "localhost", "[::1]", "203.0.113.5", "0.0.0.0"] {
+            let url = format!("http://{h}:57595/api/state");
+            let r = webhook_url_reject_reason(&url);
+            assert!(
+                r.as_deref().is_some_and(|m| m.contains("instance")),
+                "auto-instance refusée pour {h}, obtenu : {r:?}"
+            );
+        }
+        // une IP non locale sur NOTRE port n'est pas cette instance
+        assert!(webhook_url_reject_reason("http://192.0.2.10:57595/hook").is_none());
+        // sans enregistrement boot (autre processus), pas de détection
     }
 
     #[test]
@@ -324,5 +520,90 @@ mod tests {
             ..NotifyConfig::default()
         };
         assert!(send_webhook(&c2, "x", "DOWN", "y").is_err());
+        // un ancien https:// persisté avant le correctif est refusé À L'ENVOI
+        // aussi, avec le message TLS clair (aucun envoi HTTP brut sur 443)
+        let c3 = NotifyConfig {
+            webhook_url: "https://example.com/hook".into(),
+            ..NotifyConfig::default()
+        };
+        let e = send_webhook(&c3, "x", "DOWN", "y").unwrap_err();
+        assert!(
+            e.contains("TLS"),
+            "message TLS attendu à l'envoi, obtenu : {e}"
+        );
+    }
+
+    #[test]
+    fn exposition_api_masque_les_entetes() {
+        // audit 05 #5 : /api/state ne doit plus transporter les en-têtes du
+        // webhook (un Authorization y vivait en clair, lisible sans code)
+        let c = NotifyConfig {
+            headers: "Authorization: Bearer jeton-secret-999".into(),
+            ..NotifyConfig::default()
+        };
+        let v = to_api_json(&c);
+        assert_eq!(v["headers_set"], json!(true));
+        assert!(v.get("headers").is_none(), "headers en clair interdit");
+        let s = v.to_string();
+        assert!(
+            !s.contains("jeton-secret-999"),
+            "aucune valeur d'en-tête ne sort"
+        );
+        // en-têtes absents ou blancs → headers_set false
+        let blanc = NotifyConfig {
+            headers: "   ".into(),
+            ..NotifyConfig::default()
+        };
+        assert_eq!(to_api_json(&blanc)["headers_set"], json!(false));
+        let vide = NotifyConfig {
+            headers: String::new(),
+            ..NotifyConfig::default()
+        };
+        assert_eq!(to_api_json(&vide)["headers_set"], json!(false));
+        // la persistance (to_json) garde la valeur — seul /api/state la masque
+        assert_eq!(to_json(&vide)["headers"], json!(String::new()));
+        let c2 = NotifyConfig {
+            headers: "X-Jeton: abc".into(),
+            ..NotifyConfig::default()
+        };
+        assert_eq!(to_json(&c2)["headers"], json!("X-Jeton: abc"));
+    }
+
+    #[test]
+    fn ligne_de_journal_webhook_cible_et_resultat() {
+        let ok = webhook_log_line(
+            "mon-api",
+            "DOWN",
+            "connexion refusée",
+            "http://192.168.1.5:8080/hook",
+            true,
+            "ok",
+        );
+        assert!(ok.contains("[info] [webhook] envoi vers http://192.168.1.5:8080/hook"));
+        assert!(ok.contains("serveur « mon-api » → DOWN"));
+        assert!(ok.contains("(connexion refusée) : ok"));
+        let ko = webhook_log_line(
+            "srv",
+            "PORT-ONLY",
+            "détail",
+            "http://h:1/p",
+            false,
+            "erreur : HTTP 500",
+        );
+        assert!(ko.contains("[warn] [webhook] envoi vers http://h:1/p"));
+        assert!(ko.contains("erreur : HTTP 500"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn toast_desktop_titre_et_message_hostiles_via_env() {
+        // le titre/message passent par l'environnement, jamais dans le script :
+        // une apostrophe ou un guillemet ne peut plus casser ni injecter du
+        // PowerShell. Réel : PowerShell doit sortir 0.
+        let r = desktop_toast(
+            "l'apostrophe \"les guillemets\" 'tous'",
+            "message d'essai avec ' et \" et $(calc) et ${x}",
+        );
+        assert!(r.is_ok(), "toast desktop doit réussir, obtenu : {r:?}");
     }
 }

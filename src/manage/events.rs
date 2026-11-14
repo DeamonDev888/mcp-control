@@ -2,7 +2,10 @@
 // (split v0.7.20 : manage.rs reste la racine — API stable via réexport)
 use super::*;
 
-pub(super) fn notify_incident(app: &Arc<AppState>, label: &str, new_state: &str, detail: &str) {
+/// NOTIFICATION d'incident : déclenchée sur une transition UP → DOWN/PORT-ONLY.
+/// Deux canaux : toast desktop (Windows) et webhook HTTP. Le délai minimum
+/// (`min_interval_secs`) évite le spam quand un serveur oscille.
+pub(crate) fn notify_incident(app: &Arc<AppState>, label: &str, new_state: &str, detail: &str) {
     let cfg = lockv(&app.settings).notify.clone();
     if !cfg.desktop && cfg.webhook_url.trim().is_empty() {
         return;
@@ -41,7 +44,9 @@ pub(super) fn notify_incident(app: &Arc<AppState>, label: &str, new_state: &str,
         }
     }
 }
-pub(super) fn runtime_event(state: &AppState, id: &str, kind: &str, detail: &str) {
+/// Enregistre un événement runtime (crash, redémarrage, succès…) et le
+/// persiste — l'historique survit au redémarrage de l'application.
+pub(crate) fn runtime_event(state: &AppState, id: &str, kind: &str, detail: &str) {
     let label = lockv(&state.servers)
         .iter()
         .find(|s| s.id == id)
@@ -69,7 +74,10 @@ pub(super) fn runtime_event(state: &AppState, id: &str, kind: &str, detail: &str
     }
     save_config(state);
 }
-pub(super) fn note_spawn_failure(state: &AppState, id: &str) {
+/// Compte un échec de spawn auto pour l'id ; à partir de 3 échecs consécutifs,
+/// désactive l'auto-restart (sinon boucle infinie d'essais + warnings sur une
+/// machine cliente où les chemins des seeds n'existent pas).
+pub(crate) fn note_spawn_failure(state: &AppState, id: &str) {
     let (fails, backoff, disable) = {
         let mut rt = lockv(&state.runtime);
         let entry = rt.entry(id.to_string()).or_default();

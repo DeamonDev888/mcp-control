@@ -253,6 +253,7 @@ pub fn spawn_process(
     program: &str,
     args: &[String],
     workdir: Option<&str>,
+    env: &[(String, String)],
 ) -> Result<StdioHandle, String> {
     let program = resolve_windows_cmd(program);
     let mut cmd = Command::new(&program);
@@ -260,6 +261,9 @@ pub fn spawn_process(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // env additionnel de la commande de lancement (import mcpServers, lot 3) :
+    // les valeurs ne vivent que dans le process enfant — jamais journalisées.
+    cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1560,6 +1564,17 @@ fn http_request(
                     }
                     return Err(last_err);
                 }
+                if data.len() > MAX_PROBE_READ {
+                    // Dépassement explicite (audit 02, constat 6) : au lieu de
+                    // laisser le parse conclure « réponse non JSON (N octets) »
+                    // sur un corps tronqué, on nomme la vraie cause : la lecture
+                    // a été coupée au plafond mémoire.
+                    return Err(format!(
+                        "{}: réponse trop grande (plafond de lecture de {} Mio dépassé)",
+                        host,
+                        MAX_PROBE_READ / (1024 * 1024)
+                    ));
+                }
                 if header_len.is_some() && !status_ok {
                     return Err(format!(
                         "{}: réponse HTTP non-2xx (port occupé par un non-MCP ?)",
@@ -1763,8 +1778,14 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
         "::1"
     };
     let t0 = Instant::now();
+    // MOTIF D'ERREUR (audit 03, constat 4) : l'hôte de repli (::1 ou
+    // 127.0.0.1) n'a jamais accepté la connexion — son erreur (souvent
+    // « connexion refusée ») ne doit pas écraser celle de l'hôte qui a
+    // ACCEPTÉ (délai dépassé, réponse invalide…). On publie toujours
+    // l'erreur de l'hôte joignable en priorité.
     let mut attempt: Option<(serde_json::Value, String, RespHead, u64, bool)> = None;
-    let mut last_err = String::from("pas de réponse initialize");
+    let mut err_hote: Option<String> = None;
+    let mut err_repli: Option<String> = None;
     'probe: for (params, hdrs, stateless) in [
         (&init_params, &[][..], false),
         (&init_strict, &strict_init_hdrs[..], true),
@@ -1790,7 +1811,13 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
                     ));
                     break 'probe;
                 }
-                Err(e) => last_err = e,
+                Err(e) => {
+                    if host == open_host {
+                        err_hote = Some(e);
+                    } else {
+                        err_repli = Some(e);
+                    }
+                }
             }
         }
     }
@@ -1827,8 +1854,13 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
                     .map(|n| !n.trim().is_empty())
                     .unwrap_or(false);
                 if !proof {
-                    last_err =
+                    let motif =
                         "server/discover sans serverInfo : ce port ne parle pas MCP".to_string();
+                    if host == open_host {
+                        err_hote = Some(motif);
+                    } else {
+                        err_repli = Some(motif);
+                    }
                     continue;
                 }
                 discovered = Some(r);
@@ -1845,7 +1877,12 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
     }
     let (res, host, head, latency, stateless_mode) = match attempt {
         Some(x) => x,
-        None => return McpProbe::fail(last_err, true),
+        None => {
+            let motif = err_hote
+                .or(err_repli)
+                .unwrap_or_else(|| "pas de réponse initialize".to_string());
+            return McpProbe::fail(motif, true);
+        }
     };
     // serverInfo : à la racine (initialize) ou sous _meta (server/discover).
     let si = discovered
@@ -1998,6 +2035,7 @@ pub fn probe_stdio(
     workdir: Option<&str>,
     timeout_ms: u64,
     keep_alive: bool,
+    env: &[(String, String)],
 ) -> Result<(McpProbe, Option<StdioHandle>), String> {
     let t0 = Instant::now();
     let program = resolve_windows_cmd(program);
@@ -2006,6 +2044,9 @@ pub fn probe_stdio(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // env additionnel du transport stdio (import mcpServers, lot 3) : les
+    // valeurs ne vivent que dans le process enfant — jamais journalisées.
+    cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -3465,6 +3506,87 @@ tcp4       0      0  127.0.0.1.135          *.*                    LISTEN\n";
         assert!(
             ssh_error_hint("user@192.168.2.159: Permission denied (publickey).")
                 .contains("clé SSH refusée")
+        );
+    }
+
+    /// Port muet : accepte les connexions IPv4 et ne répond JAMAIS (chaque
+    /// socket acceptée est gardée ouverte pour que la lecture client expire).
+    fn fixture_muet() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind muet");
+        let port = listener.local_addr().expect("local_addr muet").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                // on garde la socket ouverte sans jamais lire ni écrire :
+                // le client attend son délai (comme un service figé réel)
+                std::mem::forget(stream);
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn probe_http_publie_l_erreur_de_l_hote_qui_a_accepte() {
+        // Régression audit 03 constat 4 : un port muet (accepte sur 127.0.0.1,
+        // ne répond jamais) ne doit PAS afficher « connexion refusée » —
+        // l'erreur de l'hôte de repli (::1, jamais joint) ne doit pas écraser
+        // celle de l'hôte qui a accepté la connexion (délai dépassé).
+        let port = fixture_muet();
+        let p = probe_http(port, "/mcp", 900);
+        assert!(!p.mcp_up);
+        let err = p.error.expect("erreur attendue");
+        assert!(
+            !err.contains("10061") && !err.contains("refus"),
+            "l'erreur de l'hôte de repli ne doit pas être publiée : {err}"
+        );
+        assert!(
+            err.contains("127.0.0.1"),
+            "l'erreur doit venir de l'hôte qui a accepté la connexion : {err}"
+        );
+    }
+
+    #[test]
+    fn reponse_au_dela_du_plafond_message_explicite() {
+        // Régression audit 02 constat 6 : une réponse dépassant le plafond de
+        // lecture (2 Mio) est refusée avec un message de dépassement de taille
+        // explicite — plus jamais « réponse non JSON (0 octets) ».
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind gros");
+        let port = listener.local_addr().expect("local_addr gros").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { return };
+                let mut buf = [0u8; 16384];
+                let _ = s.read(&mut buf);
+                let taille = 3 * 1024 * 1024;
+                let corps = vec![b'A'; taille];
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {taille}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = s.write_all(head.as_bytes());
+                // le client coupe sa lecture au plafond : l'écriture peut donc
+                // échouer (connexion fermée), on l'ignore
+                let _ = s.write_all(&corps);
+            }
+        });
+        let err = match rpc_call_host(
+            "127.0.0.1",
+            port,
+            "/mcp",
+            "initialize",
+            serde_json::json!({"protocolVersion": "2024-11-05"}),
+            1,
+            8000,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("la réponse de 3 Mio doit être refusée"),
+        };
+        assert!(
+            err.contains("plafond"),
+            "message de dépassement explicite attendu : {err}"
+        );
+        assert!(err.contains("2 Mio"), "le plafond doit être nommé : {err}");
+        assert!(
+            !err.contains("réponse non JSON"),
+            "l'ancien message trompeur ne doit plus apparaître : {err}"
         );
     }
 }

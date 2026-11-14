@@ -170,6 +170,37 @@ body{background:var(--chrome);color:var(--t1);font:13px/1.5 var(--sans);display:
   border:none;border-radius:var(--r2);background:transparent;color:var(--t3);font-size:12px;cursor:pointer}
 .wbtn:hover{background:var(--wash);color:var(--t1)}
 .wbtn.wclose:hover{background:rgba(231,94,120,.16);color:var(--bad)}
+/* Bandeau « moteur injoignable » (audit 04 #2/#3) : entre la barre de titre
+   et le contenu — apparaît au premier échec quand rien n'a jamais chargé
+   (« nouvel essai ») ou après 2 échecs de poll consécutifs, et disparaît à la
+   première réponse du moteur. */
+#deadBanner{display:flex;align-items:center;justify-content:center;gap:8px;padding:5px 12px;
+  font:12px/1.4 var(--sans);color:var(--bad);background:rgba(231,94,120,.10);
+  border-bottom:1px solid rgba(231,94,120,.30);flex-shrink:0}
+#deadBanner[hidden]{display:none}
+/* Compteurs périmés grisés tant que le moteur ne répond pas : ils ne doivent
+   pas pouvoir se lire comme à jour. */
+body.dead #titlebar .tb-badge b{color:var(--t4)}
+body.dead .tile .n{color:var(--t4)}
+/* Boot jamais réussi : message d'attente dans la zone principale vide. */
+.engine-wait{display:flex;align-items:center;justify-content:center;min-height:60vh;
+  font:13px/1.5 var(--sans);color:var(--t3);font-style:italic}
+/* Repli responsive de la barre de titre (audit 04 #8) : largeur intrinsèque
+   936 px — à 900 px « Re-sonder » et à 940 px (minimum desktop) les contrôles
+   de fenêtre sortaient de l'écran. Les libellés s'effacent d'abord (icônes
+   seules, l'infobulle porte le sens), les pastilles ensuite ; #winCtrls ne se
+   comprime jamais : visible à toute largeur. */
+.logo,.tb-actions,#winCtrls{flex-shrink:0}
+@media (max-width:1120px){
+  .tb-actions .tb-lbl{display:none}
+  .tb-actions button{padding:0 9px}
+}
+@media (max-width:700px){
+  #titlebar .tb-badge{display:none}
+}
+@media (max-width:480px){
+  #titlebar .logo .wordmark{display:none}
+}
 
 /* ===== Boutons ===========================================================
    Une hauteur, un rayon, une transition. Le survol teinte, l'accent marque. */
@@ -634,6 +665,10 @@ textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(
 :root[data-theme="light"] .set-nav{background:var(--sidebar)}
 :root[data-theme="light"] .set-pane .set-list{background:var(--card)}
 
+/* Import d'un bloc mcpServers dans le dialog « Ajouter » (audit 04 #4) :
+   séparé du formulaire par un filet — la zone accepte tout format que
+   import_mcp sait parser (JSON mcpServers, URL http, commande). */
+.dlg-import{border-top:1px solid var(--border-soft);padding-top:14px;display:grid;gap:8px}
 .dlg-body{padding:18px 20px 20px}
 form{display:grid;gap:12px}
 form label{font-size:11px;color:var(--t4);display:block;margin-bottom:5px;letter-spacing:.02em}

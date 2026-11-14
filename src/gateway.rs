@@ -177,14 +177,23 @@ fn do_action(state: &Arc<AppState>, req: Value) -> Result<Value, ToolError> {
 
 /// Les arguments validés de l'outil deviennent le corps de `/api/action` :
 /// mêmes clés, mêmes sémantiques que la page UI.
-fn action_req(action: &str, args: &Value) -> Value {
+///
+/// **Liste blanche** (audit 02-gateway constat 2) : seuls les champs
+/// déclarés dans le schéma du tool sont transmis au dispatcher — un
+/// argument inconnu ne passe jamais (le schéma strict le refuse en
+/// `-32602` AVANT le handler ; la liste blanche referme le pare-feu au
+/// point de passage unique). L'action est posée **en dernier** : fixée
+/// par le tool, elle ne peut jamais être écrasée par un argument client.
+fn action_req(action: &str, args: &Value, champs: &[&str]) -> Value {
     let mut req = serde_json::Map::new();
-    req.insert("action".into(), json!(action));
     if let Some(map) = args.as_object() {
-        for (k, v) in map {
-            req.insert(k.clone(), v.clone());
+        for champ in champs {
+            if let Some(v) = map.get(*champ) {
+                req.insert((*champ).to_string(), v.clone());
+            }
         }
     }
+    req.insert("action".into(), json!(action));
     Value::Object(req)
 }
 
@@ -239,13 +248,15 @@ fn read_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
              handshake MCP, PORT-ONLY port ouvert mais pas MCP, DOWN port fermé, \
              DISABLED en pause), leurs badges (langage/transport/framework) et les \
              compteurs globaux. C'est le premier outil à appeler.",
-            zod::object().opt(
-                "state",
-                zod::describe(
-                    "filtre d'état : up, down, port_only ou disabled",
-                    zod::enumeration(&["up", "down", "port_only", "disabled"]),
-                ),
-            ),
+            zod::object()
+                .opt(
+                    "state",
+                    zod::describe(
+                        "filtre d'état : up, down, port_only ou disabled",
+                        zod::enumeration(&["up", "down", "port_only", "disabled"]),
+                    ),
+                )
+                .strict(),
             {
                 let st = Arc::clone(state);
                 move |args| {
@@ -285,13 +296,15 @@ fn read_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
             "Détail complet d'un serveur supervisé : état, erreur éventuelle, \
              latence, version, protocol, framework détecté, pid, commande de \
              lancement et liste de ses outils (avec l'indicateur disabled).",
-            zod::object().field(
-                "id",
-                zod::describe(
-                    "identifiant du serveur (voir list_servers)",
-                    zod::string().min(1),
-                ),
-            ),
+            zod::object()
+                .field(
+                    "id",
+                    zod::describe(
+                        "identifiant du serveur (voir list_servers)",
+                        zod::string().min(1),
+                    ),
+                )
+                .strict(),
             {
                 let st = Arc::clone(state);
                 move |args| {
@@ -317,13 +330,15 @@ fn read_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
             "Liste les outils (tools) annoncés par un serveur détecté, avec leur \
              description et l'indicateur disabled (interrupteur par outil de l'UI). \
              Le proxy d'appel est call_server_tool.",
-            zod::object().field(
-                "server",
-                zod::describe(
-                    "identifiant du serveur (voir list_servers)",
-                    zod::string().min(1),
-                ),
-            ),
+            zod::object()
+                .field(
+                    "server",
+                    zod::describe(
+                        "identifiant du serveur (voir list_servers)",
+                        zod::string().min(1),
+                    ),
+                )
+                .strict(),
             {
                 let st = Arc::clone(state);
                 move |args| {
@@ -353,13 +368,15 @@ fn read_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
             "journal",
             "Dernières entrées du journal de la console (détections, actions, \
              crashs, relances, activité gateway). Ordre : plus récent d'abord.",
-            zod::object().opt(
-                "limit",
-                zod::describe(
-                    "nombre d'entrées (1..500, défaut 40)",
-                    zod::integer().min(1).max(500),
-                ),
-            ),
+            zod::object()
+                .opt(
+                    "limit",
+                    zod::describe(
+                        "nombre d'entrées (1..500, défaut 40)",
+                        zod::integer().min(1).max(500),
+                    ),
+                )
+                .strict(),
             {
                 let st = Arc::clone(state);
                 move |args| {
@@ -415,7 +432,8 @@ fn read_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                     "filtre plein texte sur id/nom/description/catégorie",
                     zod::string().min(1),
                 ),
-            ),
+            )
+            .strict(),
             {
                 move |args| {
                     let all = manage::store_json();
@@ -493,10 +511,15 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
         let st = Arc::clone(st);
         move |_args: &Value| do_action(&st, json!({ "action": action }))
     };
-    let act_id = |st: &Arc<AppState>, action: &'static str| {
+    // `champs` = la liste blanche du tool (ses champs déclarés) : seuls eux
+    // atteignent le dispatcher, jamais une clé injectée (`action`, `id`,
+    // `refresh_secs`… cf. audit 02-gateway constat 2).
+    let act_id = |st: &Arc<AppState>, action: &'static str, champs: &'static [&'static str]| {
         let st = Arc::clone(st);
         move |args: &Value| {
-            let mut req = action_req(action, args);
+            let mut req = action_req(action, args, champs);
+            // l'id est réaffirmé après la liste blanche : clé racine du
+            // dispatcher, il ne peut pointer que le serveur visé par le tool
             req["id"] = args["id"].clone();
             do_action(&st, req)
         }
@@ -518,11 +541,12 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
              plage réglée dans l'app). Synchronique : rend quand le scan est fini.",
             zod::object()
                 .opt("from", zod::integer().min(1).max(65535))
-                .opt("to", zod::integer().min(1).max(65535)),
+                .opt("to", zod::integer().min(1).max(65535))
+                .strict(),
             {
                 let st = Arc::clone(state);
                 move |args| {
-                    let mut req = action_req("scan", args);
+                    let mut req = action_req("scan", args, &["from", "to"]);
                     req["from"] = args.get("from").cloned().unwrap_or(Value::Null);
                     req["to"] = args.get("to").cloned().unwrap_or(Value::Null);
                     do_action(&st, req)
@@ -537,11 +561,12 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
              dans le journal.",
             zod::object()
                 .opt("from", zod::integer().min(1).max(65535))
-                .opt("to", zod::integer().min(1).max(65535)),
+                .opt("to", zod::integer().min(1).max(65535))
+                .strict(),
             {
                 let st = Arc::clone(state);
                 move |args| {
-                    let mut req = action_req("scan_network", args);
+                    let mut req = action_req("scan_network", args, &["from", "to"]);
                     req["from"] = args.get("from").cloned().unwrap_or(Value::Null);
                     req["to"] = args.get("to").cloned().unwrap_or(Value::Null);
                     do_action(&st, req)
@@ -612,10 +637,29 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                     "args",
                     zod::describe("arguments du programme stdio", zod::array(zod::string())),
                 )
-                .opt("workdir", zod::string()),
+                .opt("workdir", zod::string())
+                .strict(),
             {
                 let st = Arc::clone(state);
-                move |args| do_action(&st, action_req("add", args))
+                move |args| {
+                    do_action(
+                        &st,
+                        action_req(
+                            "add",
+                            args,
+                            &[
+                                "transport",
+                                "label",
+                                "port",
+                                "host",
+                                "path",
+                                "program",
+                                "args",
+                                "workdir",
+                            ],
+                        ),
+                    )
+                }
             },
         )
         .annotate("remove_server", destructive("Supprimer un serveur"))
@@ -628,8 +672,9 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                     "id",
                     zod::describe("identifiant du serveur", zod::string().min(1)),
                 )
-                .opt("durable", zod::boolean()),
-            act_id(state, "remove"),
+                .opt("durable", zod::boolean())
+                .strict(),
+            act_id(state, "remove", &["id", "durable"]),
         )
         .annotate("toggle_server", modifies("Allumer / éteindre"))
         .tool_typed(
@@ -637,24 +682,24 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
             "Interrupteur ON/OFF d'un serveur : ON = supervisé et démarrable \
              (relance le process stdio s'il en a un), OFF = désactivé (sonde \
              arrêtée, process tué).",
-            zod::object().field("id", zod::string().min(1)),
-            act_id(state, "toggle"),
+            zod::object().field("id", zod::string().min(1)).strict(),
+            act_id(state, "toggle", &["id"]),
         )
         .annotate("start_server", modifies("Démarrer"))
         .tool_typed(
             "start_server",
             "Démarre le programme d'un serveur (bouton ▶, stdio ou commande de \
              lancement connue).",
-            zod::object().field("id", zod::string().min(1)),
-            act_id(state, "start"),
+            zod::object().field("id", zod::string().min(1)).strict(),
+            act_id(state, "start", &["id"]),
         )
         .annotate("stop_server", destructive("Arrêter"))
         .tool_typed(
             "stop_server",
             "Arrête le programme d'un serveur (bouton ■ : tue le process stdio / \
              le process du port).",
-            zod::object().field("id", zod::string().min(1)),
-            act_id(state, "kill"),
+            zod::object().field("id", zod::string().min(1)).strict(),
+            act_id(state, "kill", &["id"]),
         )
         .annotate("set_start_command", modifies("Commande de lancement"))
         .tool_typed(
@@ -663,10 +708,18 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
              serveur : ce qui est exécuté par start_server et à l'autoboot.",
             zod::object()
                 .field("id", zod::string().min(1))
-                .opt("program", zod::string())
+                // nullable (audit 02-gateway constat 5) : la description promet
+                // « retire avec program=null » — null passe la validation ; le
+                // retrait lui-même appartient au dispatcher (manage/actions.rs)
+                .opt("program", zod::nullable(zod::string()))
                 .opt("args", zod::array(zod::string()))
-                .opt("workdir", zod::string()),
-            act_id(state, "set_start_cmd"),
+                .opt("workdir", zod::string())
+                .strict(),
+            act_id(
+                state,
+                "set_start_cmd",
+                &["id", "program", "args", "workdir"],
+            ),
         )
         .annotate("set_host", modifies("Re-host"))
         .tool_typed(
@@ -675,8 +728,9 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
              réimporter. Refusé sur un serveur stdio (toujours local).",
             zod::object()
                 .field("id", zod::string().min(1))
-                .field("host", zod::string().min(1)),
-            act_id(state, "set_host"),
+                .field("host", zod::string().min(1))
+                .strict(),
+            act_id(state, "set_host", &["id", "host"]),
         )
         .annotate("toggle_tool", modifies("Couper / rétablir un outil"))
         .tool_typed(
@@ -685,8 +739,9 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
              outil coupé est exclu du proxy call_server_tool.",
             zod::object()
                 .field("id", zod::string().min(1))
-                .field("tool", zod::string().min(1)),
-            act_id(state, "toggle_tool"),
+                .field("tool", zod::string().min(1))
+                .strict(),
+            act_id(state, "toggle_tool", &["id", "tool"]),
         )
         .annotate("set_auto_restart", modifies("Autoboot du serveur"))
         .tool_typed(
@@ -695,22 +750,25 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
              l'app et après un crash (bouton ⚡ de la ligne).",
             zod::object()
                 .field("id", zod::string().min(1))
-                .field("enabled", zod::boolean()),
-            act_id(state, "set_auto_restart"),
+                .field("enabled", zod::boolean())
+                .strict(),
+            act_id(state, "set_auto_restart", &["id", "enabled"]),
         )
         .annotate("reorder_servers", modifies("Réordonner"))
         .tool_typed(
             "reorder_servers",
             "Réordonne la liste (glisser-déposer) : ids dans le nouvel ordre \
              (ordre d'affichage ET priorité de sondage).",
-            zod::object().field(
-                "ids",
-                zod::describe(
-                    "ids des serveurs dans le nouvel ordre",
-                    zod::array(zod::string().min(1)),
-                ),
-            ),
-            act_id(state, "reorder"),
+            zod::object()
+                .field(
+                    "ids",
+                    zod::describe(
+                        "ids des serveurs dans le nouvel ordre",
+                        zod::array(zod::string().min(1)),
+                    ),
+                )
+                .strict(),
+            act_id(state, "reorder", &["ids"]),
         )
         .annotate("import_config", modifies("Importer une config MCP"))
         .tool_typed(
@@ -718,17 +776,19 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
             "Importe des serveurs depuis une configuration MCP existante (texte \
              JSON : config Claude/Cursor, mcpServers…) — même parseur que le \
              bouton « Importer » de l'UI.",
-            zod::object().field(
-                "text",
-                zod::describe(
-                    "contenu JSON de la configuration à importer",
-                    zod::string().min(2),
-                ),
-            ),
+            zod::object()
+                .field(
+                    "text",
+                    zod::describe(
+                        "contenu JSON de la configuration à importer",
+                        zod::string().min(2),
+                    ),
+                )
+                .strict(),
             {
                 let st = Arc::clone(state);
                 move |args| {
-                    let mut req = action_req("import_mcp", args);
+                    let mut req = action_req("import_mcp", args, &["text"]);
                     req["text"] = args["text"].clone();
                     do_action(&st, req)
                 }
@@ -753,10 +813,11 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                         "surcharges d'arguments (ex. dossier du serveur Filesystem)",
                         zod::array(zod::string()),
                     ),
-                ),
+                )
+                .strict(),
             {
                 let st = Arc::clone(state);
-                move |args| do_action(&st, action_req("install_store", args))
+                move |args| do_action(&st, action_req("install_store", args, &["id", "args"]))
             },
         )
         .annotate("ssh_save", modifies("Enregistrer une machine"))
@@ -766,20 +827,21 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
              pour la découverte de ses serveurs.",
             zod::object()
                 .field("ip", zod::string().min(1))
-                .field("user", zod::string().min(1)),
+                .field("user", zod::string().min(1))
+                .strict(),
             {
                 let st = Arc::clone(state);
-                move |args| do_action(&st, action_req("ssh_save", args))
+                move |args| do_action(&st, action_req("ssh_save", args, &["ip", "user"]))
             },
         )
         .annotate("ssh_forget", modifies("Oublier une machine"))
         .tool_typed(
             "ssh_forget",
             "Retire une machine distante enregistrée.",
-            zod::object().field("ip", zod::string().min(1)),
+            zod::object().field("ip", zod::string().min(1)).strict(),
             {
                 let st = Arc::clone(state);
-                move |args| do_action(&st, action_req("ssh_forget", args))
+                move |args| do_action(&st, action_req("ssh_forget", args, &["ip"]))
             },
         )
         .annotate(
@@ -790,10 +852,10 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
             "ssh_discover",
             "Va chercher les serveurs MCP d'une machine distante enregistrée (via \
              SSH). Sans ip : interroge toutes les machines enregistrées.",
-            zod::object().opt("ip", zod::string()),
+            zod::object().opt("ip", zod::string()).strict(),
             {
                 let st = Arc::clone(state);
-                move |args| do_action(&st, action_req("ssh_discover", args))
+                move |args| do_action(&st, action_req("ssh_discover", args, &["ip"]))
             },
         );
 
@@ -867,7 +929,8 @@ fn proxy_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                 .opt(
                     "arguments",
                     zod::describe("arguments de l'outil distant", zod::object()),
-                ),
+                )
+                .strict(),
             {
                 let st = Arc::clone(state);
                 move |args| {
@@ -1060,6 +1123,10 @@ fn is_zero_weight(q: &str) -> bool {
 
 /// Négociation `Accept` : jetons exacts (jamais par sous-chaîne —
 /// `text/event-stream-x` ne compte pas), `q=0` disqualifie le type.
+/// `*/*` (défaut de curl et de la plupart des libs HTTP — l'exemple curl du
+/// README) est acceptable et servi en JSON ; le SSE reste réservé aux
+/// clients qui demandent explicitement `text/event-stream`
+/// (audit 02-gateway constat 3).
 fn accept_media(v: &str) -> (bool, bool) {
     let mut json_ok = false;
     let mut sse_ok = false;
@@ -1078,6 +1145,8 @@ fn accept_media(v: &str) -> (bool, bool) {
         match media.as_str() {
             "application/json" if !weight_zero => json_ok = true,
             "text/event-stream" if !weight_zero => sse_ok = true,
+            // joker : tout média convient → JSON (SSE seulement si demandé seul)
+            "*/*" if !weight_zero => json_ok = true,
             _ => {}
         }
     }
@@ -1387,6 +1456,12 @@ mod tests {
         assert_eq!(accept_media("text/event-stream-x"), (false, false));
         // casse et espaces
         assert_eq!(accept_media(" Application/JSON "), (true, false));
+        // joker : acceptable (JSON servi), q=0 disqualifié, jamais par sous-chaîne
+        assert_eq!(accept_media("*/*"), (true, false));
+        assert_eq!(accept_media(" */* "), (true, false));
+        assert_eq!(accept_media("*/*;q=0"), (false, false));
+        assert_eq!(accept_media("application/xml"), (false, false));
+        assert_eq!(accept_media("*/*-x"), (false, false));
     }
 
     #[test]
@@ -1800,18 +1875,374 @@ mod tests {
         assert!(n >= 28, "la surface complète fait au moins 28 outils : {n}");
     }
 
+    /// AUDIT 02-gateway constat 2 : la liste blanche de `action_req` — seuls
+    /// les champs déclarés sont transmis, l'action est posée en dernier et ne
+    /// peut jamais être écrasée, même si le client la fournit.
     #[test]
-    fn action_req_reprend_les_arguments_et_nomme_l_action() {
-        let args = json!({ "id": "srv", "port": 3099, "extra": { "a": 1 } });
-        let req = action_req("add", &args);
-        assert_eq!(req["action"], "add");
-        assert_eq!(req["id"], "srv");
+    fn action_req_ne_transmet_que_la_liste_blanche_et_fixe_l_action() {
+        let args = json!({
+            "port": 3099,
+            "transport": "http",
+            "id": "srv",
+            "action": "reset_state",
+            "extra": { "a": 1 },
+        });
+        let req = action_req(
+            "add",
+            &args,
+            &[
+                "transport",
+                "label",
+                "port",
+                "host",
+                "path",
+                "program",
+                "args",
+                "workdir",
+            ],
+        );
+        assert_eq!(req["action"], "add", "l'action est fixée par le tool");
         assert_eq!(req["port"], 3099);
-        assert_eq!(req["extra"]["a"], 1);
-        // sans argument : seule la clé action est posée
-        let req2 = action_req("refresh", &json!({}));
-        assert_eq!(req2["action"], "refresh");
-        assert!(req2.as_object().unwrap().len() == 1, "{req2}");
+        assert_eq!(req["transport"], "http");
+        // hors liste blanche : jamais transmis (clé réservée `id`, champ
+        // d'une autre action, champ inconnu)
+        assert!(req.get("id").is_none(), "id hors liste blanche : {req}");
+        assert!(req.get("extra").is_none(), "champ inconnu : {req}");
+        assert_eq!(req.as_object().unwrap().len(), 3, "{req}");
+        // champ déclaré absent → clé non posée (pas de null artificiel)
+        let req2 = action_req("scan", &json!({ "from": 1 }), &["from", "to"]);
+        assert_eq!(req2["action"], "scan");
+        assert_eq!(req2["from"], 1);
+        assert!(req2.get("to").is_none(), "{req2}");
+        // même un `action` client ne passe pas : la liste blanche ne le
+        // contient jamais
+        let req3 = action_req(
+            "toggle",
+            &json!({ "action": "reset_runtime", "id": "x" }),
+            &["id"],
+        );
+        assert_eq!(
+            req3["action"], "toggle",
+            "l'action ne peut pas être écrasée"
+        );
+        assert_eq!(req3["id"], "x");
+        assert_eq!(req3.as_object().unwrap().len(), 2, "{req3}");
+    }
+
+    // ---------- audit 02-gateway : constats 2, 3, 5 ----------
+
+    /// corps tools/call → réponse JSON-RPC complète
+    fn appeler(core: &ServerCore, outil: &str, args: &Value) -> Value {
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": outil, "arguments": args }
+        });
+        let reply = core.dispatch(body.to_string().as_bytes()).unwrap();
+        serde_json::from_slice(&reply).unwrap()
+    }
+
+    /// Les tools d'action adossés au dispatcher, avec des arguments minimaux
+    /// VALIDES (champs déclarés seulement) — la boucle d'injection s'en sert.
+    fn tools_daction() -> Vec<(&'static str, Value)> {
+        vec![
+            ("toggle_server", json!({ "id": "cible" })),
+            ("start_server", json!({ "id": "cible" })),
+            ("stop_server", json!({ "id": "cible" })),
+            ("remove_server", json!({ "id": "cible" })),
+            ("set_start_command", json!({ "id": "cible" })),
+            ("set_host", json!({ "id": "cible", "host": "127.0.0.1" })),
+            ("toggle_tool", json!({ "id": "cible", "tool": "ping" })),
+            (
+                "set_auto_restart",
+                json!({ "id": "cible", "enabled": false }),
+            ),
+            ("reorder_servers", json!({ "ids": ["cible"] })),
+            ("add_server", json!({ "transport": "http", "port": 59999 })),
+            ("scan_ports", json!({ "from": 1, "to": 2 })),
+            ("scan_network", json!({ "from": 1, "to": 2 })),
+            ("import_config", json!({ "text": "{\"mcpServers\":{}}" })),
+            ("install_store_server", json!({ "id": "catalogue" })),
+            ("ssh_save", json!({ "ip": "127.0.0.1", "user": "u" })),
+            ("ssh_forget", json!({ "ip": "127.0.0.1" })),
+            ("ssh_discover", json!({ "ip": "127.0.0.1" })),
+        ]
+    }
+
+    /// Les 6 actions NON exposées, avec un argument qui les rend observables
+    /// si l'injection passait. open_path : chemin inexistant → même sans
+    /// correctif, explorer ne s'ouvre pas sur la machine de test.
+    fn injections_interdites() -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                "set_settings",
+                json!({ "refresh_secs": 1234, "ui_bind": "0.0.0.0" }),
+            ),
+            (
+                "set_notify",
+                json!({ "webhook_url": "http://exemple.invalid/hook" }),
+            ),
+            ("set_autostart", json!({ "enabled": false })),
+            ("reset_state", json!({ "what": "tout" })),
+            ("reset_runtime", json!({})),
+            ("open_path", json!({ "path": "Z:\\inexistant-pour-test" })),
+        ]
+    }
+
+    /// Instantané des réglages qu'une action interdite pourrait toucher.
+    fn reglages_json(state: &Arc<AppState>) -> Value {
+        let s = lockv(&state.settings);
+        json!({
+            "refresh_secs": s.refresh_secs,
+            "scan_from": s.scan_from,
+            "scan_to": s.scan_to,
+            "ui_bind": s.ui_bind,
+            "network_enabled": s.network_enabled,
+            "network_ports": s.network_ports,
+            "autostart": s.autostart,
+            "server_order": s.server_order,
+            "notify_desktop": s.notify.desktop,
+            "notify_webhook_url": s.notify.webhook_url,
+            "notify_method": s.notify.method,
+            "notify_headers": s.notify.headers,
+            "notify_states": s.notify.states,
+            "notify_min_interval_secs": s.notify.min_interval_secs,
+            "ssh_hosts": s.ssh_hosts.iter().map(|h| format!("{}@{}", h.user, h.ip)).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Instantané du journal runtime (crashs/relances — ce que reset_runtime vide).
+    fn runtime_json(state: &Arc<AppState>) -> Value {
+        crate::runtime::to_json(&lockv(&state.runtime))
+    }
+
+    /// AUDIT 02-gateway constat 2 (P0) : `action_req` recopiait TOUS les
+    /// arguments du client — poser `"action"` sur un tool d'action exécutait
+    /// une action non exposée (set_settings, reset_state, open_path…).
+    /// Boucle obligatoire : TOUS les tools d'action à schéma × chacune des 6
+    /// actions interdites → refus -32602 AVANT le handler, et AUCUN changement
+    /// (réglages, liste de serveurs, journal runtime). Les 3 tools sans
+    /// schéma (refresh, discover_peers, check_update) ne transmettent JAMAIS
+    /// leurs arguments au dispatcher (`move |_args| do_action(&st,
+    /// json!({"action": X}))`) : l'injection y est impossible par construction.
+    #[test]
+    fn injection_action_refusee_sur_tous_les_tools_daction() {
+        let state = test_state();
+        state
+            .servers
+            .lock()
+            .unwrap()
+            .push(http_server("cible", 30_901));
+        lockv(&state.runtime)
+            .entry("cible".to_string())
+            .or_default()
+            .push_event(crate::runtime::RuntimeEvent {
+                ts: 1_000,
+                id: "cible".into(),
+                label: "cible".into(),
+                kind: "crash".into(),
+                detail: "test".into(),
+            });
+        let core = build_builder(&state).core();
+        // critère du lot : la surface ne bouge pas
+        assert_eq!(tool_count(&core), 30, "tools/list doit rester à 30 tools");
+
+        let avant = (
+            reglages_json(&state),
+            fingerprint(&state),
+            runtime_json(&state),
+        );
+        let mut essais = 0usize;
+        for (outil, args) in tools_daction() {
+            for (interdite, payload) in injections_interdites() {
+                let mut arguments = args.as_object().cloned().unwrap();
+                arguments.insert("action".into(), json!(interdite));
+                for (k, v) in payload.as_object().unwrap() {
+                    arguments.insert(k.clone(), v.clone());
+                }
+                let v = appeler(&core, outil, &Value::Object(arguments));
+                essais += 1;
+                assert_eq!(
+                    v["error"]["code"], -32602,
+                    "{outil} + action={interdite} doit être refusé par le schéma : {v}"
+                );
+                assert!(
+                    !v["error"]["data"]["issues"].as_array().unwrap().is_empty(),
+                    "issues attendues pour {outil} + {interdite} : {v}"
+                );
+            }
+        }
+        assert_eq!(essais, 17 * 6, "17 tools × 6 injections");
+        let apres = (
+            reglages_json(&state),
+            fingerprint(&state),
+            runtime_json(&state),
+        );
+        assert_eq!(avant.0, apres.0, "réglages inchangés");
+        assert_eq!(avant.1, apres.1, "liste de serveurs inchangée");
+        assert_eq!(avant.2, apres.2, "journal runtime inchangé");
+    }
+
+    /// AUDIT 02-gateway constat 2 (bis) : la même faille par les AUTRES clés
+    /// réservées du dispatcher — la racine `id` (lue pour toggle/start/kill/
+    /// refresh) injectée sur des tools qui ne la déclarent pas, et des champs
+    /// d'une autre action (`durable`, `host`, `refresh_secs`) injectés là où
+    /// le schéma ne les annonce pas. Tout champ hors schéma → -32602.
+    #[test]
+    fn injection_champs_reserves_refusee_hors_schema() {
+        let state = test_state();
+        state
+            .servers
+            .lock()
+            .unwrap()
+            .push(http_server("cible", 30_902));
+        lockv(&state.runtime)
+            .entry("cible".to_string())
+            .or_default()
+            .push_event(crate::runtime::RuntimeEvent {
+                ts: 1_000,
+                id: "cible".into(),
+                label: "cible".into(),
+                kind: "crash".into(),
+                detail: "test".into(),
+            });
+        let core = build_builder(&state).core();
+        let avant = (
+            reglages_json(&state),
+            fingerprint(&state),
+            runtime_json(&state),
+        );
+        for (outil, args) in [
+            ("scan_ports", json!({ "from": 1, "to": 2, "id": "cible" })),
+            ("scan_network", json!({ "from": 1, "to": 2, "id": "cible" })),
+            (
+                "import_config",
+                json!({ "text": "{\"mcpServers\":{}}", "id": "cible" }),
+            ),
+            (
+                "ssh_save",
+                json!({ "ip": "127.0.0.1", "user": "u", "id": "cible" }),
+            ),
+            ("ssh_forget", json!({ "ip": "127.0.0.1", "id": "cible" })),
+            ("ssh_discover", json!({ "ip": "127.0.0.1", "id": "cible" })),
+            (
+                "toggle_tool",
+                json!({ "id": "cible", "tool": "ping", "durable": true }),
+            ),
+            ("remove_server", json!({ "id": "cible", "host": "autre" })),
+            (
+                "set_auto_restart",
+                json!({ "id": "cible", "enabled": true, "refresh_secs": 999 }),
+            ),
+        ] {
+            let v = appeler(&core, outil, &args);
+            assert_eq!(
+                v["error"]["code"], -32602,
+                "{outil} : champ hors schéma doit être refusé : {v}"
+            );
+        }
+        let apres = (
+            reglages_json(&state),
+            fingerprint(&state),
+            runtime_json(&state),
+        );
+        assert_eq!(avant.0, apres.0, "réglages inchangés");
+        assert_eq!(avant.1, apres.1, "liste de serveurs inchangée");
+        assert_eq!(avant.2, apres.2, "journal runtime inchangé");
+    }
+
+    /// AUDIT 02-gateway constat 3 (P1) : `Accept: */*` (défaut de curl et de
+    /// la plupart des libs — exemple curl du README) était refusé en 406.
+    /// `*/*` = acceptable et servi en JSON ; `application/xml` reste refusé ;
+    /// le joker ne déclenche jamais le SSE (réservé à `text/event-stream`).
+    #[test]
+    fn accept_joker_rend_du_json_et_xml_refuse() {
+        let core = build_builder(&test_state()).core();
+        let corps = rpc("ping", 1);
+        // curl sans -H "Accept:" → */* → 200 JSON
+        let (status, ctype, payload) = respond(
+            &core,
+            "POST",
+            &hs(&[("content-type", "application/json"), ("accept", "*/*")]),
+            corps.as_bytes(),
+        );
+        assert_eq!(status, 200, "*/* doit être accepté (défaut curl)");
+        assert_eq!(ctype, "application/json", "*/* doit être servi en JSON");
+        let v: Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(v["id"], 1);
+        // */* aux côtés de SSE → JSON (SSE seulement si demandé seul)
+        let (_, ctype, _) = respond(
+            &core,
+            "POST",
+            &hs(&[
+                ("content-type", "application/json"),
+                ("accept", "*/*, text/event-stream"),
+            ]),
+            corps.as_bytes(),
+        );
+        assert_eq!(ctype, "application/json", "le joker ne force pas le SSE");
+        // application/xml → toujours 406
+        let (status, _, _) = respond(
+            &core,
+            "POST",
+            &hs(&[
+                ("content-type", "application/json"),
+                ("accept", "application/xml"),
+            ]),
+            corps.as_bytes(),
+        );
+        assert_eq!(status, 406, "application/xml doit rester refusé");
+        // */*;q=0 : le joker est disqualifié → 406
+        let (status, _, _) = respond(
+            &core,
+            "POST",
+            &hs(&[("content-type", "application/json"), ("accept", "*/*;q=0")]),
+            corps.as_bytes(),
+        );
+        assert_eq!(status, 406, "*/*;q=0 doit rester refusé");
+    }
+
+    /// AUDIT 02-gateway constat 5 (P3) : `set_start_command` annonce
+    /// « retire avec program=null ». À l'audit, le schéma refusait `null`
+    /// (-32602) — sur litemcp 0.9 un champ `.opt` sans défaut EST nullable
+    /// (publié `type:[string,null]`, null = absence) : le refus n'est plus
+    /// reproductible. Le retrait lui-même appartient au dispatcher
+    /// (`set_start_cmd`, manage/actions.rs — hors périmètre de ce lot).
+    #[test]
+    fn set_start_command_program_null_passe_la_validation() {
+        let state = test_state();
+        state
+            .servers
+            .lock()
+            .unwrap()
+            .push(http_server("cible", 30_903));
+        let core = build_builder(&state).core();
+        // le schéma publié annonce string OU null pour program (forme
+        // anyOf de zod::nullable sur litemcp 0.9)
+        let reply = core.dispatch(rpc("tools/list", 1).as_bytes()).unwrap();
+        let v: Value = serde_json::from_slice(&reply).unwrap();
+        let outil = v["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "set_start_command")
+            .expect("set_start_command absent de tools/list");
+        assert_eq!(
+            outil["inputSchema"]["properties"]["program"],
+            json!({ "anyOf": [{ "type": "string" }, { "type": "null" }] }),
+            "program doit être publié nullable : {}",
+            outil["inputSchema"]["properties"]["program"]
+        );
+        // program:null passe la validation (jamais -32602) ; la réponse
+        // appartient ensuite au dispatcher (isError, pas une erreur JSON-RPC)
+        let v = appeler(
+            &core,
+            "set_start_command",
+            &json!({ "id": "cible", "program": null }),
+        );
+        assert!(
+            v["error"].is_null(),
+            "program:null ne doit PAS être refusé par le schéma : {v}"
+        );
     }
 
     // ---------- empreinte + proxy ----------
@@ -1864,6 +2295,7 @@ mod tests {
             program: "node".to_string(),
             args: vec![],
             workdir: None,
+            env: Vec::new(),
         };
         assert!(proxy_target(&s).is_err());
         // bound_host prioritaire sur le host de config

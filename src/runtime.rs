@@ -58,6 +58,12 @@ pub struct RuntimeState {
     pub last_attempt_ts: u64,
     /// Timestamp du dernier succès.
     pub last_success_ts: u64,
+    /// Échéance (ts epoch) du démarrage en cours : posée au spawn réussi d'un
+    /// serveur HTTP local, consommée à l'UP réellement observé (start-ok) ou
+    /// à l'échec (process sorti, échéance dépassée). 0 = pas de démarrage en
+    /// cours. Persisté : un redémarrage de l'app pendant un démarrage ne
+    /// repart pas de zéro.
+    pub starting_until: u64,
     /// Historique des événements (borné).
     pub events: Vec<RuntimeEvent>,
     /// Nombre total de redémarrages (crash + relances).
@@ -107,6 +113,7 @@ pub fn to_json(log: &RuntimeLog) -> Value {
             "fails": s.fails,
             "last_attempt_ts": s.last_attempt_ts,
             "last_success_ts": s.last_success_ts,
+            "starting_until": s.starting_until,
             "restarts": s.restarts,
             "crashes": s.crashes,
             "events": s.events.iter().map(|e| e.to_json()).collect::<Vec<_>>(),
@@ -163,6 +170,10 @@ pub fn from_json(v: &Value) -> RuntimeLog {
                     .unwrap_or(0),
                 last_success_ts: e
                     .get("last_success_ts")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0),
+                starting_until: e
+                    .get("starting_until")
                     .and_then(|x| x.as_u64())
                     .unwrap_or(0),
                 events,
@@ -269,6 +280,22 @@ mod tests {
         assert_eq!(s2.last_success_ts, 1234);
         assert_eq!(s2.events.len(), 1);
         assert_eq!(s2.events[0].kind, "crash");
+    }
+
+    #[test]
+    fn echeance_demarrage_roundtrip_json() {
+        // le marqueur « démarrage en cours » survit au redémarrage de l'app
+        // (persisté) et repart de zéro quand il est absent (ancienne config)
+        let mut log = RuntimeLog::new();
+        let s = RuntimeState {
+            starting_until: 1794609999,
+            ..Default::default()
+        };
+        log.insert("srv-start".into(), s);
+        let back = from_json(&to_json(&log));
+        assert_eq!(back.get("srv-start").unwrap().starting_until, 1794609999);
+        let log2 = from_json(&json!([{"id": "ancien"}]));
+        assert_eq!(log2.get("ancien").unwrap().starting_until, 0);
     }
 
     #[test]

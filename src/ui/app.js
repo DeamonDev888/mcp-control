@@ -131,18 +131,48 @@ const ICONS = {
 };
 const ic = n => `<svg class='ic' viewBox='0 0 24 24' aria-hidden='true'>${ICONS[n] || ''}</svg>`;
 
+/* ===== Santé moteur : bandeau « injoignable » + compteurs grisés =====
+   Chaque échec du poll compte ; dès 2 échecs consécutifs le bandeau apparaît
+   et les compteurs se grisent — des chiffres périmés ne passent plus pour à
+   jour sans signal (audit 04 #3 : catch vide). Premier chargement jamais
+   réussi : même bandeau, libellé « nouvel essai » (audit 04 #2). Le retour
+   est automatique : le premier état reçu lève bandeau et grisage. */
+let pollFails = 0;
+const DEAD_BOOT_MSG = 'moteur injoignable, nouvel essai…';
+const DEAD_MSG = 'moteur injoignable';
+function setDead(on, msg) {
+  const b = document.getElementById('deadBanner');
+  if (b) { b.hidden = !on; if (on) b.textContent = msg; }
+  document.body.classList.toggle('dead', on);
+  // boot jamais réussi : la zone principale est vide — y porter le message,
+  // render() l'écrasera à la reprise.
+  const c = document.getElementById('content');
+  if (on && !state && c && !c.firstElementChild) {
+    c.innerHTML = '<div class="engine-wait">' + esc(msg) + '</div>';
+  }
+}
 async function load() {
   if (document.hidden) return; // fenêtre masquée (tray) : polling suspendu — CPU/mémoire au repos
   try {
     const r = await fetch('/api/state');
     state = await r.json();
+    pollFails = 0;
+    setDead(false);
     if (selectedId && !state.servers.find(s => s.id === selectedId)) { selectedId = null; detailCache = null; }
     render();
     if (selectedId) {
       const r2 = await fetch('/api/detail?id=' + encodeURIComponent(selectedId));
       if (r2.ok) { detailCache = await r2.json(); renderDetail(); }
     }
-  } catch(e) { /* serveur redémarre */ }
+  } catch(e) {
+    // moteur injoignable ou redémarrage : signaler au lieu de laisser des
+    // chiffres périmés sans message. Un 401 (code d'accès demandé) n'est pas
+    // une panne : le dialog de déverrouillage est ouvert, on ne compte pas.
+    if (document.getElementById('loginDlg')?.open) return;
+    pollFails++;
+    if (state === null) setDead(true, DEAD_BOOT_MSG);
+    else if (pollFails >= 2) setDead(true, DEAD_MSG);
+  }
 }
 
 function render() {
@@ -187,9 +217,14 @@ function render() {
 /* Clé de groupement : 'local' (loopback de cette machine) ou host/IP de la
    machine distante (LAN/VPS). L'explorateur affiche les locaux à plat puis
    UN GROUPE REPLIABLE PAR MACHINE distante. */
+/* Hôtes loopback EXPLICITES = CETTE machine : sans cela un serveur déclaré
+   sur 127.0.0.1 / ::1 / localhost atterrissait sous « Machines distantes »
+   et perdait son formulaire de commande de lancement (audit 04 #6). */
+const isLoopbackHost = h => ['127.0.0.1', '::1', 'localhost'].includes(String(h || '').toLowerCase());
 function hostOf(s) {
   if (s.transport !== 'http') return 'local';
-  return s.transport_info.host || 'local';
+  const h = s.transport_info.host;
+  return (!h || isLoopbackHost(h)) ? 'local' : h;
 }
 /* Helper global : serveur par id (applySort a son propre byId local, ombre légale). */
 function byId(id) {
@@ -653,9 +688,13 @@ function renderOverview() {
 
 /* ===== Onglet Conf agent : prêt à coller dans Hermes / Claude / etc. ===== */
 const srvName = s => (s.label || s.id || 'serveur').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'serveur';
+/* URL http d'un transport : un hôte IPv6 (il contient « : ») doit être entouré
+   de crochets — http://[::1]:4104/mcp et non http://::1:4104/mcp (invalide,
+   ambigu). Un seul helper pour tous les blocs d'URL (audit 04 #5). */
+const hostForUrl = h => { const s = String(h || ''); return s.includes(':') ? '[' + s + ']' : s; };
 const srvUrl = s => {
   const h = s.transport_info.host || '127.0.0.1';
-  return 'http://' + h + ':' + s.transport_info.port + (s.transport_info.path || '/mcp');
+  return 'http://' + hostForUrl(h) + ':' + s.transport_info.port + (s.transport_info.path || '/mcp');
 };
 function hermesYaml(s) {
   const n = srvName(s);
@@ -679,10 +718,9 @@ function claudeCmd(s) {
 }
 function copyConf(btn) {
   const pre = btn.closest('.conf-block').querySelector('pre');
-  navigator.clipboard.writeText(pre.textContent).then(() => {
-    btn.textContent = 'copi\u00e9 \u2713';
-    setTimeout(() => btn.textContent = 'copier', 1500);
-  }).catch(() => {});
+  copyText(pre.textContent); // repli execCommand intégré (audit 04 #11)
+  btn.textContent = 'copi\u00e9 \u2713';
+  setTimeout(() => btn.textContent = 'copier', 1500);
 }
 function confAgent(s) {
   const blk = (t, code) => '<div class="conf-block"><div class="conf-head">' + t + '<button onclick="copyConf(this)">copier</button></div><pre>' + esc(code) + '</pre></div>';
@@ -837,7 +875,7 @@ function select(id) { selectedId = id; detailCache = null; detailTab = 'outils';
 function startCmdForm(s) {
   if (s.can_start || s.transport === 'stdio') return '';
   const host = s.transport_info && s.transport_info.host;
-  if (host) return '<div class="conf-note note-gap">Serveur distant : la commande de lancement appartient &agrave; sa machine (' + esc(host) + '), pas à MCP Control.</div>';
+  if (host && !isLoopbackHost(host)) return '<div class="conf-note note-gap">Serveur distant : la commande de lancement appartient &agrave; sa machine (' + esc(host) + '), pas à MCP Control.</div>';
   const port = (s.transport_info || {}).port || 0;
   return `<div class="startcmd-form note-gap">
     <div class="conf-note">Aucune commande de lancement connue : c'est pourquoi les boutons <b>&#9654;/&#9632;</b> et <b>&#9889;</b> sont absents. Indique comment lancer ce serveur :</div>
@@ -946,7 +984,7 @@ function srvPaths(s) {
 function ctxUrl(s) {
   if (s.transport !== 'http') return '';
   const ti = s.transport_info || {};
-  return 'http://' + (ti.host || '127.0.0.1') + ':' + ti.port + (ti.path || '/mcp');
+  return 'http://' + hostForUrl(ti.host || '127.0.0.1') + ':' + ti.port + (ti.path || '/mcp');
 }
 function srvCmd(s) {
   const sc = s.start_cmd || {};
@@ -1119,8 +1157,10 @@ async function act(action, id) {
 // Autoboot par serveur (⚡) : relance auto au démarrage de MCP Control
 // et après un crash. Persisté dans config.json par le moteur.
 async function setAuto(id, enabled) {
-  await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
+  const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({action: 'set_auto_restart', id, enabled})});
+  const j = await r.json().catch(() => ({}));
+  if (!j.ok) toast(j.error || 'échec', 'err'); // refus moteur : silence interdit (audit 04 #7)
   await load();
   if (selectedId === id) { detailCache = null; await load(); }
 }
@@ -1128,8 +1168,10 @@ async function setAuto(id, enabled) {
 // Favori (⭐) : épingle la ligne en haut de sa section (persisté). L'épingle
 // s'applique À L'AFFICHAGE — l'ordre posé au glisser-déposer reste en base.
 async function setFavorite(id, enabled) {
-  await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
+  const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({action: 'set_favorite', id, enabled})});
+  const j = await r.json().catch(() => ({}));
+  if (!j.ok) toast(j.error || 'échec', 'err'); // refus moteur : silence interdit (audit 04 #7)
   await load();
   if (selectedId === id) { detailCache = null; await load(); }
 }
@@ -1150,10 +1192,31 @@ function showHiddenServers() {
   renderServers();
 }
 
-/* Scan en un clic : la plage vient des réglages (settings), aucune saisie demandée */
+/* Scan en un clic : la plage vient des réglages (settings), aucune saisie demandée.
+   Retour visuel (audit 04 #10) : bouton occupé (désactivé) pendant le scan,
+   puis toast — nombre trouvé (champ `found` de la réponse, consommé s'il
+   existe ; le lot 3 l'ajoutera), sinon message neutre. */
+let scanBusy = false;
 async function doScan() {
-  await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'scan'})});
+  if (scanBusy) return;
+  scanBusy = true;
+  const btns = [...document.querySelectorAll('button[onclick*="doScan("]')];
+  btns.forEach(b => { b.disabled = true; });
+  try {
+    const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action: 'scan'})});
+    const j = await r.json().catch(() => ({}));
+    if (!j.ok) toast('scan : ' + (j.error || 'échec'), 'err');
+    else if (Number.isFinite(j.found)) {
+      toast(j.found + ' serveur' + (j.found > 1 ? 's' : '') + ' MCP trouvé' + (j.found > 1 ? 's' : ''),
+        j.found > 0 ? 'ok' : undefined);
+    } else toast('scan terminé — le journal détaille le résultat');
+  } catch(e) {
+    toast('scan : ' + (e && e.message || 'échec'), 'err');
+  } finally {
+    scanBusy = false;
+    btns.forEach(b => { b.disabled = false; });
+  }
   await load();
 }
 
@@ -1255,11 +1318,21 @@ function openSettingsDlg() {
   document.getElementById('sNetPorts').value = (s.network_ports || []).join(', ');
   document.getElementById('sUiBind').value = s.ui_bind || '127.0.0.1';
   document.getElementById('sUiPort').value = s.ui_port || 5090;
-  // Notifications (moteur : action set_notify, section notify de config.json)
+  // Notifications (moteur : action set_notify, section notify de config.json).
+  // Lot 5 : les en-têtes ne sortent plus de l'API (headers_set) — le champ vide
+  // signifie « inchangés » : le moteur ne reçoit la clé `headers` que si
+  // l'utilisateur en saisit de nouvelles ; https:// est refusé par le moteur
+  // (aucune pile TLS).
   document.getElementById('sNotifDesktop').checked = !!n.desktop;
-  document.getElementById('sWebhookUrl').value = n.webhook_url || '';
+  const urlField = document.getElementById('sWebhookUrl');
+  urlField.value = n.webhook_url || '';
+  urlField.placeholder = 'http://hooks.exemple.com/services/\u2026 (https non pris en charge)';
   document.getElementById('sWebhookMethod').value = n.method === 'PUT' ? 'PUT' : 'POST';
-  document.getElementById('sWebhookHeaders').value = n.headers || '';
+  const hdrField = document.getElementById('sWebhookHeaders');
+  hdrField.value = '';
+  hdrField.placeholder = n.headers_set
+    ? 'En-t\u00eates d\u00e9j\u00e0 configur\u00e9s (masqu\u00e9s) \u2014 laisser vide = inchang\u00e9s'
+    : 'Authorization: Bearer \u2026 (une paire \u00ab Cl\u00e9: valeur \u00bb par ligne)';
   const states = n.states || ['DOWN', 'PORT-ONLY'];
   const hasState = v => states.some(x => String(x).toUpperCase() === v);
   document.getElementById('sStDown').checked = hasState('DOWN');
@@ -1393,7 +1466,11 @@ function notifyFormValues() {
     desktop: document.getElementById('sNotifDesktop').checked,
     webhook_url: document.getElementById('sWebhookUrl').value.trim(),
     method: document.getElementById('sWebhookMethod').value,
-    headers: document.getElementById('sWebhookHeaders').value,
+    // Lot 5 : champ vide = en-têtes inchangés — la clé n'est PAS envoyée et
+    // le moteur conserve ceux déjà configurés (masqués côté API).
+    headers: document.getElementById('sWebhookHeaders').value.trim() === ''
+      ? undefined
+      : document.getElementById('sWebhookHeaders').value,
     states: [
       ...(document.getElementById('sStDown').checked ? ['DOWN'] : []),
       ...(document.getElementById('sStPortOnly').checked ? ['PORT-ONLY'] : []),
@@ -1431,9 +1508,11 @@ function collectSettingsForm() {
   if (bad.length) { setFieldErr('ports', 'ports invalides : ' + bad.slice(0, 3).join(', ')); ok = false; }
   else setFieldErr('ports', '');
   const netPorts = tokens.filter(t => /^\d+$/.test(t)).map(Number).filter(p => p >= 1 && p <= 65535);
-  // Webhook : vide autorisé (canal off), sinon URL http(s)
+  // Webhook : vide autorisé (canal off), sinon URL http:// uniquement —
+  // https:// est refusé par le moteur à l'enregistrement (aucune pile TLS :
+  // l'envoi partait en HTTP brut sur le port 443, audit 05 #4).
   const url = document.getElementById('sWebhookUrl').value.trim();
-  if (url && !/^https?:\/\//i.test(url)) { setFieldErr('webhook', 'URL http:// ou https:// attendue'); ok = false; }
+  if (url && !/^http:\/\//i.test(url)) { setFieldErr('webhook', 'URL http:// attendue (https non pris en charge : aucune pile TLS)'); ok = false; }
   else setFieldErr('webhook', '');
   // États notifiés : au moins un (sinon aucun incident ne déclencherait rien)
   const notify = notifyFormValues();
@@ -1603,6 +1682,39 @@ function transportChanged() {
   const stdio = document.getElementById('fTransport').value === 'stdio';
   document.getElementById('httpFields').style.display = stdio ? 'none' : '';
   document.getElementById('stdioFields').hidden = !stdio;
+}
+
+/* Import d'un bloc mcpServers / URL / commande (audit 04 #4) : le moteur
+   parse tout (import_mcp) ; l'UI affiche le nombre ajouté et, si la réponse
+   les porte, les entrées écartées avec leur motif (champ `skipped`). */
+async function importMcp() {
+  const ta = document.getElementById('fImport');
+  const msg = document.getElementById('importMsg');
+  const text = (ta.value || '').trim();
+  if (!text) { msg.textContent = '\u2717 colle un bloc mcpServers, une URL http:// ou une commande (npx, claude mcp add…)'; return; }
+  msg.textContent = '\u23f3 import\u2026';
+  const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action: 'import_mcp', text})});
+  const j = await r.json().catch(() => ({}));
+  if (!j.ok) { msg.textContent = '\u2717 ' + (j.error || 'échec'); return; }
+  const parts = ['\u2713 ' + (j.added || 0) + ' serveur' + ((j.added || 0) > 1 ? 's' : '') + ' ajouté' + ((j.added || 0) > 1 ? 's' : '')];
+  const skipped = Array.isArray(j.skipped) ? j.skipped : [];
+  if (skipped.length) {
+    parts.push('écartés : ' + skipped.map(it => typeof it === 'string' ? it
+      : ((it.name || it.id || 'entrée') + ((it.reason || it.error || it.motif) ? ' — ' + (it.reason || it.error || it.motif) : ''))).join(' ; '));
+  }
+  if (j.note) parts.push(j.note);
+  await load();
+  // succès complet : on referme (le toast rappelle le total) ; entrées
+  // écartées ou rien d'ajouté : le dialog reste ouvert pour lire les motifs.
+  if ((j.added || 0) > 0 && !skipped.length) {
+    ta.value = '';
+    msg.textContent = '';
+    document.getElementById('dlg').close();
+    toast(parts.join(' — '), 'ok');
+  } else {
+    msg.textContent = parts.join(' — ');
+  }
 }
 
 async function addServer(ev) {

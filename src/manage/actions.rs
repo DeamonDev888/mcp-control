@@ -3,6 +3,9 @@
 // par thème (serveur, config, boutique, updates) — move pur ici.
 use super::*;
 
+// Surface du dispatcher : lue par les contrats de tests (ui.rs, manage/tests.rs)
+// uniquement, d'où l'allow ciblé hors tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const ACTIONS: &[&str] = &[
     "toggle",
     "refresh",
@@ -44,7 +47,6 @@ pub const ACTIONS: &[&str] = &[
 /// pure et testée. `None` = plateforme inconnue (jamais d'URL fabriquée hors
 /// de cette table). Les assets n'embarquent pas la version : l'URL
 /// `releases/latest/download/<asset>` sert toujours LA dernière release.
-
 pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
     let req: Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -227,6 +229,10 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     .get("workdir")
                     .and_then(|x| x.as_str())
                     .map(String::from);
+                // env additionnel optionnel {"CLÉ": "valeur"} (lot 3, audit 03
+                // constat 5) : atteint le process lancé via StartCmd.env —
+                // jamais l'API (noms seuls via server_json).
+                let senv = env_from_json(&req);
                 Server {
                     id: format!("manual-stdio-{}", now_compact()),
                     label: req
@@ -238,6 +244,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                         program: program.to_string(),
                         args: sargs.clone(),
                         workdir: sworkdir.clone(),
+                        env: senv.clone(),
                     },
                     origin: Origin::Manual,
                     enabled: true,
@@ -261,6 +268,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                         program: program.to_string(),
                         args: sargs,
                         workdir: sworkdir,
+                        env: senv,
                     }),
                     auto_restart: true,
                     favorite: false,
@@ -296,6 +304,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                                 .get("workdir")
                                 .and_then(|x| x.as_str())
                                 .map(String::from),
+                            env: env_from_json(&req),
                         })
                     }
                 };
@@ -361,6 +370,26 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 .get("durable")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false);
+            // (lot 3, audit 03 constat 9) un serveur lancé par l'app via un
+            // lanceur qui détache son enfant (cas bin/launch.cjs) survit au
+            // kill_tree → process orphelin et port occupé après suppression.
+            // On libère aussi le port — SEULEMENT si l'app a elle-même lancé ce
+            // serveur (handle présent dans children) et qu'il est HTTP local :
+            // jamais le process d'un serveur distant ou importé sans lancement
+            // par l'app.
+            let was_managed = lockv(&state.children).contains_key(&id);
+            let local_port = {
+                let servers = lockv(&state.servers);
+                servers
+                    .iter()
+                    .find(|s| s.id == id)
+                    .and_then(|s| match &s.transport {
+                        Transport::Http {
+                            host: None, port, ..
+                        } => Some(*port),
+                        _ => None,
+                    })
+            };
             let mut children = lockv(&state.children);
             if let Some(h) = children.get_mut(&id) {
                 probe::kill_tree(h.child.id());
@@ -368,6 +397,19 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             }
             children.remove(&id);
             drop(children);
+            if was_managed {
+                if let Some(p) = local_port {
+                    probe::kill_port(p);
+                    add_log(
+                        state,
+                        "info",
+                        &format!(
+                            "[{}] port {} libéré après suppression (lanceur détaché)",
+                            id, p
+                        ),
+                    );
+                }
+            }
             let removed = {
                 let mut servers = lockv(&state.servers);
                 let before = servers.len();
@@ -412,8 +454,24 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 }
                 _ => None,
             };
-            scan_ports(state, range);
-            json!({"ok": true})
+            // (lot 3, audit 03 constat 10) plage plafonnée : au-delà du plafond,
+            // refus CLAIR (le scan synchrone figeait le handler des heures sur
+            // une plage large). scan_ports tronque défensivement les plages
+            // issues des réglages (scan_from/scan_to hors plafond).
+            if let Some((a, b)) = range {
+                if (b - a + 1) as usize > SCAN_MAX_PORTS {
+                    return json!({
+                        "ok": false,
+                        "error": format!(
+                            "plage trop large : {} ports demandés (max {}) — resserrez from..to",
+                            b - a + 1,
+                            SCAN_MAX_PORTS
+                        )
+                    });
+                }
+            }
+            let found = scan_ports(state, range);
+            json!({"ok": true, "found": found})
         }
         "scan_network" => {
             let range = match (
@@ -501,10 +559,19 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             if matches!(&srv.transport, Transport::Http { host: Some(_), .. }) {
                 return json!({"ok": false, "error": "serveur distant : la commande de lancement appartient à sa machine hôte"});
             }
+            // l'env existant est PRÉSERVÉ : set_start_cmd édite programme/args/
+            // workdir, pas les variables (les effacer couperait la clé d'API
+            // importée — lot 3).
+            let env = srv
+                .start_cmd
+                .as_ref()
+                .map(|c| c.env.clone())
+                .unwrap_or_default();
             srv.start_cmd = Some(StartCmd {
                 program: program.clone(),
                 args,
                 workdir,
+                env,
             });
             // Un serveur découvert (scan) n'est PAS persisté (redétecté au boot).
             // Donner une commande = l'utilisateur le revendique : promotion en
@@ -1281,6 +1348,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                                     program: it.program.to_string(),
                                     args: args.clone(),
                                     workdir: None,
+                                    env: Vec::new(),
                                 },
                                 origin: Origin::Manual,
                                 enabled: true,
@@ -1306,6 +1374,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                                     program: it.program.to_string(),
                                     args,
                                     workdir: None,
+                                    env: Vec::new(),
                                 }),
                                 tools_disabled: vec![],
                             });

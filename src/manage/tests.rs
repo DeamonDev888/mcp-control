@@ -479,6 +479,7 @@ fn save_puis_load_roundtrip_stdio() {
                 program: "prog".into(),
                 args: vec!["-x".into()],
                 workdir: Some("W".into()),
+                env: Vec::new(),
             },
             origin: Origin::Manual,
             enabled: true,
@@ -504,6 +505,7 @@ fn save_puis_load_roundtrip_stdio() {
                 program: "prog".into(),
                 args: vec!["-x".into()],
                 workdir: Some("W".into()),
+                env: Vec::new(),
             }),
             tools_disabled: vec![],
         });
@@ -519,6 +521,7 @@ fn save_puis_load_roundtrip_stdio() {
             program,
             args,
             workdir,
+            ..
         } => {
             assert_eq!(program, "prog");
             assert_eq!(args, &vec!["-x".to_string()]);
@@ -1049,6 +1052,7 @@ fn auto_restart_par_serveur_action_et_persistance() {
                 program: "node".into(),
                 args: vec![],
                 workdir: None,
+                env: Vec::new(),
             },
             origin: Origin::Manual,
             enabled: true,
@@ -1072,6 +1076,7 @@ fn auto_restart_par_serveur_action_et_persistance() {
                 program: "node".into(),
                 args: vec![],
                 workdir: None,
+                env: Vec::new(),
             }),
             auto_restart: true,
             favorite: false,
@@ -1206,6 +1211,7 @@ fn set_host_refuse_seed_et_rehost_manuel() {
                 program: "node".into(),
                 args: vec![],
                 workdir: None,
+                env: Vec::new(),
             },
             origin: Origin::Manual,
             enabled: true,
@@ -1546,6 +1552,7 @@ fn annonce_litemcp_importe_adopte_et_resynchronise() {
                 program: "python".into(),
                 args: vec!["serve.py".into()],
                 workdir: None,
+                env: Vec::new(),
             }),
             auto_restart: true,
             favorite: false,
@@ -1730,13 +1737,13 @@ fn set_notify_valide_et_persiste() {
     // 2. config complète → ok + état rendu + persisté dans config.json
     let j2 = handle_action(
             &state,
-            "{\"action\":\"set_notify\",\"desktop\":true,\"webhook_url\":\"https://example.com/hook\",\"method\":\"put\",\"headers\":\"Authorization: Bearer x\",\"states\":[\"DOWN\"],\"min_interval_secs\":60}",
+            "{\"action\":\"set_notify\",\"desktop\":true,\"webhook_url\":\"http://example.com/hook\",\"method\":\"put\",\"headers\":\"Authorization: Bearer x\",\"states\":[\"DOWN\"],\"min_interval_secs\":60}",
         );
     assert_eq!(j2["ok"], serde_json::json!(true));
     assert_eq!(j2["notify"]["desktop"], serde_json::json!(true));
     assert_eq!(
         j2["notify"]["webhook_url"],
-        serde_json::json!("https://example.com/hook")
+        serde_json::json!("http://example.com/hook")
     );
     assert_eq!(
         j2["notify"]["method"],
@@ -1747,7 +1754,7 @@ fn set_notify_valide_et_persiste() {
     {
         let st = lockv(&state.settings);
         assert!(st.notify.desktop);
-        assert_eq!(st.notify.webhook_url, "https://example.com/hook");
+        assert_eq!(st.notify.webhook_url, "http://example.com/hook");
         assert_eq!(st.notify.min_interval_secs, 60);
     }
     let cfg = std::fs::read_to_string(&path).unwrap_or_default();
@@ -1766,7 +1773,7 @@ fn set_notify_valide_et_persiste() {
     let full = state_json(&state);
     assert_eq!(
         full["settings"]["notify"]["webhook_url"],
-        serde_json::json!("https://example.com/hook")
+        serde_json::json!("http://example.com/hook")
     );
     let log = lockv(&state.log);
     assert!(
@@ -2422,5 +2429,453 @@ fn http_avec_start_cmd_charge_et_persiste() {
     assert_eq!(
         cmd2.args,
         vec!["srv.js".to_string(), "--p".to_string(), "3210".to_string()]
+    );
+}
+
+// ==================== Lot 3 — persistance, import, cycle de vie ====================
+
+/// AppState de test (config_path passé tel quel : "" = aucune écriture fichier).
+fn state_lot3(chemin: &str) -> Arc<AppState> {
+    Arc::new(AppState {
+        servers: Mutex::new(Vec::new()),
+        log: Mutex::new(VecDeque::new()),
+        settings: Mutex::new(Settings::default()),
+        children: Mutex::new(std::collections::HashMap::new()),
+        config_path: chemin.to_string(),
+        peers: Mutex::new(std::collections::HashMap::new()),
+        allowed_origins: Mutex::new(Vec::new()),
+        allowed_hosts: Mutex::new(Vec::new()),
+        spawn_fails: Mutex::new(std::collections::HashMap::new()),
+        runtime: Mutex::new(crate::runtime::RuntimeLog::new()),
+        spawning: Mutex::new(std::collections::HashSet::new()),
+        update_latest: Mutex::new(None),
+        lan_ok: Mutex::new(None),
+    })
+}
+
+/// (lot 3, audit 03 constat 5) : l'env d'un bloc mcpServers est conservé à
+/// l'import, porté par le transport ET la commande de lancement, survit au
+/// round-trip config.json — et ses VALEURS ne sortent jamais par /api/state
+/// ni /api/detail (noms seulement).
+#[test]
+fn import_env_stdio_persiste_et_ne_fuit_pas_par_lapi() {
+    let entry: Value = serde_json::from_str(
+        r#"{"command":"node","args":["srv.js"],"env":{"API_KEY":"valeur-secrete","AUTRE":"x2"}}"#,
+    )
+    .unwrap();
+    let srv = entry_to_server("store-demo".into(), "demo", &entry).expect("entrée reconnue");
+    match &srv.transport {
+        Transport::Stdio { env, .. } => {
+            assert_eq!(env.len(), 2, "env jeté à l'import");
+            assert!(env.contains(&("API_KEY".to_string(), "valeur-secrete".to_string())));
+        }
+        _ => panic!("transport stdio attendu"),
+    }
+    let c = srv.start_cmd.as_ref().expect("start_cmd stdio");
+    assert!(c
+        .env
+        .contains(&("API_KEY".to_string(), "valeur-secrete".to_string())));
+
+    // round-trip config.json : l'env survit à save/load
+    let path = tmp_config("cfg_env_import.json", None);
+    let state = state_lot3(&path);
+    lockv(&state.servers).push(srv);
+    save_config(&state);
+    let (servers, _) = load_config(&path);
+    let s2 = servers
+        .iter()
+        .find(|s| s.id == "store-demo")
+        .expect("persisté");
+    match &s2.transport {
+        Transport::Stdio { env, .. } => {
+            assert_eq!(env.len(), 2, "env perdu au round-trip config");
+            assert!(env
+                .iter()
+                .any(|(k, v)| k == "API_KEY" && v == "valeur-secrete"));
+        }
+        _ => panic!("transport stdio attendu"),
+    }
+
+    // API : noms SEULS — la valeur ne doit apparaître nulle part
+    let etat = server_json(s2, false);
+    let texte = etat.to_string();
+    assert!(
+        !texte.contains("valeur-secrete"),
+        "VALEUR d'env exposée : {texte}"
+    );
+    assert!(texte.contains("API_KEY"), "nom d'env attendu : {texte}");
+    let cmd_json = etat
+        .get("start_cmd")
+        .expect("start_cmd exposée")
+        .to_string();
+    assert!(
+        !cmd_json.contains("valeur-secrete"),
+        "VALEUR exposée : {cmd_json}"
+    );
+    assert!(
+        cmd_json.contains("API_KEY"),
+        "nom d'env attendu : {cmd_json}"
+    );
+    let detail = detail_json(&state, "store-demo").to_string();
+    assert!(
+        !detail.contains("valeur-secrete"),
+        "VALEUR exposée par /api/detail"
+    );
+}
+
+/// (lot 3, audit 03 constat 6) : une entrée {"url":"https://…"} d'un bloc JSON
+/// était ignorée en silence avec ok:true — elle est désormais listée dans
+/// `skipped` avec le même motif que le collage d'une URL https directe.
+#[test]
+fn import_json_url_https_listee_dans_skipped_avec_motif() {
+    let state = state_lot3("");
+    let raw = r#"{"mcpServers":{"aud-https":{"url":"https://exemple.org/mcp"},"aud-http":{"url":"http://127.0.0.1:3196/mcp"},"aud-bizarre":{"foo":1}}}"#;
+    let rep = import_mcp_text(&state, raw);
+    assert_eq!(rep.get("ok").and_then(|o| o.as_bool()), Some(true), "{rep}");
+    assert_eq!(rep.get("added").and_then(|a| a.as_u64()), Some(1), "{rep}");
+    let skipped = rep
+        .get("skipped")
+        .and_then(|s| s.as_array())
+        .expect("liste skipped attendue");
+    assert_eq!(skipped.len(), 2, "{rep}");
+    let https = skipped
+        .iter()
+        .find(|s| s.get("name").and_then(|n| n.as_str()) == Some("aud-https"))
+        .expect("entrée https absente de skipped");
+    let motif = https.get("reason").and_then(|r| r.as_str()).unwrap_or("");
+    assert!(
+        motif.contains("TLS non supporté"),
+        "motif attendu : {motif}"
+    );
+    let biz = skipped
+        .iter()
+        .find(|s| s.get("name").and_then(|n| n.as_str()) == Some("aud-bizarre"))
+        .expect("entrée non reconnaissable absente de skipped");
+    assert!(!biz
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .is_empty());
+    assert!(
+        lockv(&state.servers)
+            .iter()
+            .any(|s| s.id == "store-aud-http"),
+        "l'entrée http:// doit être importée"
+    );
+}
+
+/// (lot 3, audit 03 constat 7) : 50 add simultanés → 50 présents dans le
+/// fichier relu. Les écritures sont sérialisées (verrou global + tmp unique) :
+/// le dernier écrivain voit toujours les 50 pushs (chaque thread pousse AVANT
+/// de sauvegarder, et le verrou sérialise clone→écriture).
+#[test]
+fn save_config_concurrent_50_adds_tous_persistes() {
+    let path = tmp_config("cfg_concurent_50.json", None);
+    let state = state_lot3(&path);
+    std::thread::scope(|scope| {
+        for i in 0..50u32 {
+            let state = &state;
+            scope.spawn(move || {
+                lockv(&state.servers).push(Server {
+                    id: format!("conc-{i}"),
+                    label: format!("Concurrent {i}"),
+                    transport: Transport::Http {
+                        host: None,
+                        port: 30000 + i as u16,
+                        path: "/mcp".into(),
+                    },
+                    origin: Origin::Manual,
+                    enabled: true,
+                    state: SState::Down,
+                    pid: None,
+                    bound_host: None,
+                    server_name: None,
+                    version: None,
+                    protocol: None,
+                    sse: false,
+                    sse_endpoint: false,
+                    ws: false,
+                    lang: None,
+                    framework: None,
+                    via_ssh: false,
+                    tools: vec![],
+                    latency_ms: None,
+                    last_seen_ts: None,
+                    last_error: None,
+                    start_cmd: None,
+                    auto_restart: true,
+                    favorite: false,
+                    tools_disabled: vec![],
+                });
+                save_config(state);
+            });
+        }
+    });
+    let (servers, _) = load_config(&path);
+    for i in 0..50u32 {
+        assert!(
+            servers.iter().any(|s| s.id == format!("conc-{i}")),
+            "conc-{i} perdu : écriture concurrente non sérialisée"
+        );
+    }
+}
+
+/// (lot 3, audit 03 constat 8) : config.json ILLISIBLE (JSON invalide) =
+/// renommage en config.json.corrompu-<horodatage> + repart des défauts (et
+/// plus un repli silencieux qui écrasait la config à la première sauvegarde).
+#[test]
+fn config_corrompue_renommee_et_defauts() {
+    let path = tmp_config("cfg_corrompue.json", Some("{servers: [ pas du json"));
+    let (servers, _) = load_config(&path);
+    assert_eq!(servers.len(), 8, "défauts attendus après config corrompue");
+    assert!(
+        !std::path::Path::new(&path).exists(),
+        "l'original doit être renommé"
+    );
+    let prefixe = format!("{path}.corrompu-");
+    let parent = std::path::Path::new(&path).parent().unwrap();
+    assert!(
+        std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().to_string_lossy().starts_with(&prefixe)),
+        "un config.json.corrompu-<horodatage> doit exister"
+    );
+}
+
+/// (lot 3, audit 03 constat 8) : fichier VIDE = même traitement que corrompu.
+#[test]
+fn config_vide_renommee_comme_corrompue() {
+    let path = tmp_config("cfg_vide.json", Some(""));
+    let (servers, _) = load_config(&path);
+    assert_eq!(servers.len(), 8, "défauts attendus après config vide");
+    assert!(!std::path::Path::new(&path).exists(), "doit être renommé");
+}
+
+/// CRITÈRE lot 3 : une config de la v0.7.20 (sans champ env) se recharge sans
+/// perte — champ env absent → vide, tous les autres champs conservés, et le
+/// round-trip save/load ne change rien.
+#[test]
+fn config_v0_7_20_se_recharge_sans_perte() {
+    let cfg = r#"{
+  "servers": [
+    {"id":"old-http","label":"HTTP d'époque","transport":"http","host":"127.0.0.1","port":3101,"path":"/mcp","enabled":true},
+    {"id":"old-stdio","label":"STDIO d'époque","transport":"stdio","program":"node","args":["srv.js"],"workdir":"C:/tmp","enabled":false},
+    {"id":"old-lance","label":"Lancé","transport":"http","port":3102,"path":"/mcp","enabled":true,"program":"node","args":["launch.cjs"],"workdir":"C:/tmp"}
+  ],
+  "settings":{"refresh_secs":30,"ui_port":5090,"removed_seeds":["seed-news"],"api_access":"code-ancien"}
+}"#;
+    let path = tmp_config("cfg_v0720.json", Some(cfg));
+    let (servers, st) = load_config(&path);
+    let http = servers
+        .iter()
+        .find(|s| s.id == "old-http")
+        .expect("http conservé");
+    match &http.transport {
+        Transport::Http {
+            host,
+            port,
+            path: p,
+        } => {
+            assert_eq!(host.as_deref(), Some("127.0.0.1"));
+            assert_eq!(*port, 3101);
+            assert_eq!(p, "/mcp");
+        }
+        _ => panic!("transport http attendu"),
+    }
+    let stdio = servers
+        .iter()
+        .find(|s| s.id == "old-stdio")
+        .expect("stdio conservé");
+    match &stdio.transport {
+        Transport::Stdio {
+            program,
+            args,
+            workdir,
+            env,
+        } => {
+            assert_eq!(program, "node");
+            assert_eq!(args, &vec!["srv.js".to_string()]);
+            assert_eq!(workdir.as_deref(), Some("C:/tmp"));
+            assert!(env.is_empty(), "champ env absent → vide (compat v0.7.20)");
+        }
+        _ => panic!("transport stdio attendu"),
+    }
+    let lance = servers
+        .iter()
+        .find(|s| s.id == "old-lance")
+        .expect("lancé conservé");
+    let c = lance
+        .start_cmd
+        .as_ref()
+        .expect("start_cmd http reconstruite");
+    assert_eq!(c.program, "node");
+    assert!(c.env.is_empty());
+    assert_eq!(st.refresh_secs, 30);
+    assert_eq!(st.ui_port, 5090);
+    assert_eq!(st.removed_seeds, vec!["seed-news".to_string()]);
+    assert_eq!(st.api_access.as_deref(), Some("code-ancien"));
+
+    // round-trip : sauvegarde puis rechargement — rien ne se perd
+    let state = state_lot3(&path);
+    *lockv(&state.servers) = servers.clone();
+    *lockv(&state.settings) = st.clone();
+    save_config(&state);
+    let (servers2, st2) = load_config(&path);
+    assert!(servers2.iter().any(|s| s.id == "old-http"));
+    let stdio2 = servers2.iter().find(|s| s.id == "old-stdio").unwrap();
+    match &stdio2.transport {
+        Transport::Stdio {
+            program, args, env, ..
+        } => {
+            assert_eq!(program, "node");
+            assert_eq!(args, &vec!["srv.js".to_string()]);
+            assert!(env.is_empty());
+        }
+        _ => panic!("transport stdio attendu"),
+    }
+    assert_eq!(st2.refresh_secs, 30);
+    assert_eq!(st2.removed_seeds, vec!["seed-news".to_string()]);
+    assert_eq!(st2.api_access.as_deref(), Some("code-ancien"));
+}
+
+/// (lot 3, audit 03 constat 10) : plafonnement de plage — pur et testé.
+#[test]
+fn scan_plafonne_borne_la_plage_a_512() {
+    assert_eq!(
+        scan_plafonne(3000, 3200),
+        (3000, 3200),
+        "201 ports : inchangé"
+    );
+    assert_eq!(scan_plafonne(1, 3000), (1, 512), "tronqué en tête");
+    assert_eq!(scan_plafonne(64000, 65535), (64000, 64511));
+    assert_eq!(
+        scan_plafonne(65100, 65535),
+        (65100, 65535),
+        "436 ports : sous le plafond, inchangé"
+    );
+}
+
+/// (lot 3, audit 03 constat 10) : le handler refuse CLAIREMENT une plage
+/// explicite au-delà du plafond (le scan synchrone figeait l'API des heures).
+#[test]
+fn scan_handler_refuse_une_plage_trop_large() {
+    let state = state_lot3("");
+    let rep = handle_action(
+        &state,
+        &json!({"action": "scan", "from": 1, "to": 3000}).to_string(),
+    );
+    assert_eq!(
+        rep.get("ok").and_then(|o| o.as_bool()),
+        Some(false),
+        "{rep}"
+    );
+    let err = rep.get("error").and_then(|e| e.as_str()).unwrap_or("");
+    assert!(err.contains("512"), "le plafond doit être cité : {err}");
+}
+
+/// (lot 3, audit 03 constat 9) : un serveur lancé par l'app via un lanceur qui
+/// DÉTACHE son enfant (ici powershell Start-Process → node) survit au
+/// kill_tree du lanceur — remove doit libérer le port. Réciproquement, un
+/// serveur NON lancé par l'app (pas de handle) ne doit pas être tué : garanti
+/// par la garde was_managed, testée ici par construction (handle présent).
+#[test]
+fn remove_libere_le_port_dun_serveur_lance_par_lapp() {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let dir = std::env::temp_dir().join("mcpcc_tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let js = dir.join("orphelin_lot3.js");
+    std::fs::write(
+        &js,
+        format!(
+            "require('http').createServer((q,s)=>{{s.writeHead(200);s.end('ok')}}).listen({port},'127.0.0.1');\n"
+        ),
+    )
+    .unwrap();
+    // ceinture-bretelles : jamais de node orphelin résiduel après le test
+    struct PortNettoie(u16);
+    impl Drop for PortNettoie {
+        fn drop(&mut self) {
+            probe::kill_port(self.0);
+        }
+    }
+    let _garde = PortNettoie(port);
+
+    let state = state_lot3("");
+    // handle du LANCEUR dans children (comme le moteur) : le lanceur node
+    // détache le vrai serveur (child_process.spawn detached + unref, cas réel
+    // bin/launch.cjs) puis SORT — le serveur survit au kill_tree du lanceur.
+    let js_arg = js.display().to_string().replace('\\', "/");
+    let script = format!(
+        "const cp=require('child_process');const p=cp.spawn(process.execPath,['{}'],{{detached:true,stdio:'ignore'}});p.unref();",
+        js_arg
+    );
+    let lanceur = probe::spawn_process("node", &["-e".to_string(), script], None, &[])
+        .expect("spawn du lanceur");
+    lockv(&state.children).insert("lc-detach".to_string(), lanceur);
+    lockv(&state.servers).push(Server {
+        id: "lc-detach".into(),
+        label: "Lanceur détaché".into(),
+        transport: Transport::Http {
+            host: None,
+            port,
+            path: "/mcp".into(),
+        },
+        origin: Origin::Manual,
+        enabled: true,
+        state: SState::Down,
+        pid: None,
+        bound_host: None,
+        server_name: None,
+        version: None,
+        protocol: None,
+        sse: false,
+        sse_endpoint: false,
+        ws: false,
+        lang: None,
+        framework: None,
+        via_ssh: false,
+        tools: vec![],
+        latency_ms: None,
+        last_seen_ts: None,
+        last_error: None,
+        start_cmd: None,
+        auto_restart: true,
+        favorite: false,
+        tools_disabled: vec![],
+    });
+
+    // le process détaché doit écouter avant remove (attente bornée)
+    let mut ouvert = false;
+    for _ in 0..50 {
+        if probe::port_open("127.0.0.1", port, std::time::Duration::from_millis(500)) {
+            ouvert = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(ouvert, "l'orphelin doit écouter avant remove");
+
+    let rep = handle_action(
+        &state,
+        &json!({"action": "remove", "id": "lc-detach"}).to_string(),
+    );
+    assert_eq!(rep.get("ok").and_then(|o| o.as_bool()), Some(true), "{rep}");
+
+    // le port doit être libéré (kill_port sur l'orphelin détaché)
+    let mut libere = false;
+    for _ in 0..40 {
+        if !probe::port_open("127.0.0.1", port, std::time::Duration::from_millis(500)) {
+            libere = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    assert!(
+        libere,
+        "le port doit être libéré après remove (orphelin tué)"
     );
 }

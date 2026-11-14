@@ -26,7 +26,7 @@
 //!   port,path|program,args,…}],"settings":{…},"runtime":{…}}` — écrit à chaque
 //!   add/toggle/remove. Au chargement, `enabled:false` → state DISABLED.
 
-use crate::harness::{spawn, spawn_loopback, wait_until, Engine, EngineCfg, Fixture};
+use crate::harness::{free_port, spawn, spawn_loopback, wait_until, Engine, EngineCfg, Fixture};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -631,4 +631,191 @@ fn config_persistence_across_restart() {
         }
     });
     assert!(up2, "après restart, le serveur n'est pas revenu UP : {s}");
+}
+
+// ---------- lot 2 : relances infinies + période de cycle (audit 03, 2 & 3) ----------
+
+/// Commande qui sort aussitôt avec le code 1 (cross-platform).
+fn cmd_exit_immediat() -> (String, Vec<String>) {
+    #[cfg(windows)]
+    {
+        (
+            "cmd.exe".to_string(),
+            vec!["/C".to_string(), "exit".to_string(), "1".to_string()],
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        (
+            "sh".to_string(),
+            vec!["-c".to_string(), "exit 1".to_string()],
+        )
+    }
+}
+
+/// Résumé runtime d'un id (tableau "servers" de /api/runtime ; Null si absent).
+fn resume_runtime(eng: &Engine, id: &str) -> Value {
+    eng.get("/api/runtime").json()["servers"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|s| s.get("id").and_then(Value::as_str) == Some(id))
+        })
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// Un serveur HTTP local qui sort aussitôt (exit 1) est abandonné après
+/// MAX_ATTEMPTS tentatives (backoff croissant), avec une ligne de journal
+/// claire et fails = 5 dans /api/runtime — la relance n'est plus infinie.
+#[test]
+fn crashloop_http_abandonne_apres_cinq_tentatives() {
+    let _garde = crate::harness::serial_guard();
+    let eng = moteur();
+    let port_mort = free_port();
+    let (programme, args) = cmd_exit_immediat();
+    let rep = eng.action(&json!({
+        "action": "add", "transport": "http",
+        "port": port_mort, "path": "/mcp", "label": "e2e-crashloop",
+        "program": programme, "args": args
+    }));
+    assert_eq!(rep["ok"], true, "add crashloop refusé : {rep}");
+    let id = rep["id"].as_str().expect("add sans id").to_string();
+
+    // 5 tentatives espacées de backoff 5/10/20/40 s + détection au cycle
+    // suivant. Borne généreuse : le cycle réel peut durer refresh + la sonde
+    // la plus lente des serveurs découverts sur la machine (~11 s observé).
+    let abandon = wait_until(Duration::from_secs(260), || {
+        match resume_runtime(&eng, &id)
+            .get("fails")
+            .and_then(Value::as_u64)
+        {
+            Some(f) if f >= 5 => Some(true),
+            Some(_) => Some(false),
+            None => None,
+        }
+    });
+    let rt = resume_runtime(&eng, &id);
+    assert!(
+        abandon,
+        "abandon non atteint : fails={:?} — événements {:?} — journal {:?}",
+        rt.get("fails"),
+        eng.get("/api/runtime").json()["events"]
+            .as_array()
+            .map(|evs| evs
+                .iter()
+                .filter(|e| champ(e, "id") == id)
+                .map(|e| (
+                    champ(e, "kind"),
+                    e.get("ts").cloned().unwrap_or(Value::Null)
+                ))
+                .collect::<Vec<_>>()),
+        eng.get("/api/state").json()["log"].as_array().map(|l| l
+            .iter()
+            .filter(|e| champ(e, "msg").contains(&id))
+            .map(|e| champ(e, "msg").to_string())
+            .collect::<Vec<_>>())
+    );
+    assert_eq!(rt["fails"], 5, "{rt}");
+
+    // backoff croissant : espacement croissant des 5 événements start-fail
+    let mut ts: Vec<u64> = eng.get("/api/runtime").json()["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| champ(e, "id") == id && champ(e, "kind") == "start-fail")
+        .filter_map(|e| e.get("ts").and_then(Value::as_u64))
+        .collect();
+    ts.sort_unstable();
+    assert_eq!(ts.len(), 5, "5 start-fail attendus : {ts:?}");
+    let gaps: Vec<u64> = ts.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(gaps[0] >= 4, "backoff #1 (5 s) : {gaps:?}");
+    assert!(gaps[1] >= 8, "backoff #2 (10 s) : {gaps:?}");
+    assert!(gaps[2] >= 18, "backoff #3 (20 s) : {gaps:?}");
+    assert!(gaps[3] >= 38, "backoff #4 (40 s) : {gaps:?}");
+
+    // auto-restart désactivé + ligne de journal d'abandon claire
+    let s = serveurs_etat(&eng)
+        .into_iter()
+        .find(|s| champ(s, "id") == id)
+        .expect("entrée disparue");
+    assert_eq!(s["auto_restart"], false, "{s}");
+    let journal_lu = eng.get("/api/state").json()["log"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        journal_lu
+            .iter()
+            .any(|e| champ(e, "msg").contains("auto-restart désactivé après 5 échecs")),
+        "ligne d'abandon absente du journal : {journal_lu:?}"
+    );
+
+    // APRÈS abandon : plus aucune tentative — fails reste à 5 pendant 15 s
+    let relance = wait_until(Duration::from_secs(15), || {
+        match resume_runtime(&eng, &id)
+            .get("fails")
+            .and_then(Value::as_u64)
+        {
+            Some(f) if f > 5 => Some(true),
+            Some(_) => Some(false),
+            None => None,
+        }
+    });
+    assert!(!relance, "une 6ᵉ tentative a eu lieu après l'abandon");
+}
+
+/// Le cycle de supervision n'est pas bloqué par un serveur en échec de
+/// démarrage : avec un crashloop (exit 1) dans la liste, un serveur UP est
+/// re-sondé au rythme du refresh (+ une sonde). L'ancien code re-sondait 30 s
+/// DANS le cycle après chaque spawn (audit 03, constat 2 : période mesurée
+/// 48-90 s pour refresh_secs = 5, soit ~1 mise à jour du serveur UP en 40 s).
+#[test]
+fn cycle_supervision_non_bloque_par_un_crashloop() {
+    let _garde = crate::harness::serial_guard();
+    let eng = moteur();
+    let fx = Fixture::spawn_mcp();
+    let rep = ajoute_http(&eng, fx.port(), "e2e-cycle-up");
+    let _id_up = rep["id"].as_str().expect("add sans id").to_string();
+    let port_mort = free_port();
+    let (programme, args) = cmd_exit_immediat();
+    let rep = eng.action(&json!({
+        "action": "add", "transport": "http",
+        "port": port_mort, "path": "/mcp", "label": "e2e-cycle-crash",
+        "program": programme, "args": args
+    }));
+    assert_eq!(rep["ok"], true, "add crashloop refusé : {rep}");
+
+    let up = wait_until(DELAI_UP, || {
+        serveurs_etat(&eng)
+            .iter()
+            .any(|s| meme_port(s, fx.port()) && champ(s, "state") == "UP")
+            .then_some(true)
+    });
+    assert!(up, "pré-condition : la fixture n'est jamais passée UP");
+
+    // 45 s : last_seen du serveur UP doit avancer au moins 3 fois (période
+    // attendue ≈ refresh 5 s + la sonde la plus lente, ~11 s sur machine
+    // chargée en serveurs découverts). L'ancien comportement (re-sonde de 30 s
+    // au spawn, audit 03 constat 2) donnait 1-2 fronts dans cette fenêtre.
+    let debut = std::time::Instant::now();
+    let mut vus: Vec<u64> = Vec::new();
+    while debut.elapsed() < Duration::from_secs(45) {
+        if let Some(ts) = serveurs_etat(&eng)
+            .iter()
+            .find(|s| meme_port(s, fx.port()))
+            .and_then(|s| s.get("last_seen").and_then(Value::as_u64))
+        {
+            if vus.last() != Some(&ts) {
+                vus.push(ts);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(
+        vus.len() >= 3,
+        "période de cycle trop lente avec un crashloop : {} front(s) en 45 s ({vus:?})",
+        vus.len()
+    );
 }
