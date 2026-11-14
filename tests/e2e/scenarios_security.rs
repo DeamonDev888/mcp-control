@@ -337,7 +337,14 @@ impl RecepteurWebhook {
                                     break;
                                 }
                             }
-                            let mut body = buf[head_end + 4..].to_vec();
+                            // connexion fermée sans \r\n\r\n complet (sonde de scan
+                            // parallèle, client parti tôt) : corps vide — le
+                            // récepteur ne doit PAS paniquer
+                            let mut body = if buf.len() >= head_end + 4 {
+                                buf[head_end + 4..].to_vec()
+                            } else {
+                                Vec::new()
+                            };
                             while body.len() < cl {
                                 match s.read(&mut tmp) {
                                     Ok(0) => break,
@@ -608,10 +615,20 @@ fn webhook_https_et_auto_instance_refuses_journalise_et_test_notify() {
         "test_notify : {}",
         t.text().chars().take(300).collect::<String>()
     );
+    // canal desktop : réel sous Windows ; refus propre hors Windows (pas de
+    // pile de notification) — le webhook, lui, doit réussir partout
+    #[cfg(windows)]
     assert_eq!(
         tj["desktop"]["ok"],
         json!(true),
         "toast desktop réel doit réussir (un seul -Command) : {}",
+        t.text().chars().take(300).collect::<String>()
+    );
+    #[cfg(not(windows))]
+    assert_eq!(
+        tj["desktop"]["error"],
+        json!("notifications desktop : non supporté hors Windows"),
+        "desktop hors Windows : refus propre attendu : {}",
         t.text().chars().take(300).collect::<String>()
     );
     assert_eq!(
@@ -804,12 +821,12 @@ fn notification_label_hostile_passe_par_les_deux_canaux() {
     // le toast desktop n'a PAS échoué (aucun warn [notif] desktop dans mcc.log)
     // et la cible + le label sont journalisés
     let journal = mcc_log_of(&e);
-    let notif_desktop = journal
+    let echecs_desktop = journal
         .lines()
-        .filter(|l| l.contains("[notif] desktop :"))
+        .filter(|l| l.contains("[notif] desktop :") && !l.contains("non supporté hors Windows"))
         .count();
     assert_eq!(
-        notif_desktop,
+        echecs_desktop,
         0,
         "le toast desktop ne doit plus échouer : {}",
         journal

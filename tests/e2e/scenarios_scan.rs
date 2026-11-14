@@ -218,9 +218,19 @@ fn manual_same_name_two_ports_survive_scan() {
         "collision d'id entre les deux adds : {rep_a} / {rep_b}"
     );
 
-    // Scan borné à la plage des deux ports : synchrone, rapide, et il voit le
-    // port vivant (déjà connu → ignoré) et le port mort (fermé → ignoré).
-    let rep = scan_plage(&eng, port_a, port_b);
+    // Scan borné autour de CHAQUE port (deux plages d'un port) : le plafond
+    // du scan (512, lot 3) refuse une plage aléatoire trop large entre deux
+    // ports libres — les deux ports restent couverts : vivant (déjà connu →
+    // ignoré) et mort (fermé → ignoré).
+    let rep_a_scan = scan_plage(&eng, port_a, port_a);
+    assert!(
+        rep_a_scan
+            .get("ok")
+            .and_then(|o| o.as_bool())
+            .unwrap_or(false),
+        "scan refusé : {rep_a_scan}"
+    );
+    let rep = scan_plage(&eng, port_b, port_b);
     assert!(
         rep.get("ok").and_then(|o| o.as_bool()).unwrap_or(false),
         "scan refusé : {rep}"
