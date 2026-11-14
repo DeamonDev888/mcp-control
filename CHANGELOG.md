@@ -1,4 +1,4 @@
-## [Non publié] — fiabilisation : compilation, passerelle, supervision, persistance, UI, sécurité HTTP + doc alignée
+## [0.7.21] — fiabilisation : compilation, passerelle, supervision, persistance, UI, sécurité HTTP + doc alignée
 
 ### Refactorisation : `manage.rs` éclaté en 14 modules (zéro changement de comportement)
 - **Le monolithe est éclaté** en modules thématiques purs (moves, API inchangée via réexports `pub(crate) use`) : `store` (boutique), `import` (parsing mcpServers), `config` (config.json), `json` (state/detail/runtime), `scans` (ports/netstat/réseau), `peers` + SSH, `update` (GitHub), `cache`, `autostart`, `litemcp`, `log`, `events` (notifications d'incident), `actions` (dispatcher, 1 409 lignes), `tests` (2 881 lignes) — `manage.rs` : 7 543 → 89 lignes (nombres mesurés après les correctifs des lots 0-5, ci-dessous).
