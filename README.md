@@ -4,6 +4,8 @@ Il les trouve tout seul, te dit lequel marche et lequel est cassé (et pourquoi)
 
 ![L'application au démarrage](assets/readme-accueil.png)
 
+**Sommaire** : [Installer](#installer) · [Démarrer](#démarrer) · [Les 4 états](#lire-lécran--les-4-états-ce-quils-veulent-dire) · [Les boutons](#les-boutons) · [Gateway MCP](#gateway-mcp--la-console-est-un-serveur-mcp) · [Dépannage](#un-problème--la-réponse-rapide) · [Avancé](#pour-aller-plus-loin) · [Limites](#limites)
+
 ## Ça sert à quoi ?
 
 - **Voir** tous tes serveurs MCP en un coup d'œil (même ceux que tu avais oubliés).
@@ -27,8 +29,8 @@ Tout est compilé et prêt dans la [page des releases](https://github.com/Deamon
   fichier → **Ouvrir**.
 - **Linux** : `chmod +x` sur le fichier téléchargé, puis lance-le.
 - Tu préfères tout en console, sans fenêtre ? Les binaires **headless**
-  (`…windows-x86_64.exe`, `…linux-x86_64`, `…macos-universal`
-  sans le `desktop-`) sont dans la même release.
+  (`mcp-control-cli-windows-x86_64.exe`, `mcp-control-cli-linux-x86_64`,
+  `mcp-control-cli-macos-universal`) sont dans la même release.
 
 > ℹ️ Le préfixe des fichiers est `mcp-control-` depuis la v0.7.13 ;
 > les releases plus anciennes portent l'ancien préfixe `mcp-command-center-`.
@@ -58,6 +60,11 @@ Get-FileHash .\mcp-control-desktop-windows-x86_64-setup.exe -Algorithm SHA256
 
 1. Ouvre l'app (raccourci du bureau ou du menu Démarrer).
 2. La fenêtre s'ouvre. **C'est tout** — la liste se remplit toute seule.
+3. *(Optionnel)* Branche ton assistant IA dessus : voir [Gateway MCP](#gateway-mcp--la-console-est-un-serveur-mcp).
+
+Fermer la fenêtre ne quitte pas l'app : elle reste dans la zone de notification
+(près de l'horloge) et continue de superviser. Pour quitter vraiment : menu de
+son icône → **Quitter**.
 
 ## Lire l'écran : les 4 états, ce qu'ils veulent dire
 
@@ -96,10 +103,10 @@ mon-api           [JS] [HTTP]                   PORT-ONLY  127.0.0.1:32100
 Le port 32100 répond (`200 OK`) mais le handshake MCP échoue — l'app affiche
 donc PORT-ONLY, et non UP. Le champ « erreur » du détail donne le motif exact.
 
-L'app l'affiche en orange pour que tu ne la croies pas morte : **le port est
-encore pris : une vraie erreur de sortie (« port déjà utilisé ») arrivera
-au prochain démarrage. En pratique : soit le serveur a planté en laissant un
-process fils, soit ce port n'a jamais porté de serveur MCP.
+L'orange te prévient que **le port est encore pris** : tant qu'il l'est, relancer
+le serveur dessus échouera avec « port déjà utilisé ». En pratique : soit le
+serveur a planté en laissant un process fils, soit ce port n'a jamais porté de
+serveur MCP.
 
 ### ⚪ DOWN — le serveur est éteint
 
@@ -133,10 +140,10 @@ l'interrupteur **ON** dans la liste.
 
 ### En résumé
 
-| État | Le port | Le serveur MCP | Cause habituelle | quoi faire |
+| État | Le port | Le serveur MCP | Cause habituelle | Quoi faire |
 |---|---|---|---|---|
 | 🟢 **UP** | ouvert | répond | — | rien, tout va bien |
-| 🟠 **PORT-ONLY** | **ouvert** | ne répond pas | autre service sur le port, process fils resté | identifier le occupant du port, ou retirer le serveur |
+| 🟠 **PORT-ONLY** | **ouvert** | ne répond pas | autre service sur le port, process fils resté | identifier l'occupant du port, ou retirer le serveur |
 | ⚪ **DOWN** | fermé | ne répond pas | serveur arrêté / planté | **▶** pour le relancer |
 | ⚫ **DISABLED** | — | — | **mis en pause par toi** | **▶ Reprendre** |
 
@@ -160,10 +167,10 @@ node -e "require('http').createServer((q,s)=>s.end('ok')).listen(32100)"
 > répare en identifiant qui occupe le port, le second se relance.
 
 Les petits badges à côté du nom (`FastMCP`, `LiteMCP`, `rmcp`, `mcp-go`, `Spring AI`…)
-indiquent **avec quoi le serveur est construit** — **37 frameworks reconnus**, du Python
+indiquent **avec quoi le serveur est construit** — **38 frameworks reconnus**, du Python
 au PHP, avec leur langage. Le badge `STDIO` / `HTTP` / `WS` indique le transport.
 
-👉 La liste complète des 37 frameworks : **[docs/frameworks.md](docs/frameworks.md)**
+👉 La liste complète des 38 frameworks : **[docs/frameworks.md](docs/frameworks.md)**
 
 ![Les trois familles de badges](assets/readme-badges.png)
 *Trois familles, trois codes couleur. **Langage** (à gauche) : le vrai logo du langage — carré jaune JS, serpents Python, engrenage Rust, tuile Go. **Transport** : monochrome — `HTTP` le plus clair, `STDIO` médian, `WS` le plus sourd — et le chip `legacy` en pointillés pour les serveurs stdio. **Framework** (à droite) : la couleur du langage qu'il fait tourner ; seul **LiteMCP** porte un halo orange.*
@@ -179,21 +186,27 @@ au PHP, avec leur langage. Le badge `STDIO` / `HTTP` / `WS` indique le transport
 
 ## Les boutons
 
+> Dans l'app, les boutons sont des pictogrammes au trait ; les emojis ci-dessous
+> servent seulement de repère. Survole un bouton pour voir son nom.
+
 | Bouton | Ce qu'il fait |
 |---|---|
 | **⟳** | Rafraîchit tout et cherche les nouveaux serveurs |
-| **🔍 Scan ports** | Cherche des serveurs sur une plage de ports |
-| **🌐 Scan réseau** | Cherche des serveurs sur les autres PC du réseau |
+| **🔍 Scanner les ports** | Cherche des serveurs sur une plage de ports (512 ports max par scan) |
+| **🌐 Scanner le réseau** | Cherche des serveurs sur les autres PC du réseau |
 | **🖥️ Machines** | Va chercher les serveurs d'une autre machine (VPS, serveur…) via SSH |
 | **🛒 Boutique** | 63 serveurs MCP prêts à installer en 1 clic |
-| **+ Ajouter** | Ajouter un serveur à la main |
+| **+ Ajouter un serveur** | Ajouter un serveur à la main — ou coller un bloc `mcpServers` / une URL dans la même fenêtre (les variables `env` des serveurs stdio sont conservées, jamais renvoyées par l'API) |
+| **⚙ Réglages** | Rafraîchissement, plages de scan, accès réseau, notifications (toast + webhook), thème clair/sombre, réinitialisation |
+| **Filtre** (`/` ou `Ctrl+K`) | Filtre la liste par nom, port, framework ou état — `Échap` efface |
+| **⭐** | Épingle un serveur en favori, en haut de sa section |
 | **ON/OFF** | Allumer / éteindre un serveur |
 | **▶ / ■** | Démarrer / arrêter le programme du serveur |
 | **⚡** | **Autoboot du serveur** : le relancer automatiquement au démarrage de l'app et après un crash |
 | **⏸ Mettre en pause** | Retire le serveur de la supervision (il reste dans la liste, réactivable) |
 | **🗑 Supprimer** | Enlève le serveur de la liste |
 | **⇅** | Ranger la liste (A→Z, état, rapidité…) — ou glisse une ligne à la main |
-| **Auto-boot** (barre du Journal, en bas) | Ouvrir l'app elle-même au démarrage de Windows |
+| **Auto-boot** (barre du Journal, en bas) | Ouvrir l'app elle-même au démarrage de l'ordinateur (dans la zone de notification, sans fenêtre) |
 
 ![La boutique](assets/readme-boutique.png)
 *63 serveurs MCP à installer d'un clic, avec leurs logos officiels. En-tête collant : recherche instantanée, tri A→Z, filtre « Masquer les installés » — les déjà présents sont marqués.*
@@ -221,7 +234,8 @@ Concrètement, ton assistant (ZCode, Claude Desktop…) déclare simplement :
 **Sécurité et limites, volontairement :**
 
 - même port, même sas que l'API : en local (loopback) aucun code n'est demandé ; si l'app est exposée au réseau, le **code d'accès** est exigé (`X-MCC-Access` ou `?access=`), exactement comme pour `/api/*` ;
-- les outils qui touchent au sas de confiance (`set_settings`, `set_autostart`, `set_notify`, `reset_state`, `reset_runtime`, `open_path`) ne sont **pas** exposés en MCP — ces gestes restent des gestes UI locaux ;
+- **`add_server` + `start_server` lancent un programme au choix du client sur la machine** — c'est le principe même d'un serveur stdio : qui obtient le code d'accès obtient le droit d'exécuter du code, il n'existe pas de réglage intermédiaire (expose l'app au réseau en connaissance de cause) ;
+- les outils qui touchent au sas de confiance (`set_settings`, `set_autostart`, `set_notify`, `reset_state`, `reset_runtime`, `open_path`) ne sont **pas** exposés en MCP — ces gestes restent des gestes UI locaux ; ne sont pas non plus exposés : `set_favorite` (préférence d'affichage), `import_peer`, `test_notify` (déclenche un toast et une requête sortante), `open_release_page` / `download_update` (ouvrent un navigateur / lancent un téléchargement), ni les alias stdio `kill_stdio` / `start_stdio` ni l'action interne `discover` (le cœur du bouton ⟳) ;
 - le proxy `call_server_tool` ne couvre que les serveurs HTTP détectés **UP** (stdio, SSH et hors-ligne sont refusés avec le motif exact) ;
 - le transport suit les règles LiteMCP : `Content-Type: application/json` exigé, notification → `202`, GET → `405`, SSE mono-événement si le client ne veut que ça, en-têtes `Mcp-Method`/`Mcp-Name` vérifiés.
 
@@ -229,13 +243,14 @@ Concrètement, ton assistant (ZCode, Claude Desktop…) déclare simplement :
 
 | Problème | Solution |
 |---|---|
-| Mon serveur n'apparaît pas | Clique **⟳**. Sinon : **+ Ajouter** avec son numéro de port |
+| Mon serveur n'apparaît pas | Clique **⟳**. Sinon : **+ Ajouter un serveur** avec son numéro de port |
 | « Code d'accès » demandé | Ça n'arrive JAMAIS sur ton PC — seulement si tu ouvres l'app depuis une autre machine. Le code est dans `config.json` |
 | L'app ne s'ouvre plus | Elle est peut-être déjà dans la zone de notification (près de l'horloge) — clique sur son icône |
 | Où voir l'historique ? | Barre « Journal » en bas de la fenêtre — clique dessus pour la déplier |
-| Un serveur ne redémarre pas | Après 3 échecs, l'app arrête d'insister. Clique **▶** pour réessayer |
+| Un serveur ne redémarre pas | L'app réessaie avec des délais croissants (5 s → 5 min), puis arrête d'insister après 5 échecs d'affilée. Clique **▶** pour réessayer |
+| La fenêtre affiche « moteur injoignable » | Le moteur ne répond plus au rafraîchissement : la page réessaie seule toutes les 5 s — le bandeau (et le grisage des compteurs) disparaît dès la première réponse |
 | Tous mes serveurs distants sont DOWN | Un **VPN** coupe souvent le réseau local : un bandeau rouge s'affiche en haut. Déconnecte-le ou active « autoriser les connexions LAN » |
-| Mes serveurs ont disparu de la liste | Ils ont peut-être été mis **en pause** (⚪ DISABLED) : clique **▶ Reprendre** dans leur détail |
+| Mes serveurs ont disparu de la liste | Ils ont peut-être été mis **en pause** (⚫ DISABLED) : clique **▶ Reprendre** dans leur détail |
 
 ## Pour aller plus loin
 
@@ -271,7 +286,9 @@ curl -X POST -H "Content-Type: application/json" \
 
 - Par défaut, l'app n'est joignable que depuis ton PC — rien n'est ouvert vers l'extérieur.
 - Si tu l'ouvres au réseau (d'autres machines), un code d'accès est exigé d'elles automatiquement.
-- L'app vérifie les origines des connexions et plafonne la taille des requêtes.
+- L'app vérifie l'en-tête `Host` et l'origine des connexions, et plafonne la taille des requêtes.
+- Anti-déni de service : plafond de connexions simultanées avec une part réservée à ta machine, échéance de 5 s par requête, requête sans en-tête `Host` refusée — une tempête de sockets muettes venues du réseau ne coupe plus la fenêtre locale (refus explicite en 503).
+- Le gateway `/mcp` passe par le même contrôle que `/api/*`, et les réglages sensibles (code d'accès, exposition réseau, webhook, réinitialisations) n'y sont pas exposés.
 
 </details>
 
@@ -280,11 +297,26 @@ curl -X POST -H "Content-Type: application/json" \
 
 ```bash
 cargo build --release -p mcp-control -p mcp-control-desktop
-cargo test      # 75 tests
+cargo test                                    # ~197 tests unitaires + suite E2E (tests/e2e)
+cargo fmt --check && cargo clippy --all-targets -- -D warnings   # ce que vérifie la CI
 ```
 
-- `target/release/mcp-control-desktop.exe` → la fenêtre de l'app
-- `target/release/mcp-control.exe` → juste le moteur, sans fenêtre
+- `target/release/mcp-control-desktop(.exe)` → la fenêtre de l'app (Tauri)
+- `target/release/mcp-control(.exe)` → juste le moteur, sans fenêtre
+
+Où trouver quoi dans le code :
+
+| Dossier / fichier | Rôle |
+|---|---|
+| `src/lib.rs` | serveur HTTP local (UI, `/api/*`, `/mcp`), auth, boucle de supervision |
+| `src/probe.rs` | sondage des serveurs (handshake MCP HTTP / SSE / stdio / WS) et lancement des process |
+| `src/manage/` | actions (`actions.rs`), config, scans, pairs LAN + SSH, boutique, import, mise à jour |
+| `src/runtime.rs` | autoboot, backoff, historique des crashs et redémarrages |
+| `src/gateway.rs` | le serveur MCP exposé sur `/mcp` (tools, ressources, proxy) |
+| `src/ui.rs`, `src/ui/` | l'interface (coquille HTML + `app.js` + `app.css`) |
+| `src/frameworks.rs` | détection des frameworks ([docs/frameworks.md](docs/frameworks.md)) |
+| `desktop/` | la fenêtre Tauri, l'icône de la zone de notification, l'installateur Windows |
+| `tests/e2e/`, `examples/` | scénarios bout en bout et faux serveurs MCP de test |
 - Les serveurs écrits avec [LiteMCP](https://github.com/DeamonDev888/litemcp) (lib Rust) sont reconnus automatiquement.
 
 </details>
@@ -292,7 +324,11 @@ cargo test      # 75 tests
 ## Limites
 
 - Un serveur en `https://` n'est pas sondable (pas de TLS) — passe par un tunnel local.
-- Le fichier `config.json` vit à côté de l'exe.
+- Un serveur **WebSocket** est seulement **détecté** (badge WS) : aucun handshake MCP n'est joué dessus, il ne passe donc jamais UP et n'est pas proxyfiable.
+- Le webhook de notification n'embarque aucune pile TLS : seules les URL `http://` sont acceptées — une URL `https://` est refusée dès l'enregistrement (le message explique pourquoi).
+- Le proxy du gateway (`call_server_tool`) ne couvre que les serveurs **HTTP** détectés UP — pas les serveurs stdio ni ceux joints par SSH.
+- Les binaires ne sont pas signés (avertissement SmartScreen / Gatekeeper au premier lancement).
+- Le fichier `config.json` vit à côté de l'exe (à la racine du dépôt en dev ; variable d'environnement `MCC_CONFIG` pour le placer ailleurs).
 
 ## Licence
 

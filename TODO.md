@@ -1,6 +1,6 @@
 # TODO — Plan d'améliorations MCP Control
 
-**Date** : 2026-10-26 · Base : audit complet [AUDIT-2026-10-26.md](AUDIT-2026-10-26.md) + 3 analyses parallèles (tests E2E, performances, refactorisation).
+**Date** : 2026-10-26 · Base : audit complet du 2026-10-26 (les 5 fichiers `AUDIT-*.md` ont été retirés du dépôt) + 3 analyses parallèles (tests E2E, performances, refactorisation).
 Tailles : **S** = ≤ ½ jour · **M** = 1-2 j · **L** = 3+ j.
 
 ---
@@ -84,7 +84,7 @@ Points clés appris pendant l'écriture (à savoir pour maintenir) :
 
 **Hors CI** (marqué `#[ignore]`, exécution locale) : tout le SSH, le scan LAN réel, le webview Tauri. Budget : suite E2E ≤ 3 min, job CI ≤ 6 min. Contrôles d'instabilité : polling avec deadline (jamais de `sleep`), ports éphémères par bind-`:0`, assert sur ids exacts jamais sur des comptes.
 
-**Quick win avant même le harness** : l'anti-smuggling de lib.rs:207-216 (TE + CL dupliqué rejetés) n'a **aucun test, même unitaire** — 5 lignes à ajouter tout de suite.
+**Quick win avant même le harness** : l'anti-smuggling de `src/lib.rs` (contrôle « anti request-smuggling » des en-têtes de cadrage — TE + CL dupliqués rejetés) n'a **aucun test unitaire dédié** (il est couvert en E2E par `fuzz_lite`, `tests/e2e/scenarios_security.rs`) — 5 lignes à ajouter pour le verrouiller aussi au niveau unitaire.
 
 ---
 
@@ -105,7 +105,7 @@ Points clés appris pendant l'écriture (à savoir pour maintenir) :
 ### Quick wins (≤ 30 min chacun)
 - **`save_cache` écrit 108 Ko toutes les 15 s pour rien** : le test d'égalité compare `saved_at` et `last_seen` qui changent à chaque poll → l'égalité n'est jamais vraie. Exclure ces champs de la comparaison.
 - **`"scan"` synchrone dans le thread HTTP** (jusqu'à ~2,7 h sur 1..65535) → même traitement `thread::spawn` que `"scan_network"`.
-- Sortir `add_log` du verrou `servers` (branche Replace du scan, manage.rs:2773).
+- Sortir `add_log` du verrou `servers` (branche `DedupDecision::Replace` du scan, `src/manage/scans.rs`).
 - `setInterval(load, 5000)` UI → armé sur `settings.refresh_secs` (−66 % de fetches sans rien changer côté serveur).
 
 ### À ne PAS optimiser (échelle 30-40 serveurs)
@@ -117,7 +117,7 @@ Points clés appris pendant l'écriture (à savoir pour maintenir) :
 
 ### 3.1 `manage.rs` (6 443 lignes) → `src/manage/` (moves purs, API stable par ré-exports)
 
-Le monstre : `handle_action` = **1 001 lignes** (26 commandes stringly-typed, manage.rs:3229-4230), `poll_one` 300 lignes, `ssh_discover` 171, `scan_network_range` 169. Duplication mesurée : 78 `lockv(&state.servers)`, 17 `iter_mut().find(id)` (6 avec le même « serveur inconnu »), 22 `save_config` dont 15 suivis d'un `add_log`, **9 copies du littéral `Server { …25 champs… }`**, 2 blocs identiques de 12 lignes de parsing de plage de ports.
+Le monstre : `handle_action` = **1 001 lignes** (26 commandes stringly-typed — dispatcher `pub fn handle_action` de `src/manage/actions.rs`), `poll_one` 300 lignes, `ssh_discover` 171, `scan_network_range` 169. Duplication mesurée : 78 `lockv(&state.servers)`, 17 `iter_mut().find(id)` (6 avec le même « serveur inconnu »), 22 `save_config` dont 15 suivis d'un `add_log`, **9 copies du littéral `Server { …25 champs… }`**, 2 blocs identiques de 12 lignes de parsing de plage de ports.
 
 **Découpage** (un module par commit, `cargo test` vert à chaque étape, zéro changement de call-site grâce aux `pub use`) :
 `mod.rs` (ré-exports) · `log.rs` · `config.rs` · `catalog.rs` (seeds + STORE 263 lignes) · `import.rs` · `poll.rs` · `scan.rs` · `peers.rs` · `ssh.rs` · `autostart.rs` · `update.rs` · `state.rs` · `actions.rs` · `tests.rs`.
@@ -133,7 +133,7 @@ Le monstre : `handle_action` = **1 001 lignes** (26 commandes stringly-typed, ma
 | `Server::new_manual(...)` (20 champs constants remplis) | littéral 25 champs | 9 |
 | `port_range_of(req)` | 2 blocs identiques 12 lignes | 2 |
 
-**Dispatch typé** (phase finale) : `enum Action` + `from_req(&Value)` + structs de payload (`AddPayload`…) + 26 fonctions handler testables sans HTTP ; `handle_action` tombe à ~80 lignes. Filet : test de fumée sur les 26 noms d'action (l'usine `test_state()` existe déjà, manage.rs:5280).
+**Dispatch typé** (phase finale) : `enum Action` + `from_req(&Value)` + structs de payload (`AddPayload`…) + 26 fonctions handler testables sans HTTP ; `handle_action` tombe à ~80 lignes. Filet : test de fumée sur les 26 noms d'action (l'usine `test_state()` existe déjà dans `src/manage/tests.rs`).
 
 ### 3.2 `ui.rs` (2 140 lignes = 1 seule raw string) → assets servis + CSP
 
@@ -142,7 +142,7 @@ Le monstre : `handle_action` = **1 001 lignes** (26 commandes stringly-typed, ma
 
 ### 3.3 Menu Réglages — refactor dédié
 
-État actuel : 7 champs sur un seul `POST set_settings` (le « set-row » du commit est une classe CSS, pas une API). Le défaut n°1 : **la validation est dupliquée JS/Rust** — le parseur de ports existe deux fois verbatim (ui.rs:1858-1860 ↔ manage.rs:3900-3905), les bornes refresh (min/max HTML ↔ clamp Rust), la whitelist `ui_bind` (options HTML ↔ whitelist Rust), les valeurs `reset_state.what`.
+État actuel : 7 champs sur un seul `POST set_settings` (le « set-row » du commit est une classe CSS, pas une API). Le défaut n°1 : **la validation est dupliquée JS/Rust** — le parseur de ports existe deux fois verbatim (validation `collectSettings` de `src/ui/app.js` ↔ branche `set_settings` de `src/manage/actions.rs`), les bornes refresh (min/max HTML ↔ clamp Rust), la whitelist `ui_bind` (options HTML ↔ whitelist Rust), les valeurs `reset_state.what`.
 
 **Le fix central** : une `SETTINGS_SCHEMA` unique (id, label, kind, min, max, options, help) **consommée des deux côtés** — le JS construit/peuple/collecte le formulaire en boucle générique, le Rust valide en boucle générique avec les mêmes règles ; un test affirme que les deux tables couvrent exactement les mêmes 7 ids (`refresh_secs`, `scan_from`, `scan_to`, `network_enabled`, `network_ports`, `ui_bind`, `ui_port` readonly).
 
@@ -153,7 +153,7 @@ Le monstre : `handle_action` = **1 001 lignes** (26 commandes stringly-typed, ma
 - documenter l'asymétrie du thème (localStorage navigateur, jamais envoyé au serveur).
 
 ### 3.4 `lib.rs` — table de routes en data
-La chaîne de `if` route() (lib.rs:744-809) → `const ROUTES: &[(&str, &str, Handler)]` (~30 lignes modifiées, les 16 tests existants restent verts). Étape indépendante, faisable avant tout le reste.
+La chaîne de `if` de `pub fn route` (`src/lib.rs`) → `const ROUTES: &[(&str, &str, Handler)]` (~30 lignes modifiées, les 16 tests existants restent verts). Étape indépendante, faisable avant tout le reste.
 
 ### 3.5 Tests de caractérisation À ÉCRIRE D'ABORD (verrouiller le comportement avant de déplacer le code)
 1. `dedup_decide` table-driven — **red-first** avec le fix P0-2 (None-vs-None → Add)
@@ -167,9 +167,33 @@ La chaîne de `if` route() (lib.rs:744-809) → `const ROUTES: &[(&str, &str, Ha
 
 ---
 
-## 4. Durcissement sécurité (renvoi audit — détails dans AUDIT-2026-10-26.md §5)
+## 4. Durcissement sécurité (renvoi audit 2026-10-26 — les fichiers d'audit ont été retirés du dépôt)
 
-En Attente après P0 : slowloris (2.6 ci-dessus) · `Host` requis (400 sinon) · nonce flood (évincer le plus ancien au lieu de `clear()`) · `random_hex` en CSPRNG (`getrandom`/`BCryptGenRandom`) · `${esc(i.kind)}` (ui.rs:2053) · release.yml : CLI npm épinglé + SHA256SUMS des artefacts · `rust-cache` réépinglé sur un SHA vérifiable (l'actuel est introuvable en amont, résolu seulement par le cache interne d'Actions) · `Cache-Control: no-store` sur le HTML · supprimer la page de secours morte `ui-dist/index.html`.
+En Attente après P0 : slowloris (2.6 ci-dessus) · `Host` requis (400 sinon) · nonce flood (évincer le plus ancien au lieu de `clear()`) · `random_hex` en CSPRNG (`getrandom`/`BCryptGenRandom`) · `${esc(i.kind)}` (gabarits de `src/ui/app.js`) · release.yml : CLI npm épinglé + SHA256SUMS des artefacts · `rust-cache` réépinglé sur un SHA vérifiable (l'actuel est introuvable en amont, résolu seulement par le cache interne d'Actions) · `Cache-Control: no-store` sur le HTML · supprimer la page de secours morte `ui-dist/index.html`.
+
+---
+
+## 5. Reste à faire issu des lots de correction (2026-11-13, rapports `correctifs-agents/`)
+
+Lots 0-5 terminés (rapports dans `correctifs-agents/`, la doc et le CHANGELOG sont à jour). Restes PARTIEL et « découverts, non corrigés » de chaque lot :
+
+| # | Quoi | Source |
+|---|---|---|
+| 5.1 | **gateway : `set_start_command` n'implémente pas le retrait** — le schéma accepte `program:null` mais le dispatcher `set_start_cmd` (`src/manage/actions.rs`) répond « program manquant » | correctifs 01 (PARTIEL) |
+| 5.2 | **gateway : le tool `refresh` est cassé** — son handler envoie `{"action":"refresh"}` sans `id` → « id manquant » systématique ; le mapper sur `discover` (le bouton ⟳ de l'UI passe par `discover`) | correctifs 01 §4 |
+| 5.3 | **`kill` tue par port sans vérifier le pid enregistré** (audit 03 #11) : à arbitrer — D2=a ne couvre pas ce cas | correctifs 03 §4 |
+| 5.4 | `scan_from > scan_to` dans un config.json édité à la main : ignoré en silence par `scan_ports` (retour 0) — normaliser à la lecture | correctifs 03 §4 |
+| 5.5 | `install_store` n'accepte pas de `env` depuis la requête (complément naturel pour les items à token : GITHUB_TOKEN…) | correctifs 03 §4 |
+| 5.6 | **UI : refus moteur encore silencieux** sur `act()` générique (start/kill/refresh/toggle/remove), toggleAutostart, postReorder, removeSeedForever, doScanNet, refreshAll, doPeers, importPeer, sshForget, toggleTool — lire `j.ok` et toaster (l'état réel reste correct via load()) | correctifs 04 §4 |
+| 5.7 | `src/ui/app-boot.js` en fins de ligne mixtes (préexistant) | correctifs 04 §4 |
+| 5.8 | **set_notify : le message de refus d'URL à l'enregistrement (`src/manage/actions.rs`) cite encore « https:// attendu »** — utiliser `notify::webhook_url_reject_reason` (le refus https:// existe depuis le lot 5) | correctifs 05 §4 |
+| 5.9 | **la réponse de `set_notify` renvoie les en-têtes du webhook EN CLAIR** (via `notify::to_json`) à qui porte le code — utiliser `to_api_json` comme `/api/state` | correctifs 05 §4 |
+| 5.10 | code d'accès accepté en query `?access=` (audit 05 #9) : à arbitrer à part (le retirer peut casser l'ouverture de l'UI depuis une autre machine) | correctifs 05 §4 |
+| 5.11 | `allowed_hosts` figés au boot : une IP qui apparaît après le boot est refusée 403 (Host) jusqu'au redémarrage | correctifs 05 §4 |
+| 5.12 | **boot avec `autostart:false` efface l'entrée Run « MCP Control » de HKCU** (`sync_autostart_at_boot`, `src/manage/autostart.rs`) : ne toucher l'entrée que si elle pointe vers une autre installation | correctifs 02 §4 |
+| 5.13 | fixtures unitaires `probe_http_*` à lecture unique (flake non reproduit, 3× `cargo test --lib` verts) : si récidive, lire la requête jusqu'au corps complet | correctifs 02 §4 |
+| 5.14 | `http_post` / `rpc_call` (`src/probe.rs`) gardent l'écrasement `last_err` du second hôte — `rpc_call` n'a plus d'appelant interne | correctifs 02 §4 |
+| 5.15 | commentaire obsolète `src/manage.rs` (« paquets de 8 ») après le pool persistant du lot 2 | correctifs 02 §4 |
 
 ---
 

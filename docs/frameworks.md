@@ -1,10 +1,8 @@
 # Frameworks MCP reconnus
 
-MCP Control identifie **37 frameworks MCP** automatiquement,
+MCP Control identifie **38 frameworks MCP** automatiquement,
 à partir du nom que le serveur s'annonce (`serverInfo.name`), du paquet lancé
 (pour les serveurs stdio) et de quelques signatures protocolaires.
-
-> Cette page est générée depuis `src/frameworks.rs` — la source de vérité.
 
 ## Par langage
 
@@ -59,10 +57,11 @@ MCP Control identifie **37 frameworks MCP** automatiquement,
 | **LangChain4j** | `langchain4j`, `langchain4j-mcp` |
 | **mcp-java** | `mcp-java`, `mcp4j` |
 
-### .NET (3)
+### .NET (4)
 
 | Framework | Détecté par |
 |---|---|
+| **MCP C# SDK** | `modelcontextprotocol/csharp`, `csharp-sdk`, `mcp-csharp`, `dotnet-sdk` |
 | **mcp-dotnet** | `mcp-dotnet`, `dotnet-mcp` |
 | **mcpdotnet** | `mcpdotnet`, `mcp.net` |
 | **csharp-mcp** | `csharp-mcp`, `mcp-server-dotnet` |

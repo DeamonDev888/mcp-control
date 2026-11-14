@@ -538,4 +538,54 @@ mod tests {
             None
         );
     }
+
+    /// Le nombre de frameworks annoncé dans docs/frameworks.md et README.md
+    /// suit la table du code (audit 06 #1/#2 : « 37 » resté affiché alors que
+    /// la table en compte 38 — le contrat doc↔code est verrouillé ici).
+    #[test]
+    fn le_nombre_annonce_dans_la_doc_suit_la_table() {
+        let code = FRAMEWORKS.len();
+        for (fichier, texte) in [
+            ("docs/frameworks.md", include_str!("../docs/frameworks.md")),
+            ("README.md", include_str!("../README.md")),
+        ] {
+            let annonces = nombres_de_frameworks(texte);
+            assert!(
+                !annonces.is_empty(),
+                "{fichier} : aucune mention « N frameworks » trouvée"
+            );
+            for n in annonces {
+                assert_eq!(
+                    n, code,
+                    "{fichier} : « {n} frameworks » annoncé, la table en compte {code}"
+                );
+            }
+        }
+    }
+
+    /// Tous les nombres collés à « frameworks » (ex. « **38 frameworks
+    /// reconnus** ») : chiffres juste avant le mot, mot isolé (pas
+    /// « frameworks.md »), chiffres eux-mêmes précédés d'un non-alphanumérique.
+    fn nombres_de_frameworks(texte: &str) -> Vec<usize> {
+        let b = texte.as_bytes();
+        let mut res = Vec::new();
+        let mut pos = 0usize;
+        while let Some(i) = texte[pos..].find(" frameworks") {
+            let fin_mot = pos + i + " frameworks".len();
+            let mot_isole = fin_mot >= texte.len() || !b[fin_mot].is_ascii_alphanumeric();
+            // recule sur la séquence de chiffres qui précède le blanc
+            let mut j = pos + i;
+            while j > 0 && b[j - 1].is_ascii_digit() {
+                j -= 1;
+            }
+            let chiffres_isoles = j == 0 || !b[j - 1].is_ascii_alphanumeric();
+            if mot_isole && j < pos + i && chiffres_isoles {
+                if let Ok(n) = texte[j..pos + i].parse::<usize>() {
+                    res.push(n);
+                }
+            }
+            pos = fin_mot;
+        }
+        res
+    }
 }

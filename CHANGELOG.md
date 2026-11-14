@@ -1,9 +1,46 @@
-## [Non publié] — manage.rs éclaté en 14 modules (refactorisation, zéro changement de comportement)
+## [Non publié] — fiabilisation : compilation, passerelle, supervision, persistance, UI, sécurité HTTP + doc alignée
 
-### `manage.rs` : 7 543 → 84 lignes
-- **Le monolithe est éclaté** en modules thématiques purs (moves, API inchangée via réexports `pub(crate) use`) : `store` (boutique), `import` (parsing mcpServers), `config` (config.json), `json` (state/detail/runtime), `scans` (ports/netstat/réseau), `peers` + SSH, `update` (GitHub), `cache`, `autostart`, `litemcp`, `log`, `events` (notifications d'incident), `actions` (dispatcher +1 346 lignes), `tests` (2 426 lignes).
-- **160 tests verts à chaque étape**, 7 commits incrémentaux — chaque move vérifié indépendamment.
+### Refactorisation : `manage.rs` éclaté en 14 modules (zéro changement de comportement)
+- **Le monolithe est éclaté** en modules thématiques purs (moves, API inchangée via réexports `pub(crate) use`) : `store` (boutique), `import` (parsing mcpServers), `config` (config.json), `json` (state/detail/runtime), `scans` (ports/netstat/réseau), `peers` + SSH, `update` (GitHub), `cache`, `autostart`, `litemcp`, `log`, `events` (notifications d'incident), `actions` (dispatcher, 1 409 lignes), `tests` (2 881 lignes) — `manage.rs` : 7 543 → 89 lignes (nombres mesurés après les correctifs des lots 0-5, ci-dessous).
+- **160 tests unitaires verts à chaque étape du split** — mais le binaire `mcp-control` ne compilait plus depuis le 4ᵉ commit du split (E0603 : `resolve_config_path` invisible du crate binaire) : `cargo test` complet, clippy et la CI n'exécutaient donc **aucun** test à HEAD ; corrigé au lot 0 (ci-dessous). Captures README refaites pour la v0.7.19 dans le même intervalle (`445e005`).
 - **Pourquoi** : les diffs d'UI et de moteur deviennent lisibles, les modules se lisent seuls, et le prochain raffinement (découper `actions.rs` par famille avec helpers `with_server_mut`/`commit`) se fera sans toucher au monolithe.
+
+### Lot 0 — le binaire compile de nouveau, CI renforcée
+- `resolve_config_path` redevient publique : **le binaire `mcp-control` compile de nouveau** ; clippy `-D warnings` remis à zéro (glob réexport inutile retiré, doc recollée à ses fonctions) ; la **CI vérifie le build release** du crate CLI. Aucun changement fonctionnel.
+
+### Lot 1 — passerelle MCP durcie
+- **Tout argument inconnu d'un tool est refusé** (`-32602`, schémas stricts) et l'action est fixée par le tool : l'injection d'`action` (`set_settings`, `set_notify`, `set_autostart`, `reset_state`, `reset_runtime`, `open_path`) ou d'une clé du dispatcher dans un tool d'action est impossible.
+- **`Accept: */*` est accepté et servi en JSON** — l'exemple curl du README (défaut de curl et de la plupart des libs) fonctionne sans en-tête Accept ; `application/xml` reste 406, `text/event-stream` seul reste SSE.
+- `set_start_command` accepte `program: null` au niveau du schéma (plus de `-32602`) ; le retrait effectif de la commande reste à implémenter côté dispatcher (voir TODO).
+
+### Lot 2 — supervision : cycle et relances
+- **Le cycle n'est plus retardé par un serveur lent, muet ou en cours de démarrage** (pool de sondes persistant) — période ≈ refresh + sonde la plus lente (48 s → 30 s mesurés avec 1 UP + 1 muet + 1 crashloop).
+- **Relances bornées** : un démarrage qui échoue (process sorti sans MCP, échéance de 30 s dépassée) compte un échec — backoff croissant 5 → 10 → 20 → 40 s puis abandon (« auto-restart désactivé après 5 échecs » au journal) ; « start-ok » n'est journalisé qu'à l'UP réellement observé. Pendant la fenêtre de démarrage, le motif « démarrage en cours… » remplace le DOWN/PORT-ONLY prématuré.
+- Motif d'erreur d'un port qui accepte sans répondre : **délai dépassé de l'hôte joignable** au lieu du « connexion refusée » du repli. Réponse d'outil au-delà de 2 Mio : « réponse trop grande (plafond de lecture de 2 Mio dépassé) ».
+
+### Lot 3 — persistance, import, cycle de vie
+- **Import mcpServers : les variables `env` des serveurs stdio sont conservées** et passées au process lancé (clé d'API fonctionnelle) ; `/api` et le journal n'exposent que les NOMS de variables.
+- **Import d'un bloc JSON : les entrées écartées sont listées** dans la réponse `skipped:[{name,reason}]` avec motif explicite (fin du silence `ok:true`).
+- **config.json** : écritures sérialisées (50 add simultanés → 50 persistés) ; fichier illisible (corrompu/vide/BOM) renommé `config.json.corrompu-<horodatage>` + trace dans mcc.log au lieu d'un écrasement silencieux ; droits 0600 à la création sous Unix.
+- **Remove d'un serveur lancé par l'app : le port est libéré** même si le lanceur détachait son enfant (fin des process orphelins) — jamais pour un serveur non lancé par l'app.
+- **Scan de ports : plafond 512** (refus clair au-delà), sondage parallèle (~60× plus rapide), réponse `{"ok":true,"found":N}`.
+
+### Lot 4 — UI
+- **Bandeau « moteur injoignable »** + compteurs grisés dès 2 échecs de sondage consécutifs (« moteur injoignable, nouvel essai… » au premier échec si rien n'a jamais chargé) ; retour automatique dès la première réponse ; un 401 (code d'accès demandé) ne compte pas comme une panne.
+- **Dialog « Ajouter un serveur » : zone « Coller un bloc mcpServers ou une URL »** (JSON, URL http, commande npx/uvx/claude mcp add) — nombre ajouté affiché, entrées écartées listées avec leur motif.
+- **URLs IPv6 entourées de crochets** dans « Conf agent », « Copier l'URL » et le texte d'info (`http://[::1]:4104/mcp`) ; **127.0.0.1 / ::1 / localhost explicites traités comme locaux** (plus de groupe « Machines distantes », formulaire de commande de lancement disponible).
+- **Refus du moteur affichés en toast** pour favori, autoboot et scan de ports ; **scan** : bouton occupé pendant le balayage + toast « N serveur(s) MCP trouvé(s) ».
+- **Barre de titre responsive** : icônes seules sous 1 120 px, pastilles sous 700 px, wordmark sous 480 px ; contrôles de fenêtre jamais compressibles (visibles à la largeur minimale du desktop, 940 px). Bouton « copier » de « Conf agent » : repli presse-papiers comme « Copier l'URL ».
+
+### Lot 5 — sécurité HTTP
+- **Anti-déni de service** : échéance totale de 5 s par requête, plafond de connexions par adresse IP et part réservée au loopback — une tempête de sockets muettes du LAN ne coupe plus la fenêtre locale ; saturation refusée en **503 explicite** (plus de fermeture muette).
+- **/api/hello** : nonces évincés du plus ancien (plus de vidage global) et débit limité à 30 req./60 s par adresse hors loopback (429). **Requête sans en-tête `Host` → 400** (l'anti DNS-rebinding n'est plus contournable).
+- **/api/state n'expose plus les en-têtes du webhook** (booléen `headers_set`) ; dans Réglages → Notifications, champ vide = en-têtes inchangés.
+- **Webhook** : URL `https://` refusée (aucune pile TLS — l'envoi partait en HTTP brut sur 443), URL visant cette instance refusée, chaque envoi journalisé dans mcc.log (cible + résultat).
+- **Notification desktop remise en service** : un seul `-Command`, titre/message passés par variables d'environnement (plus d'injection possible via un label de serveur).
+
+### Lot 6 — doc alignée sur le code
+- README / `docs/frameworks.md` : **38 frameworks** (et non 37), libellés réels des boutons, limites WebSocket et webhook complétées, surface gateway exacte et avertissement « code d'accès = droit d'exécution » ; un test verrouille le nombre annoncé dans la doc contre la table du code (`src/frameworks.rs`).
 
 ## [0.7.20] — Le wizard Windows épingle MCP Control à la barre des tâches
 
@@ -182,7 +219,7 @@
   - **actions** : chaque bouton de l'UI a son outil, tous adossés au **même dispatcher** que l'UI (`manage::handle_action` — une seule sémantique, une seule validation, un seul journal) : `refresh`, `scan_ports`, `scan_network`, `discover_peers`, `check_update`, `add_server`, `remove_server`, `toggle_server`, `start_server`, `stop_server`, `set_start_command`, `set_host`, `toggle_tool`, `set_auto_restart`, `reorder_servers`, `import_config`, `install_store_server`, `ssh_save`, `ssh_forget`, `ssh_discover` ;
   - **gateway** : `call_server_tool(server, tool, arguments)` proxyfie un `tools/call` vers n'importe quel serveur HTTP **détecté UP** (résultat upstream rendu tel quel ; outil coupé dans l'UI et serveurs via SSH/stdio/DOWN refusés avant tout appel réseau) ;
   - **ressources** : `mcp-control://servers` (aperçu), `mcp-control://server/<id>` (une par serveur détecté, snapshot reconstruit quand l'empreinte de détection change), `mcp-control://journal`, `mcp-control://settings`.
-- **Serveur MCP 2026-07-28 complet** via la dépendance [litemcp](https://crates.io/crates/litemcp) 0.8 (serde uniquement) : `initialize`/`server/discover`, `resultType` + `_meta` sur chaque réponse, schémas d'entrée exécuteurs (zod — `-32602` avant tout handler), annotations read-only/destructive, hook `on_call` → le journal de l'UI raconte l'activité MCP.
+- **Serveur MCP 2026-07-28 complet** via la dépendance [litemcp](https://crates.io/crates/litemcp) 0.9 (serde uniquement) : `initialize`/`server/discover`, `resultType` + `_meta` sur chaque réponse, schémas d'entrée exécuteurs (zod — `-32602` avant tout handler), annotations read-only/destructive, hook `on_call` → le journal de l'UI raconte l'activité MCP.
 - **Transport reflété sur notre socket** : `Content-Type: application/json` strict (415, doublon → 400), négociation `Accept` (SSE mono-événement `event: message` — injection de champs neutralisée ; 406 sans type acceptable), en-têtes `Mcp-Method`/`Mcp-Name` vérifiés contre le corps (SEP-2243 ; incohérents → -32020), notification → **202** sans corps, GET/DELETE → **405**. Auth héritée du sas existant : loopback jamais de code, hors loopback le **code d'accès API est exigé** (`check_access` couvre désormais `/mcp` comme `/api/*`).
 - **Volontairement non exposés** (surface de confiance) : `set_settings` (code d'accès, bind, origines — le sas d'auth du gateway lui-même), `set_autostart`, `set_notify`, `reset_state`, `reset_runtime`, `open_path` — ces réglages restent des gestes UI locaux.
 - Instantané MCP échangé quand la détection change (empreinte ids/états/outils comparée toutes les 5 s ; actions passées par le gateway → rafraîchissement immédiat).
