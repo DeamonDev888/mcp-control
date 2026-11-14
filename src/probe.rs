@@ -246,6 +246,31 @@ fn kill_pid_unix(pid: u32) {
     let _ = c.arg("-9").arg(pid.to_string()).status();
 }
 
+/// Le pid existe-t-il encore sur le système ? Secours Unix à `Child::try_wait` :
+/// sur macOS (CI arm64 observée), try_wait peut rester « vivant » alors que le
+/// process n'existe plus (enfant récolté par un tiers / quirk waitpid) — un
+/// `kill -0` via le binaire système arbitre sans nouvelle dépendance. Err
+/// (binaire absent, permissions) → « vivant » : jamais de faux échec.
+#[cfg(unix)]
+pub fn pid_vivant(pid: u32) -> bool {
+    match Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(st) => st.success(),
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(unix))]
+#[allow(dead_code)] // Windows : try_wait est fiable, le secours n'est pas sollicité
+pub fn pid_vivant(_pid: u32) -> bool {
+    true
+}
+
 /// Spawn un process serveur (HTTP/HTTPS lancé par MCP Control) sans handshake
 /// JSON-RPC : le probe HTTP classique fera le handshake. stdout/stderr nullés
 /// (pas de pipe = pas de risque de blocage buffer plein).

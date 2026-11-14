@@ -63,11 +63,27 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
                 let (child_alive, exit_code) = {
                     let mut children = lockv(&state.children);
                     match children.get_mut(id) {
-                        Some(h) => match h.child.try_wait() {
-                            Ok(Some(st)) => (false, st.code()),
-                            Ok(None) => (true, None),
-                            Err(_) => (true, None),
-                        },
+                        Some(h) => {
+                            let (alive, code) = match h.child.try_wait() {
+                                Ok(Some(st)) => (false, st.code()),
+                                Ok(None) => (true, None),
+                                Err(_) => (true, None),
+                            };
+                            if alive {
+                                // Arbitrage système (CI macOS arm64 : try_wait peut
+                                // rester « vivant » sur un process déjà mort —
+                                // cf. Release #36, échec du lot 2) : kill -0 tranche,
+                                // 0 → vivant, autre code de sortie → mort.
+                                let pid = h.child.id();
+                                if pid != 0 && !probe::pid_vivant(pid) {
+                                    (false, None)
+                                } else {
+                                    (true, code)
+                                }
+                            } else {
+                                (alive, code)
+                            }
+                        }
                         None => (false, None),
                     }
                 };
