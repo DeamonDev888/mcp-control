@@ -61,28 +61,13 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
             if !res.mcp_up && host.is_none() {
                 // État du process lancé par nous, s'il existe : vivant ? code de sortie ?
                 let (child_alive, exit_code) = {
-                    let mut children = lockv(&state.children);
-                    match children.get_mut(id) {
+                    let children = lockv(&state.children);
+                    match children.get(id) {
                         Some(h) => {
-                            let (alive, code) = match h.child.try_wait() {
-                                Ok(Some(st)) => (false, st.code()),
-                                Ok(None) => (true, None),
-                                Err(_) => (true, None),
-                            };
-                            if alive {
-                                // Arbitrage système (CI macOS arm64 : try_wait peut
-                                // rester « vivant » sur un process déjà mort —
-                                // cf. Release #36, échec du lot 2) : kill -0 tranche,
-                                // 0 → vivant, autre code de sortie → mort.
-                                let pid = h.child.id();
-                                if pid != 0 && !probe::pid_vivant(pid) {
-                                    (false, None)
-                                } else {
-                                    (true, code)
-                                }
-                            } else {
-                                (alive, code)
-                            }
+                            let code = *h.exit.lock().unwrap();
+                            // watcher : Some dès que le process est sorti —
+                            // déterministe (aucune course WNOHANG/ECHILD).
+                            (code.is_none(), code)
                         }
                         None => (false, None),
                     }
@@ -161,7 +146,7 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
                             &cmd.env,
                         ) {
                             Ok(h) => {
-                                let pid = h.child.id();
+                                let pid = h.pid;
                                 lockv(&state.children).insert(id.to_string(), h);
                                 lockv(&state.spawn_fails).remove(id);
                                 {
@@ -330,15 +315,12 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
                 let mut children = lockv(&state.children);
                 let mut still = Vec::new();
                 let mut code = None;
-                for (cid, h) in children.iter_mut() {
+                for (cid, h) in children.iter() {
                     if cid == id {
-                        match h.child.try_wait() {
-                            Ok(Some(st)) => {
-                                still.push(cid.clone());
-                                code = st.code();
-                            }
-                            Ok(None) => {}
-                            Err(_) => still.push(cid.clone()),
+                        let c = *h.exit.lock().unwrap();
+                        if c.is_some() {
+                            still.push(cid.clone());
+                            code = c;
                         }
                     }
                 }
@@ -1235,6 +1217,22 @@ mod tests {
         }
     }
 
+    /// Attend (borné à 5 s) que le watcher publie la sortie du process lancé :
+    /// `sh`/`cmd` mettent quelques ms à mourir — sans cette attente, le poll
+    /// suivant peut lire exit=None (process vivant) et rater l'échec.
+    fn attendre_sortie(state: &Arc<AppState>, id: &str) {
+        for _ in 0..500 {
+            let finie = match lockv(&state.children).get(id) {
+                Some(h) => h.exit.lock().unwrap().is_some(),
+                None => true,
+            };
+            if finie {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// Commande qui vit une quinzaine de secondes (pour tester l'échéance
     /// avec un process encore vivant malgré la charge parallèle des tests)
     /// — cross-platform.
@@ -1359,6 +1357,7 @@ mod tests {
         let mut backoffs = Vec::new();
         for _ in 0..crate::runtime::MAX_ATTEMPTS {
             poll_one(&state, "crash-y"); // spawn (ou tentative) — marqueur posé
+            attendre_sortie(&state, "crash-y"); // le watcher publie la sortie
             poll_one(&state, "crash-y"); // process sorti → échec compté
             let rt = runtime_de(&state, "crash-y");
             backoffs.push(rt.backoff_secs());
@@ -1447,10 +1446,10 @@ mod tests {
         assert!(srv.auto_restart, "un seul échec n'abandonne pas");
         drop(servers);
         // nettoyage : tue le process encore vivant
-        let mut restant = lockv(&state.children).remove("lent");
-        if let Some(mut h) = restant.take() {
-            let _ = h.child.kill();
-            let _ = h.child.wait();
+        // nettoyage : tue le process encore vivant (le watcher récoltera)
+        let restant = lockv(&state.children).remove("lent");
+        if let Some(h) = restant {
+            probe::kill_tree(h.pid);
         }
     }
 

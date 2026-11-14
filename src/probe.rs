@@ -76,11 +76,33 @@ impl McpProbe {
     }
 }
 
-/// Handle d'un serveur stdio maintenu vivant (mode "start").
+/// Handle d'un serveur lancé (mode "start"). Le process est surveillé par un
+/// watcher — un thread dédié au wait() bloquant, hors du cycle de supervision :
+/// `exit` passe à Some(code) dès que le process est sorti, déterministe sur
+/// tous les OS (pas de course WNOHANG, pas de sémantique ECHILD divergente
+/// entre Windows, Linux et macOS — cf. Release #36, échec CI du lot 2).
 pub struct StdioHandle {
-    pub child: Child,
+    /// PID du process lancé (kill_tree, affichage).
+    pub pid: u32,
+    /// Code de sortie ; None tant que le process est en cours. Récolté par le
+    /// watcher (signal non exprimable → -1).
+    pub exit: std::sync::Arc<std::sync::Mutex<Option<i32>>>,
     #[allow(dead_code)] // réservé : tools/call sur stdio dans une future version
     pub stdin: Option<ChildStdin>,
+}
+
+/// Construit le handle et démarre le watcher qui récolte la sortie du process.
+fn handle_de_child(mut child: Child, stdin: Option<ChildStdin>) -> StdioHandle {
+    let pid = child.id();
+    let exit = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let slot = std::sync::Arc::clone(&exit);
+    std::thread::spawn(move || {
+        let code = child.wait().ok().and_then(|st| st.code()).unwrap_or(-1);
+        if let Ok(mut slot) = slot.lock() {
+            *slot = Some(code);
+        }
+    });
+    StdioHandle { pid, exit, stdin }
 }
 
 fn resolve_windows_cmd(program: &str) -> String {
@@ -246,31 +268,6 @@ fn kill_pid_unix(pid: u32) {
     let _ = c.arg("-9").arg(pid.to_string()).status();
 }
 
-/// Le pid existe-t-il encore sur le système ? Secours Unix à `Child::try_wait` :
-/// sur macOS (CI arm64 observée), try_wait peut rester « vivant » alors que le
-/// process n'existe plus (enfant récolté par un tiers / quirk waitpid) — un
-/// `kill -0` via le binaire système arbitre sans nouvelle dépendance. Err
-/// (binaire absent, permissions) → « vivant » : jamais de faux échec.
-#[cfg(unix)]
-pub fn pid_vivant(pid: u32) -> bool {
-    match Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    {
-        Ok(st) => st.success(),
-        Err(_) => true,
-    }
-}
-
-#[cfg(not(unix))]
-#[allow(dead_code)] // Windows : try_wait est fiable, le secours n'est pas sollicité
-pub fn pid_vivant(_pid: u32) -> bool {
-    true
-}
-
 /// Spawn un process serveur (HTTP/HTTPS lancé par MCP Control) sans handshake
 /// JSON-RPC : le probe HTTP classique fera le handshake. stdout/stderr nullés
 /// (pas de pipe = pas de risque de blocage buffer plein).
@@ -302,7 +299,7 @@ pub fn spawn_process(
     let child = cmd
         .spawn()
         .map_err(|e| format!("spawn {}: {}", program, e))?;
-    Ok(StdioHandle { child, stdin: None })
+    Ok(handle_de_child(child, None))
 }
 
 /// Langage inféré d'un serveur stdio depuis sa commande de lancement.
@@ -2247,10 +2244,7 @@ pub fn probe_stdio(
                 latency_ms: latency,
                 error: None,
             },
-            Some(StdioHandle {
-                child,
-                stdin: Some(stdin),
-            }),
+            Some(handle_de_child(child, Some(stdin))),
         ))
     } else {
         kill_tree(pid);

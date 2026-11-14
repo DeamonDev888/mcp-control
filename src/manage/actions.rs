@@ -92,9 +92,8 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     if !now_enabled {
                         // OFF réel : tuer le process lancé par MCP Control (stdio ou HTTP)
                         let mut children = lockv(&state.children);
-                        if let Some(h) = children.get_mut(&id) {
-                            probe::kill_tree(h.child.id());
-                            let _ = h.child.wait();
+                        if let Some(h) = children.get(&id) {
+                            probe::kill_tree(h.pid);
                         }
                         children.remove(&id);
                         drop(children);
@@ -172,9 +171,8 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                         }
                     }
                     let mut children = lockv(&state.children);
-                    if let Some(h) = children.get_mut(&id) {
-                        probe::kill_tree(h.child.id());
-                        let _ = h.child.wait();
+                    if let Some(h) = children.get(&id) {
+                        probe::kill_tree(h.pid);
                     }
                     children.remove(&id);
                     drop(children);
@@ -391,9 +389,8 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     })
             };
             let mut children = lockv(&state.children);
-            if let Some(h) = children.get_mut(&id) {
-                probe::kill_tree(h.child.id());
-                let _ = h.child.wait();
+            if let Some(h) = children.get(&id) {
+                probe::kill_tree(h.pid);
             }
             children.remove(&id);
             drop(children);
