@@ -22,6 +22,7 @@ pub mod cli;
 pub mod pair;
 pub mod registry;
 pub mod secret;
+pub mod session;
 
 #[cfg(test)]
 mod tests;

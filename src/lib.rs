@@ -214,6 +214,13 @@ pub fn is_loopback_bind(s: &str) -> bool {
 /// les connexions locales (fenêtre desktop, navigateur de la machine) n'ont
 /// JAMAIS de code à saisir. Les contrôles Host/Origin (anti CSRF/rebinding)
 /// restent appliqués à toutes les connexions, locales incluses.
+///
+/// **Lot M2 (DA2 = a)** : cette exemption locale n'est plus une autorisation.
+/// Le code hérité ne sert plus qu'à la tolérance en LECTURE SEULE de §10 ;
+/// l'accès à `/api/*` passe par la session locale (`auth::session`) et `/mcp`
+/// par une signature, loopback compris. La fonction reste exportée parce que
+/// c'est elle qui décrit la portée historique du code partagé (§10) — elle
+/// n'est plus consultée par `check_access`.
 pub fn effective_require_access(bind_is_loopback: bool, peer_is_loopback: bool) -> bool {
     !bind_is_loopback && !peer_is_loopback
 }
@@ -246,7 +253,9 @@ pub(crate) fn random_hex(words: usize) -> String {
 
 /// Remplit `buf` avec des octets cryptographiquement aléatoires de l'OS.
 /// `true` = rempli ; `false` = source indisponible (l'appelant a son repli).
-fn os_random(buf: &mut [u8]) -> bool {
+/// `pub(crate)` depuis le lot M2 : les jetons d'amorçage et le cookie de session
+/// (`auth::session`) tirent 32 octets ici — même source que les nonces.
+pub(crate) fn os_random(buf: &mut [u8]) -> bool {
     #[cfg(windows)]
     {
         #[link(name = "bcrypt")]
@@ -540,16 +549,33 @@ fn rafraichir_hosts_sur_host_inconnu(state: &Arc<AppState>) -> bool {
     change
 }
 
-#[allow(clippy::too_many_arguments)] // signature pur/testable, les 8 paramètres sont utiles
+/// Contrôle d'accès central de `/api/*` (pur, testable). L'ordre est imposé :
+/// les contrôles gratuits passent AVANT toute vérification d'identité.
+///
+/// 1. `OPTIONS` → 403 : les préflights CORS meurent ici, aucun cross-site ne passe ;
+/// 2. Host absent → 400 ; Host hors liste → 403 (anti DNS-rebinding) ;
+/// 3. cadrage ambigu (Content-Length dupliqué, Transfer-Encoding) → 400 ;
+/// 4. Origin hors liste → 403 (anti CSRF) ;
+/// 5. `/api/*` sans session locale valide et sans code hérité valide → 401.
+///    C'est le sas du lot M2 : le loopback n'est plus une zone de confiance
+///    (DA2 = a). Exceptions : `/api/hello` (pré-authentifié, nonce seul) et
+///    `/api/session` (c'est elle qui crée la session) ;
+/// 6. un appelant HÉRITÉ (`X-MCC-Access` ou preuve de pair, §10) n'obtient que
+///    la LECTURE : `POST /api/action` → 403 ;
+/// 7. toute écriture (`POST /api/action`, `POST /api/session`) exige
+///    `X-MCC-Request: 1` → 403 sinon (CSRF), et `application/json` → 415 sinon.
+///
+/// `/mcp` n'est plus filtré ici : sa porte est la **signature** (`gateway::serve`,
+/// §2.2). Le code hérité n'y est plus exigé — sinon un client signé du LAN sans
+/// code serait refusé avant vérification.
 pub fn check_access(
-    require_access: bool,
-    api_access: Option<&str>,
     allowed_hosts: &[String],
     allowed_origins: &[String],
     method: &str,
     path: &str,
     headers: &[(String, String)],
-    proof_ok: bool,
+    session_ok: bool,
+    legacy_ok: bool,
 ) -> Result<(), (u16, &'static str)> {
     if method == "OPTIONS" {
         return Err((403, "Forbidden"));
@@ -589,25 +615,28 @@ pub fn check_access(
     let bare_path = path.split('?').next().unwrap_or("");
     // /api/hello est PRÉ-authentifié : il ne délivre qu'un nonce à usage unique,
     // aucune donnée — c'est l'amorce de la preuve de pair (cf. verify_proof).
+    // /api/session est la seule route qui CRÉE une session : elle n'en exige pas.
     let is_hello = bare_path == "/api/hello";
-    // le gateway MCP (/mcp) est protégé comme /api/* : hors loopback, le code
-    // d'accès est exigé — c'est le même sas de confiance
-    let gated_path = bare_path.starts_with("/api") || bare_path == "/mcp";
-    if require_access && gated_path && !is_hello && !proof_ok {
-        let hdr = headers
-            .iter()
-            .find(|(n, _)| n == "x-mcc-access")
-            .map(|(_, v)| v.clone());
-        let q = query_param(path, "access");
-        let provided: Option<&str> = hdr.as_deref().or(q.as_deref());
-        let api_access = api_access.filter(|s| !s.is_empty());
-        match (api_access, provided) {
-            (Some(expected), Some(got))
-                if crate::crypto::ct_eq(expected.as_bytes(), got.as_bytes()) => {}
-            _ => return Err((401, "Unauthorized")),
+    let is_session = bare_path == "/api/session";
+    if bare_path.starts_with("/api") && !is_hello && !is_session {
+        if !session_ok {
+            // Code hérité = LECTURE SEULE (§10, DA3 = a). Aucune autre forme
+            // d'accès n'existe plus : ni `?access=` (supprimé au lot M2), ni
+            // l'exemption loopback (DA2 = a).
+            if !legacy_ok {
+                return Err((401, "Unauthorized"));
+            }
+            if method == "POST" && bare_path == "/api/action" {
+                return Err((403, "Forbidden"));
+            }
+        }
+        // CSRF (§6) : un en-tête personnalisé impose un préflight, que le
+        // serveur refuse — une page web étrangère ne peut pas l'envoyer.
+        if method == "POST" && !crate::auth::session::has_csrf_header(headers) {
+            return Err((403, "Forbidden"));
         }
     }
-    if method == "POST" && bare_path == "/api/action" {
+    if method == "POST" && (bare_path == "/api/action" || is_session) {
         let ok = headers
             .iter()
             .find(|(n, _)| n == "content-type")
@@ -618,6 +647,53 @@ pub fn check_access(
         }
     }
     Ok(())
+}
+
+/// Réponse complète d'une route : statut, type de contenu, corps et en-têtes
+/// additionnels (le `Set-Cookie` de la session, le `WWW-Authenticate` d'un 401).
+/// Le socket reste écrit à la main (`handle_conn`) ; ce type transporte juste ce
+/// qu'une route a à dire en plus du triptyque historique.
+pub struct Reply {
+    pub status: u16,
+    pub ctype: &'static str,
+    pub body: Vec<u8>,
+    pub headers: Vec<(String, String)>,
+}
+
+impl Reply {
+    pub fn new(status: u16, ctype: &'static str, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            ctype,
+            body,
+            headers: Vec::new(),
+        }
+    }
+
+    /// Réponse JSON (le cas courant de `/api/*`).
+    pub fn json(status: u16, body: serde_json::Value) -> Self {
+        Self::new(status, "application/json", body.to_string().into_bytes())
+    }
+
+    /// Ajoute un en-tête de réponse (`Set-Cookie`, `WWW-Authenticate`…).
+    pub fn with_header(mut self, name: &str, value: String) -> Self {
+        self.headers.push((name.to_string(), value));
+        self
+    }
+
+    /// Les deux champs d'une réponse à en-têtes constants (`Content-Type`
+    /// seulement) — pour `route`, dont la signature ne change pas.
+    pub fn into_parts(self) -> (u16, &'static str, Vec<u8>) {
+        (self.status, self.ctype, self.body)
+    }
+}
+
+/// Compatibilité avec les routes qui rendent déjà le triptyque historique
+/// (`/auth/pair`, appairage du lot M1) : aucun en-tête additionnel.
+impl From<(u16, &'static str, Vec<u8>)> for Reply {
+    fn from((status, ctype, body): (u16, &'static str, Vec<u8>)) -> Self {
+        Self::new(status, ctype, body)
+    }
 }
 
 fn reason_phrase(status: u16) -> &'static str {
@@ -643,6 +719,10 @@ fn reason_phrase(status: u16) -> &'static str {
 /// (instance unique — cf. la logique de reconnexion dans run_headless).
 pub struct RunOutcome {
     pub url: String,
+    /// URL à usage unique de la session locale (`http://…/#t=<jeton>`, §6).
+    /// Vide quand le moteur a été RÉUTILISÉ : le jeton appartient au process
+    /// qui a démarré le moteur, un second process ne peut pas en obtenir.
+    pub session_url: String,
     pub reused: bool,
 }
 
@@ -756,7 +836,11 @@ pub fn run_headless() -> RunOutcome {
                                     url
                                 ),
                             );
-                            return RunOutcome { url, reused: true };
+                            return RunOutcome {
+                                url,
+                                session_url: String::new(),
+                                reused: true,
+                            };
                         }
                         dead_motor = true;
                         break;
@@ -854,6 +938,19 @@ pub fn run_headless() -> RunOutcome {
     };
     let ui_url = format!("http://{}:{}", ui_url_host, ui_port);
     println!("[UI] {}  (Ctrl+C pour arrêter)", ui_url);
+    // SESSION LOCALE (docs/auth.md §6, DA2 = a) : un jeton d'amorçage de
+    // 32 octets, à usage unique, 5 minutes, ne vit que dans le FRAGMENT de
+    // l'URL — jamais envoyé au serveur, jamais dans Referer, jamais dans
+    // mcc.log (on n'écrit donc PAS ce jeton dans le journal : seule cette
+    // ligne de console le porte). Le shell Tauri navigue vers cette URL ; en
+    // headless, l'utilisateur l'ouvre une fois dans son navigateur.
+    let session_url = crate::auth::session::bootstrap_url(&ui_url);
+    println!("[session] {}", session_url);
+    manage::add_log(
+        &state,
+        "info",
+        "session locale : URL à usage unique affichée sur la console (5 min, un seul échange) — /api/* l'exige, /mcp exige une signature",
+    );
     manage::add_log(
         &state,
         "info",
@@ -990,6 +1087,7 @@ pub fn run_headless() -> RunOutcome {
     });
     RunOutcome {
         url: ui_url,
+        session_url,
         reused: false,
     }
 }
@@ -1088,12 +1186,9 @@ pub(crate) fn handle_conn(mut stream: TcpStream, state: Arc<AppState>, guard: Co
     }
     body.truncate(content_length.min(MAX_BODY));
 
-    // contrôle d'accès (preuve de pair/token/Origin/Host/Content-Type) puis routage
-    let (loopback_bind, api_access) = {
-        let st = lockv(&state.settings);
-        (is_loopback_bind(&st.ui_bind), st.api_access.clone())
-    };
-    // client local (fenêtre desktop, navigateur de la machine) → jamais de code
+    // contrôle d'accès (session locale, code hérité, Origin, Host, cadrage) puis
+    // routage. Lot M2 : le loopback n'est plus une zone de confiance (DA2 = a).
+    let api_access = { lockv(&state.settings).api_access.clone() };
     let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
     let peer_is_loopback = peer_ip.map(|ip| ip.is_loopback()).unwrap_or(false);
     let (allowed_hosts, allowed_origins) = (
@@ -1116,15 +1211,60 @@ pub(crate) fn handle_conn(mut stream: TcpStream, state: Arc<AppState>, guard: Co
             _ => false,
         }
     };
+    // Session locale de la fenêtre (docs/auth.md §6) : cookie `mcc_session`,
+    // HttpOnly + SameSite=Strict, émis par POST /api/session. Valable sur
+    // /api/* UNIQUEMENT — jamais sur /mcp (test du lot M2).
+    let session_ok = crate::auth::session::authorized(&headers);
+    // Code hérité (§10, DA3 = a) : toléré en LECTURE SEULE pendant 0.8.x.
+    // `?access=` n'existe plus (supprimé au lot M2).
+    let legacy_code_ok = api_access
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .zip(
+            headers
+                .iter()
+                .find(|(n, _)| n == "x-mcc-access")
+                .map(|(_, v)| v.as_str()),
+        )
+        .is_some_and(|(expected, got)| crate::crypto::ct_eq(expected.as_bytes(), got.as_bytes()));
+    let legacy_ok = legacy_code_ok || proof_ok;
+    let legacy_reason = if legacy_code_ok {
+        Some("legacy_access")
+    } else if proof_ok {
+        Some("legacy_proof")
+    } else {
+        None
+    };
+    // Chaque usage RÉEL du code hérité écrit un avertissement (§10) :
+    // - sur /api/*, il ne sert que si la session locale ne couvre pas la requête ;
+    // - sur /mcp, la session n'ouvre rien : un code hérité sans signature est un
+    //   usage, avec signature c'est la signature qui décide.
+    let bare_route = path.split('?').next().unwrap_or(&path);
+    let signature_presente = headers
+        .iter()
+        .any(|(n, _)| n == "signature-input" || n == "signature");
+    let usage_legacy = match legacy_reason {
+        Some(_) if bare_route == "/mcp" => !signature_presente,
+        Some(_) => !session_ok,
+        None => false,
+    };
+    if let (Some(motif), true) = (legacy_reason, usage_legacy) {
+        manage::add_log(
+            &state,
+            "warn",
+            &format!(
+                "[auth] {motif} : accès en LECTURE SEULE sur {bare_route} — client hérité, migrer vers un client appairé (docs/auth.md §10)"
+            ),
+        );
+    }
     let gated = check_access(
-        effective_require_access(loopback_bind, peer_is_loopback),
-        api_access.as_deref(),
         &allowed_hosts,
         &allowed_origins,
         &method,
         &path,
         &headers,
-        proof_ok,
+        session_ok,
+        legacy_ok,
     );
     // LOT B point 4 : Host inconnu ≠ Host étranger. Une adresse apparue après
     // le boot (VPN, carte virtuelle, changement de Wi-Fi) est acceptée sans
@@ -1149,14 +1289,13 @@ pub(crate) fn handle_conn(mut stream: TcpStream, state: Arc<AppState>, guard: Co
                     lockv(&state.allowed_origins).clone(),
                 );
                 check_access(
-                    effective_require_access(loopback_bind, peer_is_loopback),
-                    api_access.as_deref(),
                     &hosts_frais,
                     &origins_fraiches,
                     &method,
                     &path,
                     &headers,
-                    proof_ok,
+                    session_ok,
+                    legacy_ok,
                 )
             } else {
                 gated
@@ -1177,29 +1316,30 @@ pub(crate) fn handle_conn(mut stream: TcpStream, state: Arc<AppState>, guard: Co
                 None => false,
             }
     };
-    let (status, ctype, payload) = match gated {
-        Err((code, reason)) => {
-            let j = serde_json::json!({"ok": false, "error": reason}).to_string();
-            (code, "application/json", j.into_bytes())
-        }
-        Ok(()) if hello_throttled => (
+    let reply = match gated {
+        Err((code, reason)) => Reply::json(code, serde_json::json!({"ok": false, "error": reason})),
+        Ok(()) if hello_throttled => Reply::json(
             429,
-            "application/json",
             serde_json::json!({
                 "ok": false,
                 "error": "taux de /api/hello dépassé pour cette adresse — réessayez plus tard"
-            })
-            .to_string()
-            .into_bytes(),
+            }),
         ),
         // Gateway MCP : la console elle-même est un serveur MCP — POST /mcp
         // (émule le transport Streamable HTTP stateless de LiteMCP sur notre
-        // socket déjà durci ; cf. gateway::serve)
+        // socket déjà durci ; cf. gateway::serve). `legacy_ok` n'ouvre que la
+        // LECTURE (code hérité, §10) — la signature, elle, est obligatoire.
         Ok(()) if path.split('?').next() == Some("/mcp") => {
-            gateway::serve(&method, &headers, &body)
+            gateway::serve(&method, &path, &headers, &body, legacy_ok)
         }
         Ok(()) => route_peer(&state, &method, &path, &body, peer_ip),
     };
+    let Reply {
+        status,
+        ctype,
+        body: payload,
+        headers: extra,
+    } = reply;
     // ACAO dynamique : on reflète UNIQUEMENT une origine autorisée (jamais *),
     // sinon aucun site tiers ne peut lire nos réponses (/api/state inclu).
     let mut resp = format!(
@@ -1209,6 +1349,12 @@ pub(crate) fn handle_conn(mut stream: TcpStream, state: Arc<AppState>, guard: Co
         ctype,
         payload.len()
     );
+    // En-têtes portés par la route (lot M2) : `Set-Cookie` de la session et
+    // `WWW-Authenticate` du 401 de litemcp. Leurs noms et valeurs sont cons-
+    // truits par le serveur, jamais recopiés d'une entrée client.
+    for (name, value) in &extra {
+        resp.push_str(&format!("{}: {}\r\n", name, value));
+    }
     if ctype == "application/json" || ctype == "text/event-stream" {
         resp.push_str("Cache-Control: no-store\r\n");
     }
@@ -1248,19 +1394,20 @@ pub fn route(
     path: &str,
     body: &[u8],
 ) -> (u16, &'static str, Vec<u8>) {
-    route_peer(state, method, path, body, None)
+    route_peer(state, method, path, body, None).into_parts()
 }
 
-/// Routage avec l'adresse de l'appelant — seul `route_peer` la connaît, et deux
-/// décisions en dépendent : le quota d'appairage (par adresse) et le refus des
-/// actions `admin` depuis le LAN (elles sont LOCALES par construction).
+/// Routage avec l'adresse de l'appelant — seul `route_peer` la connaît, et trois
+/// décisions en dépendent : le quota d'appairage (par adresse), le refus des
+/// actions `admin` depuis le LAN (elles sont LOCALES par construction) et
+/// l'échange du jeton de session (`POST /api/session`, loopback seulement).
 pub fn route_peer(
     state: &Arc<AppState>,
     method: &str,
     path: &str,
     body: &[u8],
     peer: Option<IpAddr>,
-) -> (u16, &'static str, Vec<u8>) {
+) -> Reply {
     let bare_path = path.split('?').next().unwrap_or(path);
     // ---- Appairage (docs/auth.md §3.4) : les deux seules routes non
     // authentifiées ajoutées par le lot M1. Le sas de `check_access` ne les
@@ -1268,23 +1415,50 @@ pub fn route_peer(
     // par adresse, l'expiration à 2 minutes et le fait qu'elles n'accordent RIEN.
     if bare_path == "/auth/pair" {
         if method != "POST" {
-            return (
+            return Reply::new(
                 405,
                 "application/json",
                 br#"{"ok":false,"error":"method not allowed"}"#.to_vec(),
             );
         }
-        return crate::auth::pair::handle_post(state, body, peer, crate::types::now_ts());
+        return crate::auth::pair::handle_post(state, body, peer, crate::types::now_ts()).into();
     }
     if let Some(pair_id) = bare_path.strip_prefix("/auth/pair/") {
         if method != "GET" {
-            return (
+            return Reply::new(
                 405,
                 "application/json",
                 br#"{"ok":false,"error":"method not allowed"}"#.to_vec(),
             );
         }
-        return crate::auth::pair::handle_get(state, pair_id, crate::types::now_ts());
+        return crate::auth::pair::handle_get(state, pair_id, crate::types::now_ts()).into();
+    }
+    // ---- Session locale (docs/auth.md §6) : le jeton d'amorçage (32 octets,
+    // usage unique, 5 min) s'échange ici contre le cookie `mcc_session`. Route
+    // LOCALE par construction : le jeton ne quitte jamais la machine, un
+    // échange venu du LAN est refusé même avec un jeton valide.
+    if method == "POST" && bare_path == "/api/session" {
+        if !peer.is_some_and(|ip| ip.is_loopback()) {
+            return Reply::json(
+                403,
+                serde_json::json!({"ok": false, "error": "session locale uniquement"}),
+            );
+        }
+        let token = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("token").and_then(|t| t.as_str()).map(String::from))
+            .unwrap_or_default();
+        return match crate::auth::session::exchange(&token) {
+            Some(id) => Reply::json(200, serde_json::json!({"ok": true}))
+                .with_header("Set-Cookie", crate::auth::session::set_cookie_header(&id)),
+            None => Reply::json(
+                401,
+                serde_json::json!({
+                    "ok": false,
+                    "error": "jeton d'amorçage refusé (inconnu, déjà utilisé ou expiré)"
+                }),
+            ),
+        };
     }
     if method == "GET" && bare_path == "/" {
         // SÉCURITÉ (audit 2026-10-24) : le code d'accès n'est PLUS injecté dans la
@@ -1292,55 +1466,53 @@ pub fn route_peer(
         // l'auth. L'UI le demande à l'utilisateur (login), le garde en localStorage
         // et le présente sur chaque appel /api/* (bind loopback : jamais demandé).
         let html = ui::INDEX_HTML.replace("__MCC_VERSION__", env!("CARGO_PKG_VERSION"));
-        return (200, "text/html; charset=utf-8", html.into_bytes());
+        return Reply::new(200, "text/html; charset=utf-8", html.into_bytes());
     }
     // Assets de l'UI (split v0.7.19) : servis PRÉ-authentification comme la
     // coquille — ils ne contiennent aucun secret (le code d'accès ne quitte
     // jamais le serveur) et la page de login en a besoin pour s'afficher.
     if method == "GET" && bare_path == "/app.css" {
-        return (200, "text/css; charset=utf-8", ui_asset(ui::APP_CSS));
+        return Reply::new(200, "text/css; charset=utf-8", ui_asset(ui::APP_CSS));
     }
     if method == "GET" && bare_path == "/app-boot.js" {
-        return (
+        return Reply::new(
             200,
             "text/javascript; charset=utf-8",
             ui_asset(ui::APP_BOOT_JS),
         );
     }
     if method == "GET" && bare_path == "/app.js" {
-        return (200, "text/javascript; charset=utf-8", ui_asset(ui::APP_JS));
+        return Reply::new(200, "text/javascript; charset=utf-8", ui_asset(ui::APP_JS));
     }
     if method == "GET" && bare_path == "/api/hello" {
         // amorce de la preuve de pair : identité + nonce à usage unique, aucun secret
-        let j = serde_json::json!({
-            "app": "mcp-control",
-            "version": env!("CARGO_PKG_VERSION"),
-            "nonce": issue_hello_nonce(),
-        });
-        return (200, "application/json", j.to_string().into_bytes());
+        return Reply::json(
+            200,
+            serde_json::json!({
+                "app": "mcp-control",
+                "version": env!("CARGO_PKG_VERSION"),
+                "nonce": issue_hello_nonce(),
+            }),
+        );
     }
     if (method == "GET" || method == "POST") && bare_path == "/api/state" {
-        let j = manage::state_json(state);
-        return (200, "application/json", j.to_string().into_bytes());
+        return Reply::json(200, manage::state_json(state));
     }
     if method == "GET" && bare_path == "/api/detail" {
         if let Some(id) = query_param(path, "id") {
-            let j = manage::detail_json(state, &id);
-            return (200, "application/json", j.to_string().into_bytes());
+            return Reply::json(200, manage::detail_json(state, &id));
         }
     }
     // Historique runtime : crashs, redémarrages, échecs de démarrage et
     // backoff — l'outil de supervision en lecture seule.
     if method == "GET" && bare_path == "/api/runtime" {
-        let j = manage::runtime_json(state);
-        return (200, "application/json", j.to_string().into_bytes());
+        return Reply::json(200, manage::runtime_json(state));
     }
     if method == "GET" && bare_path == "/api/store" {
-        let j = manage::store_json();
-        return (200, "application/json", j.to_string().into_bytes());
+        return Reply::json(200, manage::store_json());
     }
     if method == "GET" && bare_path == "/api/store-logos" {
-        return (
+        return Reply::new(
             200,
             "application/json",
             logos::LOGOS_JSON.as_bytes().to_vec(),
@@ -1353,30 +1525,29 @@ pub fn route_peer(
             .iter()
             .map(|f| serde_json::json!({"id": f.id, "label": f.label, "lang": f.lang}))
             .collect();
-        let j = serde_json::json!({"frameworks": arr});
-        return (200, "application/json", j.to_string().into_bytes());
+        return Reply::json(200, serde_json::json!({"frameworks": arr}));
     }
     if method == "POST" && bare_path == "/api/action" {
         // Les actions d'authentification sont LOCALES (droit `admin`, §4) : un
-        // appel venu du LAN est refusé AVANT le dispatcher, même avec le code
-        // d'accès hérité. La session locale du lot M2 renforcera ce contrôle.
+        // appel venu du LAN est refusé AVANT le dispatcher, même avec une
+        // session valide (le cookie SameSite=Strict ne circule jamais en
+        // cross-site, mais on ne s'en remet pas à lui seul).
         let nom = serde_json::from_slice::<serde_json::Value>(body)
             .ok()
             .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(String::from))
             .unwrap_or_default();
         let local = peer.is_some_and(|ip| ip.is_loopback());
         if crate::auth::action_reservee_admin(&nom) && !local {
-            return (
+            return Reply::new(
                 403,
                 "application/json",
                 br#"{"ok":false,"error":"action locale uniquement"}"#.to_vec(),
             );
         }
         let text = String::from_utf8_lossy(body).to_string();
-        let j = manage::handle_action(state, &text);
-        return (200, "application/json", j.to_string().into_bytes());
+        return Reply::json(200, manage::handle_action(state, &text));
     }
-    (
+    Reply::new(
         404,
         "application/json",
         br#"{"ok":false,"error":"not found"}"#.to_vec(),
@@ -1426,18 +1597,34 @@ mod tests {
             .collect()
     }
 
+    /// Appel de `check_access` avec les listes de test (Host/Origin du port
+    /// 5090) : `session` = cookie de session valide, `legacy` = code hérité
+    /// (`X-MCC-Access` / preuve de pair) valide.
+    fn acc(
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        session: bool,
+        legacy: bool,
+    ) -> Result<(), (u16, &'static str)> {
+        check_access(
+            &["127.0.0.1".to_string()],
+            &["http://127.0.0.1:5090".to_string()],
+            method,
+            path,
+            &hs(headers),
+            session,
+            legacy,
+        )
+    }
+
     #[test]
     fn check_access_options_est_toujours_refuse() {
-        let hosts = vec!["127.0.0.1".to_string()];
-        let origins = vec!["http://127.0.0.1:5090".to_string()];
-        let r = check_access(
-            false,
-            None,
-            &hosts,
-            &origins,
+        let r = acc(
             "OPTIONS",
             "/api/action",
-            &[("host".into(), "127.0.0.1:5090".into())],
+            &[("host", "127.0.0.1:5090")],
+            false,
             false,
         );
         assert_eq!(r, Err((403, "Forbidden")));
@@ -1451,128 +1638,110 @@ mod tests {
             "::1".to_string(),
         ];
         let origins = vec![];
-        let r = check_access(
-            false,
-            None,
-            &hosts,
-            &origins,
-            "GET",
-            "/api/state",
-            &hs(&[("host", "evil.example.com:5090")]),
-            false,
-        );
-        assert_eq!(r, Err((403, "Forbidden")));
-        // host autorisé, avec ou sans port, IPv6 entre crochets
-        for h in ["127.0.0.1:5090", "127.0.0.1", "[::1]:5090"] {
-            let r2 = check_access(
-                false,
-                None,
+        let check = |h: &str| {
+            check_access(
                 &hosts,
                 &origins,
                 "GET",
                 "/api/state",
                 &hs(&[("host", h)]),
+                true,
                 false,
-            );
-            assert!(r2.is_ok(), "host {} doit passer", h);
+            )
+        };
+        assert_eq!(check("evil.example.com:5090"), Err((403, "Forbidden")));
+        // host autorisé, avec ou sans port, IPv6 entre crochets
+        for h in ["127.0.0.1:5090", "127.0.0.1", "[::1]:5090"] {
+            assert!(check(h).is_ok(), "host {h} doit passer");
         }
     }
 
     #[test]
     fn check_access_origin_inconnue_refuse() {
-        let hosts = vec!["127.0.0.1".to_string()];
-        let origins = vec!["http://127.0.0.1:5090".to_string()];
-        let r = check_access(
-            false,
-            None,
-            &hosts,
-            &origins,
+        let r = acc(
             "POST",
             "/api/action",
-            &hs(&[
+            &[
                 ("host", "127.0.0.1:5090"),
                 ("origin", "https://malveille.example"),
-            ]),
+            ],
+            true,
             false,
         );
         assert_eq!(r, Err((403, "Forbidden")));
-        let ok = check_access(
-            false,
-            None,
-            &hosts,
-            &origins,
+        let ok = acc(
             "GET",
             "/api/state",
-            &hs(&[
+            &[
                 ("host", "127.0.0.1:5090"),
                 ("origin", "http://127.0.0.1:5090"),
-            ]),
+            ],
+            true,
             false,
         );
         assert!(ok.is_ok());
     }
 
+    /// Lot M2 (DA2 = a) : le loopback n'est plus une zone de confiance.
+    /// `?access=` n'existe plus (D5 clos) ; `X-MCC-Access` ne donne que la
+    /// LECTURE ; sans session ni code hérité, `/api/*` rend 401 — d'où que
+    /// vienne la requête.
     #[test]
-    fn check_access_api_exige_le_code_hors_loopback() {
-        let hosts = vec!["127.0.0.1".to_string()];
-        let origins = vec!["http://127.0.0.1:5090".to_string()];
+    fn check_access_api_exige_la_session_locale_meme_en_loopback() {
         let base = &[("host", "127.0.0.1:5090")] as &[(&str, &str)];
-        // sans code → 401
-        let r = check_access(
-            true,
-            Some("abc"),
-            &hosts,
-            &origins,
-            "GET",
-            "/api/state",
-            &hs(base),
-            false,
+        // aucune identité → 401
+        assert_eq!(
+            acc("GET", "/api/state", base, false, false),
+            Err((401, "Unauthorized"))
         );
-        assert_eq!(r, Err((401, "Unauthorized")));
-        // mauvais code → 401
-        let r = check_access(
-            true,
-            Some("abc"),
-            &hosts,
-            &origins,
-            "GET",
-            "/api/state",
-            &hs(&[("host", "127.0.0.1:5090"), ("x-mcc-access", "zzz")]),
-            false,
+        // `?access=` ne donne plus rien (supprimé au lot M2)
+        assert_eq!(
+            acc("GET", "/api/detail?id=x&access=abc", base, false, false),
+            Err((401, "Unauthorized"))
         );
-        assert_eq!(r, Err((401, "Unauthorized")));
-        // bon code (header) → OK ; bon code (?access=) → OK
-        assert!(check_access(
-            true,
-            Some("abc"),
-            &hosts,
-            &origins,
-            "GET",
-            "/api/state",
-            &hs(&[("host", "127.0.0.1:5090"), ("x-mcc-access", "abc")]),
+        // session valide → OK
+        assert!(acc("GET", "/api/state", base, true, false).is_ok());
+        // code hérité : la LECTURE passe, l'écriture est refusée
+        assert!(acc("GET", "/api/state", base, false, true).is_ok());
+        assert_eq!(
+            acc(
+                "POST",
+                "/api/action",
+                &[
+                    ("host", "127.0.0.1:5090"),
+                    ("content-type", "application/json"),
+                    ("x-mcc-request", "1"),
+                ],
+                false,
+                true,
+            ),
+            Err((403, "Forbidden"))
+        );
+        // /api/hello reste pré-authentifié ; /api/session crée la session
+        assert!(acc("GET", "/api/hello", base, false, false).is_ok());
+        // CSRF : une session valide ne suffit pas sur une écriture (§6)
+        assert_eq!(
+            acc(
+                "POST",
+                "/api/action",
+                &[
+                    ("host", "127.0.0.1:5090"),
+                    ("content-type", "application/json"),
+                ],
+                true,
+                false,
+            ),
+            Err((403, "Forbidden"))
+        );
+        // `/mcp` n'est plus filtré ici : sa porte est la signature (§2.2)
+        assert!(acc(
+            "POST",
+            "/mcp",
+            &[
+                ("host", "127.0.0.1:5090"),
+                ("content-type", "application/json")
+            ],
             false,
-        )
-        .is_ok());
-        assert!(check_access(
-            true,
-            Some("abc"),
-            &hosts,
-            &origins,
-            "GET",
-            "/api/detail?id=x&access=abc",
-            &hs(base),
-            false,
-        )
-        .is_ok());
-        // loopback (require_access=false) : aucun code requis
-        assert!(check_access(
-            false,
-            Some("abc"),
-            &hosts,
-            &origins,
-            "GET",
-            "/api/state",
-            &hs(base),
             false,
         )
         .is_ok());
@@ -1580,60 +1749,24 @@ mod tests {
 
     #[test]
     fn check_access_action_post_exige_content_type_json() {
-        let hosts = vec!["127.0.0.1".to_string()];
-        let origins = vec![];
+        let base = &[("host", "127.0.0.1:5090"), ("x-mcc-request", "1")] as &[(&str, &str)];
+        let with_ct = |ct: Option<&'static str>| {
+            let mut h: Vec<(&str, &str)> = base.to_vec();
+            if let Some(ct) = ct {
+                h.push(("content-type", ct));
+            }
+            acc("POST", "/api/action", &h, true, false)
+        };
         // text/plain = requête « simple » sans préflight depuis un site web → 415
-        let r = check_access(
-            false,
-            None,
-            &hosts,
-            &origins,
-            "POST",
-            "/api/action",
-            &hs(&[("host", "127.0.0.1:5090"), ("content-type", "text/plain")]),
-            false,
-        );
-        assert_eq!(r, Err((415, "Unsupported Media Type")));
-        // application/json (+paramètres) → OK ; absent → 415
-        assert!(check_access(
-            false,
-            None,
-            &hosts,
-            &origins,
-            "POST",
-            "/api/action",
-            &hs(&[
-                ("host", "127.0.0.1:5090"),
-                ("content-type", "application/json; charset=utf-8")
-            ]),
-            false,
-        )
-        .is_ok());
         assert_eq!(
-            check_access(
-                false,
-                None,
-                &hosts,
-                &origins,
-                "POST",
-                "/api/action",
-                &hs(&[("host", "127.0.0.1:5090")]),
-                false,
-            ),
+            with_ct(Some("text/plain")),
             Err((415, "Unsupported Media Type"))
         );
+        // application/json (+paramètres) → OK ; absent → 415
+        assert!(with_ct(Some("application/json; charset=utf-8")).is_ok());
+        assert_eq!(with_ct(None), Err((415, "Unsupported Media Type")));
         // GET /api/state sans content-type : pas concerné
-        assert!(check_access(
-            false,
-            None,
-            &hosts,
-            &origins,
-            "GET",
-            "/api/state",
-            &hs(&[("host", "127.0.0.1:5090")]),
-            false,
-        )
-        .is_ok());
+        assert!(acc("GET", "/api/state", base, true, false).is_ok());
     }
 
     #[test]
@@ -1727,46 +1860,15 @@ mod tests {
     }
 
     #[test]
-    fn check_access_hello_preauth_et_proof_remplace_le_code() {
-        let hosts = vec!["127.0.0.1".to_string()];
-        let origins = vec![];
+    fn check_access_hello_preauth_et_legacy_en_lecture_seule() {
         let base = &[("host", "127.0.0.1:5090")] as &[(&str, &str)];
-        // /api/hello est pré-authentifié (nonce seulement) même hors loopback
-        assert!(check_access(
-            true,
-            Some("abc"),
-            &hosts,
-            &origins,
-            "GET",
-            "/api/hello",
-            &hs(base),
-            false
-        )
-        .is_ok());
-        // une preuve de pair valide authentifie /api/state sans code en clair
-        assert!(check_access(
-            true,
-            Some("abc"),
-            &hosts,
-            &origins,
-            "GET",
-            "/api/state",
-            &hs(base),
-            true
-        )
-        .is_ok());
-        // sans preuve ni code → 401 inchangé
+        // /api/hello est pré-authentifié (nonce seulement), sans session
+        assert!(acc("GET", "/api/hello", base, false, false).is_ok());
+        // une preuve de pair valide (code hérité, §10) donne la LECTURE
+        assert!(acc("GET", "/api/state", base, false, true).is_ok());
+        // sans preuve, sans code, sans session → 401
         assert_eq!(
-            check_access(
-                true,
-                Some("abc"),
-                &hosts,
-                &origins,
-                "GET",
-                "/api/state",
-                &hs(base),
-                false
-            ),
+            acc("GET", "/api/state", base, false, false),
             Err((401, "Unauthorized"))
         );
     }
@@ -1835,7 +1937,8 @@ mod tests {
             "created": crate::types::now_ts(),
         })
         .to_string();
-        let (s, ctype, body) = route_peer(&state, "POST", "/auth/pair", corps.as_bytes(), loopback);
+        let (s, ctype, body) =
+            route_peer(&state, "POST", "/auth/pair", corps.as_bytes(), loopback).into_parts();
         assert_eq!(
             s,
             200,
@@ -1856,7 +1959,8 @@ mod tests {
             &format!("/auth/pair/{pair_id}"),
             b"",
             loopback,
-        );
+        )
+        .into_parts();
         assert_eq!(s, 200);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["status"], "pending");
@@ -1868,12 +1972,12 @@ mod tests {
                 b"",
                 loopback
             )
-            .0,
+            .status,
             404
         );
         // méthodes inattendues : refus explicite, jamais un dispatch
         assert_eq!(
-            route_peer(&state, "GET", "/auth/pair", b"", loopback).0,
+            route_peer(&state, "GET", "/auth/pair", b"", loopback).status,
             405
         );
         assert_eq!(
@@ -1884,7 +1988,7 @@ mod tests {
                 b"{}",
                 loopback
             )
-            .0,
+            .status,
             405
         );
 
@@ -1892,7 +1996,7 @@ mod tests {
         // appel venu du LAN est déjà refusé AVANT le dispatcher.
         let action = br#"{"action":"client_list"}"#;
         assert_eq!(
-            route_peer(&state, "POST", "/api/action", action, loopback).0,
+            route_peer(&state, "POST", "/api/action", action, loopback).status,
             200
         );
         assert_eq!(
@@ -1903,7 +2007,7 @@ mod tests {
                 action,
                 Some("192.0.2.30".parse().unwrap())
             )
-            .0,
+            .status,
             403,
             "une action d'authentification ne doit jamais être joignable du LAN"
         );
@@ -1916,7 +2020,7 @@ mod tests {
                 br#"{"action":"client_inconnu_xyz"}"#,
                 Some("192.0.2.30".parse().unwrap())
             )
-            .0,
+            .status,
             200
         );
     }
@@ -1988,14 +2092,24 @@ mod tests {
         assert!(!text.contains("code-secret-123"), "aucun secret dans hello");
     }
 
+    /// Le `?access=` de l'ancien code est SUPPRIMÉ (lot M2, clôt D5 et l'audit
+    /// 05 #9) : la query ne donne plus aucun accès, et elle ne pollue pas non
+    /// plus la lecture d'`id`.
     #[test]
-    fn route_accepte_query_access_sur_state_et_detail() {
+    fn query_access_ne_donne_aucun_acces_et_ne_pollue_pas_l_id() {
+        let base = &[("host", "127.0.0.1:5090")] as &[(&str, &str)];
+        assert_eq!(
+            acc(
+                "GET",
+                "/api/state?access=code-secret-123",
+                base,
+                false,
+                false
+            ),
+            Err((401, "Unauthorized")),
+            "?access= ne doit plus rien ouvrir"
+        );
         let state = test_state_with_access(Some("code-secret-123"));
-        let (st1, _, body1) = route(&state, "GET", "/api/state?access=code-secret-123", b"");
-        assert_eq!(st1, 200);
-        let v1: serde_json::Value = serde_json::from_slice(&body1).unwrap();
-        assert!(v1.get("servers").is_some());
-
         // /api/detail avec ?id=...&access=... ne doit pas polluer l'id avec "&access=..."
         state.servers.lock().unwrap().push(crate::types::Server {
             id: "seed-overmind".into(),
@@ -2125,18 +2239,17 @@ mod tests {
             ("GET", "/"),
             ("POST", "/api/action"),
         ] {
-            let r = check_access(false, None, &hosts, &[], meth, chemin, &hs(&[]), false);
+            let r = check_access(&hosts, &[], meth, chemin, &hs(&[]), false, false);
             assert_eq!(r, Err((400, "Bad Request")), "{meth} {chemin} sans Host");
         }
         // avec Host présent : comportements inchangés
         assert!(check_access(
-            false,
-            None,
             &hosts,
             &[],
             "GET",
             "/api/state",
             &hs(&[("host", "127.0.0.1:5090")]),
+            true,
             false
         )
         .is_ok());

@@ -22,7 +22,19 @@ fn main() {
     // ci-dessous réaffiche la fenêtre existante si le desktop est relancé ;
     // (2) run_headless se RECONNECTE à un moteur déjà en cours (headless ou
     // desktop) au lieu d'en lancer un second — un seul processus supervise.
-    let ui_url = mcp_control::run_headless().url;
+    let outcome = mcp_control::run_headless();
+    // SESSION LOCALE (docs/auth.md §6) : le shell navigue vers l'URL à usage
+    // unique `http://127.0.0.1:<port>/#t=<jeton>` — le fragment n'est jamais
+    // envoyé au serveur, `app.js` l'échange contre le cookie `mcc_session` puis
+    // l'efface. Aucun jeton à demander à l'utilisateur.
+    // Si le moteur a été RÉUTILISÉ (un moteur tournait déjà, desktop ou
+    // headless), ce process n'a pas tiré de jeton : on ouvre l'URL nue et
+    // l'UI signalera l'absence de session.
+    let ui_url = if outcome.session_url.is_empty() {
+        outcome.url
+    } else {
+        outcome.session_url
+    };
     // lancé au boot de Windows (entrée autostart) → pas de fenêtre, tray seulement
     let hidden = std::env::args().any(|a| a == "--hidden");
 

@@ -610,9 +610,22 @@ fn gateway_transport_regles_litemcp() {
     assert_eq!(resp.status, 200);
     assert!(resp.json().get("result").is_some());
 
+    // En-têtes SEP-2243 incohérents → requête REFUSÉE. Depuis le lot M2 la
+    // vérification de signature passe avant le contrôle du noyau, et la
+    // signature couvre `Mcp-Method` : la lib refuse elle-même la requête dont
+    // l'en-tête couvert ne colle pas au corps. Le refus est donc le 401 de
+    // corps constant (`-32600`) ; `-32020` reste le code du noyau sans
+    // vérificateur (tests unitaires). Aucun résultat ne sort dans les deux cas.
     let resp = mcp_with(&eng, &[("Mcp-Method", "ping")], &corps);
     let rep = resp.json();
-    assert_eq!(rep["error"]["code"], -32020, "mismatch SEP-2243 : {rep}");
+    assert!(
+        rep.get("result").is_none(),
+        "un Mcp-Method incohérent ne doit jamais rendre de résultat : {rep}"
+    );
+    assert!(
+        rep["error"]["code"] == json!(-32600) || rep["error"]["code"] == json!(-32020),
+        "refus attendu (401 de corps constant ou -32020) : {rep}"
+    );
 
     let brut = format!(
         "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nMcp-Method: tools/call\r\nMcp-Method: ping\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

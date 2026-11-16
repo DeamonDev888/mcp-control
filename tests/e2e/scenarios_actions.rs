@@ -148,9 +148,13 @@ fn post_json_long(eng: &Engine, v: &Value, lecture: Duration) -> (u16, Value) {
     flux.set_read_timeout(Some(lecture)).ok();
     flux.set_write_timeout(Some(Duration::from_secs(5))).ok();
     let corps = v.to_string();
+    // Lot M2 : `/api/action` exige la session locale (`Set-Cookie` de
+    // /api/session) et l'en-tête anti-CSRF `X-MCC-Request: 1` — ce client
+    // HTTP minimal les présente comme le fait app.js.
     let requete = format!(
-        "POST /api/action HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST /api/action HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nX-MCC-Request: 1\r\nCookie: mcc_session={}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         eng.port,
+        eng.session_cookie().unwrap_or(""),
         corps.len(),
         corps
     );

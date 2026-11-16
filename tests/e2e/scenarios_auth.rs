@@ -11,7 +11,10 @@
 //! (`MCC_KEYRING_SERVICE=""`, posé par le harnais) : aucun test n'écrit dans le
 //! gestionnaire d'identifiants de l'utilisateur.
 
-use crate::harness::{serial_guard, spawn, Engine, EngineCfg, Resp};
+use crate::harness::{
+    free_port, hex_bytes, nouveau_keyid, serial_guard, spawn, Engine, EngineCfg, Resp, SignMode,
+};
+use litemcp::auth::sign::{RequestToSign, Signer, SigningKey};
 use serde_json::{json, Value};
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -55,11 +58,18 @@ fn statut_pair(e: &Engine, pair_id: &str) -> (u16, Value) {
     (r.status, r.json())
 }
 
+/// Clients du registre — HORS client du harnais : depuis le lot M2 le harnais
+/// s'appaire lui-même au démarrage (`harness::Engine::client_keyid`), ces
+/// scénarios comptent donc les appairages qu'ILS ont provoqués.
 fn clients(e: &Engine) -> Vec<Value> {
+    let harnais = e.client_keyid().to_string();
     e.action(&json!({ "action": "client_list" }))["clients"]
         .as_array()
         .cloned()
         .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c["keyid"].as_str() != Some(harnais.as_str()))
+        .collect()
 }
 
 /// (critère 1) Appairage complet entre DEUX process : le moteur, et le VRAI
@@ -300,11 +310,18 @@ fn tempete_de_500_demandes_bornee_et_instance_vivante() {
     }
     let duree = debut.elapsed();
     assert!(autres.is_empty(), "statuts inattendus : {autres:?}");
-    assert_eq!(
-        acceptees, 5,
-        "le quota d'appairage (5/min/Adresse) doit borner la tempête"
+    // Le quota est de 5 demandes par adresse et par minute ; l'appairage du
+    // harnais (lot M2) en a consommé une au démarrage — la propriété vérifiée
+    // est le PLAFOND (jamais plus de 5 admises), pas le compte exact.
+    assert!(
+        acceptees <= 5,
+        "le quota d'appairage (5/min/Adresse) doit borner la tempête : {acceptees} admises"
     );
-    assert_eq!(refusees, 495);
+    assert!(
+        refusees >= 495,
+        "les 500 demandes doivent être refusées au-delà du quota : {refusees} refus"
+    );
+    assert_eq!(acceptees + refusees, 500);
     assert!(
         duree < Duration::from_secs(120),
         "les refus doivent être rendus vite (mesuré {duree:?})"
@@ -453,4 +470,749 @@ fn redemarrage_le_client_reste_appaire() {
     );
     // la demande d'appairage, elle, n'est pas persistée : 404 après redémarrage
     assert_eq!(e.get(&format!("/auth/pair/{pair_id}")).status, 404);
+}
+
+// =====================================================================
+// Lot M2 — le sas : matrice {identité} × {transport} × {surface}
+// =====================================================================
+
+/// Corps JSON-RPC d'un `tools/list` numéroté.
+fn corps_tools_list(id: u64) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "method": "tools/list" })
+}
+
+/// Corps JSON-RPC d'un `tools/call`.
+fn corps_tool(outil: &str, args: Value, id: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": { "name": outil, "arguments": args }
+    })
+}
+
+/// Appaire un client de test avec exactement `droits` et rend son signeur.
+/// Le keyid est neuf à chaque appel (aucune collision avec le harnais).
+fn client_appaire(e: &Engine, droits: &[&str]) -> Signer {
+    let cle = SigningKey::generate();
+    let keyid = nouveau_keyid();
+    let publique = hex_bytes(&cle.verifying_key().to_bytes());
+    let demande = json!({
+        "keyid": keyid,
+        "label": format!("matrice {}", droits.join("+")),
+        "public_key": publique,
+        "created": now(),
+    });
+    let r = e.post_json("/auth/pair", &demande);
+    assert_eq!(r.status, 200, "appairage refusé : {}", r.text());
+    let pair_id = r.json()["pair_id"].as_str().expect("pair_id").to_string();
+    let ok = e.action(&json!({
+        "action": "pair_approve", "pair_id": pair_id, "rights": droits,
+    }));
+    assert_eq!(ok["ok"], json!(true), "approbation refusée : {ok}");
+    Signer::new(cle).with_keyid(keyid)
+}
+
+/// `POST /mcp` signé par `signer`. `created`/`nonce` imposés quand la matrice
+/// teste l'horloge ou le rejeu. `SignMode::None` : c'est NOUS qui signons, le
+/// harnais n'ajoute rien.
+fn post_mcp_signe(
+    e: &Engine,
+    signer: &Signer,
+    host: &str,
+    corps: &Value,
+    created: Option<u64>,
+    nonce: Option<[u8; 16]>,
+) -> Resp {
+    let authority = format!("{}:{}", host, e.port);
+    let body = corps.to_string();
+    let methode = corps["method"].as_str().unwrap_or("");
+    let mut base: Vec<(String, String)> =
+        vec![("Content-Type".to_string(), "application/json".to_string())];
+    base.push(("Mcp-Method".to_string(), methode.to_string()));
+    if matches!(methode, "tools/call" | "prompts/get") {
+        if let Some(nom) = corps["params"]["name"].as_str() {
+            base.push(("Mcp-Name".to_string(), nom.to_string()));
+        }
+    }
+    let refs0: Vec<(&str, &str)> = base.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+    let a_signer = RequestToSign::new("POST", "/mcp", &authority, &refs0, body.as_bytes());
+    let signes = match (created, nonce) {
+        // nonce imposé (rejeu) : `created` fourni ou courant — les deux envois
+        // doivent produire des octets IDENTIQUES pour que le rejeu soit réel.
+        (c, Some(n)) => signer.headers_at(&a_signer, c.unwrap_or_else(now), &n),
+        // `created` imposé seul (horloge décalée) : nonce neuf
+        (Some(c), None) => signer.headers_at(&a_signer, c, &nonce_neuf()),
+        (None, None) => signer.headers(&a_signer),
+    };
+    let mut all = base;
+    for (n, v) in signes.iter() {
+        all.push((n.to_string(), v.to_string()));
+    }
+    let refs: Vec<(&str, &str)> = all.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+    e.send(
+        host,
+        e.port,
+        "POST",
+        "/mcp",
+        &refs,
+        Some(body.as_bytes()),
+        SignMode::None,
+    )
+}
+
+/// `POST /mcp` SANS signature (ni clé, ni cookie) : le cas « process local sans
+/// identité » du critère de fin.
+fn post_mcp_sans_signature(e: &Engine, host: &str, corps: &Value) -> Resp {
+    let body = corps.to_string();
+    let methode = corps["method"].as_str().unwrap_or("");
+    let mut entetes: Vec<(String, String)> = vec![
+        ("Content-Type".to_string(), "application/json".to_string()),
+        ("Mcp-Method".to_string(), methode.to_string()),
+        // pas de cookie : on ne veut pas de la session locale sur /mcp
+        ("Cookie".to_string(), "-".to_string()),
+    ];
+    if matches!(methode, "tools/call" | "prompts/get") {
+        if let Some(nom) = corps["params"]["name"].as_str() {
+            entetes.push(("Mcp-Name".to_string(), nom.to_string()));
+        }
+    }
+    let refs: Vec<(&str, &str)> = entetes
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.as_str()))
+        .collect();
+    e.send(
+        host,
+        e.port,
+        "POST",
+        "/mcp",
+        &refs,
+        Some(body.as_bytes()),
+        SignMode::None,
+    )
+}
+
+/// Un refus d'authentification : 401, corps constant de la lib et
+/// `WWW-Authenticate` présent.
+fn est_refus_401(r: &Resp) -> bool {
+    r.status == 401
+        && r.header("www-authenticate")
+            .is_some_and(|v| v.contains("Signature") && v.contains("litemcp-auth-v1"))
+        && r.text().contains("unauthorized")
+}
+
+/// Un refus de droit : 403 `-32023` (le handler n'a pas tourné).
+fn est_refus_droit(r: &Resp) -> bool {
+    if r.status != 403 {
+        return false;
+    }
+    let v = r.json();
+    v["error"]["code"] == json!(-32023)
+        && v["error"]["data"]["reason"].as_str() == Some("right_missing")
+}
+
+/// Nonce de 16 octets pour une signature imposée (jamais réutilisé dans un
+/// même cas : un nonce rejoué serait refusé pour une autre raison).
+fn nonce_neuf() -> [u8; 16] {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::SeqCst);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let a = nanos ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let b = nanos.rotate_left(17) ^ u64::from(std::process::id());
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&a.to_le_bytes());
+    out[8..].copy_from_slice(&b.to_le_bytes());
+    out
+}
+
+/// Nombre d'outils publiés par une réponse `tools/list`.
+fn nombre_outils(r: &Resp) -> usize {
+    r.json()["result"]["tools"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+/// Résultat attendu d'une cellule de la matrice.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Attendu {
+    /// 200 et exactement `n` outils publiés (`tools/list`).
+    Liste(usize),
+    /// 200 avec un résultat : l'outil a réellement tourné.
+    Ok,
+    /// 401 de corps constant + `WWW-Authenticate` (identité absente, fausse,
+    /// périmée, rejouée ou révoquée).
+    Refus401,
+    /// 403 `-32023` : droit manquant, le handler n'a pas tourné.
+    RefusDroit,
+}
+
+/// Une ligne de la matrice : identité + attendus des quatre surfaces `/mcp`,
+/// dans l'ordre tools/list, outil lecture, outil pilotage, outil execution.
+/// Les deux cellules `/api/*` sont vérifiées à part (elles ne dépendent que de
+/// la session locale, jamais de la clé MCP).
+struct Cas {
+    nom: &'static str,
+    attendus: [Attendu; 4],
+}
+
+/// Exécute une ligne et rend le nombre de cellules CONFORMES (sur 6).
+/// `requete(host, corps)` doit envoyer le `POST /mcp` du cas.
+fn execute_cas(
+    e: &Engine,
+    host: &str,
+    cas: &Cas,
+    requete: &dyn Fn(&str, &Value) -> Resp,
+    session_disponible: bool,
+) -> usize {
+    let mut conformes = 0usize;
+    let tl = requete(host, &corps_tools_list(10));
+    let cellule_tl = match cas.attendus[0] {
+        Attendu::Liste(n) => tl.status == 200 && nombre_outils(&tl) == n,
+        Attendu::Refus401 => est_refus_401(&tl),
+        Attendu::Ok => tl.status == 200 && tl.json().get("result").is_some(),
+        Attendu::RefusDroit => est_refus_droit(&tl),
+    };
+    assert!(
+        cellule_tl,
+        "{} / {host} — tools/list : {}",
+        cas.nom,
+        tl.text().chars().take(300).collect::<String>()
+    );
+    conformes += 1;
+
+    for (index, (outil, args)) in [
+        ("list_servers", json!({})),
+        ("refresh", json!({})),
+        ("add_server", json!({ "transport": "http", "port": 30_977 })),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let r = requete(host, &corps_tool(outil, args, 11 + index as u64));
+        let ok = match cas.attendus[index + 1] {
+            Attendu::Refus401 => est_refus_401(&r),
+            Attendu::RefusDroit => est_refus_droit(&r),
+            Attendu::Ok => r.status == 200 && r.json().get("result").is_some(),
+            Attendu::Liste(_) => false,
+        };
+        assert!(
+            ok,
+            "{} / {host} — {outil} : attendu {:?}, obtenu {} ({})",
+            cas.nom,
+            cas.attendus[index + 1],
+            r.status,
+            r.text().chars().take(300).collect::<String>()
+        );
+        conformes += 1;
+    }
+
+    // /api/* : seule la SESSION locale y donne accès — jamais la clé MCP.
+    let etat = e.send(host, e.port, "GET", "/api/state", &[], None, SignMode::None);
+    let attendu_api = if session_disponible { 200 } else { 401 };
+    assert_eq!(
+        etat.status,
+        attendu_api,
+        "{} / {host} — /api/state (session {})",
+        cas.nom,
+        if session_disponible {
+            "présente"
+        } else {
+            "absente"
+        }
+    );
+    conformes += 1;
+    let action = e.send(
+        host,
+        e.port,
+        "POST",
+        "/api/action",
+        &[("Content-Type", "application/json")],
+        Some(br#"{"action":"client_list"}"#),
+        SignMode::None,
+    );
+    assert_eq!(
+        action.status,
+        if session_disponible { 200 } else { 401 },
+        "{} / {host} — /api/action (session {})",
+        cas.nom,
+        if session_disponible {
+            "présente"
+        } else {
+            "absente"
+        }
+    );
+    conformes += 1;
+    conformes
+}
+
+/// Signature volontairement fausse : on signe juste, puis on altère le dernier
+/// caractère de la valeur `Signature` (64 octets Ed25519 ⇒ refus).
+fn signature_alteree(signer: &Signer, host: &str, e: &Engine, corps: &Value) -> Resp {
+    let authority = format!("{}:{}", host, e.port);
+    let body = corps.to_string();
+    let base = [
+        ("Content-Type", "application/json"),
+        ("Mcp-Method", corps["method"].as_str().unwrap_or("")),
+    ];
+    let a_signer = RequestToSign::new("POST", "/mcp", &authority, &base, body.as_bytes());
+    let signes = signer.headers(&a_signer);
+    let mut all: Vec<(String, String)> = base
+        .iter()
+        .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
+        .collect();
+    for (n, v) in signes.iter() {
+        let valeur = if n.eq_ignore_ascii_case("signature") {
+            let mut v = v.to_string();
+            let dernier = if v.ends_with(':') { '"' } else { 'A' };
+            v.pop();
+            v.push(dernier);
+            v
+        } else {
+            v.to_string()
+        };
+        all.push((n.to_string(), valeur));
+    }
+    let refs: Vec<(&str, &str)> = all.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+    e.send(
+        host,
+        e.port,
+        "POST",
+        "/mcp",
+        &refs,
+        Some(body.as_bytes()),
+        SignMode::None,
+    )
+}
+
+/// Matrice complète : {sans identité, signature fausse, rejeu, horloge
+/// décalée, clé révoquée, client lecture, pilotage, execution} × {loopback,
+/// LAN} × {tools/list, outil lecture, outil pilotage, outil execution,
+/// `/api/state`, `/api/action`}.
+///
+/// Attendus (les deux transports se comportent pareil sur /mcp : la signature
+/// ne dépend pas du chemin réseau) :
+/// - sans identité, signature fausse, horloge décalée, clé révoquée → 401 sur
+///   les quatre surfaces /mcp ; outils lecture/pilotage/execution compris.
+/// - rejeu → le PREMIER envoi d'un corps signé passe (200 + 10 outils pour
+///   `tools/list`), le SECOND avec les mêmes octets rend 401 (nonce consommé).
+/// - lecture → 10 outils, outil lecture OK, pilotage et execution 403.
+/// - pilotage → 10 outils, outil lecture 403 (droits non hiérarchiques),
+///   pilotage OK, execution 403.
+/// - execution → 10 outils, lecture 403, pilotage 403, execution OK.
+/// - `/api/*` : 200 en loopback (session locale du harnais), 401 en LAN —
+///   dans TOUS les cas, la clé MCP n'ouvre rien.
+#[test]
+fn matrice_identite_transport_surface() {
+    let _garde = serial_guard();
+    let mut e = spawn(EngineCfg {
+        ui_port: free_port(),
+        ui_bind: "0.0.0.0",
+        api_access: None,
+    })
+    .expect("spawn moteur LAN");
+    e.wait_ready(Duration::from_secs(30)).expect("moteur prêt");
+    let lan = e.lan_ip();
+    if lan.is_none() {
+        eprintln!("SKIP moitié LAN de la matrice : aucune IP LAN non-loopback");
+    }
+
+    // Identités de la matrice (appairées avec la session du harnais).
+    let c_lecture = client_appaire(&e, &["lecture"]);
+    let c_pilotage = client_appaire(&e, &["pilotage"]);
+    let c_execution = client_appaire(&e, &["execution"]);
+    let c_revoque = client_appaire(&e, &["lecture"]);
+    let keyid_revoque = {
+        // le keyid du client révoqué est le dernier appairé
+        let clients = e.action(&json!({ "action": "client_list" }))["clients"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        clients
+            .last()
+            .and_then(|c| c["keyid"].as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let revoque = e.action(&json!({
+        "action": "client_revoke", "keyid": keyid_revoque,
+    }));
+    assert_eq!(revoque["ok"], json!(true), "révocation : {revoque}");
+    let c_inconnu = {
+        let cle = SigningKey::generate();
+        Signer::new(cle).with_keyid(nouveau_keyid())
+    };
+
+    let cas_sans_identite = Cas {
+        nom: "sans identité",
+        attendus: [Attendu::Refus401; 4],
+    };
+    let cas_signature_fausse = Cas {
+        nom: "signature fausse",
+        attendus: [Attendu::Refus401; 4],
+    };
+    let cas_horloge = Cas {
+        nom: "horloge décalée",
+        attendus: [Attendu::Refus401; 4],
+    };
+    let cas_revoque = Cas {
+        nom: "clé révoquée",
+        attendus: [Attendu::Refus401; 4],
+    };
+    let cas_lecture = Cas {
+        nom: "client lecture",
+        attendus: [
+            Attendu::Liste(10),
+            Attendu::Ok,
+            Attendu::RefusDroit,
+            Attendu::RefusDroit,
+        ],
+    };
+    let cas_pilotage = Cas {
+        nom: "client pilotage",
+        attendus: [
+            Attendu::Liste(10),
+            Attendu::RefusDroit,
+            Attendu::Ok,
+            Attendu::RefusDroit,
+        ],
+    };
+    let cas_execution = Cas {
+        nom: "client execution",
+        attendus: [
+            Attendu::Liste(10),
+            Attendu::RefusDroit,
+            Attendu::RefusDroit,
+            Attendu::Ok,
+        ],
+    };
+
+    let horloge_decalee = now().saturating_sub(3600);
+    let mut conformes = 0usize;
+    let mut total = 0usize;
+    let mut hosts: Vec<String> = vec!["127.0.0.1".to_string()];
+    if let Some(ip) = &lan {
+        hosts.push(ip.clone());
+    }
+    for host in &hosts {
+        let session = host == "127.0.0.1";
+        let h = host.as_str();
+        conformes += execute_cas(
+            &e,
+            h,
+            &cas_sans_identite,
+            &|h, c| post_mcp_sans_signature(&e, h, c),
+            session,
+        );
+        total += 6;
+        conformes += execute_cas(
+            &e,
+            h,
+            &cas_signature_fausse,
+            &|h, c| signature_alteree(&c_execution, h, &e, c),
+            session,
+        );
+        total += 6;
+        conformes += execute_cas(
+            &e,
+            h,
+            &cas_horloge,
+            &|h, c| post_mcp_signe(&e, &c_lecture, h, c, Some(horloge_decalee), None),
+            session,
+        );
+        total += 6;
+        conformes += execute_cas(
+            &e,
+            h,
+            &cas_revoque,
+            &|h, c| post_mcp_signe(&e, &c_revoque, h, c, None, None),
+            session,
+        );
+        total += 6;
+        conformes += execute_cas(
+            &e,
+            h,
+            &cas_lecture,
+            &|h, c| post_mcp_signe(&e, &c_lecture, h, c, None, None),
+            session,
+        );
+        total += 6;
+        conformes += execute_cas(
+            &e,
+            h,
+            &cas_pilotage,
+            &|h, c| post_mcp_signe(&e, &c_pilotage, h, c, None, None),
+            session,
+        );
+        total += 6;
+        conformes += execute_cas(
+            &e,
+            h,
+            &cas_execution,
+            &|h, c| post_mcp_signe(&e, &c_execution, h, c, None, None),
+            session,
+        );
+        total += 6;
+        // une clé JAMAIS appairée : même refus qu'une signature fausse
+        conformes += execute_cas(
+            &e,
+            h,
+            &cas_sans_identite,
+            &|h, c| post_mcp_signe(&e, &c_inconnu, h, c, None, None),
+            session,
+        );
+        total += 6;
+    }
+
+    // REJEU : le premier envoi passe, le second (octets identiques) est refusé.
+    for (i, host) in hosts.iter().enumerate() {
+        let h = host.as_str();
+        let corps = corps_tools_list(40);
+        // nonce distinct par transport : le cache est par `keyid`, un nonce déjà
+        // vu sur loopback serait refusé sur le LAN pour une autre raison.
+        let nonce = [0x5au8.wrapping_add(i as u8); 16];
+        let premier = post_mcp_signe(&e, &c_execution, h, &corps, None, Some(nonce));
+        let second = post_mcp_signe(&e, &c_execution, h, &corps, None, Some(nonce));
+        assert_eq!(
+            premier.status,
+            200,
+            "rejeu / {h} — premier envoi : {}",
+            premier.text()
+        );
+        assert_eq!(
+            nombre_outils(&premier),
+            10,
+            "un client `execution` ne voit que ses 10 outils"
+        );
+        assert!(
+            est_refus_401(&second),
+            "rejeu / {h} — second envoi (même nonce) doit être refusé : {} {}",
+            second.status,
+            second.text()
+        );
+        conformes += 6;
+        total += 6;
+    }
+
+    assert_eq!(
+        conformes, total,
+        "toutes les cellules doivent être conformes"
+    );
+    eprintln!("matrice : {conformes}/{total} cellules conformes");
+}
+
+/// La session locale n'est JAMAIS valable sur `/mcp` (docs/auth.md §6) : le
+/// cookie du harnais présenté à `/mcp` sans signature rend 401.
+#[test]
+fn session_locale_jamais_valable_sur_mcp() {
+    let _garde = serial_guard();
+    let e = engine_ready();
+    let cookie = e
+        .session_cookie()
+        .expect("le harnais doit avoir une session")
+        .to_string();
+    let corps = corps_tools_list(1);
+    let body = corps.to_string();
+    let entetes = [
+        ("Content-Type", "application/json"),
+        ("Mcp-Method", "tools/list"),
+    ];
+    let mut avec_cookie: Vec<(&str, &str)> = entetes.to_vec();
+    let valeur = format!("mcc_session={cookie}");
+    avec_cookie.push(("Cookie", &valeur));
+    let r = e.send(
+        "127.0.0.1",
+        e.port,
+        "POST",
+        "/mcp",
+        &avec_cookie,
+        Some(body.as_bytes()),
+        SignMode::None,
+    );
+    assert!(
+        est_refus_401(&r),
+        "la session locale ne doit rien ouvrir sur /mcp : {} {}",
+        r.status,
+        r.text()
+    );
+    // …alors que la même session sur /api/state passe
+    assert_eq!(e.get("/api/state").status, 200);
+}
+
+/// Le `X-MCC-Access` hérité (DA3 = a) ne donne que la LECTURE sur `/mcp`, et
+/// chaque usage laisse un avertissement au journal. `?access=` n'existe plus.
+#[test]
+fn legacy_access_en_lecture_seule_et_journalise() {
+    let _garde = serial_guard();
+    let code = "e2e-m2-legacy";
+    let cfg = EngineCfg {
+        ui_port: free_port(),
+        ui_bind: "0.0.0.0",
+        api_access: Some(code.to_string()),
+    };
+    let mut e = spawn(cfg).expect("spawn moteur LAN");
+    e.wait_ready(Duration::from_secs(30)).expect("moteur prêt");
+    let host = "127.0.0.1";
+
+    // lecture : tools/list passe avec 10 outils (identité `lecture` implicite)
+    let r = e.send(
+        host,
+        e.port,
+        "POST",
+        "/mcp",
+        &[
+            ("Content-Type", "application/json"),
+            ("Mcp-Method", "tools/list"),
+            ("X-MCC-Access", code),
+        ],
+        Some(corps_tools_list(1).to_string().as_bytes()),
+        SignMode::None,
+    );
+    assert_eq!(r.status, 200, "legacy : {}", r.text());
+    assert_eq!(
+        nombre_outils(&r),
+        10,
+        "un code hérité ne voit que les outils de lecture"
+    );
+    // écriture : refus de droit, handler non appelé
+    let avant = e.get("/api/state").json()["stats"]["total"].clone();
+    let appel = corps_tool(
+        "add_server",
+        json!({ "transport": "http", "port": 30_966 }),
+        2,
+    );
+    let r = e.send(
+        host,
+        e.port,
+        "POST",
+        "/mcp",
+        &[
+            ("Content-Type", "application/json"),
+            ("Mcp-Method", "tools/call"),
+            ("Mcp-Name", "add_server"),
+            ("X-MCC-Access", code),
+        ],
+        Some(appel.to_string().as_bytes()),
+        SignMode::None,
+    );
+    assert!(
+        est_refus_droit(&r),
+        "legacy sur un outil execution : {} {}",
+        r.status,
+        r.text()
+    );
+    assert_eq!(
+        e.get("/api/state").json()["stats"]["total"],
+        avant,
+        "le handler n'a pas tourné"
+    );
+    // journal : chaque usage du code hérité est signalé
+    let journal = std::fs::read_to_string(e.tmp_dir().join("mcc.log")).unwrap_or_default();
+    assert!(
+        journal.contains("[auth] legacy_access") && journal.contains("LECTURE SEULE"),
+        "avertissement legacy_access attendu au journal"
+    );
+    // `/api/*` : le code hérité ne donne QUE la lecture, et `?access=` est mort
+    assert_eq!(
+        e.send(
+            host,
+            e.port,
+            "GET",
+            "/api/state",
+            &[("X-MCC-Access", code), ("Cookie", "-")],
+            None,
+            SignMode::None,
+        )
+        .status,
+        200,
+        "X-MCC-Access : lecture autorisée"
+    );
+    assert_eq!(
+        e.send(
+            host,
+            e.port,
+            "GET",
+            &format!("/api/state?access={code}"),
+            &[("Cookie", "-")],
+            None,
+            SignMode::None,
+        )
+        .status,
+        401,
+        "?access= ne donne plus aucun accès (D5 clos)"
+    );
+    assert_eq!(
+        e.send(
+            host,
+            e.port,
+            "POST",
+            "/api/action",
+            &[
+                ("Content-Type", "application/json"),
+                ("X-MCC-Request", "1"),
+                ("X-MCC-Access", code),
+                ("Cookie", "-"),
+            ],
+            Some(br#"{"action":"client_list"}"#),
+            SignMode::None,
+        )
+        .status,
+        403,
+        "code hérité : /api/action refusé (lecture seule)"
+    );
+}
+
+/// Le jeton d'amorçage est à usage unique et la route est locale : un second
+/// échange rend 401, et un échange venu du LAN est refusé (403).
+#[test]
+fn jeton_amorcage_usage_unique_et_local() {
+    let _garde = serial_guard();
+    let mut e = spawn(EngineCfg {
+        ui_port: free_port(),
+        ui_bind: "0.0.0.0",
+        api_access: None,
+    })
+    .expect("spawn");
+    e.wait_ready(Duration::from_secs(30)).expect("moteur prêt");
+    // le harnais a déjà consommé le jeton au démarrage : un rejeu local échoue
+    let deja = e.session_cookie().expect("session").to_string();
+    assert_eq!(deja.len(), 43);
+    // un jeton inventé est refusé
+    let r = e.send(
+        "127.0.0.1",
+        e.port,
+        "POST",
+        "/api/session",
+        &[("Content-Type", "application/json")],
+        Some(br#"{"token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#),
+        SignMode::None,
+    );
+    assert_eq!(r.status, 401, "jeton inventé : {}", r.text());
+    // depuis le LAN, même un jeton valide est refusé (route locale)
+    if let Some(ip) = e.lan_ip() {
+        let r = e.send(
+            &ip,
+            e.port,
+            "POST",
+            "/api/session",
+            &[("Content-Type", "application/json"), ("X-MCC-Request", "1")],
+            Some(br#"{"token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#),
+            SignMode::None,
+        );
+        assert_eq!(
+            r.status,
+            403,
+            "échange depuis le LAN doit être refusé : {}",
+            r.text()
+        );
+    }
+}
+
+/// Un moteur loopback prêt, identité et session comprises.
+fn engine_ready() -> Engine {
+    let mut e = spawn(EngineCfg::default()).expect("spawn du moteur");
+    e.wait_ready(Duration::from_secs(30)).expect("moteur prêt");
+    e
 }

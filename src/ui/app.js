@@ -28,8 +28,41 @@ function applyThemeAndSave(t) {
   try { localStorage.setItem('mcc.theme', document.documentElement.dataset.theme); } catch (e) {}
 }
 const _mccFetch = window.fetch.bind(window);
+
+/* Session locale (docs/auth.md §6) : le jeton d'amorçage arrive dans le
+   FRAGMENT de l'URL — jamais envoyé au serveur, jamais dans Referer, jamais
+   dans mcc.log. On l'échange UNE fois contre le cookie `mcc_session`
+   (HttpOnly, SameSite=Strict), puis on efface le fragment : l'URL redevient
+   celle qu'on peut copier sans rien livrer. Rien n'est stocké côté page (ni
+   localStorage ni en-tête Authorization) : le cookie fait tout. */
+async function exchangeSession() {
+  let token = '';
+  try {
+    const m = /[#&]t=([^&\s]+)/.exec(window.location.hash || '');
+    if (m) token = decodeURIComponent(m[1]);
+  } catch (e) { token = ''; }
+  if (!token) return false;
+  let ok = false;
+  try {
+    const r = await _mccFetch('/api/session', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-MCC-Request': '1'},
+      body: JSON.stringify({token: token})
+    });
+    ok = r.ok;
+  } catch (e) { ok = false; }
+  // fragment effacé DANS TOUS LES CAS : le jeton est à usage unique, le garder
+  // dans la barre d'adresse ne ferait que l'afficher.
+  try { history.replaceState(null, '', window.location.pathname + window.location.search); } catch (e) {}
+  return ok;
+}
+/* Une seule tentative par chargement ; toutes les requêtes /api/* attendent
+   son issue (le cookie doit exister avant la première lecture d'état). */
+const sessionReady = exchangeSession();
+
 window.fetch = async (url, opts = {}) => {
   const isApi = typeof url === 'string' && url.startsWith('/api/');
+  if (isApi) await sessionReady;
   const code = accessCode();
   if (isApi && code) {
     opts.headers = Object.assign({}, opts.headers || {}, {'X-MCC-Access': code});
@@ -1163,7 +1196,8 @@ function netDown() {
 async function postAction(body, opts) {
   let r;
   try {
-    r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    r = await fetch('/api/action', {method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-MCC-Request': '1'},
       body: JSON.stringify(body)});
   } catch (e) {
     return netDown(); // erreur réseau : bandeau immédiat (lot C #3)

@@ -168,7 +168,12 @@ fn auth_matrix_lan() {
         &[],
         None,
     );
-    assert_eq!(good_q.status, 200, "LAN avec bon code (?access=) → 200");
+    // Lot M2 : `?access=` est SUPPRIMÉ (D5 clos, audit 05 #9) — la query ne
+    // donne plus aucun accès, seul l'en-tête `X-MCC-Access` survit en lecture.
+    assert_eq!(
+        good_q.status, 401,
+        "LAN avec bon code en query (?access=) → 401 : la query est morte"
+    );
 
     // client LOCAL du même moteur (fenêtre desktop, navigateur de la machine) :
     // jamais de code, même quand le bind est 0.0.0.0

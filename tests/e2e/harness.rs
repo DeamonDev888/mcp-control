@@ -16,6 +16,8 @@
 
 #![allow(dead_code)]
 
+use litemcp::auth::sign::RequestToSign;
+use litemcp::auth::sign::{Signer, SigningKey};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -24,7 +26,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Compteur pour des répertoires temporaires uniques par process de test.
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
@@ -99,6 +101,23 @@ pub struct Engine {
     pub port: u16,
     /// Bind demandé — conservé pour relancer le moteur (`restart`).
     bind: &'static str,
+    /// Session locale (docs/auth.md §6) : le cookie obtenu en échangeant le
+    /// jeton d'amorçage imprimé sur la console du moteur.
+    session: Option<String>,
+    /// Identité du harnais sur `/mcp` (paire Ed25519 appairée au démarrage,
+    /// droits `lecture` + `pilotage` + `execution`). None = aucune identité.
+    signer: Option<Arc<Signer>>,
+    /// `keyid` de l'identité du harnais (vide tant qu'elle n'est pas appairée).
+    keyid: String,
+}
+
+/// Mode de signature d'une requête `/mcp`.
+#[derive(Clone, Copy, PartialEq)]
+pub enum SignMode {
+    /// Signature automatique du client du harnais (loopback seulement).
+    Auto,
+    /// Aucune signature ajoutée (cas négatifs de la matrice).
+    None,
 }
 
 /// Lance le binaire mcp-control avec une config isolée dans un tmp unique.
@@ -184,6 +203,9 @@ fn spawn_in(cfg: EngineCfg, tmp: PathBuf) -> std::io::Result<Engine> {
         code: cfg.api_access,
         port: cfg.ui_port,
         bind: cfg.ui_bind,
+        session: None,
+        signer: None,
+        keyid: String::new(),
     })
 }
 
@@ -227,7 +249,11 @@ impl Engine {
                 if try_hello(port) == Some(true) {
                     self.port = port;
                     self.base_url = format!("http://127.0.0.1:{}", port);
-                    return Ok(());
+                    // Lot M2 : le harnais s'appaire au démarrage (session locale
+                    // puis client Ed25519 au registre) et signe ensuite ses
+                    // requêtes `/mcp` — plus aucun scénario n'appelle le gateway
+                    // sans identité.
+                    return self.authenticate();
                 }
             }
             if Instant::now() >= deadline {
@@ -270,6 +296,10 @@ impl Engine {
     /// Requête HTTP arbitraire vers `host:port` (Host: dérivé de host, sauf si
     /// les en-têtes en contiennent déjà un). Retourne une Resp même en cas
     /// d'échec de connexion (status 0) pour que les assertions parlent clair.
+    ///
+    /// Lot M2 : la session locale est posée sur les requêtes **loopback** et le
+    /// client du harnais signe les `POST /mcp` loopback. Une cible LAN ne reçoit
+    /// ni cookie ni signature — comme un client distant réel.
     pub fn request(
         &self,
         host: &str,
@@ -279,28 +309,101 @@ impl Engine {
         headers: &[(&str, &str)],
         body: Option<&[u8]>,
     ) -> Resp {
+        self.send(host, port, method, path, headers, body, SignMode::Auto)
+    }
+
+    /// Idem avec contrôle explicite de la signature (matrice du lot M2) :
+    /// `SignMode::None` envoie la requête telle quelle, même vers `/mcp`.
+    #[allow(clippy::too_many_arguments)] // miroir du harnais de transport
+    pub fn send(
+        &self,
+        host: &str,
+        port: u16,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        sign: SignMode,
+    ) -> Resp {
         let addr: SocketAddr = match format!("{}:{}", host, port).parse() {
             Ok(a) => a,
             Err(e) => return Resp::dead(format!("adresse invalide {}:{} : {}", host, port, e)),
         };
-        let mut req = Vec::with_capacity(512 + body.map(|b| b.len()).unwrap_or(0));
-        req.extend_from_slice(format!("{} {} HTTP/1.1\r\n", method, path).as_bytes());
-        let has_host = headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("host"));
-        if !has_host {
-            req.extend_from_slice(format!("Host: {}:{}\r\n", host, port).as_bytes());
+        let local = is_loopback_host(host);
+        // Liste finale des en-têtes : Host, ceux de l'appelant, Content-Type,
+        // CSRF, cookie de session, puis signature. La signature couvre
+        // exactement cette liste (content-type et mcp-* compris).
+        let mut all: Vec<(String, String)> = Vec::new();
+        if !headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("host")) {
+            all.push(("Host".to_string(), format!("{}:{}", host, port)));
         }
         for (n, v) in headers {
+            all.push(((*n).to_string(), (*v).to_string()));
+        }
+        let has = |all: &Vec<(String, String)>, name: &str| {
+            all.iter().any(|(n, _)| n.eq_ignore_ascii_case(name))
+        };
+        if body.is_some() && !has(&all, "content-type") {
+            all.push(("Content-Type".to_string(), "application/json".to_string()));
+        }
+        // En-têtes de routage SEP-2243 : `Mcp-Method` (obligatoire pour la
+        // signature : c'est un composant couvert exigé) et `Mcp-Name` quand la
+        // méthode route sur un nom. Un vrai client les envoie ; le noyau
+        // vérifie leur cohérence avec le corps (-32020).
+        if path.starts_with("/mcp") && !has(&all, "mcp-method") {
+            if let Some(corps) = body {
+                for (nom, valeur) in mcp_routing(corps) {
+                    if !has(&all, nom) {
+                        all.push((nom.to_string(), valeur));
+                    }
+                }
+            }
+        }
+        // CSRF de §6 : toute écriture locale de l'UI porte `X-MCC-Request: 1`.
+        if local
+            && method == "POST"
+            && (path.starts_with("/api/action") || path.starts_with("/api/session"))
+            && !has(&all, "x-mcc-request")
+        {
+            all.push(("X-MCC-Request".to_string(), "1".to_string()));
+        }
+        if local {
+            if let Some(cookie) = &self.session {
+                if !has(&all, "cookie") {
+                    all.push(("Cookie".to_string(), format!("mcc_session={cookie}")));
+                }
+            }
+        }
+        if sign == SignMode::Auto
+            && local
+            && path.starts_with("/mcp")
+            && !has(&all, "signature-input")
+        {
+            if let Some(signer) = &self.signer {
+                let servis: Vec<(&str, &str)> =
+                    all.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+                let authority = all
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case("host"))
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("");
+                let corps = body.unwrap_or(b"");
+                let a_signer = RequestToSign::new(method, path, authority, &servis, corps);
+                let signes = signer.headers(&a_signer);
+                for (n, v) in signes.iter() {
+                    all.push((n.to_string(), v.to_string()));
+                }
+            }
+        }
+        let mut req = Vec::with_capacity(512 + body.map(|b| b.len()).unwrap_or(0));
+        req.extend_from_slice(format!("{} {} HTTP/1.1\r\n", method, path).as_bytes());
+        for (n, v) in &all {
             req.extend_from_slice(format!("{}: {}\r\n", n, v).as_bytes());
         }
         match body {
             Some(b) => {
-                req.extend_from_slice(
-                    format!(
-                        "Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        b.len()
-                    )
-                    .as_bytes(),
-                );
+                req.extend_from_slice(format!("Content-Length: {}\r\n", b.len()).as_bytes());
+                req.extend_from_slice(b"Connection: close\r\n\r\n");
                 // LE CORPS : annoncé par Content-Length, il DOIT suivre — sinon
                 // le moteur attend (30 s de read timeout) et la réponse n'arrive
                 // jamais du côté client.
@@ -348,6 +451,169 @@ impl Engine {
             ));
         }
         Resp::parse(&data)
+    }
+
+    // ---------- session locale + appairage (docs/auth.md §6 et §3.4) ----------
+
+    /// Cookie de session (None avant l'échange du jeton d'amorçage).
+    pub fn session_cookie(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+
+    /// Signeur du harnais sur `/mcp` (None = aucune identité).
+    pub fn signer(&self) -> Option<&Arc<Signer>> {
+        self.signer.as_ref()
+    }
+
+    /// `keyid` du client appairé par le harnais ("" s'il n'y en a pas).
+    pub fn client_keyid(&self) -> &str {
+        &self.keyid
+    }
+
+    /// Session locale + client appairé : appelé à la fin de `wait_ready`.
+    fn authenticate(&mut self) -> Result<(), String> {
+        self.open_session()?;
+        self.pair_harness_client()?;
+        // rejeu de la requête de garde : la session doit maintenant passer
+        if self.get("/api/state").status != 200 {
+            return Err("session locale refusée par /api/state".to_string());
+        }
+        Ok(())
+    }
+
+    /// Échange le jeton d'amorçage imprimé sur la console du moteur (§6) contre
+    /// le cookie `mcc_session`. Exactement ce que fait `app.js` dans la fenêtre.
+    fn open_session(&mut self) -> Result<(), String> {
+        let token = self.bootstrap_token()?;
+        let corps = json!({ "token": token }).to_string();
+        let r = self.send(
+            "127.0.0.1",
+            self.port,
+            "POST",
+            "/api/session",
+            &[],
+            Some(corps.as_bytes()),
+            SignMode::None,
+        );
+        if r.status != 200 {
+            return Err(format!("POST /api/session → {} : {}", r.status, r.text()));
+        }
+        let set_cookie = r
+            .header("set-cookie")
+            .ok_or("Set-Cookie absent de /api/session")?;
+        let valeur = set_cookie
+            .split(';')
+            .next()
+            .and_then(|c| c.trim().strip_prefix("mcc_session="))
+            .ok_or("cookie de session absent de Set-Cookie")?;
+        if valeur.len() != 43 {
+            return Err(format!(
+                "cookie de session inattendu ({} car.)",
+                valeur.len()
+            ));
+        }
+        self.session = Some(valeur.to_string());
+        Ok(())
+    }
+
+    /// Lit `[session] http://…/#t=<jeton>` dans la console du moteur (stdout
+    /// redirigé dans le tmp). Le jeton n'apparaît nulle part ailleurs.
+    fn bootstrap_token(&self) -> Result<String, String> {
+        let log = self.tmp.join("mcc-stdout.log");
+        let limite = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(texte) = std::fs::read_to_string(&log) {
+                for ligne in texte.lines() {
+                    if let Some(reste) = ligne.split("#t=").nth(1) {
+                        let jeton = reste.trim().to_string();
+                        if jeton.len() == 43 {
+                            return Ok(jeton);
+                        }
+                    }
+                }
+            }
+            if Instant::now() >= limite {
+                return Err(format!(
+                    "jeton d'amorçage introuvable dans {} (le moteur n'imprime pas l'URL de session ?)",
+                    log.display()
+                ));
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Appaire le client du harnais (droits `lecture`+`pilotage`+`execution`) au
+    /// démarrage. La clé et le keyid vivent dans le tmp : au `restart`, le même
+    /// client est réutilisé (le registre a survécu dans config.json).
+    fn pair_harness_client(&mut self) -> Result<(), String> {
+        let cle_path = self.tmp.join("e2e-client.key");
+        let id_path = self.tmp.join("e2e-client.id");
+        let (cle, keyid) = if cle_path.exists() && id_path.exists() {
+            let texte = std::fs::read_to_string(&cle_path).map_err(|e| e.to_string())?;
+            let keyid = std::fs::read_to_string(&id_path)
+                .map_err(|e| e.to_string())?
+                .trim()
+                .to_string();
+            (
+                SigningKey::import(&texte).map_err(|e| format!("clé client illisible : {e}"))?,
+                keyid,
+            )
+        } else {
+            let cle = SigningKey::generate();
+            let keyid = nouveau_keyid();
+            std::fs::write(&cle_path, cle.export()).map_err(|e| e.to_string())?;
+            std::fs::write(&id_path, &keyid).map_err(|e| e.to_string())?;
+            (cle, keyid)
+        };
+        let signer = Signer::new(cle).with_keyid(keyid.clone());
+        self.signer = Some(Arc::new(signer));
+        self.keyid = keyid.clone();
+        if self.client_known(&keyid) {
+            return Ok(());
+        }
+        let publique = hex_bytes(&self.signer.as_ref().unwrap().verifying_key().to_bytes());
+        let demande = json!({
+            "keyid": keyid,
+            "label": "harnais e2e",
+            "public_key": publique,
+            "created": now_unix(),
+        })
+        .to_string();
+        let r = self.send(
+            "127.0.0.1",
+            self.port,
+            "POST",
+            "/auth/pair",
+            &[],
+            Some(demande.as_bytes()),
+            SignMode::None,
+        );
+        if r.status != 200 {
+            return Err(format!("POST /auth/pair → {} : {}", r.status, r.text()));
+        }
+        let pair_id = r
+            .json()
+            .get("pair_id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or("pair_id absent de la réponse d'appairage")?;
+        let approbation = self.action(&json!({
+            "action": "pair_approve",
+            "pair_id": pair_id,
+            "rights": ["lecture", "pilotage", "execution"],
+        }));
+        if approbation["ok"] != json!(true) {
+            return Err(format!("approbation d'appairage refusée : {approbation}"));
+        }
+        Ok(())
+    }
+
+    /// Le client du harnais est-il déjà au registre ? (après un redémarrage)
+    fn client_known(&self, keyid: &str) -> bool {
+        self.action(&json!({ "action": "client_list" }))["clients"]
+            .as_array()
+            .map(|arr| arr.iter().any(|c| c["keyid"] == json!(keyid)))
+            .unwrap_or(false)
     }
 
     /// GET simple sur le moteur (loopback).
@@ -423,6 +689,74 @@ impl Drop for Engine {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+// ---------- utilitaires de signature (lot M2) ----------
+
+/// `host` désigne-t-il la machine locale ? (cookie de session et signature
+/// automatiques ne partent que vers le loopback ; une cible LAN est traitée
+/// comme un client distant réel.)
+pub fn is_loopback_host(h: &str) -> bool {
+    matches!(h, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+}
+
+/// En-têtes de routage SEP-2243 déduits du corps JSON-RPC : `Mcp-Method`, plus
+/// `Mcp-Name` pour les méthodes qui routent sur un nom (tools/call → `name`,
+/// resources/read → `uri`).
+pub fn mcp_routing(body: &[u8]) -> Vec<(&'static str, String)> {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return Vec::new();
+    };
+    let Some(methode) = v.get("method").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let mut out = vec![("Mcp-Method", methode.to_string())];
+    let champ = match methode {
+        "tools/call" | "prompts/get" => Some("name"),
+        "resources/read" => Some("uri"),
+        _ => None,
+    };
+    if let Some(champ) = champ {
+        if let Some(nom) = v
+            .get("params")
+            .and_then(|p| p.get(champ))
+            .and_then(Value::as_str)
+        {
+            out.push(("Mcp-Name", nom.to_string()));
+        }
+    }
+    out
+}
+
+/// Hexadécimal minuscule — la forme des clés publiques de `docs/auth.md` §3.2.
+pub fn hex_bytes(b: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(b.len() * 2);
+    for octet in b {
+        let _ = write!(s, "{:02x}", octet);
+    }
+    s
+}
+
+/// Horodatage Unix en secondes (paramètre `created` de la signature).
+pub fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `keyid` de test : `^mcc-[a-z0-9]{1,8}-[0-9a-f]{16}$` (§3.1). Unique par
+/// moteur de test (nanosecondes + pid + compteur).
+pub fn nouveau_keyid() -> String {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let n = N.fetch_add(1, Ordering::SeqCst);
+    let graine = nanos ^ (u64::from(std::process::id()) << 32) ^ n;
+    format!("mcc-e2e-{:016x}", graine)
 }
 
 /// Sonde /api/hello rapide (wait_ready) : Some(true) = 200 + nonce ;
