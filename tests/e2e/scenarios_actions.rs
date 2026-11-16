@@ -26,9 +26,9 @@
 //!   "utilisateur SSH requis (ou enregistre la machine)", "ip manquante",
 //!   "tool manquant", "item inconnu", "texte vide", "pair inconnu",
 //!   "action inconnue: <nom>".
-//! - id inconnu : toggle/start/start_stdio/set_*/toggle_tool → ok:false
-//!   "serveur inconnu" ; refresh → ok:TRUE (poll_one silencieux) ; kill →
-//!   ok:TRUE (arrêt d'un id inconnu = no-op) ; remove → ok:false sans error.
+//! - id inconnu : toggle/start/start_stdio/kill/kill_stdio/remove/set_*/
+//!   toggle_tool → ok:false "serveur inconnu" ; refresh → ok:TRUE (poll_one
+//!   silencieux) ; reorder → ok:true (ids inconnus filtrés).
 //! - reorder : payload {"ids":[…]} — ids inconnus filtrés, manquants ajoutés
 //!   en fin ; persisté dans settings.server_order.
 //! - set_settings : clamp refresh_secs 5..3600, scan_from/scan_to permutés si
@@ -275,27 +275,29 @@ fn contrat_id_inconnu() -> Vec<(&'static str, Value, Attendu)> {
             json!({"action": "start", "id": bogus}),
             Attendu::Erreur("serveur inconnu"),
         ),
-        // kill : arrêt d'un id inconnu = no-op → ok:true (contrat réel)
+        // kill : id inconnu = refus explicite (lot F point 5 — l'ancien
+        // ok:true ne laissait aucun message à l'interface)
         (
             "kill",
             json!({"action": "kill", "id": bogus}),
-            Attendu::Vrai,
+            Attendu::Erreur("serveur inconnu"),
         ),
         (
             "start_stdio",
             json!({"action": "start_stdio", "id": bogus}),
             Attendu::Erreur("serveur inconnu"),
         ),
+        // kill_stdio = même geste que kill (alias) : même refus
         (
             "kill_stdio",
             json!({"action": "kill_stdio", "id": bogus}),
-            Attendu::Vrai,
+            Attendu::Erreur("serveur inconnu"),
         ),
-        // remove introuvable : {"ok":false} SANS champ error
+        // remove introuvable : refus explicite (lot F point 5)
         (
             "remove",
             json!({"action": "remove", "id": bogus}),
-            Attendu::Faux,
+            Attendu::Erreur("serveur inconnu"),
         ),
         (
             "set_start_cmd",

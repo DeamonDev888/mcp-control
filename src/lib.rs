@@ -439,6 +439,94 @@ fn origin_host(o: &str) -> String {
     host_only_of(r)
 }
 
+/// Fenêtre minimale entre deux recalculs des listes anti-rebinding : une
+/// rafale de Hosts inconnus ne doit pas forcer une énumération d'interfaces
+/// (sous-process ipconfig/hostname) à chaque requête (lot B point 4).
+const HOSTS_RECALC_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Dernier recalcul des listes d'hôtes autorisés (limite de fréquence).
+static HOSTS_RECALC_LAST: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Listes anti DNS-rebinding (origines + hôtes) pour le port UI courant :
+/// boucle + IP locales actuelles + hôtes des origines additionnelles
+/// (settings.allowed_origins). Pure et testée — partagée par le boot et le
+/// recalcul à chaud déclenché par un Host inconnu (lot B point 4).
+fn listes_hosts_origins(
+    ui_port: u16,
+    local_ips: &[String],
+    extra_origins: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let mut origins: Vec<String> = vec![
+        format!("http://127.0.0.1:{ui_port}"),
+        format!("http://localhost:{ui_port}"),
+        format!("http://[::1]:{ui_port}"),
+    ];
+    let mut hosts: Vec<String> = vec![
+        "127.0.0.1".to_string(),
+        "localhost".to_string(),
+        "::1".to_string(),
+    ];
+    for ip in local_ips {
+        origins.push(format!("http://{ip}:{ui_port}"));
+        hosts.push(ip.clone());
+    }
+    for o in extra_origins {
+        origins.push(o.clone());
+        hosts.push(origin_host(o));
+    }
+    (origins, hosts)
+}
+
+/// Limite de fréquence du recalcul (pure, testée) : un seul recalcul par
+/// fenêtre — une adresse hostile ne peut pas forcer une énumération
+/// d'interfaces à chaque requête.
+fn recalc_permis(dernier: Option<Instant>, maintenant: Instant) -> bool {
+    dernier
+        .map(|t| maintenant.duration_since(t) >= HOSTS_RECALC_INTERVAL)
+        .unwrap_or(true)
+}
+
+/// Un Host inconnu se présente : recalcule les IP locales (l'adresse a pu
+/// apparaître après le boot — VPN, carte virtuelle, changement de Wi-Fi) et
+/// remplace les listes si elles ont changé. Retourne true si les listes ont
+/// bougé (le rejet 403 doit être rejugé). AUCUN affaiblissement : un Host ne
+/// peut entrer dans les listes que s'il EST l'adresse d'une interface actuelle
+/// de la machine — un nom ou une IP étrangère reste refusé. Borné en
+/// fréquence (HOSTS_RECALC_INTERVAL).
+fn rafraichir_hosts_sur_host_inconnu(state: &Arc<AppState>) -> bool {
+    let maintenant = Instant::now();
+    {
+        let mut last = lockv(&HOSTS_RECALC_LAST);
+        if !recalc_permis(*last, maintenant) {
+            return false;
+        }
+        *last = Some(maintenant);
+    }
+    let (ui_port, extra) = {
+        let st = lockv(&state.settings);
+        (st.ui_port, st.allowed_origins.clone())
+    };
+    let (origins, hosts) = listes_hosts_origins(ui_port, &manage::local_ips(), &extra);
+    let change = {
+        let mut h = lockv(&state.allowed_hosts);
+        let mut o = lockv(&state.allowed_origins);
+        let change = *h != hosts || *o != origins;
+        if change {
+            *h = hosts;
+            *o = origins;
+        }
+        change
+    };
+    if change {
+        manage::add_log(
+            state,
+            "info",
+            "[sécurité] Host inconnu : adresses locales recalculées — une nouvelle interface (VPN, Wi-Fi, carte virtuelle) est acceptée comme Host ; les hôtes étrangers restent refusés",
+        );
+    }
+    change
+}
+
 #[allow(clippy::too_many_arguments)] // signature pur/testable, les 8 paramètres sont utiles
 pub fn check_access(
     require_access: bool,
@@ -703,7 +791,10 @@ pub fn run_headless() -> RunOutcome {
     }
     // SÉCURITÉ (audit v0.6.6) :
     // - bind non-loopback → code d'accès API généré au boot si absent (persisté) ;
-    // - origines/hostes autorisés (anti CSRF / DNS-rebinding) figés au boot.
+    // - origines/hostes autorisés (anti CSRF / DNS-rebinding) calculés au boot,
+    //   puis recalculés à chaud quand un Host inconnu se présente (lot B point 4
+    //   : une IP apparue après le démarrage — VPN, carte virtuelle, Wi-Fi —
+    //   n'est plus refusée en 403 jusqu'au redémarrage de l'app).
     let local_ips_list = manage::local_ips();
     let loopback = is_loopback_bind(&ui_bind);
     let mut generated = false;
@@ -716,24 +807,7 @@ pub fn run_headless() -> RunOutcome {
     }
     {
         let extra = lockv(&state.settings).allowed_origins.clone();
-        let mut origins: Vec<String> = vec![
-            format!("http://127.0.0.1:{}", ui_port),
-            format!("http://localhost:{}", ui_port),
-            format!("http://[::1]:{}", ui_port),
-        ];
-        let mut hosts: Vec<String> = vec![
-            "127.0.0.1".to_string(),
-            "localhost".to_string(),
-            "::1".to_string(),
-        ];
-        for ip in &local_ips_list {
-            origins.push(format!("http://{}:{}", ip, ui_port));
-            hosts.push(ip.clone());
-        }
-        for o in &extra {
-            origins.push(o.clone());
-            hosts.push(origin_host(o));
-        }
+        let (origins, hosts) = listes_hosts_origins(ui_port, &local_ips_list, &extra);
         *lockv(&state.allowed_origins) = origins;
         *lockv(&state.allowed_hosts) = hosts;
     }
@@ -1033,6 +1107,44 @@ pub(crate) fn handle_conn(mut stream: TcpStream, state: Arc<AppState>, guard: Co
         &headers,
         proof_ok,
     );
+    // LOT B point 4 : Host inconnu ≠ Host étranger. Une adresse apparue après
+    // le boot (VPN, carte virtuelle, changement de Wi-Fi) est acceptée sans
+    // redémarrage : on recalcule les IP locales (borné en fréquence) et on
+    // rejuge UNE fois avec les listes à jour. Un Host qui n'est l'adresse
+    // d'aucune interface de la machine (DNS-rebinding, forgery) reste 403 —
+    // aucune liste n'accepte jamais un nom ou une IP étrangère à la machine.
+    let gated = match gated {
+        Err((403, _)) if method != "OPTIONS" => {
+            let host_inconnu = headers
+                .iter()
+                .find(|(n, _)| n == "host")
+                .map(|(_, h)| host_only_of(h))
+                .is_some_and(|host_only| {
+                    !allowed_hosts
+                        .iter()
+                        .any(|a| a.to_ascii_lowercase() == host_only)
+                });
+            if host_inconnu && rafraichir_hosts_sur_host_inconnu(&state) {
+                let (hosts_frais, origins_fraiches) = (
+                    lockv(&state.allowed_hosts).clone(),
+                    lockv(&state.allowed_origins).clone(),
+                );
+                check_access(
+                    effective_require_access(loopback_bind, peer_is_loopback),
+                    api_access.as_deref(),
+                    &hosts_frais,
+                    &origins_fraiches,
+                    &method,
+                    &path,
+                    &headers,
+                    proof_ok,
+                )
+            } else {
+                gated
+            }
+        }
+        autre => autre,
+    };
     // limiteur de débit /api/hello (audit 05 #6) : hors loopback, une adresse
     // ne peut plus remplir la table de nonces à outrance. Le loopback est
     // exempté : la fenêtre locale et le harnais e2e sondent /api/hello en rafale.
@@ -1745,6 +1857,49 @@ mod tests {
         assert_eq!(st2, 200);
         let v2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
         assert_eq!(v2["id"], serde_json::json!(expected_id));
+    }
+
+    // ---------- lot B : recalcul des hôtes autorisés ----------
+
+    #[test]
+    fn listes_hosts_origins_boucle_ips_et_extras() {
+        let (origins, hosts) = listes_hosts_origins(
+            5392,
+            &["10.2.0.2".to_string(), "192.168.1.5".to_string()],
+            &["http://mon-ui.local:8080".to_string()],
+        );
+        assert!(origins.contains(&"http://127.0.0.1:5392".to_string()));
+        assert!(origins.contains(&"http://localhost:5392".to_string()));
+        assert!(origins.contains(&"http://[::1]:5392".to_string()));
+        assert!(origins.contains(&"http://10.2.0.2:5392".to_string()));
+        assert!(origins.contains(&"http://mon-ui.local:8080".to_string()));
+        for h in [
+            "127.0.0.1",
+            "localhost",
+            "::1",
+            "10.2.0.2",
+            "192.168.1.5",
+            "mon-ui.local",
+        ] {
+            assert!(hosts.contains(&h.to_string()), "host {h} attendu");
+        }
+        assert_eq!(origins.len(), hosts.len(), "les listes restent parallèles");
+    }
+
+    #[test]
+    fn recalc_limite_de_frequence() {
+        let maintenant = Instant::now();
+        assert!(recalc_permis(None, maintenant), "jamais calculé : permis");
+        let ancien = maintenant - HOSTS_RECALC_INTERVAL;
+        assert!(
+            recalc_permis(Some(ancien), maintenant),
+            "fenêtre écoulée : permis"
+        );
+        let recent = maintenant - Duration::from_millis(500);
+        assert!(
+            !recalc_permis(Some(recent), maintenant),
+            "dans la fenêtre : refusé (pas d'énumération d'interfaces à chaque requête)"
+        );
     }
 
     // ---------- lot 5 : sécurité HTTP ----------

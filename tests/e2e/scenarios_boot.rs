@@ -399,3 +399,101 @@ fn harness_surface_compile() {
     assert_eq!(cfg.ui_bind, "127.0.0.1", "défaut = loopback");
     assert_ne!(free_port(), 0, "un port libre est trouvé");
 }
+
+/// 9. Lot B point 1 (Windows) : au boot d'une instance de test
+///    (`autostart:false`, config harnais), l'entrée « MCP Control » de
+///    HKCU\Software\Microsoft\Windows\CurrentVersion\Run reste INTACTE —
+///    l'instance de test ne doit plus effacer ni réécrire le démarrage
+///    automatique de l'installation réelle. La décision est testée en
+///    unitaire (autostart.rs, fonction pure) ; ici on prouve le vrai chemin
+///    sur le VRAI binaire, registre réel en LECTURE SEULE. Hors Windows :
+///    sauté (même décision pour XDG/LaunchAgent, couverte par l'unitaire).
+#[cfg(windows)]
+#[test]
+fn boot_ne_touche_pas_l_entree_run() {
+    let _garde = crate::harness::serial_guard();
+    let run_value = || -> Option<String> {
+        let out = std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                "MCP Control",
+            ])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.contains("REG_SZ"))
+            .map(|l| l.trim().to_string())
+    };
+    let avant = run_value();
+    let e = spawn_loopback();
+    // boot complet effectué (sync_autostart_at_boot inclus) : le moteur répond
+    assert_eq!(e.get("/api/hello").status, 200);
+    assert_eq!(e.get("/api/state").status, 200);
+    drop(e);
+    let apres = run_value();
+    assert_eq!(
+        avant, apres,
+        "l'entrée Run ne doit ni disparaître ni changer au boot (autostart:false)"
+    );
+}
+
+/// 10. Lot B point 4 : un Host ÉTRANGER reste 403 même après le recalcul des
+///     adresses locales déclenché par un Host inconnu (aucun affaiblissement
+///     de l'anti DNS-rebinding) ; l'Host RÉEL de la machine reste accepté
+///     après le recalcul — 401 sans code (contrôle Host passé), jamais 403.
+///     Le second Host étranger tombe dans la fenêtre de limite de fréquence
+///     (5 s) : 403 aussi, le recalcul ne peut pas être forcé en rafale.
+#[test]
+fn host_inconnu_recalc_sans_affaiblir() {
+    let _garde = crate::harness::serial_guard();
+    let e = spawn_lan_with_code(CODE);
+    let host = e.lan_ip().unwrap_or_else(|| "127.0.0.1".to_string());
+    // 1er Host étranger : 403 — déclenche un recalcul des IP locales
+    let forged1 = e.request(
+        &host,
+        e.port,
+        "GET",
+        "/api/state",
+        &[("Host", "evil.example.com")],
+        None,
+    );
+    assert_eq!(
+        forged1.status,
+        403,
+        "Host étranger → 403 (détail : {})",
+        forged1.text().chars().take(200).collect::<String>()
+    );
+    // 2nd Host étranger, dans la fenêtre de limite de fréquence : toujours 403
+    let forged2 = e.request(
+        &host,
+        e.port,
+        "GET",
+        "/api/state",
+        &[("Host", "evil2.example.com")],
+        None,
+    );
+    assert_eq!(
+        forged2.status, 403,
+        "Host étranger après recalcul → toujours 403"
+    );
+    // l'Host RÉEL de la machine reste accepté après le recalcul :
+    // /api/hello 200 (Host admis, pré-authentifié) et /api/state 401 (Host
+    // admis, code exigé) — jamais 403, sinon les listes du boot auraient
+    // été écrasées par le recalcul.
+    let hello = e.request(&host, e.port, "GET", "/api/hello", &[], None);
+    assert_eq!(
+        hello.status, 200,
+        "Host LAN réel doit rester admis après recalcul"
+    );
+    let st = e.request(&host, e.port, "GET", "/api/state", &[], None);
+    assert_eq!(
+        st.status, 401,
+        "Host LAN réel + sans code → 401 (Host admis), jamais 403"
+    );
+}

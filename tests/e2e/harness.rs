@@ -187,8 +187,7 @@ impl Engine {
                     self.tmp.display()
                 ));
             }
-            for off in 0..=9u16 {
-                let port = self.port + off;
+            for port in ports_candidats(self.port) {
                 if try_hello(port) == Some(true) {
                     self.port = port;
                     self.base_url = format!("http://127.0.0.1:{}", port);
@@ -200,7 +199,7 @@ impl Engine {
                     "moteur pas prêt après {:?} (ports {}..{} sondés, tmp {})",
                     timeout,
                     self.port,
-                    self.port + 9,
+                    self.port.saturating_add(9),
                     self.tmp.display()
                 ));
             }
@@ -277,11 +276,16 @@ impl Engine {
             Ok(s) => s,
             Err(e) => return Resp::dead(format!("connexion {}:{} : {}", host, port, e)),
         };
-        // lecture 30 s : certaines actions sont SYNCHRONES côté moteur
+        // lecture 60 s : certaines actions sont SYNCHRONES côté moteur
         // (« scan », « discover » : sondage réel des ports) et peuvent
-        // dépasser largement 10 s sous charge — un timeout trop court
-        // tronquait la réponse et faisait échouer le POST (ok:false fantôme)
-        stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+        // dépasser largement 30 s sous charge — un timeout trop court
+        // tronquait la réponse et faisait échouer le POST (ok:false fantôme).
+        // Cas observé (lot F) : la découverte locale périodique sonde TOUS les
+        // ports en écoute de la machine (34 ici) et sature le pool de sondes ;
+        // le scan d'un seul port a alors dépassé 30 s et le client a rendu une
+        // « réponse vide » alors que le moteur travaillait normalement (aucune
+        // erreur au journal). 60 s laisse la marge d'un cycle complet.
+        stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
         if stream.write_all(&req).is_err() {
             return Resp::dead(format!("écriture {}:{} échouée", host, port));
@@ -487,14 +491,33 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
 
 // ---------- utilitaires d'attente ----------
 
+/// Ports candidats de `wait_ready` : base, base+1 … base+9, SATURÉS à u16.
+/// L'arithmétique saturante est obligatoire : un port éphémère Windows peut
+/// dépasser 65 526, et `base + 9` débordait en u16 (panique « attempt to add
+/// with overflow » du harnais, sans aucun rapport avec le moteur).
+fn ports_candidats(base: u16) -> Vec<u16> {
+    (0..=9u16).map(|off| base.saturating_add(off)).collect()
+}
+
 /// Un port libre (bind :0 → port → drop). Course possible mais improbable ;
 /// le repli +1..+9 du moteur couvre le cas.
+/// Le port rendu laisse TOUJOURS la marge de 9 du repli : au-delà de 65 526,
+/// `base + 9` déborderait (cas couvert aussi par la saturation ci-dessus).
 pub fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind 127.0.0.1:0")
-        .local_addr()
-        .expect("local_addr")
-        .port()
+    let mut dernier = 0u16;
+    for _ in 0..32 {
+        dernier = TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind 127.0.0.1:0")
+            .local_addr()
+            .expect("local_addr")
+            .port();
+        if dernier <= u16::MAX - 9 {
+            return dernier;
+        }
+    }
+    // 32 tirages de suite au-delà de 65 526 : jamais observé (plage éphémère
+    // Windows 49152-65535) — la saturation de wait_ready couvre ce cas.
+    dernier
 }
 
 /// Sonde `f` toutes les ~150 ms jusqu'au délai : Some(true) → succès ;
@@ -756,4 +779,33 @@ fn fake_conn(mut s: TcpStream, mode: FakeMode) {
     );
     let _ = s.write_all(resp.as_bytes());
     let _ = s.flush();
+}
+
+// ---------- tests du harnais lui-même ----------
+
+/// Non-régression de l'échec aléatoire du lot B : `port + off` en u16 paniquait
+/// (« attempt to add with overflow ») quand `free_port()` rendait ≥ 65 527.
+#[test]
+fn harnais_ports_candidats_ne_debordent_pas() {
+    assert_eq!(ports_candidats(5432), (5432..=5441).collect::<Vec<u16>>());
+    // base au ras du plafond : les 10 candidats restent dans u16
+    assert_eq!(ports_candidats(u16::MAX), vec![u16::MAX; 10]);
+    assert_eq!(
+        ports_candidats(u16::MAX - 5).last().copied(),
+        Some(u16::MAX)
+    );
+}
+
+/// `free_port()` doit laisser la marge de 9 du repli moteur : sinon
+/// `wait_ready` sonde des ports hors u16 (l'ancien panic).
+#[test]
+fn harnais_free_port_laisse_la_marge_du_repli() {
+    for _ in 0..64 {
+        let p = free_port();
+        assert!(
+            p <= u16::MAX - 9,
+            "free_port a rendu {} : la marge de 9 du repli moteur déborde",
+            p
+        );
+    }
 }

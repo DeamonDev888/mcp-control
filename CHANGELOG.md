@@ -1,3 +1,37 @@
+## [Non publié] — supervision au rythme réglé, gateway réparé, boutique avec variables d'environnement, panne moteur vue plus tôt
+
+### Supervision — un serveur muet ne retarde plus les autres
+- **La période de supervision redevient celle du réglage** (« Intervalle de sondage », 15 s par défaut, 5 s minimum) : le cycle n'attend plus la fin des sondes, un serveur encore en sonde est sauté au cycle suivant, et une sonde est coupée dès la première forme envoyée sans aucun octet reçu. Mesuré sur une instance de test (1 serveur sain + 1 muet + 1 lent, réglage à 5 s) : **période du serveur sain 30-31 s avant, 5 s réguliers après** ; un serveur qui répond en ~6 s reste classé UP.
+- **Un port qui accepte la connexion sans jamais répondre est classé en ~10 s au lieu de ~30** (9,9 / 10,4 / 9,8 s sur trois mesures, contre 30,2 s avant). L'erreur publiée reste celle de l'hôte qui a accepté la connexion, pas celle du repli refusé.
+- **`config.json` édité à la main avec `scan_from > scan_to`** : la plage est remise dans l'ordre au chargement, avec une ligne « plage de scan inversée (…) — remise dans l'ordre au chargement » dans `mcc.log`, au lieu d'un scan qui ne rendait aucun port.
+
+### Gateway MCP — `refresh` fait ce qu'il annonce, `set_start_command` sait retirer
+- **Le tool `refresh` re-sonde tous les serveurs puis relance la recherche des nouveaux** (l'équivalent exact du bouton ⟳). L'ancien handler envoyait une action sans `id` et répondait « id manquant » à chaque appel ; en direct : `tools/call refresh` → `{"ok":true}`.
+- **`set_start_command` accepte `program: null` (ou une chaîne vide) pour RETIRER la commande de lancement** : réponse `{"ok":true,"removed":true}`, `start_cmd: null` dans l'état, retrait persisté au rechargement. L'autoboot du serveur est désactivé au passage (il n'y aurait plus rien à lancer) et le process déjà lancé n'est pas tué — c'est le bouton ■ qui arrête.
+- **Contrat modifié** : `program: "   "` (espaces seuls) levait une erreur, il retire désormais la commande, comme `null` et la chaîne vide.
+- **`stop_server` / `remove_server` sur un identifiant inconnu répondent `{"ok":false,"error":"serveur inconnu"}`** au lieu d'un `ok` sans motif (Stop ne disait rien, Supprimer affichait un « échec » générique).
+
+### Boutique — variables d'environnement à l'installation
+- **L'installation d'un serveur de la boutique accepte un champ `env`** (`{"GITHUB_TOKEN": "…"}`) pour les items à jeton : les variables atteignent le transport et la commande de lancement, survivent au rechargement de la configuration, et **les valeurs ne ressortent jamais** — ni `/api/state`, ni `/api/detail`, ni la réponse, ni le journal (noms seuls).
+- Disponible par l'API locale (`install_store`) et par le tool `install_store_server` du gateway ; le bouton Installer de l'interface ne propose pas encore de champ de saisie (suivi dans `TODO.md`, section 5, R9).
+
+### Interface — un seul chemin pour les actions, panne moteur vue plus tôt
+- **Tous les envois d'action de la page passent par un helper unique** (`postAction`, 30 sites d'appel, un seul `fetch('/api/action')`) qui lit `ok` et affiche `error` en toast : un refus du moteur ne peut plus passer en silence.
+- **Moteur mort : réessai 2 s après le premier échec** (`POLL_RETRY_MS`), bandeau « moteur injoignable » au 2ᵉ échec consécutif au lieu d'attendre deux cycles complets, réessais toutes les 2 s pendant la panne, retour au rythme réglé dès la première réponse.
+- **Une action qui ne part pas (erreur réseau) arme le bandeau immédiatement**, sans toast parasite ni exception ; au retour du moteur le bandeau tombe au réessai suivant.
+
+### Démarrage automatique — une copie de l'app ne touche plus l'entrée d'une autre
+- **Au démarrage, l'app n'écrit ou ne supprime l'entrée « MCP Control » que si elle pointe déjà sur son propre exécutable.** Une entrée qui pointe vers une autre installation — instance de test, build de développement, autre dossier — n'est jamais touchée ; seul le geste explicite sur l'interrupteur Auto-boot écrit l'entrée de l'exécutable courant. Même règle sous Linux (fichier XDG) et macOS (LaunchAgent).
+
+### Sécurité — réponses masquées, motif de refus précis, réseau qui change
+- **`set_notify` renvoie la configuration masquée** (même forme que `/api/state`, booléen `headers_set`) : les en-têtes du webhook ne ressortent plus en clair, pas même vers l'appelant qui vient de les enregistrer.
+- **Le refus d'une URL de webhook donne le motif précis** (`https://` non pris en charge : aucune pile TLS embarquée) au lieu du message générique qui laissait croire que https était accepté.
+- **Un `Host` inconnu déclenche un recalcul borné des adresses de la machine** (un recalcul au plus toutes les 5 s) : une adresse apparue après le démarrage (VPN, carte virtuelle, changement de Wi-Fi) n'est plus refusée jusqu'au redémarrage ; un `Host` qui n'est l'adresse d'aucune interface reste refusé en 403.
+
+### Tests
+- `cargo fmt --check` et `cargo clippy --all-targets -- -D warnings` : 0 avertissement. `cargo test --lib` : **214 verts**. `cargo test --test e2e --no-fail-fast` : **59 verts**, deux passages consécutifs.
+- Harnais E2E : plus de débordement u16 du port de repli (« attempt to add with overflow »), et fixtures `probe_http_*` qui lisent la requête jusqu'au corps complet — les deux causes d'instabilité corrigées dans cette passe.
+
 ## [0.7.21] — fiabilisation : compilation, passerelle, supervision, persistance, UI, sécurité HTTP + doc alignée
 
 ### Refactorisation : `manage.rs` éclaté en 14 modules (zéro changement de comportement)

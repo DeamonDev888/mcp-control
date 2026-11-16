@@ -818,20 +818,22 @@ mod tests {
     #[test]
     fn lot4_refus_moteur_toaste_sur_setfavorite_setauto_scan() {
         // #7/#10 : un refus du moteur (j.ok=false) ne peut plus être
-        // silencieux — j.error est affiché en toast d'erreur. Le scan rend le
-        // bouton occupé puis toast le nombre trouvé (champ found, consommé
-        // s'il existe — le lot 3 l'ajoutera).
-        for name in ["setAuto", "setFavorite", "doScan"] {
+        // silencieux. Depuis le lot C (TODO-RESTES), la lecture de j.ok et le
+        // toast de j.error vivent dans le helper unique postAction — setAuto
+        // et setFavorite y passent ; doScan garde son toast préfixé (quiet)
+        // plus le champ found et le bouton occupé.
+        for name in ["setAuto", "setFavorite"] {
             let f = fn_body(APP_JS, name);
             assert!(
-                f.contains("j.ok"),
-                "{name} doit lire j.ok (refus moteur silencieux sinon)"
-            );
-            assert!(
-                f.contains("j.error"),
-                "{name} doit afficher j.error en toast d'erreur"
+                f.contains("postAction("),
+                "{name} doit passer par le helper postAction (refus moteur silencieux sinon)"
             );
         }
+        let helper = fn_body(APP_JS, "postAction");
+        assert!(
+            helper.contains("j.ok") && helper.contains("toast("),
+            "le helper postAction doit lire j.ok et toast le refus"
+        );
         let scan = fn_body(APP_JS, "doScan");
         assert!(
             scan.contains("found"),
@@ -882,6 +884,115 @@ mod tests {
         assert!(
             f.contains("copyText("),
             "copyConf doit réutiliser copyText (repli copyFallback)"
+        );
+    }
+
+    // ---------- Lot C GUI (TODO-RESTES, 3e passe) ---------------------------
+    // #1 : un seul helper d'envoi d'action (postAction) — tous les fetch vers
+    // /api/action y passent, il lit ok et toast error ; #2 : réessai rapide du
+    // poll en panne moteur (2 s) ; #3 : bandeau immédiat sur erreur réseau
+    // d'une action. Le comportement réel (délais, toasts, console) est mesuré
+    // hors CI dans un navigateur sur une instance privée.
+
+    #[test]
+    fn restes_c_un_seul_helper_envoi_action_lit_ok_et_toaste() {
+        // #1 : plus aucun fetch('/api/action') hors du helper ; il lit j.ok,
+        // toast j.error en erreur et renvoie la réponse. Les dix appels
+        // autrefois silencieux y passent tous.
+        let n = APP_JS.matches("fetch('/api/action'").count();
+        assert_eq!(
+            n, 1,
+            "fetch('/api/action') doit n'exister que dans postAction, trouvé : {n}"
+        );
+        let h = fn_body(APP_JS, "postAction");
+        assert!(
+            h.contains("fetch('/api/action'"),
+            "le fetch restant doit être celui du helper postAction"
+        );
+        assert!(h.contains("j.ok"), "le helper doit lire j.ok");
+        assert!(
+            h.contains("toast("),
+            "le helper doit afficher j.error en toast d'erreur"
+        );
+        assert!(h.contains("return j"), "le helper doit renvoyer la réponse");
+        for name in [
+            "act",
+            "toggleAutostart",
+            "postReorder",
+            "removeSeedForever",
+            "doScanNet",
+            "doPeers",
+            "importPeer",
+            "sshForget",
+            "toggleTool",
+            "refreshAll",
+        ] {
+            let f = fn_body(APP_JS, name);
+            assert!(
+                f.contains("postAction("),
+                "{name} doit passer par le helper postAction (refus silencieux sinon)"
+            );
+        }
+        // refreshAll : sans toast par serveur (quiet), mais échec GLOBAL signalé.
+        let ra = fn_body(APP_JS, "refreshAll");
+        assert!(
+            ra.contains("{quiet: true}"),
+            "refreshAll ne doit pas toaster par serveur (option quiet)"
+        );
+        assert!(
+            ra.contains("toast("),
+            "refreshAll doit signaler un échec global"
+        );
+    }
+
+    #[test]
+    fn restes_c_reessai_rapide_moteur_mort() {
+        // #2 : après le premier échec de poll, réessai à 2 s (POLL_RETRY_MS)
+        // au lieu du prochain cycle complet — bandeau toujours au 2ᵉ échec,
+        // mais ~refresh_secs+2 s au lieu de ~2×refresh_secs ; pendant la
+        // panne chaque échec réarme le réessai rapide ; le rythme normal
+        // (armPolling) revient dès que le moteur répond (render).
+        let load = fn_body(APP_JS, "load");
+        assert!(
+            load.contains("POLL_RETRY_MS"),
+            "load() doit réarmer le poll en réessai rapide après un échec"
+        );
+        assert!(
+            APP_JS.contains("POLL_RETRY_MS = 2000"),
+            "constante de réessai 2 s absente"
+        );
+        let arm = fn_body(APP_JS, "armPolling");
+        assert!(
+            arm.contains("refresh_secs"),
+            "le rythme normal doit rester réglé par refresh_secs"
+        );
+        assert!(
+            !APP_JS.contains("setInterval(load"),
+            "le polling ne doit plus être un intervalle fixe (réessai rapide impossible sinon)"
+        );
+        assert!(
+            APP_JS.contains("pollFails >= 2"),
+            "le bandeau doit rester armé au 2ᵉ échec consécutif"
+        );
+    }
+
+    #[test]
+    fn restes_c_erreur_reseau_action_bandeau_immediat() {
+        // #3 : une action qui ne part pas (erreur réseau, pas un refus) arme
+        // le bandeau tout de suite et passe le poll en réessai rapide.
+        let nd = fn_body(APP_JS, "netDown");
+        assert!(
+            nd.contains("setDead(true"),
+            "netDown doit armer le bandeau immédiatement"
+        );
+        assert!(
+            nd.contains("POLL_RETRY_MS"),
+            "netDown doit passer le poll en réessai rapide"
+        );
+        let h = fn_body(APP_JS, "postAction");
+        assert!(
+            h.contains("netDown()"),
+            "postAction doit signaler l'erreur réseau par netDown()"
         );
     }
 }

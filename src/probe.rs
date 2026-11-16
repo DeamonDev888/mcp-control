@@ -1219,6 +1219,40 @@ pub fn ssh_probe_server(
     }
 }
 
+/// Vrai si l'erreur de [`http_request`] correspond à un hôte qui n'a JAMAIS
+/// accepté la connexion (« addr … » ou échec de connect — forme
+/// « {host}: {erreur io} »). Les erreurs POST-connexion ont toutes une forme
+/// distincte et prévisible : « {host} write: … », « {host} read: … »,
+/// « {host}: réponse vide », « {host}: réponse HTTP non-2xx … »,
+/// « {host}: réponse trop grande … ». Utilisée par [`http_post`] pour publier
+/// l'erreur de l'hôte qui a accepté (même correctif que probe_http,
+/// audit 03 constat 4, reporté ici au lot A).
+fn connexion_manquee(err: &str, host: &str) -> bool {
+    if err.starts_with("addr ") {
+        return true;
+    }
+    let pfx = format!("{host}: ");
+    if !err.starts_with(&pfx) {
+        // « write: » / « read: » : la connexion était établie
+        return false;
+    }
+    let reste = &err[pfx.len()..];
+    !(reste.starts_with("réponse vide")
+        || reste.starts_with("réponse HTTP non-2xx")
+        || reste.starts_with("réponse trop grande"))
+}
+
+/// Vrai si l'erreur de [`http_request`] signifie « aucune réponse » : la
+/// connexion a été ACCEPTÉE mais aucun octet n'est arrivé avant l'échéance
+/// (« {host} read: … » — le motif n'est publié que si `data` est vide) ou
+/// l'hôte a refermé sans rien écrire (« {host}: réponse vide »). C'est le
+/// signal d'un port MUET (lot A) : probe_http cesse alors de rejouer les
+/// formes suivantes. Tout le reste (write, non-2xx, trop grande, JSON
+/// invalide…) prouve une activité du serveur et justifie les autres formes.
+fn zero_octets(err: &str, host: &str) -> bool {
+    err.starts_with(&format!("{host} read: ")) || err.starts_with(&format!("{host}: réponse vide"))
+}
+
 /// POST JSON vers localhost (essaye ::1 puis 127.0.0.1), lit toute la réponse (gère chunked).
 /// Renvoie (host_utilisé, corps, transport SSE détecté).
 pub fn http_post(
@@ -1227,14 +1261,28 @@ pub fn http_post(
     body: &str,
     timeout_ms: u64,
 ) -> Result<(String, Vec<u8>, RespHead), String> {
-    let mut last_err = String::new();
+    // MOTIF D'ERREUR (lot A — même correctif que probe_http) : l'erreur de
+    // l'hôte de repli (::1 ou 127.0.0.1) qui n'a jamais accepté la connexion
+    // ne doit pas écraser celle de l'hôte qui a accepté (délai dépassé,
+    // réponse invalide…). On publie en priorité la 1re erreur post-connexion.
+    let mut err_accept: Option<String> = None;
+    let mut err_dernier = String::new();
     for host in ["::1", "127.0.0.1"] {
         match http_post_host(host, port, path, body, timeout_ms, &[]) {
             Ok((b, h)) => return Ok((host.to_string(), b, h)),
-            Err(e) => last_err = e,
+            Err(e) => {
+                if !connexion_manquee(&e, host) && err_accept.is_none() {
+                    err_accept = Some(e);
+                } else {
+                    err_dernier = e;
+                }
+            }
         }
     }
-    Err(last_err)
+    Err(match err_accept {
+        Some(e) => e,
+        None => err_dernier,
+    })
 }
 
 /// Cap mémoire d'une réponse de sonde : un serveur LAN rapide ne doit pas pouvoir
@@ -1808,6 +1856,7 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
     let mut attempt: Option<(serde_json::Value, String, RespHead, u64, bool)> = None;
     let mut err_hote: Option<String> = None;
     let mut err_repli: Option<String> = None;
+    let mut muet = false;
     'probe: for (params, hdrs, stateless) in [
         (&init_params, &[][..], false),
         (&init_strict, &strict_init_hdrs[..], true),
@@ -1835,7 +1884,18 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
                 }
                 Err(e) => {
                     if host == open_host {
+                        // PORT MUET (lot A) : la forme a expiré sans AUCUN octet
+                        // de l'hôte vérifié ouvert — rejouer les formes suivantes
+                        // (strict, server/discover) ne peut rien donner : un port
+                        // qui n'écrit jamais un octet n'en écrira pas davantage
+                        // pour une autre requête. L'ancien code encaissait les
+                        // 3 formes (~18-25 s de classement pour un muet).
+                        let muet_forme = zero_octets(&e, open_host);
                         err_hote = Some(e);
+                        if muet_forme {
+                            muet = true;
+                            break 'probe;
+                        }
                     } else {
                         err_repli = Some(e);
                     }
@@ -1848,7 +1908,9 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
     // custom requests »). La découverte passe par `server/discover`, et le
     // serverInfo vit sous result._meta["io.modelcontextprotocol/serverInfo"].
     let mut discovered: Option<serde_json::Value> = None;
-    if attempt.is_none() {
+    // PORT MUET : la 3e forme est sautée elle aussi — un port qui n'a répondu
+    // aucun octet aux deux premières n'en répondra pas davantage à celle-ci.
+    if attempt.is_none() && !muet {
         let discover_hdrs: [(&str, &str); 2] = [
             ("MCP-Protocol-Version", "2026-07-28"),
             ("Mcp-Method", "server/discover"),
@@ -2583,6 +2645,42 @@ mod tests {
     use super::*;
     use std::thread;
 
+    /// Lit la requête HTTP COMPLÈTE (en-têtes + corps annoncé par
+    /// `Content-Length`) au lieu d'un `read` unique. Sous charge, un seul
+    /// `read` peut ne rendre que les en-têtes : la fixture qui décide sur
+    /// `req.contains("method")` répond alors à côté, et fermer une socket
+    /// avec un corps non lu envoie un RST au client (sonde en erreur). C'est
+    /// la cause des flakes entre tests `probe_http_*` parallèles (audit 01
+    /// constat 7, lot F point 6) — PAS une collision de ports.
+    fn lire_requete(s: &mut std::net::TcpStream) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            if let Some(p) = find_sub(&buf, b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..p]).to_ascii_lowercase();
+                let mut cl = 0usize;
+                for line in head.lines().skip(1) {
+                    if let Some(v) = line.trim().strip_prefix("content-length:") {
+                        cl = v.trim().parse().unwrap_or(0);
+                        break;
+                    }
+                }
+                if buf.len() >= p + 4 + cl {
+                    break;
+                }
+            }
+            if buf.len() > MAX_PROBE_READ * 2 {
+                break;
+            }
+            match s.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
     /// RÉGRESSION faux positifs : un port HTTP qui répond du JSON-RPC SANS
     /// serverInfo (`{"result":{}}`) ne doit JAMAIS être découvert comme
     /// serveur MCP — ni par `initialize`, ni par le repli `server/discover`
@@ -2600,10 +2698,7 @@ mod tests {
         thread::spawn(move || {
             for stream in l.incoming() {
                 let Ok(mut s) = stream else { continue };
-                use std::io::Read;
-                let mut buf = [0u8; 16384];
-                let n = s.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let req = lire_requete(&mut s);
                 // ne répondre qu'aux vraies requêtes JSON-RPC : sinon cette
                 // fixture empoisonne les sondes /health, /sse et WS des autres
                 // tests parallèles (tests flaky).
@@ -2705,9 +2800,7 @@ mod tests {
         thread::spawn(move || {
             for stream in l.incoming() {
                 let Ok(mut s) = stream else { return };
-                let mut buf = [0u8; 4096];
-                let n = s.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let req = lire_requete(&mut s);
                 let resp = if req.contains("Upgrade: websocket") {
                     "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
                 } else {
@@ -2739,11 +2832,31 @@ mod tests {
             "un serveur HTTP qui ne fait pas d'upgrade ne doit pas être marqué WS"
         );
 
-        // 3) port fermé → false, jamais de panic
-        let l3 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port3 = l3.local_addr().unwrap().port();
-        drop(l3);
-        assert!(!ws_upgrade_host("127.0.0.1", port3, "/mcp", 600));
+        // 3) port fermé → false, jamais de panic. Le port rendu par bind(:0)
+        //    puis RELÂCHÉ peut être repris par un test parallèle entre le drop
+        //    et la sonde (collision de ports éphémères) : on retire un port
+        //    tant que celui qu'on vient de relâcher répond encore.
+        let mut ferme_verifie = false;
+        for _ in 0..8 {
+            let l3 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port3 = l3.local_addr().unwrap().port();
+            drop(l3);
+            let repris = std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], port3)),
+                std::time::Duration::from_millis(200),
+            )
+            .is_ok();
+            if repris {
+                continue;
+            }
+            assert!(!ws_upgrade_host("127.0.0.1", port3, "/mcp", 600));
+            ferme_verifie = true;
+            break;
+        }
+        assert!(
+            ferme_verifie,
+            "aucun port resté fermé après 8 tirages (machine anormalement chargée)"
+        );
     }
 
     #[test]
@@ -2816,12 +2929,7 @@ mod tests {
                     Ok(s) => s,
                     Err(_) => return,
                 };
-                let mut buf = [0u8; 16384];
-                let n = match stream.read(&mut buf) {
-                    Ok(n) => n,
-                    Err(_) => continue,
-                };
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let req = lire_requete(&mut stream);
                 // sonde de port (TCP nu, pas de JSON-RPC) : on ferme sans consommer de réponse
                 if !req.contains("\"method\"") {
                     continue;
@@ -2895,12 +3003,7 @@ mod tests {
         thread::spawn(move || {
             for stream in l.incoming() {
                 let Ok(mut s) = stream else { return };
-                let mut buf = [0u8; 16384];
-                let n = match s.read(&mut buf) {
-                    Ok(n) => n,
-                    Err(_) => continue,
-                };
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let req = lire_requete(&mut s);
                 if !req.starts_with("POST / ") {
                     let _ = s.write_all(
                         b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -3056,12 +3159,7 @@ tcp4       0      0  127.0.0.1.135          *.*                    LISTEN\n";
                     Ok(s) => s,
                     Err(_) => return,
                 };
-                let mut buf = [0u8; 16384];
-                let n = match stream.read(&mut buf) {
-                    Ok(n) => n,
-                    Err(_) => continue,
-                };
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let req = lire_requete(&mut stream);
                 if req.starts_with("GET /health") {
                     let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
                     let _ = stream.write_all(resp.as_bytes());
@@ -3150,9 +3248,7 @@ tcp4       0      0  127.0.0.1.135          *.*                    LISTEN\n";
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut s) = stream else { return };
-                let mut buf = [0u8; 8192];
-                let _ = s.read(&mut buf);
-                let req = String::from_utf8_lossy(&buf).to_string();
+                let req = lire_requete(&mut s);
                 let resp = if req.starts_with("GET /api/hello") {
                     let body = r#"{"app":"mcp-control","version":"0.7.1","nonce":"aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233"}"#;
                     format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
@@ -3189,8 +3285,7 @@ tcp4       0      0  127.0.0.1.135          *.*                    LISTEN\n";
         let port = listener.local_addr().unwrap().port();
         thread::spawn(move || {
             if let Ok((mut s, _)) = listener.accept() {
-                let mut buf = [0u8; 8192];
-                let _ = s.read(&mut buf);
+                let _ = lire_requete(&mut s);
                 let body = b"Use /health";
                 let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), String::from_utf8_lossy(body));
                 let _ = s.write_all(resp.as_bytes());
@@ -3203,12 +3298,22 @@ tcp4       0      0  127.0.0.1.135          *.*                    LISTEN\n";
 
     #[test]
     fn probe_http_port_ferme_est_down() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let p = probe_http(port, "/mcp", 800);
-        assert!(!p.mcp_up);
-        assert!(!p.port_open);
+        // Un port rendu par bind(:0) puis RELÂCHÉ peut être repris par un autre
+        // test parallèle entre le drop et la sonde (collision de ports
+        // éphémères, audit 01 constat 7) : on ne conclut que sur un port resté
+        // fermé, en retirant un port si celui-ci a été repris.
+        for _ in 0..8 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let p = probe_http(port, "/mcp", 800);
+            if p.port_open {
+                continue; // port repris par un test parallèle : on retire
+            }
+            assert!(!p.mcp_up, "un port fermé ne doit jamais être UP");
+            return;
+        }
+        panic!("aucun port resté fermé après 8 tirages (machine anormalement chargée)");
     }
 
     #[test]
@@ -3405,9 +3510,7 @@ tcp4       0      0  127.0.0.1.135          *.*                    LISTEN\n";
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         thread::spawn(move || {
             if let Ok((mut s, _)) = l.accept() {
-                let mut buf = [0u8; 4096];
-                let n = s.read(&mut buf).unwrap_or(0);
-                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+                let _ = tx.send(lire_requete(&mut s));
                 let _ = s.write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\n");
             }
         });
@@ -3458,12 +3561,7 @@ tcp4       0      0  127.0.0.1.135          *.*                    LISTEN\n";
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut s) = stream else { return };
-                let mut buf = [0u8; 16384];
-                let n = match s.read(&mut buf) {
-                    Ok(n) if n > 0 => n,
-                    _ => continue,
-                };
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let req = lire_requete(&mut s);
                 if req.contains("\"initialize\"") {
                     let body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"serverInfo\":{\"name\":\"stateful-mcp\",\"version\":\"1.0.0\"}}}";
                     let resp = format!(
@@ -3560,6 +3658,72 @@ tcp4       0      0  127.0.0.1.135          *.*                    LISTEN\n";
         assert!(
             err.contains("127.0.0.1"),
             "l'erreur doit venir de l'hôte qui a accepté la connexion : {err}"
+        );
+    }
+
+    #[test]
+    fn probe_http_port_muet_une_seule_forme_envoyee() {
+        // Régression lot A : un port muet (accepte, ne répond jamais) doit être
+        // classé après UNE SEULE forme de sonde. L'ancien code rejouait les
+        // 3 formes (legacy, strict, server/discover) — le muet encaissait
+        // ~18-25 s (3 × timeout) et fixait la période du cycle entier.
+        // Comptage par connexions acceptées : 1 port_open + 1 forme = 2
+        // (l'ancien comportement en donnait 4 : port_open + 3 formes).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind muet lot A");
+        let port = listener.local_addr().expect("local_addr muet lot A").port();
+        let compteur = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = compteur.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::mem::forget(stream); // accepte, ne répond jamais
+            }
+        });
+        let p = probe_http(port, "/mcp", 900);
+        assert!(!p.mcp_up);
+        let n = compteur.load(std::sync::atomic::Ordering::SeqCst);
+        // 2 = la sonde de port + la forme unique. Le seuil rejette l'ancien
+        // comportement (3 formes rejouées = 4 et plus). La tolérance à 1
+        // couvre les sondes qui n'ouvrent qu'une connexion ; la cause des
+        // flakes entre tests parallèles (port relâché puis repris, requête
+        // lue à moitié) est corrigée dans les fixtures (lire_requete +
+        // retirage des ports relâchés), pas ici.
+        assert!(
+            n <= 2,
+            "un port muet ne doit subir qu'une seule forme de sonde (port_open + 1 forme), \
+             pas les 3 formes rejouées de l'ancien code — compté : {n}"
+        );
+        let err = p.error.expect("erreur attendue");
+        assert!(
+            err.contains("127.0.0.1"),
+            "l'erreur publiée doit venir de la forme qui a expiré : {err}"
+        );
+    }
+
+    #[test]
+    fn http_post_publie_l_erreur_de_l_hote_qui_a_accepte() {
+        // Régression lot A (même défaut que probe_http, corrigé au lot 2) :
+        // un port muet sur ::1 (127.0.0.1 fermé) ne doit PAS afficher le
+        // « connexion refusée » du repli 127.0.0.1 — l'erreur de l'hôte qui
+        // a accepté la connexion (délai dépassé) doit être publiée.
+        let listener = std::net::TcpListener::bind("[::1]:0").expect("bind muet ::1");
+        let port = listener.local_addr().expect("local_addr muet ::1").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::mem::forget(stream); // accepte, ne répond jamais
+            }
+        });
+        let err = match http_post(port, "/mcp", "{}", 900) {
+            Err(e) => e,
+            Ok(_) => panic!("un port muet doit échouer"),
+        };
+        assert!(
+            err.contains("::1"),
+            "l'erreur doit venir de l'hôte qui a accepté (::1) : {err}"
+        );
+        assert!(
+            !err.contains("10061") && !err.contains("refus"),
+            "l'erreur du repli (127.0.0.1 refusé) ne doit pas être publiée : {err}"
         );
     }
 

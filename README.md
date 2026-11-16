@@ -147,6 +147,10 @@ l'interrupteur **ON** dans la liste.
 | ⚪ **DOWN** | fermé | ne répond pas | serveur arrêté / planté | **▶** pour le relancer |
 | ⚫ **DISABLED** | — | — | **mis en pause par toi** | **▶ Reprendre** |
 
+### Le rythme de supervision suit ton réglage
+
+L'app sonde les serveurs à l'**intervalle de sondage** réglé dans **⚙ Réglages → Général** (15 s par défaut, 5 s minimum). Un serveur qui accepte la connexion sans jamais répondre, ou qui met plusieurs secondes à répondre, ne décale plus les autres : chaque cycle part à l'heure, un serveur encore en cours de sonde est simplement sauté ce tour-ci, et un port muet est classé en une dizaine de secondes au lieu d'attendre trois délais complets. Un serveur lent mais vivant (réponse en ~6 s) reste classé **UP**.
+
 ### Reproduire les 4 états chez soi
 
 ```bash
@@ -194,7 +198,7 @@ au PHP, avec leur langage. Le badge `STDIO` / `HTTP` / `WS` indique le transport
 | **⟳** | Rafraîchit tout et cherche les nouveaux serveurs |
 | **🔍 Scanner les ports** | Cherche des serveurs sur une plage de ports (512 ports max par scan) |
 | **🌐 Scanner le réseau** | Cherche des serveurs sur les autres PC du réseau |
-| **🖥️ Machines** | Va chercher les serveurs d'une autre machine (VPS, serveur…) via SSH |
+| **🖥️ Machines** | Va chercher les serveurs d'une autre machine (VPS, serveur…) via SSH — et détecte aussi les autres instances MCP Control du réseau local |
 | **🛒 Boutique** | 63 serveurs MCP prêts à installer en 1 clic |
 | **+ Ajouter un serveur** | Ajouter un serveur à la main — ou coller un bloc `mcpServers` / une URL dans la même fenêtre (les variables `env` des serveurs stdio sont conservées, jamais renvoyées par l'API) |
 | **⚙ Réglages** | Rafraîchissement, plages de scan, accès réseau, notifications (toast + webhook), thème clair/sombre, réinitialisation |
@@ -205,8 +209,8 @@ au PHP, avec leur langage. Le badge `STDIO` / `HTTP` / `WS` indique le transport
 | **⚡** | **Autoboot du serveur** : le relancer automatiquement au démarrage de l'app et après un crash |
 | **⏸ Mettre en pause** | Retire le serveur de la supervision (il reste dans la liste, réactivable) |
 | **🗑 Supprimer** | Enlève le serveur de la liste |
-| **⇅** | Ranger la liste (A→Z, état, rapidité…) — ou glisse une ligne à la main |
-| **Auto-boot** (barre du Journal, en bas) | Ouvrir l'app elle-même au démarrage de l'ordinateur (dans la zone de notification, sans fenêtre) |
+| **⇅** | Ranger la liste — ⇅ manuel, A→Z, état, port, latence, tools, framework, transport — ou glisse une ligne à la main |
+| **Auto-boot** (barre du Journal, en bas) | Ouvrir l'app elle-même au démarrage de l'ordinateur (dans la zone de notification, sans fenêtre). Au démarrage, une copie de l'app ne touche l'entrée que si elle pointe déjà sur son propre exécutable : une version de développement ou une instance d'essai ne casse pas le démarrage automatique de l'installation réelle |
 
 ![La boutique](assets/readme-boutique.png)
 *63 serveurs MCP à installer d'un clic, avec leurs logos officiels. En-tête collant : recherche instantanée, tri A→Z, filtre « Masquer les installés » — les déjà présents sont marqués.*
@@ -217,9 +221,26 @@ L'app n'est pas seulement une fenêtre : elle **expose un vrai serveur MCP** sur
 
 | Groupe | Tools |
 |---|---|
-| **Superviser** (lecture) | `list_servers` (états fins + filtre), `server_detail`, `list_server_tools`, `journal`, `runtime_history`, `list_peers`, `store_catalog`, `list_frameworks`, `get_settings` |
-| **Agir** (boutons de l'UI) | `refresh`, `scan_ports`, `scan_network`, `discover_peers`, `add_server`, `remove_server`, `toggle_server`, `start_server`, `stop_server`, `set_start_command`, `set_host`, `toggle_tool`, `set_auto_restart`, `reorder_servers`, `import_config`, `install_store_server`, `ssh_save`, `ssh_forget`, `ssh_discover`, `check_update` |
+| **Superviser** (lecture) | `list_servers` (états fins + filtre), `server_detail`, `list_server_tools`, `journal`, `runtime_history`, `list_peers`, `store_catalog`, `list_frameworks`, `get_settings`, `check_update` (le bouton « Vérifier » des réglages : interroge GitHub, ne touche à aucun serveur) |
+| **Agir** (boutons de l'UI) | `refresh`, `scan_ports`, `scan_network`, `discover_peers`, `add_server`, `remove_server`, `toggle_server`, `start_server`, `stop_server`, `set_start_command`, `set_host`, `toggle_tool`, `set_auto_restart`, `reorder_servers`, `import_config`, `install_store_server`, `ssh_save`, `ssh_forget`, `ssh_discover` |
 | **Gateway** (proxy) | `call_server_tool(server, tool, arguments)` — appelle un outil de n'importe quel serveur HTTP **détecté UP**, en respectant l'interrupteur par outil de l'UI |
+
+Les schémas sont **stricts** : un paramètre inconnu est refusé (`-32602`) avant tout effet. Ceux qui changent quelque chose pour toi :
+
+| Tool | Paramètre à connaître |
+|---|---|
+| `list_servers` | `state` : `up`, `down`, `port_only` ou `disabled` |
+| `journal` | `limit` (1 à 500, 40 par défaut) |
+| `store_catalog` | `query` : recherche plein texte dans le catalogue |
+| `scan_ports`, `scan_network` | `from`, `to` (sinon les plages réglées dans l'app) |
+| `add_server` | `transport` (`http` ou `stdio`) + `port`/`host`/`path`, ou `program`/`args`/`workdir` |
+| `remove_server` | `durable: true` : empêche aussi un serveur de base d'être réinjecté au démarrage |
+| `set_start_command` | `program: null` : **retire** la commande de lancement (l'autoboot du serveur est désactivé, le process en cours n'est pas tué) |
+| `install_store_server` | `args`, et `env` (`{"GITHUB_TOKEN": "…"}`) pour les items de la boutique qui demandent un jeton |
+| `ssh_discover` | `ip` (sans `ip` : toutes les machines enregistrées) |
+| `call_server_tool` | `server`, `tool`, `arguments` |
+
+**Installer depuis la boutique avec un jeton.** L'API locale (`install_store`) et le tool `install_store_server` acceptent `env` à l'installation : les valeurs ne sortent jamais — ni `/api/state`, ni `/api/detail`, ni la réponse, ni le journal (noms seuls) — et n'atteignent que le process lancé (exemple `curl` dans [Pour aller plus loin](#pour-aller-plus-loin)). Le bouton Installer de l'app ne propose pas encore de champ de saisie.
 
 Plus des **ressources** à parcourir : `mcp-control://servers` (aperçu), `mcp-control://server/<id>` (une par serveur détecté, mise à jour à chaque changement de détection), `mcp-control://journal`, `mcp-control://settings`.
 
@@ -233,7 +254,7 @@ Concrètement, ton assistant (ZCode, Claude Desktop…) déclare simplement :
 
 **Sécurité et limites, volontairement :**
 
-- même port, même sas que l'API : en local (loopback) aucun code n'est demandé ; si l'app est exposée au réseau, le **code d'accès** est exigé (`X-MCC-Access` ou `?access=`), exactement comme pour `/api/*` ;
+- même port, même sas que l'API : en local (loopback) aucun code n'est demandé ; si l'app est exposée au réseau, le **code d'accès** est exigé (`X-MCC-Access` ou `?access=`), exactement comme pour `/api/*` — la page de saisie et l'app desktop passent par l'en-tête, `?access=` reste accepté pour ouvrir l'interface depuis une autre machine ;
 - **`add_server` + `start_server` lancent un programme au choix du client sur la machine** — c'est le principe même d'un serveur stdio : qui obtient le code d'accès obtient le droit d'exécuter du code, il n'existe pas de réglage intermédiaire (expose l'app au réseau en connaissance de cause) ;
 - les outils qui touchent au sas de confiance (`set_settings`, `set_autostart`, `set_notify`, `reset_state`, `reset_runtime`, `open_path`) ne sont **pas** exposés en MCP — ces gestes restent des gestes UI locaux ; ne sont pas non plus exposés : `set_favorite` (préférence d'affichage), `import_peer`, `test_notify` (déclenche un toast et une requête sortante), `open_release_page` / `download_update` (ouvrent un navigateur / lancent un téléchargement), ni les alias stdio `kill_stdio` / `start_stdio` ni l'action interne `discover` (le cœur du bouton ⟳) ;
 - le proxy `call_server_tool` ne couvre que les serveurs HTTP détectés **UP** (stdio, SSH et hors-ligne sont refusés avec le motif exact) ;
@@ -243,13 +264,13 @@ Concrètement, ton assistant (ZCode, Claude Desktop…) déclare simplement :
 
 | Problème | Solution |
 |---|---|
-| Mon serveur n'apparaît pas | Clique **⟳**. Sinon : **+ Ajouter un serveur** avec son numéro de port |
+| Mon serveur n'apparaît pas | Clique **⟳** : il re-sonde tout et cherche les nouveaux sur **tous les ports en écoute** de la machine. Sinon : **+ Ajouter un serveur** avec son numéro de port |
 | « Code d'accès » demandé | Ça n'arrive JAMAIS sur ton PC — seulement si tu ouvres l'app depuis une autre machine. Le code est dans `config.json` |
 | L'app ne s'ouvre plus | Elle est peut-être déjà dans la zone de notification (près de l'horloge) — clique sur son icône |
 | Où voir l'historique ? | Barre « Journal » en bas de la fenêtre — clique dessus pour la déplier |
 | Un serveur ne redémarre pas | L'app réessaie avec des délais croissants (5 s → 5 min), puis arrête d'insister après 5 échecs d'affilée. Clique **▶** pour réessayer |
-| La fenêtre affiche « moteur injoignable » | Le moteur ne répond plus au rafraîchissement : la page réessaie seule toutes les 5 s — le bandeau (et le grisage des compteurs) disparaît dès la première réponse |
-| Tous mes serveurs distants sont DOWN | Un **VPN** coupe souvent le réseau local : un bandeau rouge s'affiche en haut. Déconnecte-le ou active « autoriser les connexions LAN » |
+| La fenêtre affiche « moteur injoignable » | Le moteur ne répond plus au rafraîchissement : la page réessaie seule toutes les 2 s. Le bandeau (et le grisage des compteurs) apparaît au 2ᵉ échec consécutif — une vingtaine de secondes après la panne avec l'intervalle par défaut, mesuré 19,6 s — et disparaît dès la première réponse (mesuré : quelques millisecondes après le retour du moteur) |
+| Tous mes serveurs distants sont DOWN | Un **VPN** coupe souvent le réseau local : une **pastille rouge** apparaît dans la barre du Journal (le message complet s'affiche au clic). Déconnecte-le ou active « autoriser les connexions LAN » |
 | Mes serveurs ont disparu de la liste | Ils ont peut-être été mis **en pause** (⚫ DISABLED) : clique **▶ Reprendre** dans leur détail |
 
 ## Pour aller plus loin
@@ -267,6 +288,12 @@ curl "http://127.0.0.1:5090/api/detail?id=seed-overmind"
 # une action (refresh, toggle, scan, add, remove, start, kill…)
 curl -X POST -H "Content-Type: application/json" \
   -d '{"action":"add","transport":"stdio","label":"mon-mcp","program":"node","args":["dist/index.js"]}' \
+  http://127.0.0.1:5090/api/action
+
+# installer un serveur de la boutique en lui passant son jeton
+# (les valeurs ne ressortent jamais : noms seuls dans l'API et le journal)
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"action":"install_store","id":"github","env":{"GITHUB_TOKEN":"ghp_…"}}' \
   http://127.0.0.1:5090/api/action
 
 # la même app est un SERVEUR MCP (gateway) — lister ses tools :
@@ -297,9 +324,12 @@ curl -X POST -H "Content-Type: application/json" \
 
 ```bash
 cargo build --release -p mcp-control -p mcp-control-desktop
-cargo test                                    # ~197 tests unitaires + suite E2E (tests/e2e)
+cargo test --lib                              # ~214 tests unitaires
+cargo test --test e2e                          # scénarios bout en bout (moteur réel)
 cargo fmt --check && cargo clippy --all-targets -- -D warnings   # ce que vérifie la CI
 ```
+
+> `cargo test` nu peut bloquer sur les doctests d'une dépendance locale : utilise les deux commandes ci-dessus, comme la CI.
 
 - `target/release/mcp-control-desktop(.exe)` → la fenêtre de l'app (Tauri)
 - `target/release/mcp-control(.exe)` → juste le moteur, sans fenêtre

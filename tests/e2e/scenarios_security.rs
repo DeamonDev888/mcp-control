@@ -11,6 +11,8 @@
 //! - OPTIONS → 403 ; Host/Origin étrangers → 403 ; /api hors loopback → 401 ;
 //! - JSON malformé / action inconnue → 200 avec {"ok":false,...} ;
 //! - bloc d'en-têtes > 1 MiB → connexion fermée sans réponse (le moteur survit).
+//! - (lot B) réponse set_notify masquée (headers_set) + motif précis du refus
+//!   d'URL webhook (TLS pour https, « instance » pour la boucle sur soi).
 //!
 //! À exécuter SEUL (jamais en parallèle des autres scénarios) :
 //! `cargo test --test e2e scenarios_security -- --test-threads=1`
@@ -547,23 +549,24 @@ fn webhook_https_et_auto_instance_refuses_journalise_et_test_notify() {
     let recu = RecepteurWebhook::demarrer();
     let url_receveur = format!("http://127.0.0.1:{}/hook", recu.port);
 
-    // 1. https:// → refus à l'enregistrement. Le message PRÉCIS (TLS) est
-    // porté par webhook_url_reject_reason et appliqué À L'ENVOI (notify.rs,
-    // cf. test unitaire) ; le handler set_notify (actions.rs, hors périmètre
-    // du lot 5) retourne son message générique « invalide » — le volet UI
-    // affiche lui le message clair avant d'atteindre le moteur.
+    // 1. https:// → refus à l'enregistrement avec le motif PRÉCIS (lot B
+    // point 3 : le handler set_notify renvoie désormais
+    // notify::webhook_url_reject_reason — plus le vieux message générique qui
+    // citait encore https:// comme une forme valide).
     let r = e.post_json(
         "/api/action",
         &json!({"action": "set_notify", "webhook_url": "https://example.com/hook"}),
     );
     assert_eq!(r.json()["ok"], json!(false), "https:// doit être refusé");
+    let erreur = r.json()["error"].as_str().unwrap_or_default().to_string();
     assert!(
-        r.json()["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("invalide"),
-        "refus d'enregistrement attendu, obtenu : {}",
+        erreur.contains("TLS"),
+        "motif TLS précis attendu, obtenu : {}",
         r.text().chars().take(200).collect::<String>()
+    );
+    assert!(
+        !erreur.contains("ou https"),
+        "l'ancien message générique ne doit plus sortir"
     );
 
     // 2. URL qui vise CETTE instance → refus (boucle sur soi)
@@ -583,8 +586,8 @@ fn webhook_https_et_auto_instance_refuses_journalise_et_test_notify() {
         r2.json()["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("invalide"),
-        "refus d'enregistrement attendu, obtenu : {}",
+            .contains("instance"),
+        "motif précis « cette instance elle-même » attendu, obtenu : {}",
         r2.text().chars().take(200).collect::<String>()
     );
 
@@ -845,5 +848,77 @@ fn notification_label_hostile_passe_par_les_deux_canaux() {
     assert!(
         journal.contains("insolent"),
         "le label hostile figure dans la ligne de journal (serveur « … »)"
+    );
+}
+
+/// Lot B, points 2-3 : la RÉPONSE de set_notify masque les en-têtes du
+/// webhook (même surface que /api/state — un Authorization ne doit sortir ni
+/// ici ni là), et le refus d'URL à l'enregistrement porte le motif PRÉCIS de
+/// notify::webhook_url_reject_reason (TLS pour https://, « http:// attendu »
+/// pour un autre schéma — plus le vieux « http:// ou https:// attendu »).
+#[test]
+fn set_notify_reponse_masquee_et_motif_precis() {
+    let _garde = crate::harness::serial_guard();
+    let e = spawn_loopback();
+
+    // 1. enregistrement avec en-têtes → la réponse ne transporte JAMAIS la valeur
+    let r = e.post_json(
+        "/api/action",
+        &json!({
+            "action": "set_notify",
+            "desktop": true,
+            "webhook_url": "http://hooks.exemple.test/hook",
+            "headers": "X-Jeton: valeur-e2e-5392"
+        }),
+    );
+    assert_eq!(r.status, 200);
+    let j = r.json();
+    assert_eq!(
+        j["ok"],
+        json!(true),
+        "enregistrement accepté : {}",
+        r.text().chars().take(200).collect::<String>()
+    );
+    assert_eq!(
+        j["notify"]["headers_set"],
+        json!(true),
+        "booléen headers_set attendu dans la réponse set_notify"
+    );
+    assert!(
+        j["notify"].get("headers").is_none(),
+        "les en-têtes ne doivent PAS sortir en clair dans la réponse set_notify"
+    );
+    assert!(
+        !r.text().contains("valeur-e2e-5392"),
+        "valeur d'en-tête qui fuite dans la réponse set_notify : {}",
+        r.text().chars().take(300).collect::<String>()
+    );
+
+    // 2. URL https:// → motif précis TLS (plus le vieux message générique)
+    let r2 = e.post_json(
+        "/api/action",
+        &json!({"action": "set_notify", "webhook_url": "https://hooks.exemple.test/hook"}),
+    );
+    let j2 = r2.json();
+    assert_eq!(j2["ok"], json!(false));
+    let err2 = j2["error"].as_str().unwrap_or_default();
+    assert!(err2.contains("TLS"), "motif TLS attendu, obtenu : {err2}");
+    assert!(
+        !err2.contains("ou https"),
+        "l'ancien message générique ne doit plus sortir"
+    );
+
+    // 3. autre schéma → motif précis aussi (http:// attendu)
+    let r3 = e.post_json(
+        "/api/action",
+        &json!({"action": "set_notify", "webhook_url": "ftp://hooks.exemple.test/hook"}),
+    );
+    let j3 = r3.json();
+    assert_eq!(j3["ok"], json!(false));
+    let err3 = j3["error"].as_str().unwrap_or_default();
+    assert!(err3.contains("http://"), "motif attendu, obtenu : {err3}");
+    assert!(
+        !err3.contains("ou https"),
+        "l'ancien message générique ne doit plus sortir"
     );
 }

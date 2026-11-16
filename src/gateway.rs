@@ -532,7 +532,19 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
             "Re-sonde tous les serveurs et relance la recherche des nouveaux \
              (équivalent du bouton ⟳) : rafraîchit les états, latences et \
              catalogue d'outils de chaque serveur.",
-            act(state, "refresh"),
+            {
+                let st = Arc::clone(state);
+                move |_args| {
+                    // ⟳ de l'UI (refreshAll) : re-sonde de TOUS les serveurs
+                    // (poll_all — pool non bloquant, les serveurs encore en
+                    // sonde sont sautés) PUIS recherche des nouveaux (action
+                    // discover = scan_listening). Régression lot A : l'ancien
+                    // handler envoyait {"action":"refresh"} sans id — le
+                    // dispatcher exige un id → « id manquant » à chaque appel.
+                    manage::poll_all(&st);
+                    do_action(&st, json!({ "action": "discover" }))
+                }
+            },
         )
         .annotate("scan_ports", modifies("Scan de ports"))
         .tool_typed(
@@ -801,7 +813,9 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
         .tool_typed(
             "install_store_server",
             "Installe un serveur du catalogue boutique en un clic (id du \
-             catalogue, voir store_catalog).",
+             catalogue, voir store_catalog). `env` fournit les variables \
+             d'environnement du process lancé (jetons d'API) — les valeurs ne \
+             sont jamais renvoyées par la suite (noms seuls dans l'API).",
             zod::object()
                 .field(
                     "id",
@@ -814,10 +828,23 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                         zod::array(zod::string()),
                     ),
                 )
+                .opt(
+                    "env",
+                    zod::describe(
+                        "variables d'environnement du process (ex. GITHUB_TOKEN) — \
+                         valeurs jamais renvoyées par la suite",
+                        zod::record(zod::string()),
+                    ),
+                )
                 .strict(),
             {
                 let st = Arc::clone(state);
-                move |args| do_action(&st, action_req("install_store", args, &["id", "args"]))
+                move |args| {
+                    do_action(
+                        &st,
+                        action_req("install_store", args, &["id", "args", "env"]),
+                    )
+                }
             },
         )
         .annotate("ssh_save", modifies("Enregistrer une machine"))

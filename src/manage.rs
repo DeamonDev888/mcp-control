@@ -36,9 +36,13 @@ pub fn tools_actifs(s: &Server) -> usize {
         .count()
 }
 
-/// Nombre de sondes menées en parallèle par cycle. Les serveurs lents (SSH,
-/// process MCP muet) ne doivent pas retarder tout le monde : avec 30 serveurs
-/// dont 15 en SSH, un cycle séquentiel dépassait largement le refresh de 15 s.
+/// Supervision : les sondes tournent sur un pool persistant de 12 workers
+/// (manage/litemcp.rs) — chaque serveur publie son état à la fin de SA sonde,
+/// sans attendre les serveurs lents (SSH, process MCP muet), qui sont sautés
+/// par le cycle suivant tant que leur sonde tourne. L'ancien découpage en
+/// paquets de 8 joints par `thread::scope` imposait une barrière par paquet :
+/// avec 30 serveurs dont 15 en SSH, un cycle séquentiel dépassait largement
+/// le refresh de 15 s.
 // litemcp : déplacé vers manage/litemcp.rs (v0.7.20) — réexport pour API stable.
 mod litemcp;
 pub(crate) use litemcp::*;

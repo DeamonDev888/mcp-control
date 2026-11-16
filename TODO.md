@@ -1,6 +1,7 @@
 # TODO — Plan d'améliorations MCP Control
 
 **Date** : 2026-10-26 · Base : audit complet du 2026-10-26 (les 5 fichiers `AUDIT-*.md` ont été retirés du dépôt) + 3 analyses parallèles (tests E2E, performances, refactorisation).
+**Mise à jour** : 2026-11-15 — lots A (moteur), B (autostart + sécurité), C (interface), F (finition), G (passe navigateur) et D (docs) livrés, non commités (rapports dans `restes-agents/`) ; section 5 réécrite en conséquence.
 Tailles : **S** = ≤ ½ jour · **M** = 1-2 j · **L** = 3+ j.
 
 ---
@@ -173,27 +174,34 @@ En Attente après P0 : slowloris (2.6 ci-dessus) · `Host` requis (400 sinon) ·
 
 ---
 
-## 5. Reste à faire issu des lots de correction (2026-11-13, rapports `correctifs-agents/`)
+## 5. Reste à faire après les lots de correction (état au 2026-11-15)
 
-Lots 0-5 terminés (rapports dans `correctifs-agents/`, la doc et le CHANGELOG sont à jour). Restes PARTIEL et « découverts, non corrigés » de chaque lot :
+Lots 0-5 (2026-11-13) et lots A (moteur), B (autostart + sécurité), C (interface), F (finition) livrés (rapports dans `correctifs-agents/` puis `restes-agents/`). La liste 2026-11-13 (5.1 à 5.15) est close : points **livrés** retirés (5.1, 5.2, 5.4, 5.5, 5.6, 5.8, 5.9, 5.11, 5.12, 5.14, 5.15), points **tranchés** (5.10 : `?access=` conservé, D5 = a ; `env` conservé dans le tool `install_store_server`, D6 = a), point **non reproduit** retiré (5.7) et point **corrigé à la racine** (5.13, fixtures `probe_http_*`).
+
+Ce qui reste ouvert (nouvelle numérotation) :
 
 | # | Quoi | Source |
 |---|---|---|
-| 5.1 | **gateway : `set_start_command` n'implémente pas le retrait** — le schéma accepte `program:null` mais le dispatcher `set_start_cmd` (`src/manage/actions.rs`) répond « program manquant » | correctifs 01 (PARTIEL) |
-| 5.2 | **gateway : le tool `refresh` est cassé** — son handler envoie `{"action":"refresh"}` sans `id` → « id manquant » systématique ; le mapper sur `discover` (le bouton ⟳ de l'UI passe par `discover`) | correctifs 01 §4 |
-| 5.3 | **`kill` tue par port sans vérifier le pid enregistré** (audit 03 #11) : à arbitrer — D2=a ne couvre pas ce cas | correctifs 03 §4 |
-| 5.4 | `scan_from > scan_to` dans un config.json édité à la main : ignoré en silence par `scan_ports` (retour 0) — normaliser à la lecture | correctifs 03 §4 |
-| 5.5 | `install_store` n'accepte pas de `env` depuis la requête (complément naturel pour les items à token : GITHUB_TOKEN…) | correctifs 03 §4 |
-| 5.6 | **UI : refus moteur encore silencieux** sur `act()` générique (start/kill/refresh/toggle/remove), toggleAutostart, postReorder, removeSeedForever, doScanNet, refreshAll, doPeers, importPeer, sshForget, toggleTool — lire `j.ok` et toaster (l'état réel reste correct via load()) | correctifs 04 §4 |
-| 5.7 | `src/ui/app-boot.js` en fins de ligne mixtes (préexistant) | correctifs 04 §4 |
-| 5.8 | **set_notify : le message de refus d'URL à l'enregistrement (`src/manage/actions.rs`) cite encore « https:// attendu »** — utiliser `notify::webhook_url_reject_reason` (le refus https:// existe depuis le lot 5) | correctifs 05 §4 |
-| 5.9 | **la réponse de `set_notify` renvoie les en-têtes du webhook EN CLAIR** (via `notify::to_json`) à qui porte le code — utiliser `to_api_json` comme `/api/state` | correctifs 05 §4 |
-| 5.10 | code d'accès accepté en query `?access=` (audit 05 #9) : à arbitrer à part (le retirer peut casser l'ouverture de l'UI depuis une autre machine) | correctifs 05 §4 |
-| 5.11 | `allowed_hosts` figés au boot : une IP qui apparaît après le boot est refusée 403 (Host) jusqu'au redémarrage | correctifs 05 §4 |
-| 5.12 | **boot avec `autostart:false` efface l'entrée Run « MCP Control » de HKCU** (`sync_autostart_at_boot`, `src/manage/autostart.rs`) : ne toucher l'entrée que si elle pointe vers une autre installation | correctifs 02 §4 |
-| 5.13 | fixtures unitaires `probe_http_*` à lecture unique (flake non reproduit, 3× `cargo test --lib` verts) : si récidive, lire la requête jusqu'au corps complet | correctifs 02 §4 |
-| 5.14 | `http_post` / `rpc_call` (`src/probe.rs`) gardent l'écrasement `last_err` du second hôte — `rpc_call` n'a plus d'appelant interne | correctifs 02 §4 |
-| 5.15 | commentaire obsolète `src/manage.rs` (« paquets de 8 ») après le pool persistant du lot 2 | correctifs 02 §4 |
+| R1 | **`kill` / `stop_server` tue le process qui écoute sur le port sans vérifier le pid enregistré** — peut tuer un tiers qui a pris le port (observé : une fixture node tuée à la place du serveur visé) | A §4, C §4 |
+| R2 | **La découverte (⟳ / `discover`) sonde TOUS les ports en écoute de la machine** — en test, elle importe les serveurs réels de l'utilisateur et les annonces LiteMCP de `%TEMP%` dans la config de l'instance | A §4 |
+| R3 | **Adoption automatique du registre LiteMCP** : `poll_all` importe les annonces du registre local à chaque cycle et écrit la configuration quand une annonce s'applique | A §4 |
+| R4 | **Actions sans chemin de refus** (`reorder`, `scan_network`, `discover_peers`, `discover`, `set_autostart`) : toujours `ok:true`, aucun motif d'échec à afficher côté interface | C §4 |
+| R5 | **Aucune vérification d'empreinte à la mise à jour** : le téléchargement direct ne compare ni SHA-256 ni signature (le README documente pourtant `SHA256SUMS.txt` à la main) | TODO-RESTES, lot D |
+| R6 | **Flake de fond (produit)** : la découverte locale périodique sonde tous les ports en écoute et sature le pool de 12 sondes — une action `scan` synchrone peut attendre > 30 s (contourné dans le harnais par un délai de lecture à 60 s). À arbitrer : borner aux `network_ports` ou rendre la découverte non bloquante | F §4 |
+| R7 | `set_autostart` reste sans garde d'appartenance : appelé depuis une instance de développement, il réécrit l'entrée de l'installation réelle (comportement voulu « geste explicite », à revoir si l'on veut une confirmation côté interface) | B §4 |
+| R8 | `install_store_server` peut rendre `state:"DOWN"` quand `npx` est lent au premier spawn alors que le process démarre (cosmétique, se redresse au cycle suivant) | A §4 |
+| R9 | **Le bouton Installer de la boutique n'a pas de champ pour les variables d'environnement** : `env` n'est disponible que par l'API locale (`install_store`) et le tool `install_store_server` | A §1 point 6, `src/ui/app.js` (`installStore`) |
+| R10 | `recorded_run_value()` dépend du format texte de `reg query` (défaut sûr : entrée classée « ailleurs » donc jamais touchée, mais cassant si Microsoft change la sortie) | B §4 |
+| R11 | Le scénario E2E `scenarios_actions` appelle `set_autostart{enabled:false}` : sur une machine où l'entrée « MCP Control » existe, il la supprime (suite non neutre pour le registre) | F §4, B §4 |
+| R12 | `src/ui/app-boot.js` : fins de ligne mixtes préexistantes, couvertes par aucun test | C §4 |
+| R13 | Tolérance `n <= 2` de `probe_http_port_muet_une_seule_forme_envoyee` conservée (la cause réelle des flakes est corrigée dans les fixtures) | F §4 |
+| R14 | **Passe navigateur du lot C faite le 2026-11-15** (rapport `G-navigateur.md`) : toasts, bandeau et reprise conformes ; **non couverts** : le glisser-déposer (pas de drag dans le volet) et les largeurs 900 / 1 280 px (volet figé à 440 px) | G §1 |
+| R15 | **Refaire les trois captures du README à la main** : `assets/readme-accueil.png`, `assets/readme-detail.png`, `assets/readme-rust.png` (la dernière est datée du 2026-10-26, cinq jours avant les autres) | TODO-RESTES, « À faire à la main » |
+| R16 | **Le bandeau « moteur injoignable » arrive à ~20 s, pas 17 s** : chaque requête en échec coûte ~2 s, donc 15 s de cycle + 2 s + 2 s + 2 s. Mesuré 21,1 s après le dernier état reçu (19,6 s après la panne). À arbitrer : compter le 1er échec comme suffisant si la requête a duré > 1 s, ou réessayer sans délai après un échec de transport | G §1 point 2, G §2 (G1) |
+| R17 | **`sshForget` sur un pair inconnu rend un toast « échec »** (`{ok:false}` sans champ `error`) : même famille que R4, alors que `kill` / `remove` ont reçu leur motif | G §2 (G5) |
+
+<!-- Ligne du 2026-11-13 retirée le 2026-11-15 (périmée) :
+| 5.5 | `install_store` n'accepte pas de `env` depuis la requête (complément naturel pour les items à token : GITHUB_TOKEN…) | correctifs 03 §4 | -->
 
 ---
 

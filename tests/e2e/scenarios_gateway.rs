@@ -685,18 +685,47 @@ fn gateway_injection_action_refusee_et_program_null_nullable() {
 
     // audit constat 5 : program:null n'est PLUS refusé par le schéma
     // (nullable) — la réponse qui suit appartient au dispatcher, jamais
-    // une erreur JSON-RPC -32602
+    // une erreur JSON-RPC -32602. Lot A : le dispatcher RETIRE la commande
+    // (ok:true + removed:true) au lieu de répondre « program manquant ».
+    // On pose d'abord une commande pour que le retrait soit observable —
+    // sur un serveur LOCAL sans host (set_start_cmd refuse à raison un
+    // serveur avec host : la commande appartient à sa machine hôte).
+    let rep = eng.action(&json!({
+        "action": "add", "transport": "http",
+        "port": fx.port(), "path": "/mcp", "label": "e2e-gw-local-cmd"
+    }));
+    let id_local = rep["id"].as_str().expect("add local sans id").to_string();
     let rep = mcp(
         &eng,
         &rpc_call(
             "set_start_command",
-            json!({ "id": id, "program": null }),
+            json!({ "id": id_local, "program": "node", "args": ["srv.js"] }),
+            14,
+        ),
+    );
+    let sc = structured(rep, "set_start_command (pose)");
+    assert_eq!(sc["ok"], true, "la pose doit réussir : {sc}");
+    let rep = mcp(
+        &eng,
+        &rpc_call(
+            "set_start_command",
+            json!({ "id": id_local, "program": null }),
             13,
         ),
     );
     assert!(
         rep.get("error").is_none(),
         "program:null ne doit pas être refusé par le schéma : {rep}"
+    );
+    let sc = structured(rep, "set_start_command (retrait)");
+    assert_eq!(sc["ok"], true, "le retrait doit réussir : {sc}");
+    assert_eq!(sc["removed"], true, "le retrait doit être signalé : {sc}");
+    assert_eq!(
+        serveur_par_port(&eng, fx.port())
+            .and_then(|s| s.get("start_cmd").cloned())
+            .unwrap_or(Value::Null),
+        Value::Null,
+        "la commande doit être retirée de l'état du moteur"
     );
 }
 
@@ -757,5 +786,69 @@ fn gateway_auth_heritee_du_sas_api() {
     assert!(
         rep.get("result").is_some(),
         "ping LAN avec code sans result : {rep}"
+    );
+}
+
+/// tools/call refresh : l'équivalent MCP du bouton ⟳ — re-sonde de tous les
+/// serveurs + recherche des nouveaux. Régression lot A : l'ancien handler
+/// envoyait {"action":"refresh"} sans id, que le dispatcher exige pour
+/// « refresh » → « id manquant » systématique (isError à chaque appel).
+#[test]
+fn gateway_tool_refresh_re_sonde_et_decouvre_les_nouveaux() {
+    let _garde = serial_guard();
+    let eng = moteur();
+    let fx = Fixture::spawn_mcp();
+    let rep = ajoute_http(&eng, fx.port(), "e2e-gw-refresh");
+    let _id = rep["id"].as_str().expect("add sans id").to_string();
+    attend_up(&eng, fx.port());
+
+    // 1. le tool répond SANS erreur (l'ancien bug : « id manquant »)
+    let rep = mcp(&eng, &rpc_call("refresh", json!({}), 40));
+    let result = rep.get("result").expect("refresh sans result");
+    assert_ne!(
+        result.get("isError").and_then(Value::as_bool),
+        Some(true),
+        "tools/call refresh ne doit plus être en erreur : {rep}"
+    );
+    assert!(
+        !rep.to_string().contains("id manquant"),
+        "la régression « id manquant » est de retour : {rep}"
+    );
+
+    // 2. la recherche des nouveaux est passée : une fixture lancée APRÈS le
+    //    boot n'est connue d'aucun scan — seul le ⟳ (discover) peut la trouver
+    let fx2 = Fixture::spawn_mcp();
+    let _ = mcp(&eng, &rpc_call("refresh", json!({}), 41));
+    let decouvert = wait_until(DELAI_SNAPSHOT, || {
+        serveur_par_port(&eng, fx2.port())
+            .filter(|s| champ(s, "state") == "UP")
+            .map(|_| true)
+    });
+    assert!(
+        decouvert,
+        "le tool refresh doit découvrir les nouveaux serveurs MCP (fixture 2 jamais détectée)"
+    );
+
+    // 3. le journal raconte la recherche (scan local → scan terminé)
+    let sc = structured(
+        mcp(&eng, &rpc_call("journal", json!({ "limit": 100 }), 42)),
+        "journal",
+    );
+    let msgs: Vec<String> = sc["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e.get("msg").and_then(Value::as_str).map(String::from))
+        .collect();
+    assert!(
+        msgs.iter().any(|m| m.contains("scan local")),
+        "le journal ne raconte pas la recherche des nouveaux : {msgs:?}"
+    );
+
+    // 4. le serveur connu reste UP après les re-sondes
+    assert_eq!(
+        champ(&serveur_par_port(&eng, fx.port()).unwrap(), "state"),
+        "UP",
+        "le serveur connu doit rester UP après tools/call refresh"
     );
 }

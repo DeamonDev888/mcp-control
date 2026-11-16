@@ -306,7 +306,18 @@ pub fn load_config(path: &str) -> (Vec<Server>, crate::types::Settings) {
             }
         }
     }
-    let settings = parse_settings(&v, settings);
+    let mut settings = parse_settings(&v, settings);
+    // (lot A) plage de scan inversée (config.json édité à la main) :
+    // silencieusement ignorée par scan_ports (0 port rendu) — remise dans
+    // l'ordre au chargement, avec une ligne au journal de boot.
+    if settings.scan_from > settings.scan_to {
+        let (from, to) = (settings.scan_from, settings.scan_to);
+        std::mem::swap(&mut settings.scan_from, &mut settings.scan_to);
+        journal_boot(
+            path,
+            &format!("plage de scan inversée ({from} > {to}) — remise dans l'ordre au chargement"),
+        );
+    }
     // « Retirer durablement » : les seeds explicitement retirés ne sont pas réinjectés
     let removed: Vec<String> = settings.removed_seeds.clone();
     servers.retain(|s| !(s.origin == Origin::Seed && removed.contains(&s.id)));

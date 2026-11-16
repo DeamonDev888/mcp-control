@@ -172,6 +172,9 @@ async function load() {
     pollFails++;
     if (state === null) setDead(true, DEAD_BOOT_MSG);
     else if (pollFails >= 2) setDead(true, DEAD_MSG);
+    // panne : réessai RAPIDE (2 s) au lieu du prochain cycle complet —
+    // bandeau dès le 2ᵉ échec, ~refresh_secs+2 s au lieu de ~2×refresh_secs.
+    scheduleNext(POLL_RETRY_MS);
   }
 }
 
@@ -471,8 +474,7 @@ function saveFold(el) {
 }
 
 async function toggleAutostart() {
-  await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'set_autostart', enabled: !state.autostart})});
+  await postAction({action: 'set_autostart', enabled: !state.autostart});
   await load();
 }
 
@@ -543,9 +545,7 @@ async function groupDrop(ev, key) {
   const s = byId(moved);
   if (!s || s.transport !== 'http') { alert('Seuls les serveurs HTTP peuvent \u00eatre h\u00e9berg\u00e9s par une machine distante.'); return; }
   if (!confirm('H\u00e9berger « ' + (s.label || moved) + ' » sur ' + key + ' ? (le host du transport devient ' + key + ')')) return;
-  const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'set_host', id: moved, host: key})});
-  const j = await r.json().catch(() => ({}));
+  const j = await postAction({action: 'set_host', id: moved, host: key}, {quiet: true});
   if (!j.ok) alert('set_host : ' + (j.error || '\u00e9chec'));
   await load();
 }
@@ -603,8 +603,7 @@ function applySort(mode) {
   postReorder(ids);
 }
 async function postReorder(ids) {
-  await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'reorder', ids})}).catch(() => {});
+  await postAction({action: 'reorder', ids});
   await load();
 }
 function rowDragEnd(ev) {
@@ -892,9 +891,7 @@ async function setStartCmd(id) {
   const args = (document.getElementById('scArgs').value || '').split(/\s+/).filter(Boolean);
   const workdir = (document.getElementById('scWorkdir').value || '').trim();
   if (!program) { alert('Programme requis (ex : node, python, chemin .exe)'); return; }
-  const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'set_start_cmd', id, program, args, workdir: workdir || null})});
-  const j = await r.json();
+  const j = await postAction({action: 'set_start_cmd', id, program, args, workdir: workdir || null}, {quiet: true});
   if (!j.ok) alert(j.error || 'erreur');
   else { await load(); detailCache = null; if (selectedId) renderDetail(); }
 }
@@ -910,8 +907,7 @@ function removeSrv(id) {
 function removeSeedForever(id) {
   if (!confirm('Retirer ce seed DURABLEMENT ? Il ne sera pas réinjecté au redémarrage de MCP Control.')) return;
   selectedId = null; detailCache = null;
-  fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'remove', id, durable: true})}).then(load);
+  postAction({action: 'remove', id, durable: true}).then(() => load());
 }
 
 /* ===== Actions ===== */
@@ -1017,12 +1013,8 @@ function srvInfoText(s) {
 }
 async function openInExplorer(path) {
   if (!path) return;
-  try {
-    const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({action: 'open_path', path: path})});
-    const j = await r.json();
-    toast(j.ok ? 'explorateur ouvert' : ('échec : ' + (j.error || 'inconnu')), j.ok ? 'ok' : 'err');
-  } catch (e) { toast('échec : ' + e, 'err'); }
+  const j = await postAction({action: 'open_path', path: path}, {quiet: true});
+  toast(j.ok ? 'explorateur ouvert' : ('échec : ' + (j.error || 'inconnu')), j.ok ? 'ok' : 'err');
 }
 function rowCtx(ev, id) {
   ev.preventDefault();
@@ -1148,19 +1140,54 @@ document.addEventListener('keydown', (e) => {
 });
 window.addEventListener('resize', ctxClose);
 
+/* ===== Envoi d'action — UN SEUL chemin (lot C #1) =====
+   postAction(body, opts) : POST /api/action, lit j.ok, affiche j.error en
+   toast d'erreur et RENVOIE la réponse (les appelants réagissent à j.added,
+   j.found, j.started…). Tout envoi d'action de la page passe par ici —
+   contrat testé (plus aucun fetch d'action ailleurs). Les appelants qui
+   affichent déjà le refus dans leur propre zone (messages de dialog, volet
+   réglages, replis de mise à jour) passent {quiet: true} pour éviter un
+   double signal. */
+function netDown() {
+  // Panne réseau constatée (erreur de transport, pas un refus) : bandeau
+  // immédiat au lieu d'attendre le prochain cycle de sondage (lot C #3), et
+  // poll passé en réessai rapide. Renvoie une réponse synthétique ok:false
+  // pour que les appelants réagissent (repli downloadUpdate…).
+  if (!document.getElementById('loginDlg')?.open) {
+    pollFails = Math.max(pollFails, 1); // le prochain échec de poll compte comme 2ᵉ
+    setDead(true, state === null ? DEAD_BOOT_MSG : DEAD_MSG);
+    scheduleNext(POLL_RETRY_MS);
+  }
+  return {ok: false, error: 'moteur injoignable', netDown: true};
+}
+async function postAction(body, opts) {
+  let r;
+  try {
+    r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)});
+  } catch (e) {
+    return netDown(); // erreur réseau : bandeau immédiat (lot C #3)
+  }
+  let j = null;
+  try { j = await r.json(); } catch (e) { /* corps non JSON : couvert plus bas */ }
+  if (!j) {
+    // pas de corps JSON (ex. 401 pendant le dialog du code d'accès) : le
+    // dialog couvre déjà l'écran — pas de double signal.
+    if (document.getElementById('loginDlg')?.open) return {ok: false, error: "code d'accès requis"};
+    j = {ok: false, error: 'réponse illisible du moteur (HTTP ' + r.status + ')'};
+  }
+  if (!j.ok && !(opts && opts.quiet)) toast(j.error || 'échec', 'err'); // refus moteur : silence interdit (audit 04 #7)
+  return j;
+}
 async function act(action, id) {
-  await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action, id})});
+  await postAction({action, id});
   await load();
 }
 
 // Autoboot par serveur (⚡) : relance auto au démarrage de MCP Control
 // et après un crash. Persisté dans config.json par le moteur.
 async function setAuto(id, enabled) {
-  const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'set_auto_restart', id, enabled})});
-  const j = await r.json().catch(() => ({}));
-  if (!j.ok) toast(j.error || 'échec', 'err'); // refus moteur : silence interdit (audit 04 #7)
+  await postAction({action: 'set_auto_restart', id, enabled}); // refus toasté par le helper (audit 04 #7)
   await load();
   if (selectedId === id) { detailCache = null; await load(); }
 }
@@ -1168,10 +1195,7 @@ async function setAuto(id, enabled) {
 // Favori (⭐) : épingle la ligne en haut de sa section (persisté). L'épingle
 // s'applique À L'AFFICHAGE — l'ordre posé au glisser-déposer reste en base.
 async function setFavorite(id, enabled) {
-  const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'set_favorite', id, enabled})});
-  const j = await r.json().catch(() => ({}));
-  if (!j.ok) toast(j.error || 'échec', 'err'); // refus moteur : silence interdit (audit 04 #7)
+  await postAction({action: 'set_favorite', id, enabled}); // refus toasté par le helper (audit 04 #7)
   await load();
   if (selectedId === id) { detailCache = null; await load(); }
 }
@@ -1203,16 +1227,12 @@ async function doScan() {
   const btns = [...document.querySelectorAll('button[onclick*="doScan("]')];
   btns.forEach(b => { b.disabled = true; });
   try {
-    const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({action: 'scan'})});
-    const j = await r.json().catch(() => ({}));
+    const j = await postAction({action: 'scan'}, {quiet: true}); // refus toasté plus bas avec son préfixe
     if (!j.ok) toast('scan : ' + (j.error || 'échec'), 'err');
     else if (Number.isFinite(j.found)) {
       toast(j.found + ' serveur' + (j.found > 1 ? 's' : '') + ' MCP trouvé' + (j.found > 1 ? 's' : ''),
         j.found > 0 ? 'ok' : undefined);
     } else toast('scan terminé — le journal détaille le résultat');
-  } catch(e) {
-    toast('scan : ' + (e && e.message || 'échec'), 'err');
   } finally {
     scanBusy = false;
     btns.forEach(b => { b.disabled = false; });
@@ -1221,33 +1241,30 @@ async function doScan() {
 }
 
 async function doScanNet() {
-  await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'scan_network'})});
+  await postAction({action: 'scan_network'});
   await load();
 }
 
 async function refreshAll() {
   // Re-sonde les serveurs connus ET découvre les nouveaux (tous ports en
-  // écoute — action discover) en parallèle, un seul rechargement d'état à la fin.
-  const ids = state.servers.filter(s => s.enabled).map(s => s.id);
-  const jobs = ids.map(id =>
-    fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({action: 'refresh', id})}).catch(() => {}));
-  jobs.push(fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'discover'})}).catch(() => {}));
-  await Promise.all(jobs);
+  // écoute — action discover) en parallèle, un seul rechargement d'état à la
+  // fin. Sans toast par serveur (bruit) : un échec GLOBAL est signalé
+  // (lot C #1) ; une panne réseau arme de toute façon le bandeau via postAction.
+  const ids = (state && state.servers ? state.servers : []).filter(s => s.enabled).map(s => s.id);
+  const jobs = ids.map(id => postAction({action: 'refresh', id}, {quiet: true}));
+  jobs.push(postAction({action: 'discover'}, {quiet: true}));
+  const res = await Promise.all(jobs);
+  if (res.some(j => !j.ok)) toast('rafraîchissement global : au moins un appel a échoué', 'err');
   await load();
 }
 
 async function doPeers() {
-  await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'discover_peers'})});
+  await postAction({action: 'discover_peers'});
   await load();
 }
 
 async function importPeer(ip) {
-  await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'import_peer', ip})});
+  await postAction({action: 'import_peer', ip});
   await load();
 }
 
@@ -1374,9 +1391,7 @@ async function checkUpdateNow() {
   const msg = document.getElementById('updMsg');
   msg.style.color = '';
   msg.textContent = '⏳ vérification de la release GitHub…';
-  const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'check_update'})});
-  const j = await r.json();
+  const j = await postAction({action: 'check_update'}, {quiet: true});
   if (j.ok && j.checked && j.update_available) {
     document.getElementById('sLatest').textContent = 'v' + j.latest;
     msg.textContent = '\u2b06 v' + j.latest + ' disponible (installée : v' + j.current + ') — bouton « Mettre à jour » en bas à droite';
@@ -1397,12 +1412,9 @@ async function openReleasePage() {
   // défaut de la machine (action open_release_page, URL fixe sans argument).
   // Repli : si le moteur ne peut pas (headless sans navigateur), on tente
   // window.open — utile quand l'UI tourne dans un vrai navigateur.
-  try {
-    const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({action: 'open_release_page'})});
-    const j = await r.json();
-    if (j.ok) return;
-  } catch (e) { /* moteur injoignable : on tente le repli */ }
+  const j = await postAction({action: 'open_release_page'}, {quiet: true});
+  if (j.ok) return;
+  // moteur injoignable ou refus : repli window.open (navigateur classique)
   window.open('https://github.com/DeamonDev888/mcp-control/releases/latest', '_blank', 'noopener,noreferrer');
 }
 /* OS du navigateur — la machine où atterrit le téléchargement quand l'UI est
@@ -1426,19 +1438,17 @@ async function downloadUpdate() {
   const body = {action: 'download_update'};
   const os = browserOs();
   if (os) body.os = os;
-  try {
-    const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body)});
-    const j = await r.json();
-    if (j.url) lastUpdateUrl = j.url;
-    if (j.ok) { toast('téléchargement lancé : ' + (j.asset || 'mise à jour'), 'ok'); return; }
-    if (j.url) { window.open(j.url, '_blank', 'noopener,noreferrer'); return; }
-    toast(j.error || 'échec du téléchargement', 'err');
-  } catch (e) {
-    // moteur injoignable : repli sur la dernière URL connue, sinon message
+  const j = await postAction(body, {quiet: true});
+  if (j.netDown) {
+    // moteur injoignable (bandeau déjà armé) : repli sur la dernière URL connue
     if (lastUpdateUrl) window.open(lastUpdateUrl, '_blank', 'noopener,noreferrer');
     else toast('moteur injoignable — réessaie plus tard', 'err');
+    return;
   }
+  if (j.url) lastUpdateUrl = j.url;
+  if (j.ok) { toast('téléchargement lancé : ' + (j.asset || 'mise à jour'), 'ok'); return; }
+  if (j.url) { window.open(j.url, '_blank', 'noopener,noreferrer'); return; }
+  toast(j.error || 'échec du téléchargement', 'err');
 }
 async function resetState(what) {
   const sel = document.getElementById('sResetWhat');
@@ -1448,9 +1458,7 @@ async function resetState(what) {
   const row = document.getElementById('resetMsgRow');
   if (row) row.hidden = false;
   msg.textContent = '⏳ réinitialisation…';
-  const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'reset_state', what})});
-  const j = await r.json();
+  const j = await postAction({action: 'reset_state', what}, {quiet: true});
   if (!j.ok) msg.textContent = '✗ ' + (j.error || 'échec');
   else {
     const det = (j.reinjected ? ' · ' + j.reinjected + ' seed(s) réinjecté(s)' : '') + (j.removed ? ' · ' + j.removed + ' serveur(s) retiré(s)' : '');
@@ -1542,9 +1550,7 @@ async function saveSettings() {
   if (!form) return false;
   const msg = document.getElementById('settingsMsg');
   const parts = [];
-  const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(form.settings)});
-  const j = await r.json();
+  const j = await postAction(form.settings, {quiet: true});
   if (!j.ok) { msg.textContent = '\u2717 ' + (j.error || '\u00e9chec'); return false; }
   parts.push((j.changed || []).length
     ? '\u2713 enregistr\u00e9 : ' + j.changed.map(k => SETTINGS_LABELS[k] || k).join(', ')
@@ -1552,9 +1558,7 @@ async function saveSettings() {
   if ((j.changed || []).includes('ui_bind')) parts.push('l\u2019\u00e9coute s\u2019applique au prochain d\u00e9marrage');
   if (form.swapped) parts.push('plage de scan r\u00e9ordonn\u00e9e (du plus petit au plus grand port)');
   if (form.notifyChanged) {
-    const r2 = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(Object.assign({action: 'set_notify'}, form.notify))});
-    const j2 = await r2.json();
+    const j2 = await postAction(Object.assign({action: 'set_notify'}, form.notify), {quiet: true});
     parts.push(j2.ok ? 'notifications enregistr\u00e9es' : '\u2717 notifications : ' + (j2.error || '\u00e9chec'));
   }
   msg.textContent = parts.join(' \u00b7 ');
@@ -1568,9 +1572,7 @@ async function saveSettings() {
 async function testNotify() {
   if (settingsDirty) { const saved = await saveSettings(); if (!saved) return; }
   showMsg('notifyMsgRow', 'notifyMsg', '\u23f3 test en cours\u2026');
-  const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'test_notify'})});
-  const j = await r.json();
+  const j = await postAction({action: 'test_notify'}, {quiet: true});
   if (!j.ok) { showMsg('notifyMsgRow', 'notifyMsg', '\u2717 ' + (j.error || '\u00e9chec')); return; }
   const parts = [];
   if (j.desktop) parts.push(j.desktop.ok ? 'desktop \u2713 (toast affich\u00e9)' : 'desktop \u2717 \u2014 ' + (j.desktop.error || '?'));
@@ -1580,9 +1582,7 @@ async function testNotify() {
 /* Historique runtime : crashs, relances, backoff — reset_runtime du moteur. */
 async function resetRuntime() {
   if (!confirm('Effacer l\u2019historique runtime (crashs, relances, backoff) ?')) return;
-  const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'reset_runtime'})});
-  const j = await r.json();
+  const j = await postAction({action: 'reset_runtime'}, {quiet: true});
   showMsg('runtimeMsgRow', 'runtimeMsg',
     j.ok ? '\u2713 historique effac\u00e9 (' + (j.cleared || 0) + ' serveur(s))' : '\u2717 ' + (j.error || '\u00e9chec'));
   await load();
@@ -1640,9 +1640,7 @@ async function sshDiscover(ip, user) {
   if (!ip || !user) { alert('IP et utilisateur SSH requis'); return; }
   const msg = document.getElementById('machineMsg');
   msg.textContent = '⏳ connexion SSH + netstat distant + sonde des ports… (jusqu\u2019à ~30 s, vois le journal)';
-  const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'ssh_discover', ip, user})});
-  const j = await r.json();
+  const j = await postAction({action: 'ssh_discover', ip, user}, {quiet: true});
   if (j.ok && j.started) {
     msg.textContent = '⏳ d\u00e9couverte lanc\u00e9e sur ' + ip + ' — le journal et la liste se remplissent pendant la sonde.';
     let t = 0;
@@ -1657,21 +1655,17 @@ async function sshDiscover(ip, user) {
 async function sshSave() {
   const f = sshForm();
   if (!f.ip || !f.user) { alert('IP et utilisateur SSH requis'); return; }
-  const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'ssh_save', ip: f.ip, user: f.user})});
-  const j = await r.json();
+  const j = await postAction({action: 'ssh_save', ip: f.ip, user: f.user}, {quiet: true});
   document.getElementById('machineMsg').textContent = j.ok ? '✓ machine enregistr\u00e9e' : '✗ ' + (j.error || 'erreur');
   await load(); renderMachines();
 }
 async function sshForget(ip) {
-  await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'ssh_forget', ip})});
+  await postAction({action: 'ssh_forget', ip});
   await load(); renderMachines();
 }
 
 async function toggleTool(id, name) {
-  await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'toggle_tool', id, tool: name})});
+  await postAction({action: 'toggle_tool', id, tool: name});
   const r = await fetch('/api/detail?id=' + encodeURIComponent(id));
   if (r.ok) { detailCache = await r.json(); renderDetail(); }
   await load();
@@ -1693,9 +1687,7 @@ async function importMcp() {
   const text = (ta.value || '').trim();
   if (!text) { msg.textContent = '\u2717 colle un bloc mcpServers, une URL http:// ou une commande (npx, claude mcp add…)'; return; }
   msg.textContent = '\u23f3 import\u2026';
-  const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'import_mcp', text})});
-  const j = await r.json().catch(() => ({}));
+  const j = await postAction({action: 'import_mcp', text}, {quiet: true});
   if (!j.ok) { msg.textContent = '\u2717 ' + (j.error || 'échec'); return; }
   const parts = ['\u2713 ' + (j.added || 0) + ' serveur' + ((j.added || 0) > 1 ? 's' : '') + ' ajouté' + ((j.added || 0) > 1 ? 's' : '')];
   const skipped = Array.isArray(j.skipped) ? j.skipped : [];
@@ -1735,8 +1727,7 @@ async function addServer(ev) {
   else { body.program = document.getElementById('fProgram').value;
          body.workdir = document.getElementById('fWorkdir').value || null;
          body.args = document.getElementById('fArgs').value.split(/\s+/).filter(Boolean); }
-  const r = await fetch('/api/action', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
-  const j = await r.json();
+  const j = await postAction(body, {quiet: true});
   if (!j.ok) alert(j.error || 'erreur');
   else { document.getElementById('dlg').close(); selectedId = j.id; await act('refresh', j.id); }
   return false;
@@ -1845,9 +1836,7 @@ async function installStore(id, btn) {
     }
     body.args = ['-y', '@modelcontextprotocol/server-filesystem', dir.trim()];
   }
-  const r = await fetch('/api/action', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(body)});
-  const j = await r.json();
+  const j = await postAction(body, {quiet: true});
   if (j.ok) {
     // re-rendu : la carte bascule sur l'état « Déjà installé » (source de
     // vérité = state.servers, pas un libellé collé sur le bouton)
@@ -1905,19 +1894,24 @@ function toggleLog() {
   document.getElementById('logpanel').classList.toggle('min', v === null ? true : v === 'true');
 })();
 /* ===== Polling armé sur les réglages =====
-   L'intervalle suit settings.refresh_secs (re-armé à chaque rendu quand il
-   change) : fini le 5 s fixe qui interrogeait 3× plus vite que les données
-   ne changeaient. Avant le premier état chargé (ou serveur momentanément
-   injoignable), on retente au rythme par défaut de 5 s. */
+   Rythme normal : settings.refresh_secs (min 5 s), ré-armé à chaque état
+   reçu. Panne moteur (lot C #2) : après le PREMIER échec de load(), réessai
+   RAPIDE à 2 s (POLL_RETRY_MS) au lieu du prochain cycle complet — bandeau
+   toujours au 2ᵉ échec, mais ~refresh_secs+2 s au lieu de ~2×refresh_secs ;
+   pendant la panne, chaque échec réarme un réessai de 2 s (fourchette mission
+   2 à 5 s) ; dès que le moteur répond, render() → armPolling() revient au
+   rythme normal. Un seul timer à la fois : scheduleNext remplace le
+   setTimeout en attente (fenêtre masquée : load() sort tôt, la chaîne reprend
+   au retour par visibilitychange). */
 let pollTimer = null;
-let pollMs = 0;
+const POLL_RETRY_MS = 2000; // panne : réessai rapide (lot C #2)
+function scheduleNext(ms) {
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = setTimeout(load, ms);
+}
 function armPolling() {
   const secs = Math.max(5, (state && state.settings && state.settings.refresh_secs) || 5);
-  const ms = secs * 1000;
-  if (ms === pollMs) return;
-  if (pollTimer) clearInterval(pollTimer);
-  pollMs = ms;
-  pollTimer = setInterval(load, ms);
+  scheduleNext(secs * 1000);
 }
 loadFrameworks();
 updateLogoutBtn();

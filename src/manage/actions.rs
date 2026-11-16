@@ -149,6 +149,15 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     json!({"ok": true})
                 }
                 "kill_stdio" | "kill" => {
+                    // Lot F point 5 : id inconnu = refus EXPLICITE. L'ancien
+                    // {ok:true} (kill) et le {ok:false} sans `error` (remove)
+                    // ne laissaient à l'interface qu'un toast « échec »
+                    // générique — même forme de refus que les autres actions.
+                    // kill_stdio est le même geste (alias historique) : même
+                    // contrat. refresh reste un no-op silencieux (ok:true).
+                    if !lockv(&state.servers).iter().any(|s| s.id == id) {
+                        return json!({"ok": false, "error": "serveur inconnu"});
+                    }
                     let local_port = {
                         let servers = lockv(&state.servers);
                         servers
@@ -437,7 +446,12 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     }
                 ),
             );
-            json!({"ok": removed})
+            if !removed {
+                // Lot F point 5 : l'interface ne peut afficher qu'un « échec »
+                // générique sur un {ok:false} sans `error` — motif explicite.
+                return json!({"ok": false, "error": "serveur inconnu"});
+            }
+            json!({"ok": true})
         }
         "scan" => {
             let range = match (
@@ -522,16 +536,19 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             // commande à la main ici. Seeds refusés (la config par défaut
             // réécraserait) et serveurs distants refusés (le process appartient
             // à sa machine hôte, pas au moteur local).
+            // `program` null/absent/chaîne vide = RETRAIT de la commande (lot A :
+            // le schéma gateway est nullable depuis le lot 1 — le dispatcher
+            // répondait « program manquant » au lieu de retirer) ; l'autoboot
+            // est désactivé puisque le serveur n'a plus rien à lancer.
             let id = match id {
                 Some(i) => i,
                 None => return json!({"ok": false, "error": "id manquant"}),
             };
-            let program = match req.get("program").and_then(|x| x.as_str()) {
-                Some(p) if !p.trim().is_empty() => p.trim().to_string(),
-                _ => {
-                    return json!({"ok": false, "error": "program manquant (ex : node, python, chemin .exe)"});
-                }
-            };
+            let program = req
+                .get("program")
+                .and_then(|x| x.as_str())
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty());
             let args: Vec<String> = req
                 .get("args")
                 .and_then(|x| x.as_array())
@@ -556,6 +573,22 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             if matches!(&srv.transport, Transport::Http { host: Some(_), .. }) {
                 return json!({"ok": false, "error": "serveur distant : la commande de lancement appartient à sa machine hôte"});
             }
+            let Some(program) = program else {
+                // RETRAIT : plus de commande → plus d'autoboot (un
+                // auto-restart sans commande ne spawnerait rien de vivant).
+                // Le process DÉJÀ lancé n'est pas tué : le retrait de la
+                // commande ne vaut pas un Stop (bouton dédié).
+                srv.start_cmd = None;
+                srv.auto_restart = false;
+                drop(servers);
+                save_config(state);
+                add_log(
+                    state,
+                    "info",
+                    &format!("[set_start_cmd] {id} : commande retirée (autoboot désactivé)"),
+                );
+                return json!({"ok": true, "removed": true});
+            };
             // l'env existant est PRÉSERVÉ : set_start_cmd édite programme/args/
             // workdir, pas les variables (les effacer couperait la clé d'API
             // importée — lot 3).
@@ -822,7 +855,12 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             if let Some(u) = req.get("webhook_url").and_then(|x| x.as_str()) {
                 let u = u.trim();
                 if !u.is_empty() && !crate::notify::valid_webhook_url(u) {
-                    return json!({"ok": false, "error": "URL de webhook invalide (http:// ou https:// attendu)"});
+                    // LOT B point 3 : motif PRÉCIS du refus (https:// est refusé
+                    // depuis le lot 5 — l'ancien message générique citait encore
+                    // https:// comme une forme valide).
+                    let motif = crate::notify::webhook_url_reject_reason(u)
+                        .unwrap_or_else(|| "URL de webhook invalide".to_string());
+                    return json!({"ok": false, "error": motif});
                 }
                 c.webhook_url = u.to_string();
             }
@@ -852,7 +890,10 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             lockv(&state.settings).notify = c.clone();
             save_config(state);
             add_log(state, "info", "[notif] configuration enregistrée");
-            json!({"ok": true, "notify": crate::notify::to_json(&c)})
+            // LOT B point 2 : la réponse porte la forme MASQUÉE (to_api_json) —
+            // les en-têtes du webhook ne sortent JAMAIS en clair, pas même à
+            // l'appelant qui vient d'enregistrer (même surface que /api/state).
+            json!({"ok": true, "notify": crate::notify::to_api_json(&c)})
         }
         "test_notify" => {
             // Bouton « Tester » du panneau Notifications (dialog Réglages) :
@@ -1333,6 +1374,13 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     if it.id == "filesystem" && filesystem_dossier_manquant(&args) {
                         return json!({"ok": false, "error": "précisez le dossier à exposer : {\"action\":\"install_store\",\"id\":\"filesystem\",\"args\":[\"-y\",\"@modelcontextprotocol/server-filesystem\",\"C:/chemin/autorisé\"]}"});
                     }
+                    // env additionnel optionnel {"CLÉ": "valeur"} (lot A) : des
+                    // items du catalogue ont besoin d'un jeton (GITHUB_TOKEN…).
+                    // Mêmes garanties que l'import (lot 3) : les valeurs
+                    // n'atteignent que le process lancé (StartCmd.env → spawn) —
+                    // jamais l'API (noms seuls via server_json), le gateway
+                    // (résultat sans env) ni le journal.
+                    let env = env_from_json(&req);
                     let id = format!("store-{}", it.id);
                     let already = {
                         let mut servers = lockv(&state.servers);
@@ -1345,7 +1393,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                                     program: it.program.to_string(),
                                     args: args.clone(),
                                     workdir: None,
-                                    env: Vec::new(),
+                                    env: env.clone(),
                                 },
                                 origin: Origin::Manual,
                                 enabled: true,
@@ -1371,7 +1419,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                                     program: it.program.to_string(),
                                     args,
                                     workdir: None,
-                                    env: Vec::new(),
+                                    env,
                                 }),
                                 tools_disabled: vec![],
                             });

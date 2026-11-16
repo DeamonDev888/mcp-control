@@ -180,10 +180,9 @@ pub fn import_litemcp_registry(state: &Arc<AppState>) {
 
 // ---------- pool de sondes persistant (audit 03, constat 2) ----------
 
-use std::collections::VecDeque;
-use std::sync::mpsc;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Condvar, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Nombre de workers du pool de sondes (persistant). Chaque poll_one est borné
 /// par ses propres timeouts ; 12 workers en parallèle couvrent largement les
@@ -194,21 +193,54 @@ use std::time::{Duration, Instant};
 /// plus lent du paquet retardait tous les suivants, et la re-sonde de 30 s
 /// après un spawn bloquait le cycle entier — périodes mesurées à 48-90 s).
 const POLL_WORKERS: usize = 12;
-/// Garde-fou anti-blocage : les sondes sont toutes timeout-bornées (~20 s au
-/// pire), si un cycle dépassait quand même ce délai l'attente s'abandonne pour
-/// ne jamais figer la supervision.
-const CYCLE_MAX_SECS: u64 = 120;
+/// Durée au-delà de laquelle une entrée « en sonde » est considérée
+/// abandonnée (un poll_one est borné par ses propres timeouts — l'entrée
+/// est normalement libérée par le worker à sa fin). Garde-fou : si un
+/// worker mourait sans libérer, le serveur serait sauté pour toujours.
+const SONDAGE_MAX_SECS: u64 = 120;
 
-/// Un travail de sondage : état applicatif + id de serveur + accusé de fin.
+/// Un travail de sondage : état applicatif + id de serveur.
 struct Travail {
     state: Arc<AppState>,
     id: String,
-    fait: mpsc::Sender<()>,
 }
 
 static FILE_TRAVAIL: OnceLock<Mutex<VecDeque<Travail>>> = OnceLock::new();
 static FILE_SIGNAL: OnceLock<Condvar> = OnceLock::new();
 static POOL_DEMARRE: OnceLock<()> = OnceLock::new();
+/// Serveurs actuellement en sonde (marqués à l'envoi, libérés par le worker
+/// à la fin du poll_one). Le cycle suivant SAUTE un serveur encore en sonde
+/// au lieu d'attendre la sonde la plus lente (lot A) ou d'empiler des sondes
+/// doublons du même serveur muet.
+static SONDAGE_EN_COURS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+fn sonde_en_cours_map() -> &'static Mutex<HashMap<String, Instant>> {
+    SONDAGE_EN_COURS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Filtre les ids encore en sonde ET marque les autres en UNE seule section
+/// verrouillée : le poller et le tool refresh appellent poll_all en concurrence
+/// — sans l'atomicité, deux appelants verraient le même serveur libre et
+/// empileraient deux sondes du même id.
+fn filtrer_et_marquer_sondage(ids: Vec<String>) -> Vec<String> {
+    let mut map = lockv(sonde_en_cours_map());
+    map.retain(|_, t| t.elapsed().as_secs() < SONDAGE_MAX_SECS);
+    let maintenant = Instant::now();
+    let mut retenus = Vec::with_capacity(ids.len());
+    for id in ids {
+        if !map.contains_key(&id) {
+            map.insert(id.clone(), maintenant);
+            retenus.push(id);
+        }
+    }
+    retenus
+}
+
+/// Libère le marqueur à la fin d'un poll_one (branche normale OU panic —
+/// le worker appelle après catch_unwind).
+fn liberer_sondage(id: &str) {
+    lockv(sonde_en_cours_map()).remove(id);
+}
 
 fn file_travail() -> (&'static Mutex<VecDeque<Travail>>, &'static Condvar) {
     (
@@ -235,17 +267,23 @@ fn worker_sondes() {
                 };
             }
         };
-        let Travail { state, id, fait } = travail;
+        let Travail { state, id } = travail;
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             poll_one(&state, &id);
         }));
-        let _ = fait.send(());
+        // le marqueur est libéré même en cas de panic : le serveur sera
+        // re-sondé au cycle suivant (jamais sauté pour toujours)
+        liberer_sondage(&id);
     }
 }
 
-/// Cycle de sondage via le pool : tous les serveurs partent en parallèle,
-/// l'attente de fin est plafonnée (un cycle ne peut plus être prolongé au-delà
-/// de CYCLE_MAX_SECS quoi qu'il arrive).
+/// Envoi des sondes au pool SANS ATTENTE (lot A) : chaque poll_one s'exécute
+/// en parallèle chez un worker et publie l'état de SON serveur à sa fin ; le
+/// cycle suivant part à l'heure même si une sonde (port muet, serveur lent)
+/// tourne encore — ce serveur est simplement sauté (marqueur
+/// SONDAGE_EN_COURS). L'ancien cycle attendait l'accusé de réception de
+/// CHAQUE serveur (plafonné à 120 s) : la sonde la plus lente fixait la
+/// période entière (30-48 s mesurés au lot 2 pour refresh 5 s).
 fn cycle_via_pool(state: &Arc<AppState>, ids: &[String]) {
     if ids.is_empty() {
         return;
@@ -258,27 +296,19 @@ fn cycle_via_pool(state: &Arc<AppState>, ids: &[String]) {
                 .spawn(worker_sondes);
         }
     });
-    let (tx, rx) = mpsc::channel();
+    // marque DÉJÀ posé par filtrer_et_marquer_sondage (atomique avec le
+    // filtre) : un cycle suivant ne peut jamais empiler un doublon pour un
+    // serveur dont la sonde n'a pas encore démarré
     {
         let mut q = lockv(file);
         for id in ids {
             q.push_back(Travail {
                 state: state.clone(),
                 id: id.clone(),
-                fait: tx.clone(),
             });
         }
     }
     signal.notify_all();
-    let echeance = Instant::now() + Duration::from_secs(CYCLE_MAX_SECS);
-    let mut restants = ids.len();
-    while restants > 0 {
-        let reste = echeance.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(reste) {
-            Ok(()) => restants -= 1,
-            Err(_) => break, // timeout : on ne fige jamais le poller
-        }
-    }
 }
 
 pub fn poll_all(state: &Arc<AppState>) {
@@ -291,9 +321,13 @@ pub fn poll_all(state: &Arc<AppState>) {
     let order = lockv(&state.settings).server_order.clone();
     let mut ids: Vec<String> = lockv(&state.servers).iter().map(|s| s.id.clone()).collect();
     ids.sort_by_key(|id| order.iter().position(|x| x == id).unwrap_or(usize::MAX));
-    // Sondes en parallèle via le pool persistant. Chaque poll_one prend ses
-    // verrous brièvement et relâche avant d'écrire au journal ; les spawns
-    // concurrents restent protégés par `state.spawning`.
+    // Un serveur encore en sonde (cycle précédent) est simplement SAUTÉ :
+    // son poll_one publiera son état à sa fin, sans retarder ce cycle-ci ni
+    // empiler un doublon (lot A — période des sains ≤ refresh + 2 s).
+    let ids = filtrer_et_marquer_sondage(ids);
+    // Sondes en parallèle via le pool persistant, sans attente de fin.
+    // Chaque poll_one prend ses verrous brièvement et relâche avant d'écrire
+    // au journal ; les spawns concurrents restent protégés par `state.spawning`.
     cycle_via_pool(state, &ids);
     save_cache(state);
 }

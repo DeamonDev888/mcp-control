@@ -52,8 +52,12 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
                 }
             } else {
                 match &host {
-                    Some(h) => probe::probe_http_host(h, port, &path, 6000),
-                    None => probe::probe_http(port, &path, 6000),
+                    // budget de sonde 8 s (lot A) : un serveur réellement lent
+                    // mais vivant (réponse en ~6 s) doit rester classé UP —
+                    // le port muet, lui, est coupé dès la 1re forme sans octet
+                    // (probe_http, bail précoce) au lieu d'encaisser 3 timeout.
+                    Some(h) => probe::probe_http_host(h, port, &path, 8000),
+                    None => probe::probe_http(port, &path, 8000),
                 }
             };
             // Auto-start : serveur HTTP LOCAL éteint + commande de lancement configurée

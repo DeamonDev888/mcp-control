@@ -1426,12 +1426,26 @@ fn set_start_cmd_refuse_seed_et_distant_persiste_le_local() {
     );
     assert_eq!(j2["ok"], serde_json::json!(false));
 
-    // 3. programme vide → erreur propre
+    // 3. programme vide (espaces seuls) = RETRAIT (lot A : null/"" retire la
+    //    commande ; scan-1 n'en a pas — no-op visible, autoboot désactivé)
     let j3 = handle_action(
         &state,
         "{\"action\":\"set_start_cmd\",\"id\":\"scan-1\",\"program\":\"  \"}",
     );
-    assert_eq!(j3["ok"], serde_json::json!(false));
+    assert_eq!(j3["ok"], serde_json::json!(true));
+    assert_eq!(j3["removed"], serde_json::json!(true));
+    {
+        let servers = lockv(&state.servers);
+        let scan1 = servers.iter().find(|s| s.id == "scan-1").unwrap();
+        assert!(
+            scan1.start_cmd.is_none(),
+            "aucune commande n'existait : reste None"
+        );
+        assert!(
+            !scan1.auto_restart,
+            "autoboot désactivé par le retrait (plus rien à lancer)"
+        );
+    }
 
     // 4. local découvert → OK : start_cmd posé (args + workdir) et persisté
     let j4 = handle_action(
@@ -2877,5 +2891,225 @@ fn remove_libere_le_port_dun_serveur_lance_par_lapp() {
     assert!(
         libere,
         "le port doit être libéré après remove (orphelin tué)"
+    );
+}
+
+// ==================== Lot A — moteur ====================
+
+/// (lot A, point 3) : `set_start_command` avec `program` null (ou chaîne vide)
+/// RETIRE la commande de lancement et désactive l'autoboot — le schéma
+/// gateway est nullable depuis le lot 1, le dispatcher répondait
+/// « program manquant » au lieu de retirer. Le retrait survit au reload.
+#[test]
+fn set_start_cmd_program_null_retire_commande_et_autoboot() {
+    let path = tmp_config("cfg_setstartcmd_null.json", Some("{\"servers\":[]}"));
+    let mut base = match Arc::try_unwrap(test_state()) {
+        Ok(s) => s,
+        Err(_) => panic!("test_state doit être unique"),
+    };
+    base.config_path = path.clone();
+    let state = Arc::new(base);
+    {
+        let mut st = lockv(&state.settings);
+        st.autostart = false;
+    }
+    {
+        let mut servers = lockv(&state.servers);
+        servers.push(Server {
+            id: "scan-null".into(),
+            label: "port-4243".into(),
+            transport: Transport::Http {
+                host: None,
+                port: 4243,
+                path: "/mcp".into(),
+            },
+            origin: Origin::Discovered,
+            enabled: true,
+            state: SState::Down,
+            pid: None,
+            bound_host: None,
+            server_name: None,
+            version: None,
+            protocol: None,
+            sse: false,
+            sse_endpoint: false,
+            ws: false,
+            lang: None,
+            framework: None,
+            via_ssh: false,
+            tools: vec![],
+            latency_ms: None,
+            last_seen_ts: None,
+            last_error: None,
+            start_cmd: None,
+            auto_restart: true,
+            favorite: false,
+            tools_disabled: vec![],
+        });
+    }
+
+    // pose une commande (avec env, pour vérifier que le retrait ne rapporte
+    // rien d'exposé) puis retire-la par program:null
+    let j = handle_action(
+        &state,
+        "{\"action\":\"set_start_cmd\",\"id\":\"scan-null\",\"program\":\"node\",\"args\":[\"srv.js\"]}",
+    );
+    assert_eq!(j["ok"], serde_json::json!(true));
+    let j2 = handle_action(
+        &state,
+        "{\"action\":\"set_start_cmd\",\"id\":\"scan-null\",\"program\":null}",
+    );
+    assert_eq!(
+        j2["ok"],
+        serde_json::json!(true),
+        "program:null doit retirer la commande : {j2}"
+    );
+    assert_eq!(j2["removed"], serde_json::json!(true));
+    {
+        let servers = lockv(&state.servers);
+        let srv = servers.iter().find(|s| s.id == "scan-null").unwrap();
+        assert!(srv.start_cmd.is_none(), "la commande doit être retirée");
+        assert!(
+            !srv.auto_restart,
+            "autoboot désactivé : le serveur n'a plus rien à lancer"
+        );
+        assert_eq!(
+            srv.origin,
+            Origin::Manual,
+            "l'origine n'est pas rétrogradée"
+        );
+    }
+    // la chaîne vide vaut null
+    let j3 = handle_action(
+        &state,
+        "{\"action\":\"set_start_cmd\",\"id\":\"scan-null\",\"program\":\"\"}",
+    );
+    assert_eq!(j3["ok"], serde_json::json!(true));
+
+    // le retrait survit au reload (config réécrite sans commande)
+    let (servers, _) = load_config(&path);
+    let srv = servers
+        .iter()
+        .find(|s| s.id == "scan-null")
+        .expect("persisté");
+    assert!(srv.start_cmd.is_none(), "retrait non persisté");
+    assert!(!srv.auto_restart, "autoboot désactivé non persisté");
+}
+
+/// (lot A, point 6) : `install_store` accepte un champ `env` optionnel
+/// (des items du catalogue ont besoin d'un jeton). Mêmes garanties que
+/// l'import (lot 3) : les valeurs atteignent le process lancé (transport ET
+/// start_cmd), survivent au round-trip config — et ne sortent JAMAIS par
+/// l'API (noms seuls).
+#[test]
+fn install_store_env_persiste_et_ne_fuit_pas_par_lapi() {
+    let path = tmp_config("cfg_store_env.json", Some("{\"servers\":[]}"));
+    let state = state_lot3(&path);
+    let rep = handle_action(
+        &state,
+        r#"{"action":"install_store","id":"github","env":{"GITHUB_TOKEN":"valeur-secrete-lotA"}}"#,
+    );
+    assert_eq!(rep.get("ok").and_then(|o| o.as_bool()), Some(true), "{rep}");
+    assert_eq!(rep.get("added").and_then(|a| a.as_u64()), Some(1), "{rep}");
+
+    let srv = lockv(&state.servers)
+        .iter()
+        .find(|s| s.id == "store-github")
+        .expect("serveur boutique installé")
+        .clone();
+    let attendu = (
+        "GITHUB_TOKEN".to_string(),
+        "valeur-secrete-lotA".to_string(),
+    );
+    match &srv.transport {
+        Transport::Stdio { env, .. } => {
+            assert!(env.contains(&attendu), "env perdu côté transport");
+        }
+        _ => panic!("transport stdio attendu pour un item boutique"),
+    }
+    let cmd = srv.start_cmd.as_ref().expect("start_cmd boutique");
+    assert!(cmd.env.contains(&attendu), "env perdu côté start_cmd");
+
+    // round-trip config.json : l'env survit à save/load
+    save_config(&state);
+    let (servers, _) = load_config(&path);
+    let s2 = servers
+        .iter()
+        .find(|s| s.id == "store-github")
+        .expect("persisté");
+    match &s2.transport {
+        Transport::Stdio { env, .. } => {
+            assert!(env.contains(&attendu), "env perdu au round-trip config");
+        }
+        _ => panic!("transport stdio attendu"),
+    }
+
+    // API : noms SEULS — la valeur ne sort par aucune vue
+    let etat = server_json(s2, false).to_string();
+    assert!(
+        !etat.contains("valeur-secrete-lotA"),
+        "VALEUR exposée : {etat}"
+    );
+    assert!(etat.contains("GITHUB_TOKEN"), "nom d'env attendu : {etat}");
+    let detail = detail_json(&state, "store-github").to_string();
+    assert!(
+        !detail.contains("valeur-secrete-lotA"),
+        "VALEUR exposée par /api/detail : {detail}"
+    );
+    // le résultat du dispatcher ne renvoie pas la valeur non plus
+    assert!(
+        !rep.to_string().contains("valeur-secrete-lotA"),
+        "VALEUR exposée par la réponse d'install : {rep}"
+    );
+}
+
+/// (lot A, point 5) : une plage de scan inversée dans un config.json édité à
+/// la main (scan_from > scan_to) était silencieusement ignorée (0 port) —
+/// elle est remise dans l'ordre au chargement, avec une ligne au journal.
+#[test]
+fn config_plage_scan_inversee_remise_dans_l_ordre_avec_journal() {
+    let cfg = r#"{"settings":{"scan_from":3200,"scan_to":3000}}"#;
+    let path = tmp_config("cfg_scan_inverse.json", Some(cfg));
+    let (_, st) = load_config(&path);
+    assert_eq!(
+        (st.scan_from, st.scan_to),
+        (3000, 3200),
+        "la plage doit être remise dans l'ordre au chargement"
+    );
+    let mcc = std::fs::read_to_string(std::path::Path::new(&path).with_file_name("mcc.log"))
+        .unwrap_or_default();
+    assert!(
+        mcc.contains("plage de scan inversée (3200 > 3000)"),
+        "ligne de journal attendue : {mcc}"
+    );
+}
+
+/// (lot F, point 5) : `kill` répondait {ok:true} sur un identifiant inconnu
+/// (arrêt d'un serveur inexistant = no-op silencieux) et `remove` {ok:false}
+/// SANS champ `error` — dans les deux cas l'interface ne pouvait afficher
+/// qu'un « échec » générique. Même forme de refus que les autres actions.
+#[test]
+fn kill_et_remove_id_inconnu_refusent_avec_motif() {
+    let state = test_state();
+    for (action, corps) in [
+        ("kill", r#"{"action":"kill","id":"inconnu-lotF"}"#),
+        (
+            "kill_stdio",
+            r#"{"action":"kill_stdio","id":"inconnu-lotF"}"#,
+        ),
+        ("remove", r#"{"action":"remove","id":"inconnu-lotF"}"#),
+    ] {
+        let j = handle_action(&state, corps);
+        assert_eq!(j["ok"], serde_json::json!(false), "{action} : {j}");
+        assert_eq!(
+            j["error"],
+            serde_json::json!("serveur inconnu"),
+            "{action} doit renvoyer un motif exploitable : {j}"
+        );
+    }
+    // aucun serveur n'a été touché : l'état est inchangé
+    assert!(
+        lockv(&state.servers).iter().all(|s| s.id != "inconnu-lotF"),
+        "aucun serveur ne doit être créé par un refus"
     );
 }
