@@ -12,8 +12,11 @@ license = "MIT OR Apache-2.0"
 serde_json = "1"
 # Gateway MCP : la console elle-même devient un serveur MCP (POST /mcp sur le
 # port UI) — dispatch MCP 2026-07-28 embarqué (ServerCore::dispatch), catalogues
-# dynamiques. Sans features optionnelles : serde + serde_json seulement.
-litemcp = "0.9"
+# dynamiques. Dépendance **par chemin** : la 0.12.0 (features `auth-sign`,
+# `tls`) n'est pas publiée — crates.io s'arrête à 0.11.0. `default-features`
+# reste actif : les macros servent (`litemcp::zod`). Retour à une version
+# publiée au lot D.
+litemcp = { path = "../litemcp", features = ["auth-sign"] }
 
 [[bin]]
 name = "mcp-control"

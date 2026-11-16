@@ -119,9 +119,13 @@ fn gateway_initialize_tools_list_et_discover() {
         }),
     );
     let res = rep.get("result").expect("initialize sans result");
+    // Profil protocolaire `Legacy` (2025-11-25) retenu au lot M0 : le gateway sert encore
+    // `initialize` et négocie la révision legacy — sans quoi tout client MCP actuel (Claude
+    // Desktop, Cursor) cesse de fonctionner. Le profil strict 2026-07-28 (`_meta` obligatoire,
+    // pas d'`initialize`) se décide au lot M2 et devra alors changer cette assertion.
     assert_eq!(
-        res["protocolVersion"], "2026-07-28",
-        "le gateway annonce la spec LiteMCP : {res}"
+        res["protocolVersion"], "2025-11-25",
+        "le gateway annonce la révision legacy négociée : {res}"
     );
     assert_eq!(res["serverInfo"]["name"], "mcp-control");
     assert!(

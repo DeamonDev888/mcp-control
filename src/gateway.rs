@@ -50,7 +50,7 @@ use crate::types::{lockv, AppState, SState, Transport};
 use litemcp::error::ToolError;
 use litemcp::jsonrpc::ErrorObject;
 use litemcp::protocol::{ResourceContents, ToolAnnotations};
-use litemcp::server::McpHeaders;
+use litemcp::server::{McpHeaders, ProtocolProfile};
 use litemcp::zod;
 use litemcp::{Gateway as LiteGateway, ServerBuilder, ServerCore};
 use serde_json::{json, Value};
@@ -212,24 +212,29 @@ fn destructive(title: &'static str) -> ToolAnnotations {
 /// Construit un instantané complet du gateway : outils de supervision
 /// (statiques, données lues en direct) + ressources par serveur détecté.
 fn build_builder(state: &Arc<AppState>) -> ServerBuilder {
-    let builder = ServerBuilder::new("mcp-control", env!("CARGO_PKG_VERSION")).on_call({
-        let st = Arc::clone(state);
-        move |ev| {
-            // une ligne par message dispatché : le journal de l'UI raconte
-            // aussi ce que font les clients MCP (audit trail gratuit)
-            manage::add_log(
-                &st,
-                "info",
-                &format!(
-                    "[gateway] {} {} → {:?} en {} ms",
-                    ev.method,
-                    ev.name.unwrap_or("-"),
-                    ev.status,
-                    ev.duration.as_millis()
-                ),
-            );
-        }
-    });
+    // Profil legacy 2025-11-25 assumé : les clients MCP actuels (Claude
+    // Desktop, Cursor, Claude Code) font `initialize` sans `_meta` — le profil
+    // strict 2026-07-28 les refuserait ; le passage au moderne se tranche au M2.
+    let builder = ServerBuilder::new("mcp-control", env!("CARGO_PKG_VERSION"))
+        .protocol_profile(ProtocolProfile::Legacy)
+        .on_call({
+            let st = Arc::clone(state);
+            move |ev| {
+                // une ligne par message dispatché : le journal de l'UI raconte
+                // aussi ce que font les clients MCP (audit trail gratuit)
+                manage::add_log(
+                    &st,
+                    "info",
+                    &format!(
+                        "[gateway] {} {} → {:?} en {} ms",
+                        ev.method,
+                        ev.name.unwrap_or("-"),
+                        ev.status,
+                        ev.duration.as_millis()
+                    ),
+                );
+            }
+        });
     let builder = read_tools(builder, state);
     let builder = action_tools(builder, state);
     let builder = proxy_tools(builder, state);
@@ -1318,8 +1323,10 @@ fn respond(
         None
     } else {
         Some(McpHeaders {
+            protocol_version: None,
             method: mcp_method,
             name: mcp_name,
+            params: Vec::new(),
         })
     };
     // dispatch sur le noyau — panique de repli → -32603 avec id repris
