@@ -221,6 +221,11 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
     };
     let latest = lockv(&state.update_latest).clone();
     let lan = *lockv(&state.lan_ok);
+    // Écran « Accès » (lot M3) : compteurs SEULEMENT — le bandeau de l'UI a
+    // besoin de savoir qu'une demande attend, sans transporter de texte venu
+    // d'un client par ce canal (le détail vit dans `access_list`, action
+    // locale). Aucun verrou de réglages n'est tenu ici (pair::list le prend).
+    let access = crate::auth::confirm::summary(state);
     json!({
         "servers": list, "log": logarr,
         "latest_version": latest,
@@ -231,6 +236,7 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
         "stats": {"up": up, "total": total, "tools": tools},
         "settings": settings_val,
         "peers": peers_arr,
+        "access": access,
     })
 }
 

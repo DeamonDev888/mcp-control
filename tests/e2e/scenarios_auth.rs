@@ -12,7 +12,8 @@
 //! gestionnaire d'identifiants de l'utilisateur.
 
 use crate::harness::{
-    free_port, hex_bytes, nouveau_keyid, serial_guard, spawn, Engine, EngineCfg, Resp, SignMode,
+    demande_confirmation, free_port, hex_bytes, nouveau_keyid, serial_guard, spawn, Engine,
+    EngineCfg, Resp, SignMode,
 };
 use litemcp::auth::sign::{RequestToSign, Signer, SigningKey};
 use serde_json::{json, Value};
@@ -492,12 +493,18 @@ fn corps_tool(outil: &str, args: Value, id: u64) -> Value {
 /// Appaire un client de test avec exactement `droits` et rend son signeur.
 /// Le keyid est neuf à chaque appel (aucune collision avec le harnais).
 fn client_appaire(e: &Engine, droits: &[&str]) -> Signer {
+    client_appaire_label(e, droits, &format!("matrice {}", droits.join("+")))
+}
+
+/// Idem avec un libellé imposé (le libellé est un texte VENU DU CLIENT : la page
+/// doit l'échapper, `docs/auth.md` §5 et test `libelle_hostile_jamais_dans_le_html`).
+fn client_appaire_label(e: &Engine, droits: &[&str], label: &str) -> Signer {
     let cle = SigningKey::generate();
     let keyid = nouveau_keyid();
     let publique = hex_bytes(&cle.verifying_key().to_bytes());
     let demande = json!({
         "keyid": keyid,
-        "label": format!("matrice {}", droits.join("+")),
+        "label": label,
         "public_key": publique,
         "created": now(),
     });
@@ -691,7 +698,16 @@ fn execute_cas(
     .into_iter()
     .enumerate()
     {
-        let r = requete(host, &corps_tool(outil, args, 11 + index as u64));
+        // Lot M3 : un outil `execution` n'est plus exécuté sans confirmation.
+        // Pour une identité qui en a le droit, le harnais donne l'accord local
+        // exigé par `docs/auth.md` §5 et REJOUE la requête (nouvelle signature,
+        // donc nouveau nonce) : la cellule vérifie le droit, pas la confirmation
+        // (les scénarios de confirmation forment le lot M3 et la coupent).
+        let mut r = requete(host, &corps_tool(outil, args.clone(), 11 + index as u64));
+        if demande_confirmation(&r) {
+            e.approuver_en_attente();
+            r = requete(host, &corps_tool(outil, args, 11 + index as u64));
+        }
         let ok = match cas.attendus[index + 1] {
             Attendu::Refus401 => est_refus_401(&r),
             Attendu::RefusDroit => est_refus_droit(&r),
@@ -1215,4 +1231,547 @@ fn engine_ready() -> Engine {
     let mut e = spawn(EngineCfg::default()).expect("spawn du moteur");
     e.wait_ready(Duration::from_secs(30)).expect("moteur prêt");
     e
+}
+
+// =====================================================================
+// Lot M3 — confirmation humaine avant exécution (docs/auth.md §5)
+// =====================================================================
+
+/// Durée du permis de confirmation des moteurs lancés PENDANT le test
+/// (`MCC_CONFIRM_SECS`, §5) : dix minutes ne se jouent pas dans une suite de
+/// tests. Le `Drop` remet l'environnement en état, même si le test panique.
+struct GardeConfirmSecs;
+
+impl GardeConfirmSecs {
+    /// Aucune durée imposée : les moteurs du test prennent les 10 min de §5.
+    fn defaut() -> Self {
+        std::env::remove_var("MCC_E2E_CONFIRM_SECS");
+        GardeConfirmSecs
+    }
+
+    /// Permis de `secs` secondes (préparation pour éprouver l'expiration).
+    fn court(secs: u64) -> Self {
+        std::env::set_var("MCC_E2E_CONFIRM_SECS", secs.to_string());
+        GardeConfirmSecs
+    }
+}
+
+impl Drop for GardeConfirmSecs {
+    fn drop(&mut self) {
+        std::env::remove_var("MCC_E2E_CONFIRM_SECS");
+    }
+}
+
+/// Programme lancé par ces scénarios : il écrit un marqueur (preuve HORS du
+/// moteur que le process a réellement démarré) puis répond juste assez au
+/// protocole pour que la sonde stdio le déclare UP.
+const MARQUEUR_JS: &str = r#"
+const fs = require('fs');
+fs.writeFileSync(process.argv[1], 'lance');
+let tampon = '';
+process.stdin.on('data', d => {
+  tampon += d;
+  let i;
+  while ((i = tampon.indexOf('\n')) >= 0) {
+    const ligne = tampon.slice(0, i);
+    tampon = tampon.slice(i + 1);
+    let m;
+    try { m = JSON.parse(ligne); } catch (e) { continue; }
+    if (m.id === undefined || m.id === null) continue;
+    const r = m.method === 'initialize'
+      ? { protocolVersion: '2025-06-18', capabilities: { tools: {} },
+          serverInfo: { name: 'marqueur', version: '0.1' } }
+      : m.method === 'tools/list' ? { tools: [] } : {};
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: r }) + '\n');
+  }
+});
+setInterval(() => {}, 1000);
+"#;
+
+/// Le poller ne doit pas lancer le programme à la place de la confirmation :
+/// même méthode que `scenarios_actions` (réglage à 1 h, puis on laisse passer
+/// le cycle déjà armé — après quoi plus aucune sonde ne touche ces serveurs).
+fn poller_endormi(e: &Engine) {
+    let rep = e.action(&json!({ "action": "set_settings", "refresh_secs": 3600 }));
+    assert_eq!(rep["ok"], json!(true), "set_settings refusé : {rep}");
+    std::thread::sleep(Duration::from_secs(8));
+}
+
+/// Serveur stdio ajouté par l'API LOCALE (session `admin`, hors confirmation :
+/// c'est le point de départ du scénario, pas son sujet).
+fn ajoute_marqueur(e: &Engine, nom: &str) -> (String, std::path::PathBuf) {
+    let marqueur = e.tmp_dir().join(format!("{nom}.txt"));
+    let _ = std::fs::remove_file(&marqueur);
+    let rep = e.action(&json!({
+        "action": "add", "transport": "stdio", "program": "node",
+        "args": ["-e", MARQUEUR_JS, marqueur.display().to_string()],
+        "label": nom,
+    }));
+    assert_eq!(rep["ok"], json!(true), "add stdio refusé : {rep}");
+    (
+        rep["id"].as_str().expect("id du serveur").to_string(),
+        marqueur,
+    )
+}
+
+/// La demande en attente la plus récente pour `outil`, telle que l'écran
+/// « Accès » la montre (session locale).
+fn demande_en_attente(e: &Engine, outil: &str) -> Value {
+    let l = e.action(&json!({ "action": "access_list" }));
+    assert_eq!(l["ok"], json!(true), "access_list refusé : {l}");
+    l["pending"]
+        .as_array()
+        .and_then(|a| a.iter().rev().find(|p| p["tool"] == json!(outil)).cloned())
+        .unwrap_or_else(|| panic!("aucune demande en attente pour {outil} : {l}"))
+}
+
+/// Le marqueur apparaît-il dans le délai imparti ?
+fn marqueur_ecrit(marqueur: &std::path::Path, delai: Duration) -> bool {
+    crate::harness::wait_until(delai, || if marqueur.exists() { Some(true) } else { None })
+}
+
+/// Critère de fin n° 1 et n° 2 : un appel `execution` sans accord ne lance RIEN
+/// (le process est absent du disque, pas seulement de l'état du moteur), reçoit
+/// `403` + `-32023` + `approval_pending` + `retryable` + `retryAfterMs`, apparaît
+/// sur l'écran « Accès » avec l'effet exact — puis part après approbation
+/// locale. Le permis « une fois » est consommé par l'exécution.
+#[test]
+fn confirmation_rien_ne_part_sans_accord_puis_part() {
+    let _garde = serial_guard();
+    let _secs = GardeConfirmSecs::defaut();
+    let mut e = engine_ready();
+    e.set_auto_approve(false);
+    poller_endormi(&e);
+    let (id, marqueur) = ajoute_marqueur(&e, "m3-t1");
+    let client = client_appaire(&e, &["execution"]);
+    let appel = |n: u64| {
+        post_mcp_signe(
+            &e,
+            &client,
+            "127.0.0.1",
+            &corps_tool("start_server", json!({ "id": id }), n),
+            None,
+            None,
+        )
+    };
+
+    // 1) aucun accord : refus « en attente », et AUCUN process
+    let r = appel(1);
+    assert!(
+        demande_confirmation(&r),
+        "attendu 403/-32023/approval_pending : {} {}",
+        r.status,
+        r.text()
+    );
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        !marqueur.exists(),
+        "un process a été lancé avant tout accord : {}",
+        marqueur.display()
+    );
+
+    // 2) la demande porte l'effet EXACT (programme, arguments, dossier) et
+    //    l'identité de l'appelant
+    let p = demande_en_attente(&e, "start_server");
+    assert_eq!(p["effect"]["program"], json!("node"), "{p}");
+    assert_eq!(p["effect"]["args"][0], json!("-e"), "{p}");
+    assert_eq!(
+        p["effect"]["args"][2],
+        json!(marqueur.display().to_string()),
+        "{p}"
+    );
+    assert_eq!(p["address"], json!("127.0.0.1"), "{p}");
+    assert!(
+        p["fingerprint"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("ed25519:"),
+        "empreinte courte attendue : {p}"
+    );
+
+    // 3) approbation par la SEULE session locale, puis réessai : ça part
+    let ok = e.action(&json!({
+        "action": "confirm_approve", "request_id": p["id"], "mode": "once",
+    }));
+    assert_eq!(ok["ok"], json!(true), "approbation refusée : {ok}");
+    let r = appel(2);
+    assert_eq!(r.status, 200, "après accord : {} {}", r.status, r.text());
+    assert!(
+        r.json().get("result").is_some(),
+        "pas de résultat : {}",
+        r.text()
+    );
+    assert!(
+        marqueur_ecrit(&marqueur, Duration::from_secs(20)),
+        "le programme n'a pas été lancé après l'accord"
+    );
+
+    // 4) le permis « une fois » est consommé : le MÊME appel redemande
+    let r = appel(3);
+    assert!(
+        demande_confirmation(&r),
+        "permis « une fois » non consommé : {} {}",
+        r.status,
+        r.text()
+    );
+    let l = e.action(&json!({ "action": "access_list" }));
+    assert!(
+        l["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["verdict"] == "accordé (une fois)"),
+        "le journal d'accès doit porter l'accord : {l}"
+    );
+    e.action(&json!({ "action": "kill", "id": id }));
+}
+
+/// Critère de fin n° 3 : le permis de 10 minutes (§5) vaut pour ce client, cet
+/// outil et ces arguments ; à son échéance, le même appel REDEMANDE — durée
+/// réglée à 2 s pour le test, par `MCC_CONFIRM_SECS`.
+#[test]
+fn permis_expire_et_redemande() {
+    let _garde = serial_guard();
+    let _secs = GardeConfirmSecs::court(2);
+    let mut e = engine_ready();
+    e.set_auto_approve(false);
+    poller_endormi(&e);
+    let (id, marqueur) = ajoute_marqueur(&e, "m3-t2");
+    let client = client_appaire(&e, &["execution"]);
+    let appel = |n: u64| {
+        post_mcp_signe(
+            &e,
+            &client,
+            "127.0.0.1",
+            &corps_tool("start_server", json!({ "id": id }), n),
+            None,
+            None,
+        )
+    };
+
+    assert!(demande_confirmation(&appel(1)));
+    let p = demande_en_attente(&e, "start_server");
+    // la durée du permis est bien celle de la configuration de test
+    assert_eq!(
+        e.action(&json!({ "action": "access_list" }))["window_secs"],
+        json!(2),
+        "MCC_CONFIRM_SECS n'a pas été pris en compte"
+    );
+    let ok = e.action(&json!({
+        "action": "confirm_approve", "request_id": p["id"], "mode": "window",
+    }));
+    assert_eq!(ok["ok"], json!(true), "approbation refusée : {ok}");
+
+    // permis valide : l'appel passe
+    let r = appel(2);
+    assert_eq!(r.status, 200, "permis valide : {} {}", r.status, r.text());
+    assert!(marqueur_ecrit(&marqueur, Duration::from_secs(20)));
+
+    // 2 s plus tard : échu, donc redemandé (rien ne s'exécute sans nouvel accord)
+    std::thread::sleep(Duration::from_secs(3));
+    let r = appel(3);
+    assert!(
+        demande_confirmation(&r),
+        "permis expiré = redemande : {} {}",
+        r.status,
+        r.text()
+    );
+    let l = e.action(&json!({ "action": "access_list" }));
+    assert!(
+        l["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["verdict"] == "permis expiré"),
+        "l'expiration doit laisser une ligne au journal d'accès : {l}"
+    );
+    assert_eq!(
+        demande_en_attente(&e, "start_server")["tool"],
+        json!("start_server")
+    );
+    e.action(&json!({ "action": "kill", "id": id }));
+}
+
+/// Critère de fin n° 4 : une demande refusée ne lance rien, et le client reçoit
+/// `approval_denied` (jamais d'exécution).
+#[test]
+fn refus_local_ne_lance_rien() {
+    let _garde = serial_guard();
+    let _secs = GardeConfirmSecs::defaut();
+    let mut e = engine_ready();
+    e.set_auto_approve(false);
+    poller_endormi(&e);
+    let (id, marqueur) = ajoute_marqueur(&e, "m3-t3");
+    let client = client_appaire(&e, &["execution"]);
+    let appel = |n: u64| {
+        post_mcp_signe(
+            &e,
+            &client,
+            "127.0.0.1",
+            &corps_tool("start_server", json!({ "id": id }), n),
+            None,
+            None,
+        )
+    };
+
+    assert!(demande_confirmation(&appel(1)));
+    let p = demande_en_attente(&e, "start_server");
+    let ok = e.action(&json!({ "action": "confirm_deny", "request_id": p["id"] }));
+    assert_eq!(ok["ok"], json!(true), "refus : {ok}");
+
+    let r = appel(2);
+    assert_eq!(r.status, 403, "refus local : {} {}", r.status, r.text());
+    assert_eq!(
+        r.json()["error"]["data"]["reason"].as_str(),
+        Some("approval_denied"),
+        "{}",
+        r.text()
+    );
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        !marqueur.exists(),
+        "un refus a quand même lancé le programme"
+    );
+    // le refus est journalisé, localement et dans mcc.log
+    let l = e.action(&json!({ "action": "access_list" }));
+    assert!(
+        l["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["verdict"] == "refusée (local)"),
+        "{l}"
+    );
+    let journal = std::fs::read_to_string(e.tmp_dir().join("mcc.log")).unwrap_or_default();
+    assert!(
+        journal.contains("[auth] confirmation refusée par la session locale"),
+        "refus absent de mcc.log"
+    );
+}
+
+/// Critère de fin n° 5, et la règle d'isolation de §5 : un autre client ne peut
+/// ni approuver ni seulement atteindre une demande — l'approbation n'existe que
+/// par la session locale, et `/mcp` n'expose aucun outil de décision.
+#[test]
+fn approbation_par_un_autre_client_refusee() {
+    let _garde = serial_guard();
+    let _secs = GardeConfirmSecs::defaut();
+    let mut e = engine_ready();
+    e.set_auto_approve(false);
+    poller_endormi(&e);
+    let (id, marqueur) = ajoute_marqueur(&e, "m3-t4");
+    let a = client_appaire(&e, &["execution"]);
+    let b = client_appaire(&e, &["execution"]);
+    let appel = |s: &Signer, n: u64| {
+        post_mcp_signe(
+            &e,
+            s,
+            "127.0.0.1",
+            &corps_tool("start_server", json!({ "id": id }), n),
+            None,
+            None,
+        )
+    };
+
+    assert!(demande_confirmation(&appel(&a, 1)));
+    let demande = demande_en_attente(&e, "start_server")["id"].clone();
+    let id_demande = demande.as_str().expect("id de demande").to_string();
+
+    // B (identité `execution` valide) tente d'approuver par la route locale :
+    // sans la session de la fenêtre, c'est 401 — aucune clé MCP n'y ouvre quoi
+    // que ce soit.
+    let corps = json!({
+        "action": "confirm_approve", "request_id": id_demande, "mode": "window"
+    })
+    .to_string();
+    let r = e.send(
+        "127.0.0.1",
+        e.port,
+        "POST",
+        "/api/action",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-MCC-Request", "1"),
+            ("Cookie", "-"),
+        ],
+        Some(corps.as_bytes()),
+        SignMode::None,
+    );
+    assert_eq!(
+        r.status,
+        401,
+        "un client ne peut pas approuver : {} {}",
+        r.status,
+        r.text()
+    );
+
+    // et /mcp n'expose AUCUN outil de décision (ni de lecture de l'écran)
+    let tl = post_mcp_signe(&e, &b, "127.0.0.1", &corps_tools_list(2), None, None);
+    assert_eq!(
+        nombre_outils(&tl),
+        10,
+        "tools/list du client : {}",
+        tl.text()
+    );
+    let texte = tl.text();
+    for interdit in [
+        "confirm_approve",
+        "confirm_deny",
+        "grant_revoke",
+        "access_list",
+    ] {
+        assert!(!texte.contains(interdit), "{interdit} exposé sur /mcp");
+    }
+    let r = post_mcp_signe(
+        &e,
+        &b,
+        "127.0.0.1",
+        &corps_tool(
+            "confirm_approve",
+            json!({ "request_id": id_demande, "mode": "window" }),
+            3,
+        ),
+        None,
+        None,
+    );
+    // un outil de décision n'existe pas sur /mcp : erreur JSON-RPC -32602
+    // (les erreurs MCP voyagent en HTTP 200, seul le corps fait foi)
+    let v = r.json();
+    assert_eq!(v["error"]["code"], json!(-32602), "{}", r.text());
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Unknown tool"),
+        "{}",
+        r.text()
+    );
+    assert!(v.get("result").is_none(), "{}", r.text());
+
+    // la demande de A attend toujours, et rien n'a été lancé
+    assert_eq!(
+        demande_en_attente(&e, "start_server")["id"],
+        demande,
+        "la demande de A ne doit pas avoir bougé"
+    );
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        !marqueur.exists(),
+        "une tentative de B a lancé le programme"
+    );
+
+    // Point 5 du lot : un refus de DROIT ne peut venir que du hook
+    // `on_auth_decision` (la politique de confirmation ne produit jamais
+    // `right_missing`) — sa ligne dans l'écran prouve le branchement C4.
+    let r = post_mcp_signe(
+        &e,
+        &b,
+        "127.0.0.1",
+        &corps_tool("list_servers", json!({}), 5),
+        None,
+        None,
+    );
+    assert!(
+        est_refus_droit(&r),
+        "lecture attendue en refus : {}",
+        r.text()
+    );
+    let l = e.action(&json!({ "action": "access_list" }));
+    assert!(
+        l["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["reason"] == "right_missing" && d["tool"] == "list_servers"),
+        "le refus de droit doit passer par on_auth_decision : {l}"
+    );
+
+    // la session locale, elle, décide — et tout part
+    let ok = e.action(&json!({
+        "action": "confirm_approve", "request_id": id_demande, "mode": "window",
+    }));
+    assert_eq!(ok["ok"], json!(true), "approbation locale : {ok}");
+    let r = appel(&a, 4);
+    assert_eq!(
+        r.status,
+        200,
+        "après accord local : {} {}",
+        r.status,
+        r.text()
+    );
+    assert!(marqueur_ecrit(&marqueur, Duration::from_secs(20)));
+    e.action(&json!({ "action": "kill", "id": id }));
+}
+
+/// Point 3 et 4 du lot : le bandeau ne transporte QUE des compteurs (aucun texte
+/// venu d'un client par `/api/state`), l'écran « Accès » n'est lisible que par la
+/// session locale, et un libellé hostile reste une donnée — jamais du HTML.
+#[test]
+fn bandeau_sans_texte_de_client_et_ecran_local_seulement() {
+    let _garde = serial_guard();
+    let _secs = GardeConfirmSecs::defaut();
+    let mut e = engine_ready();
+    e.set_auto_approve(false);
+    poller_endormi(&e);
+    let (id, _marqueur) = ajoute_marqueur(&e, "m3-t5");
+    let hostile = "<img src=x onerror=alert(1)>";
+    let client = client_appaire_label(&e, &["execution"], hostile);
+    let r = post_mcp_signe(
+        &e,
+        &client,
+        "127.0.0.1",
+        &corps_tool("start_server", json!({ "id": id }), 1),
+        None,
+        None,
+    );
+    assert!(demande_confirmation(&r));
+
+    // /api/state : compteurs seulement — le libellé hostile n'y figure pas (il
+    // ne vit que dans `access_list`, réservé à la session locale, et dans le
+    // toast système tronqué)
+    let brut = e.get("/api/state").text();
+    assert!(
+        !brut.contains("onerror"),
+        "le libellé du client voyage dans /api/state"
+    );
+    let v = e.get("/api/state").json();
+    let access = v["access"].as_object().expect("access dans /api/state");
+    assert_eq!(access.len(), 3, "compteurs seulement : {access:?}");
+    for (nom, valeur) in access {
+        assert!(valeur.is_u64(), "{nom} doit être un compteur, pas un texte");
+    }
+    assert_eq!(
+        v["access"]["pending"],
+        json!(1),
+        "bandeau : {}",
+        v["access"]
+    );
+
+    // l'écran « Accès » est local : hors session, 401 (aucune fuite au LAN)
+    let r = e.send(
+        "127.0.0.1",
+        e.port,
+        "POST",
+        "/api/action",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-MCC-Request", "1"),
+            ("Cookie", "-"),
+        ],
+        Some(br#"{"action":"access_list"}"#),
+        SignMode::None,
+    );
+    assert_eq!(r.status, 401, "access_list hors session : {}", r.text());
+
+    // avec la session : la demande est là, libellé BRUT (c'est la page qui
+    // l'échappe — test `libelle_hostile_jamais_dans_le_html` côté ui.rs)
+    let l = e.action(&json!({ "action": "access_list" }));
+    assert_eq!(l["pending"][0]["label"], json!(hostile), "{l}");
+    assert_eq!(l["pending"][0]["tool"], json!("start_server"));
+    assert!(l["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["label"] == json!(hostile)));
+    e.action(&json!({ "action": "kill", "id": id }));
 }

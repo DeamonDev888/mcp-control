@@ -382,6 +382,33 @@ $n.ShowBalloonTip(8000);
 Start-Sleep -Seconds 9;
 $n.Dispose()";
 
+/// Ce que dit la notification d'une **demande de confirmation** (lot M3,
+/// `docs/auth.md` §5) : libellé et empreinte courte du client, adresse source,
+/// outil et effet exact. Rendu pur (titre, texte) pour être testable sans
+/// afficher de toast — et pour prouver qu'aucun secret n'y entre.
+pub fn approval_pending_message(
+    label: &str,
+    fingerprint: &str,
+    address: &str,
+    tool: &str,
+    effect: &str,
+) -> (String, String) {
+    let qui = if label.trim().is_empty() {
+        fingerprint.to_string()
+    } else {
+        format!("{} ({})", label.trim(), fingerprint)
+    };
+    let effet: String = if effect.chars().count() > 200 {
+        effect.chars().take(200).collect::<String>() + "…"
+    } else {
+        effect.to_string()
+    };
+    (
+        "MCP Control — confirmation demandée".to_string(),
+        format!("{qui} depuis {address} — {tool} : {effet} — ouvrez Accès pour approuver"),
+    )
+}
+
 /// Toast desktop Windows. Silencieux si indisponible (le poller ne doit pas
 /// tomber). Titre et message transmis PAR L'ENVIRONNEMENT, jamais dans le
 /// script : apostrophes et guillemets sont inertes (aucune concaténation).
@@ -404,6 +431,33 @@ pub fn desktop_toast(title: &str, message: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_de_demande_de_confirmation_sans_secret() {
+        let (titre, texte) = approval_pending_message(
+            "atelier",
+            "ed25519:3f9a1c07b2d84e51",
+            "192.168.40.7",
+            "start_server",
+            "node srv.js",
+        );
+        assert!(titre.contains("confirmation"));
+        for attendu in [
+            "atelier",
+            "3f9a1c07b2d84e51",
+            "192.168.40.7",
+            "start_server",
+            "node srv.js",
+        ] {
+            assert!(texte.contains(attendu), "{texte}");
+        }
+        // libellé vide : l'empreinte seule identifie le client
+        let (_, texte) = approval_pending_message("", "ed25519:abc", "127.0.0.1", "x", "y");
+        assert!(texte.starts_with("ed25519:abc "), "{texte}");
+        // effet très long : tronqué, jamais un toast de 10 000 caractères
+        let (_, texte) = approval_pending_message("a", "b", "c", "d", &"x".repeat(5_000));
+        assert!(texte.chars().count() < 400, "{}", texte.chars().count());
+    }
 
     #[test]
     fn config_par_defaut_sans_webhook() {

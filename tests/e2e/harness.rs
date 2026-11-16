@@ -109,6 +109,9 @@ pub struct Engine {
     signer: Option<Arc<Signer>>,
     /// `keyid` de l'identité du harnais (vide tant qu'elle n'est pas appairée).
     keyid: String,
+    /// Approbation automatique des demandes de confirmation (lot M3) — voir
+    /// [`Engine::set_auto_approve`].
+    auto_approve: bool,
 }
 
 /// Mode de signature d'une requête `/mcp`.
@@ -183,6 +186,18 @@ fn spawn_in(cfg: EngineCfg, tmp: PathBuf) -> std::io::Result<Engine> {
             cmd.env_remove("MCC_API_ACCESS");
         }
     }
+    // Durée du permis de confirmation (lot M3, `docs/auth.md` §5) : dix minutes
+    // en production, quelques secondes pour éprouver l'expiration. Le test la
+    // pose dans SON environnement (`MCC_E2E_CONFIRM_SECS`) — les scénarios E2E
+    // sont sérialisés, aucun autre moteur ne la lit.
+    match std::env::var("MCC_E2E_CONFIRM_SECS") {
+        Ok(v) => {
+            cmd.env("MCC_CONFIRM_SECS", v);
+        }
+        Err(_) => {
+            cmd.env_remove("MCC_CONFIRM_SECS");
+        }
+    }
     // stdout/stderr vers des fichiers du tmp : débogage facile, aucun risque
     // de blocage pipe-buffer (on ne les lit jamais en temps réel).
     let out_log = std::fs::File::create(tmp.join("mcc-stdout.log"))?;
@@ -206,6 +221,7 @@ fn spawn_in(cfg: EngineCfg, tmp: PathBuf) -> std::io::Result<Engine> {
         session: None,
         signer: None,
         keyid: String::new(),
+        auto_approve: true,
     })
 }
 
@@ -314,8 +330,62 @@ impl Engine {
 
     /// Idem avec contrôle explicite de la signature (matrice du lot M2) :
     /// `SignMode::None` envoie la requête telle quelle, même vers `/mcp`.
+    // Lot M3 : si le moteur répond « confirmation en attente » à un `POST /mcp`
+    // signé par le harnais, l'approbation locale est donnée puis la requête est
+    // renvoyée UNE fois (nouvelle signature, donc nouveau nonce). C'est
+    // exactement le geste de l'utilisateur dans l'écran « Accès », et cela
+    // laisse chaque scénario maître de son sujet ; `set_auto_approve(false)`
+    // rend la main aux scénarios de confirmation.
     #[allow(clippy::too_many_arguments)] // miroir du harnais de transport
     pub fn send(
+        &self,
+        host: &str,
+        port: u16,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        sign: SignMode,
+    ) -> Resp {
+        let r = self.send_once(host, port, method, path, headers, body, sign);
+        if !self.auto_approve
+            || sign != SignMode::Auto
+            || !is_loopback_host(host)
+            || !path.starts_with("/mcp")
+            || !demande_confirmation(&r)
+        {
+            return r;
+        }
+        self.approuver_en_attente();
+        self.send_once(host, port, method, path, headers, body, sign)
+    }
+
+    /// Approuve (une fois) toutes les demandes en attente, tous clients confondus.
+    ///
+    /// C'est le geste de l'utilisateur dans l'écran « Accès », rejoué par le
+    /// harnais : les scénarios E2E sont sérialisés et n'ont qu'un seul moteur
+    /// vivant, donc aucune demande étrangère ne traîne. Aucune assertion ici :
+    /// un scénario qui veut prouver un refus ne passe pas par cette fonction.
+    pub fn approuver_en_attente(&self) {
+        let l = self.action(&json!({ "action": "access_list" }));
+        let ids: Vec<String> = l["pending"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| p["id"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in ids {
+            let _ = self.action(&json!({
+                "action": "confirm_approve", "request_id": id, "mode": "once",
+            }));
+        }
+    }
+
+    /// Corps de [`Engine::send`], sans la reprise après approbation.
+    #[allow(clippy::too_many_arguments)] // miroir du harnais de transport
+    fn send_once(
         &self,
         host: &str,
         port: u16,
@@ -463,6 +533,17 @@ impl Engine {
     /// Signeur du harnais sur `/mcp` (None = aucune identité).
     pub fn signer(&self) -> Option<&Arc<Signer>> {
         self.signer.as_ref()
+    }
+
+    /// Approbation automatique des confirmations (lot M3, `docs/auth.md` §5).
+    ///
+    /// Active par défaut : elle tient le rôle de l'utilisateur qui clique
+    /// « Accepter une fois » dans l'écran « Accès », pour que les scénarios des
+    /// lots précédents (qui appellent des outils `execution` par `/mcp`)
+    /// continuent de vérifier leur propre sujet et non la confirmation. Un
+    /// scénario qui ÉTUDIE la confirmation la coupe d'abord.
+    pub fn set_auto_approve(&mut self, on: bool) {
+        self.auto_approve = on;
     }
 
     /// `keyid` du client appairé par le harnais ("" s'il n'y en a pas).
@@ -698,6 +779,20 @@ impl Drop for Engine {
 /// comme un client distant réel.)
 pub fn is_loopback_host(h: &str) -> bool {
     matches!(h, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+}
+
+/// La réponse est-elle le refus « confirmation en attente » du lot M3
+/// (`docs/auth.md` §5 : `403`, `-32023`, `data.reason = "approval_pending"`,
+/// `retryable`, `retryAfterMs`) ?
+pub fn demande_confirmation(r: &Resp) -> bool {
+    if r.status != 403 {
+        return false;
+    }
+    let v = r.json();
+    v["error"]["code"] == json!(-32023)
+        && v["error"]["data"]["reason"].as_str() == Some("approval_pending")
+        && v["error"]["data"]["retryable"] == json!(true)
+        && v["error"]["data"]["retryAfterMs"].is_number()
 }
 
 /// En-têtes de routage SEP-2243 déduits du corps JSON-RPC : `Mcp-Method`, plus

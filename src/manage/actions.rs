@@ -51,6 +51,11 @@ pub const ACTIONS: &[&str] = &[
     "client_set_scopes",
     "client_revoke",
     "client_rotate",
+    // Lot M3 — écran « Accès » et décisions de confirmation (droit `admin`).
+    "access_list",
+    "confirm_approve",
+    "confirm_deny",
+    "grant_revoke",
 ];
 
 /// Asset de la release correspondant à (type de binaire, OS) — table blanche
@@ -1509,31 +1514,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 Err(e) => json!({"ok": false, "error": e}),
             }
         }
-        "client_list" => {
-            let settings = lockv(&state.settings);
-            let clients: Vec<Value> = settings
-                .auth
-                .clients
-                .iter()
-                .map(|c| {
-                    let mut v = c.to_json();
-                    if let Value::Object(o) = &mut v {
-                        o.insert(
-                            "fingerprint".into(),
-                            json!(crate::auth::registry::fingerprint_of(&c.public_key)
-                                .unwrap_or_default()),
-                        );
-                        o.insert(
-                            "fingerprint_court".into(),
-                            json!(crate::auth::registry::short_fingerprint_of(&c.public_key)
-                                .unwrap_or_default()),
-                        );
-                    }
-                    v
-                })
-                .collect();
-            json!({ "ok": true, "clients": clients })
-        }
+        "client_list" => clients_json(state),
         "client_set_scopes" => {
             let keyid = req.get("keyid").and_then(|x| x.as_str()).unwrap_or("");
             let rights: Vec<String> = req
@@ -1614,6 +1595,88 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 Err(e) => json!({"ok": false, "error": e.motif()}),
             }
         }
+        // ---- Écran « Accès » (lot M3, docs/auth.md §5) ---------------------
+        // Tout ce qui suit est LOCAL : `action_reservee_admin` refuse un appel
+        // venu du LAN avant le dispatcher, et `confirm` refuse en plus un
+        // acteur qui n'est pas la session locale (défense en profondeur).
+        "access_list" => {
+            let mut v = crate::auth::confirm::list(state, crate::auth::confirm::Actor::LocalAdmin);
+            let pairs = crate::auth::pair::list(state, crate::types::now_ts());
+            if let Value::Object(o) = &mut v {
+                // Contrat des actions locales : `ok` explicite. Sans lui, l'écran
+                // « Accès » s'arrête sur « lecture impossible » et n'affiche rien.
+                o.insert("ok".into(), json!(true));
+                o.insert(
+                    "clients".into(),
+                    clients_json(state)
+                        .get("clients")
+                        .cloned()
+                        .unwrap_or(json!([])),
+                );
+                o.insert(
+                    "pairs".into(),
+                    pairs.get("pending").cloned().unwrap_or(json!([])),
+                );
+                o.insert("pairs_max".into(), pairs["pending_max"].clone());
+                o.insert("pairs_ttl_secs".into(), pairs["ttl_secs"].clone());
+                o.insert("server_pub".into(), pairs["server_pub"].clone());
+            }
+            v
+        }
+        "confirm_approve" => {
+            let id = req.get("request_id").and_then(|x| x.as_str()).unwrap_or("");
+            let mode = req.get("mode").and_then(|x| x.as_str()).unwrap_or("once");
+            match crate::auth::confirm::approve(
+                state,
+                id,
+                mode,
+                crate::auth::confirm::Actor::LocalAdmin,
+            ) {
+                Ok(v) => v,
+                Err(e) => json!({"ok": false, "error": e}),
+            }
+        }
+        "confirm_deny" => {
+            let id = req.get("request_id").and_then(|x| x.as_str()).unwrap_or("");
+            match crate::auth::confirm::deny(state, id, crate::auth::confirm::Actor::LocalAdmin) {
+                Ok(v) => v,
+                Err(e) => json!({"ok": false, "error": e}),
+            }
+        }
+        "grant_revoke" => {
+            let id = req.get("request_id").and_then(|x| x.as_str()).unwrap_or("");
+            match crate::auth::confirm::revoke(state, id, crate::auth::confirm::Actor::LocalAdmin) {
+                Ok(v) => v,
+                Err(e) => json!({"ok": false, "error": e}),
+            }
+        }
         _ => json!({"ok": false, "error": format!("action inconnue: {}", action)}),
     }
+}
+
+/// Registre des clients, tel que l'écran « Accès » et `client_list` l'affichent
+/// (clés PUBLIQUES et empreintes seulement — aucun secret, par construction).
+fn clients_json(state: &Arc<AppState>) -> Value {
+    let settings = lockv(&state.settings);
+    let clients: Vec<Value> = settings
+        .auth
+        .clients
+        .iter()
+        .map(|c| {
+            let mut v = c.to_json();
+            if let Value::Object(o) = &mut v {
+                o.insert(
+                    "fingerprint".into(),
+                    json!(crate::auth::registry::fingerprint_of(&c.public_key).unwrap_or_default()),
+                );
+                o.insert(
+                    "fingerprint_court".into(),
+                    json!(crate::auth::registry::short_fingerprint_of(&c.public_key)
+                        .unwrap_or_default()),
+                );
+            }
+            v
+        })
+        .collect();
+    json!({ "ok": true, "clients": clients })
 }

@@ -119,7 +119,10 @@ let state = null;
 let selectedId = null;
 let detailCache = null;
 let detailTab = 'outils';
-const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+// Échappement HTML de TOUT texte venu d'un client. Les caractères de
+// contrôle (C0 et DEL) sont retirés : un libellé hostile ne doit ni sortir de
+// son contexte ni injecter de séquence de terminal (lot M3).
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])).replace(/[\u0000-\u001f\u007f]/g, '');
 const js = s => esc(JSON.stringify(String(s ?? '')));
 let overviewFilter = null; // filtre de tuile d'accueil : 'up' = ne montrer que les UP
 
@@ -160,6 +163,7 @@ const ICONS = {
   upload: "<path d='M12 15.5V4m0 0L7.5 8.5M12 4l4.5 4.5'/><path d='M4 16.5V19a1.5 1.5 0 0 0 1.5 1.5h13A1.5 1.5 0 0 0 20 19v-2.5'/>",
   download: "<path d='M12 4v11.5m0 0L7.5 11M12 15.5l4.5-4.5'/><path d='M4 16.5V19a1.5 1.5 0 0 0 1.5 1.5h13A1.5 1.5 0 0 0 20 19v-2.5'/>",
   warn: "<path d='M12 3.5 2.5 20h19L12 3.5Z'/><path d='M12 10v4.5M12 17.1v.1'/>",
+  shield: "<path d='M12 3 4.5 6v5.5c0 4.4 3.1 8.3 7.5 9.5 4.4-1.2 7.5-5.1 7.5-9.5V6L12 3Z'/><path d='m8.8 11.8 2.2 2.2 4.2-4.4'/>",
   save: "<path d='M5 3.5h11L20.5 8v11a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 19V5A1.5 1.5 0 0 1 5 3.5Z'/><path d='M8 3.5V8h7V3.5M7.5 20.5v-6h9v6'/>",
 };
 const ic = n => `<svg class='ic' viewBox='0 0 24 24' aria-hidden='true'>${ICONS[n] || ''}</svg>`;
@@ -246,6 +250,7 @@ function render() {
   renderServers();
   renderPeers();
   renderLog();
+  accessBadge();
   if (!selectedId) renderOverview();
 }
 
@@ -1927,6 +1932,294 @@ function toggleLog() {
   try { v = localStorage.getItem('mcc.logmin'); } catch (e) {}
   document.getElementById('logpanel').classList.toggle('min', v === null ? true : v === 'true');
 })();
+/* ===== Écran « Accès » (lot M3, docs/auth.md §5) ========================
+   Quatre volets : confirmations en attente (ce qui va être lancé), clients
+   appairés (droits, révocation), demandes d'appairage (code de comparaison),
+   100 dernières décisions. TOUT texte venu d'un client passe par esc() : un
+   libellé hostile ne doit jamais devenir du HTML (test « libellé hostile » côté
+   Rust). Les ordres partent par postAction (session locale) — jamais un fetch
+   direct vers /api/action. */
+let accessState = null;
+let accessTab = 'confirmations';
+let accessTimer = null;
+const pairDroits = {}; // pair_id -> droits choisis localement (défaut : lecture)
+
+function accessMsg(txt) {
+  const el = document.getElementById('accessMsg');
+  if (el) el.textContent = txt || '';
+}
+function accessBadge() {
+  const a = (state && state.access) || {};
+  const n = (a.pending || 0) + (a.pairs || 0);
+  const b = document.getElementById('accessBanner');
+  if (b) {
+    b.hidden = !n;
+    if (n) {
+      const parts = [];
+      if (a.pending) parts.push(a.pending + ' confirmation' + (a.pending > 1 ? 's' : '') + ' avant ex\u00e9cution');
+      if (a.pairs) parts.push(a.pairs + ' demande' + (a.pairs > 1 ? 's' : '') + ' d\u2019appairage');
+      b.innerHTML = ic('shield') + '<span>' + parts.join(' et ') + ' en attente &mdash; cliquer pour d\u00e9cider</span>';
+    }
+  }
+  const badge = document.getElementById('tbAccessN');
+  if (badge) { badge.hidden = !n; badge.textContent = String(n); }
+  const cp = document.getElementById('accCountPending');
+  if (cp) { cp.hidden = !(a.pending || 0); cp.textContent = String(a.pending || 0); }
+  const cpa = document.getElementById('accCountPairs');
+  if (cpa) { cpa.hidden = !(a.pairs || 0); cpa.textContent = String(a.pairs || 0); }
+}
+function openAccessDlg(pending) {
+  const d = document.getElementById('accessDlg');
+  if (!d) return;
+  let tab = 'confirmations';
+  if (!pending) { try { tab = localStorage.getItem('mcc.acctab') || tab; } catch (e) {} }
+  setAccessTab(tab);
+  accessMsg('');
+  d.showModal();
+  refreshAccess();
+  if (accessTimer) clearInterval(accessTimer);
+  // rafraîchissement tant que l'écran est ouvert : une demande arrive pendant
+  // qu'on le regarde, et l'expiration (2 min) doit se voir sans clic.
+  accessTimer = setInterval(() => { if (d.open) refreshAccess(); }, 3000);
+}
+function closeAccessDlg() {
+  if (accessTimer) { clearInterval(accessTimer); accessTimer = null; }
+  const d = document.getElementById('accessDlg');
+  if (d && d.open) d.close();
+}
+function setAccessTab(name) {
+  accessTab = name;
+  document.querySelectorAll('#accessDlg .set-nav-btn').forEach(b => b.classList.toggle('sel', b.dataset.atab === name));
+  document.querySelectorAll('#accessDlg .set-pane').forEach(p => p.classList.toggle('sel', p.dataset.atab === name));
+  try { localStorage.setItem('mcc.acctab', name); } catch (e) {}
+}
+async function refreshAccess() {
+  const j = await postAction({action: 'access_list'}, {quiet: true});
+  if (!j.ok) { accessMsg('\u2717 ' + (j.error || 'lecture impossible')); return; }
+  accessState = j;
+  accessMsg('');
+  renderAccess();
+}
+function renderAccess() {
+  if (!accessState) return;
+  renderAccPending();
+  renderAccClients();
+  renderAccPairs();
+  renderAccDecisions();
+  accessBadge();
+}
+/* Effet exact d'un appel : tout est échappé, rien n'est interprété. */
+function effectHtml(e) {
+  if (!e || typeof e !== 'object') return '';
+  const out = [];
+  const add = (k, v) => {
+    const t = v === undefined || v === null ? '' : String(v);
+    if (t) out.push('<div class="acc-kv"><span class="acc-k">' + esc(k) + '</span><span class="acc-v">' + esc(t) + '</span></div>');
+  };
+  if (e.kind === 'lancement') {
+    add('programme', e.program);
+    if (Array.isArray(e.args) && e.args.length) add('arguments', e.args.join(' '));
+    add('dossier de travail', e.workdir);
+    if (Array.isArray(e.env) && e.env.length) add('variables', e.env.join(', ') + ' (valeurs masquées)');
+  } else if (e.kind === 'outil') {
+    add('serveur', e.target);
+    add('outil', e.tool);
+    if (e.arguments !== undefined) add('arguments', JSON.stringify(e.arguments));
+  } else if (e.kind === 'ssh') {
+    add('cible', e.target);
+  } else if (e.kind === 'import') {
+    (e.servers || []).forEach((s, i) => add('serveur ' + (i + 1),
+      [s.label, s.program].filter(Boolean).join(' \u2014 ') +
+      (Array.isArray(s.args) && s.args.length ? ' ' + s.args.join(' ') : '')));
+  } else {
+    add('cible', e.target || e.label);
+  }
+  if (e.note) add('note', e.note);
+  return out.join('');
+}
+function renderAccPending() {
+  const box = document.getElementById('accPending');
+  const grantsBox = document.getElementById('accGrants');
+  if (!box || !grantsBox) return;
+  const pend = accessState.pending || [];
+  const ttl = accessState.request_ttl_secs || 120;
+  let html = pend.length ? '' :
+    '<div class="empty-sec">aucune confirmation en attente \u2014 un appel d\u2019outil ' +
+    '<code>execution</code> appara\u00eetra ici et rien ne sera lanc\u00e9 sans votre accord</div>';
+  html += pend.map(p => `<div class="acc-card warn">
+    <div class="acc-h">
+      <span class="acc-tool">${esc(p.tool)}</span>
+      <span class="acc-ttl" title="une demande non d\u00e9cid\u00e9e expire au bout de ${esc(ttl)} s">expire dans ${esc(p.expires_in)} s</span>
+    </div>
+    <div class="acc-who">${esc(p.label || p.keyid)} <span class="acc-fp" title="${esc(p.fingerprint)}">${esc(String(p.fingerprint || '').slice(0, 24))}</span> depuis <b>${esc(p.address)}</b></div>
+    <div class="acc-what">${esc((p.effect || {}).resume || '')}</div>
+    ${effectHtml(p.effect)}
+    <div class="acc-acts">
+      <button class="primary" onclick="confirmApprove(${js(p.id)},'once')">Accepter une fois</button>
+      <button onclick="confirmApprove(${js(p.id)},'window')">Accepter ${esc(Math.round((accessState.window_secs || 600) / 60))} minutes</button>
+      <button class="danger" onclick="confirmDeny(${js(p.id)})">Refuser</button>
+    </div>
+  </div>`).join('');
+  box.innerHTML = html;
+
+  const grants = accessState.grants || [];
+  let gh = '<div class="acc-sub">Permis en cours</div>';
+  gh += grants.length ? '' : '<div class="empty-sec">aucun permis actif</div>';
+  gh += grants.map(g => `<div class="acc-card ok">
+    <div class="acc-h">
+      <span class="acc-tool">${esc(g.tool)}</span>
+      <span class="acc-tag">${esc(g.mode === 'once' ? 'une fois' : 'fen\u00eatre')}</span>
+      <span class="acc-ttl">${esc(g.expires_in)} s restantes</span>
+    </div>
+    <div class="acc-who">${esc(g.label || g.keyid)}</div>
+    <div class="acc-acts"><button class="danger" onclick="grantRevoke(${js(g.id)})">R\u00e9voquer</button></div>
+  </div>`).join('');
+  grantsBox.innerHTML = gh;
+}
+function renderAccClients() {
+  const box = document.getElementById('accClients');
+  if (!box) return;
+  const clients = accessState.clients || [];
+  let html = clients.length ? '' : '<div class="empty-sec">aucun client appair\u00e9</div>';
+  html += clients.map(c => {
+    const droits = c.rights || [];
+    const boutons = ['lecture', 'pilotage', 'execution'].map(r => {
+      const classeOn = droits.includes(r) ? ' on' : '';
+      return `<button class="acc-right${classeOn}" onclick="clientToggleRight(${js(c.keyid)},${js(r)})"
+        title="${esc(droits.includes(r) ? 'Retirer' : 'Accorder')} le droit ${esc(r)}">${esc(r)}</button>`;
+    }).join('');
+    const revoque = c.status === 'revoked';
+    const classeOff = revoque ? ' off' : '';
+    const badgeRevoque = revoque ? '<span class="acc-tag bad">r\u00e9voqu\u00e9</span>' : '';
+    const btnRevoque = revoque ? ''
+      : '<button class="danger" onclick="clientRevokeConfirm(' + js(c.keyid) + ')">R\u00e9voquer</button>';
+    return `<div class="acc-card${classeOff}">
+      <div class="acc-h">
+        <span class="acc-tool">${esc(c.label || c.keyid)}</span>
+        <span class="acc-tag">${esc(c.keyid)}</span>
+        ${badgeRevoque}
+      </div>
+      <div class="acc-who"><span class="acc-fp" title="${esc(c.fingerprint)}">${esc(c.fingerprint_court || c.fingerprint)}</span>
+        \u00b7 appair\u00e9 depuis ${esc(c.paired_from || '?')}
+        \u00b7 cr\u00e9\u00e9 le ${esc(c.created_at || '?')}
+        \u00b7 derni\u00e8re utilisation : ${esc(c.last_used_at || 'jamais')}</div>
+      <div class="acc-acts">${boutons}${btnRevoque}
+      </div>
+    </div>`;
+  }).join('');
+  box.innerHTML = html;
+}
+
+function renderAccPairs() {
+  const box = document.getElementById('accPairs');
+  if (!box) return;
+  const pairs = accessState.pairs || [];
+  let html = pairs.length ? '' :
+    '<div class="empty-sec">aucune demande d\u2019appairage \u2014 un client qui lance <code>mcp-control auth pair</code> appara\u00eetra ici</div>';
+  html += pairs.map(p => {
+    if (!pairDroits[p.pair_id]) pairDroits[p.pair_id] = ['lecture'];
+    const choisis = pairDroits[p.pair_id];
+    const cases = ['lecture', 'pilotage', 'execution'].map(r =>
+      `<label class="acc-chk"><input type="checkbox" data-pair="${esc(p.pair_id)}" data-right="${esc(r)}"
+        ${esc(choisis.includes(r) ? 'checked' : '')} onchange="pairRightChange(this)">${esc(r)}</label>`).join('');
+    return `<div class="acc-card">
+      <div class="acc-h">
+        <span class="acc-code" title="le client affiche le m\u00eame code : s\u2019ils diff\u00e8rent, refusez">${esc(p.code)}</span>
+        <span class="acc-ttl">expire dans ${esc(p.expires_in)} s</span>
+      </div>
+      <div class="acc-who">${esc(p.label || p.keyid)} <span class="acc-fp" title="${esc(p.fingerprint)}">${esc(p.fingerprint_court || '')}</span>
+        \u00b7 ${esc(p.keyid)} \u00b7 depuis ${esc(p.paired_from || '?')}</div>
+      <div class="acc-acts">${cases}
+        <button class="primary" onclick="pairApprove(${js(p.pair_id)})">Accepter</button>
+        <button class="danger" onclick="pairReject(${js(p.pair_id)})">Refuser</button>
+      </div>
+    </div>`;
+  }).join('');
+  box.innerHTML = html;
+}
+function renderAccDecisions() {
+  const box = document.getElementById('accDecisions');
+  if (!box) return;
+  const d = accessState.decisions || [];
+  const heure = ts => {
+    try { return new Date(Number(ts) * 1000).toLocaleTimeString(); } catch (e) { return '?'; }
+  };
+  let html = d.length ? '' : '<div class="empty-sec">aucune d\u00e9cision enregistr\u00e9e pour l\u2019instant</div>';
+  html += d.map(x => `<div class="acc-line">
+    <span class="acc-when">${esc(heure(x.ts))}</span>
+    <span class="acc-verdict">${esc(x.verdict)}</span>
+    <span class="acc-tool">${esc(x.tool)}</span>
+    <span class="acc-who-sm">${esc(x.keyid)}</span>
+    <span class="acc-reason">${esc(x.reason === '-' ? '' : (x.reason || ''))}</span>
+  </div>`).join('');
+  box.innerHTML = html;
+}
+async function confirmApprove(id, mode) {
+  const j = await postAction({action: 'confirm_approve', request_id: id, mode}, {quiet: true});
+  if (!j.ok) { accessMsg('\u2717 ' + (j.error || 'refus')); return; }
+  toast(mode === 'once' ? 'confirm\u00e9 : une seule ex\u00e9cution' : 'confirm\u00e9 pour la dur\u00e9e du permis', 'ok');
+  await refreshAccess();
+  await load();
+}
+async function confirmDeny(id) {
+  const j = await postAction({action: 'confirm_deny', request_id: id}, {quiet: true});
+  if (!j.ok) { accessMsg('\u2717 ' + (j.error || 'refus')); return; }
+  toast('demande refus\u00e9e : rien ne sera ex\u00e9cut\u00e9', 'ok');
+  await refreshAccess();
+  await load();
+}
+async function grantRevoke(id) {
+  const j = await postAction({action: 'grant_revoke', request_id: id}, {quiet: true});
+  if (!j.ok) { accessMsg('\u2717 ' + (j.error || 'refus')); return; }
+  await refreshAccess();
+}
+async function clientToggleRight(keyid, right) {
+  const c = (accessState.clients || []).find(x => x.keyid === keyid);
+  if (!c) return;
+  const actuels = c.rights || [];
+  const droits = actuels.includes(right) ? actuels.filter(r => r !== right) : actuels.concat([right]);
+  const j = await postAction({action: 'client_set_scopes', keyid, rights: droits}, {quiet: true});
+  if (!j.ok) { accessMsg('\u2717 ' + (j.error || 'refus')); return; }
+  await refreshAccess();
+}
+async function clientRevokeConfirm(keyid) {
+  if (!confirm('R\u00e9voquer ' + keyid + ' ? Ses requ\u00eates seront refus\u00e9es d\u00e8s la suivante.')) return;
+  const j = await postAction({action: 'client_revoke', keyid}, {quiet: true});
+  if (!j.ok) { accessMsg('\u2717 ' + (j.error || 'refus')); return; }
+  await refreshAccess();
+}
+function pairRightChange(el) {
+  const id = el.dataset.pair;
+  const droit = el.dataset.right;
+  const liste = pairDroits[id] || [];
+  if (el.checked) { if (!liste.includes(droit)) liste.push(droit); } else {
+    const i = liste.indexOf(droit);
+    if (i >= 0) liste.splice(i, 1);
+  }
+  pairDroits[id] = liste;
+}
+async function pairApprove(pairId) {
+  const droits = pairDroits[pairId] || ['lecture'];
+  const j = await postAction({action: 'pair_approve', pair_id: pairId, rights: droits}, {quiet: true});
+  if (!j.ok) { accessMsg('\u2717 ' + (j.error || 'refus')); return; }
+  delete pairDroits[pairId];
+  toast('client appair\u00e9', 'ok');
+  await refreshAccess();
+  await load();
+}
+async function pairReject(pairId) {
+  const j = await postAction({action: 'pair_reject', pair_id: pairId}, {quiet: true});
+  if (!j.ok) { accessMsg('\u2717 ' + (j.error || 'refus')); return; }
+  delete pairDroits[pairId];
+  await refreshAccess();
+}
+/* Esc ferme l'écran Accès (aucune saisie en cours : rien à jeter). */
+(function () {
+  const d = document.getElementById('accessDlg');
+  if (!d) return;
+  d.addEventListener('cancel', () => { if (accessTimer) { clearInterval(accessTimer); accessTimer = null; } });
+})();
+
 /* ===== Polling armé sur les réglages =====
    Rythme normal : settings.refresh_secs (min 5 s), ré-armé à chaque état
    reçu. Panne moteur (lot C #2) : après le PREMIER échec de load(), réessai

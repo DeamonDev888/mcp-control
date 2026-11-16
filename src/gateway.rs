@@ -336,8 +336,33 @@ fn with_rights(mut b: ServerBuilder) -> ServerBuilder {
 /// signature (contrat C7). C'est le seul constructeur utilisé par `install` et
 /// `refresh` : sans vérificateur, la lib retombe sur son chemin historique
 /// (autorisation inactive) — un moteur ne doit jamais partir ainsi.
+///
+/// Lot M3 : la **confirmation humaine** (contrat C5, `docs/auth.md` §5) est
+/// posée ici, avec le journal des décisions d'autorisation (contrat C4). Les
+/// trois vont ensemble : `require_approval` sans politique est un échec fermé
+/// côté lib, et une politique sans `on_auth_decision` ne laisse aucune trace.
 fn build_builder_guarded(state: &Arc<AppState>) -> ServerBuilder {
-    build_builder(state).verifier(verifier_for(state))
+    let b = build_builder(state).verifier(verifier_for(state));
+    let b = with_approval(b, state);
+    let st = Arc::clone(state);
+    b.on_auth_decision(move |ev| crate::auth::confirm::note_decision(&st, ev))
+}
+
+/// Les 10 outils `execution` passent par la confirmation humaine (§5 : « les
+/// dix outils `execution`, sans exception »). Aucun autre outil n'est confirmé :
+/// `stop_server` et `remove_server` sont destructifs mais ne lancent rien.
+///
+/// La politique reçoit les arguments **après validation et injection des
+/// défauts** (contrat C5) : ce qui est approuvé est exactement ce qui s'exécute.
+fn with_approval(mut b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
+    for (tool, right) in TOOL_RIGHTS {
+        if right == crate::auth::RIGHT_EXECUTION {
+            b = b.require_approval(tool);
+        }
+    }
+    b.approval_policy(Arc::new(crate::auth::confirm::Policy {
+        state: Arc::clone(state),
+    }))
 }
 
 // ---------- outils de lecture (l'état est lu EN DIRECT à chaque appel) ----------
@@ -1341,7 +1366,12 @@ pub fn serve(
     headers: &[(String, String)],
     body: &[u8],
     legacy: bool,
+    peer: Option<std::net::IpAddr>,
 ) -> Reply {
+    // Adresse source de la requête : la politique de confirmation (C5) ne
+    // reçoit que `(client, outil, arguments, request_id)` ; l'adresse exigée
+    // par `docs/auth.md` §5 vient de ce canal, propre au fil de la connexion.
+    crate::auth::confirm::set_request_peer(peer);
     let Some(gw) = current() else {
         return Reply::new(
             503,
@@ -1744,6 +1774,7 @@ mod tests {
             &hs(&[("content-type", "application/json")]),
             b"{}",
             false,
+            None,
         );
         assert_eq!(r.status, 503);
     }
@@ -2227,6 +2258,21 @@ mod tests {
             (
                 "client_rotate",
                 json!({ "keyid": "mcc-a-0000000000000001", "new_keyid": "mcc-a-0000000000000002", "public_key": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a" }),
+            ),
+            // Lot M3 : les décisions de confirmation sont locales elles aussi
+            // (session `admin`) — aucun outil ne doit les atteindre.
+            ("access_list", json!({})),
+            (
+                "confirm_approve",
+                json!({ "request_id": "00000000000000000000000000000000", "mode": "window" }),
+            ),
+            (
+                "confirm_deny",
+                json!({ "request_id": "00000000000000000000000000000000" }),
+            ),
+            (
+                "grant_revoke",
+                json!({ "request_id": "00000000000000000000000000000000" }),
             ),
         ]
     }

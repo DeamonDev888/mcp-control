@@ -34,6 +34,7 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     <button onclick="doScanNet()" title="Balayer le r&eacute;seau local pour d&eacute;couvrir les serveurs MCP distants"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='8.5'/><path d='M3.5 12h17M12 3.5c2.4 2.4 3.8 5.3 3.8 8.5s-1.4 6.1-3.8 8.5c-2.4-2.4-3.8-5.3-3.8-8.5s1.4-6.1 3.8-8.5Z'/></svg><span class="tb-lbl">Scanner le r&eacute;seau</span></button>
     <button onclick="openMachineDlg()" title="Machines distantes (SSH) et d&eacute;tection des moteurs MCP Control du LAN"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='2.5' y='4' width='19' height='13' rx='2'/><path d='M8 21h8M12 17v4'/></svg><span class="tb-lbl">Machines</span></button>
     <button onclick="openStore()" title="Catalogue de serveurs MCP pr&ecirc;ts &agrave; installer"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='9' cy='20' r='1.4'/><circle cx='17' cy='20' r='1.4'/><path d='M2.5 3.5h2.2l2.5 11.5h10.3l2-8H6'/></svg><span class="tb-lbl">Boutique</span></button>
+    <button id="tbAccess" onclick="openAccessDlg()" title="Acc&egrave;s &mdash; clients appair&eacute;s, demandes d'appairage et confirmations avant ex&eacute;cution"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 3 4.5 6v5.5c0 4.4 3.1 8.3 7.5 9.5 4.4-1.2 7.5-5.1 7.5-9.5V6L12 3Z'/><path d='m8.8 11.8 2.2 2.2 4.2-4.4'/></svg><span class="tb-lbl">Acc&egrave;s</span><span id="tbAccessN" class="tb-count" hidden>0</span></button>
     <button onclick="openSettingsDlg()" title="R&eacute;glages du client"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='3.1'/><path d='M12 2.8v2.6M12 18.6v2.6M2.8 12h2.6M18.6 12h2.6M5.5 5.5l1.9 1.9M16.6 16.6l1.9 1.9M18.5 5.5l-1.9 1.9M7.4 16.6l-1.9 1.9'/></svg><span class="tb-lbl">R&eacute;glages</span></button>
     <button onclick="refreshAll()" title="Re-sonder tous les serveurs connus et d&eacute;couvrir les nouveaux (tous ports en &eacute;coute)"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M21 12a9 9 0 1 1-2.6-6.4L21 8'/><path d='M21 3v5h-5'/></svg></button>
   </div>
@@ -45,6 +46,9 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 </div>
 
 <div id="deadBanner" hidden></div>
+
+<div id="accessBanner" hidden onclick="openAccessDlg(true)"
+  title="Une demande attend une d&eacute;cision locale &mdash; cliquer pour ouvrir l'&eacute;cran Acc&egrave;s"></div>
 
 <div id="main">
   <aside id="explorer">
@@ -409,6 +413,46 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
       <button onclick="closeSettings()">Annuler</button>
       <button class="primary" onclick="saveSettings()">Enregistrer</button>
     </div>
+  </div>
+</dialog>
+
+<dialog id="accessDlg" class="settings-dlg access-dlg">
+  <div class="dlg-head">
+    <div class="dlg-title">
+      <svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
+        <path d='M12 3 4.5 6v5.5c0 4.4 3.1 8.3 7.5 9.5 4.4-1.2 7.5-5.1 7.5-9.5V6L12 3Z'
+          fill='none' stroke='currentColor' stroke-width='1.5' stroke-linejoin='round'/>
+        <path d='m8.8 11.8 2.2 2.2 4.2-4.4' fill='none' stroke='currentColor' stroke-width='1.5'
+          stroke-linecap='round' stroke-linejoin='round'/>
+      </svg>
+      <div>
+        <h2>Acc&egrave;s</h2>
+        <p>Clients appair&eacute;s, demandes d'appairage et confirmations avant ex&eacute;cution</p>
+      </div>
+    </div>
+    <button class="close" onclick="closeAccessDlg()" title="Fermer">&times;</button>
+  </div>
+  <div class="set-shell">
+    <nav class="set-nav" id="accessNav" aria-label="Sections de l'&eacute;cran Acc&egrave;s">
+      <button class="set-nav-btn sel" data-atab="confirmations" onclick="setAccessTab('confirmations')"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 3 4.5 6v5.5c0 4.4 3.1 8.3 7.5 9.5 4.4-1.2 7.5-5.1 7.5-9.5V6L12 3Z'/><path d='m8.8 11.8 2.2 2.2 4.2-4.4'/></svg>Confirmations<span class="nav-count" id="accCountPending" hidden>0</span></button>
+      <button class="set-nav-btn" data-atab="clients" onclick="setAccessTab('clients')"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='8' r='3.4'/><path d='M5 20c0-3.6 3.1-6 7-6s7 2.4 7 6'/></svg>Clients</button>
+      <button class="set-nav-btn" data-atab="appairage" onclick="setAccessTab('appairage')"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M9.5 14.5 14.5 9.5'/><path d='M8 11 5.8 13.2a3.6 3.6 0 0 0 5 5L13 16'/><path d='M16 13l2.2-2.2a3.6 3.6 0 0 0-5-5L11 8'/></svg>Appairage<span class="nav-count" id="accCountPairs" hidden>0</span></button>
+      <button class="set-nav-btn" data-atab="journal" onclick="setAccessTab('journal')"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M5 4.5h14v15H5z'/><path d='M8.5 8.5h7M8.5 12h7M8.5 15.5h4'/></svg>Journal</button>
+    </nav>
+    <div class="set-panes acc-panes">
+      <section class="set-pane sel" data-atab="confirmations">
+        <div id="accPending" class="acc-list"></div>
+        <div id="accGrants" class="acc-list"></div>
+      </section>
+      <section class="set-pane" data-atab="clients"><div id="accClients" class="acc-list"></div></section>
+      <section class="set-pane" data-atab="appairage"><div id="accPairs" class="acc-list"></div></section>
+      <section class="set-pane" data-atab="journal"><div id="accDecisions" class="acc-list"></div></section>
+    </div>
+  </div>
+  <div id="accessMsg" class="machine-msg set-msgline"></div>
+  <div class="dlg-foot">
+    <span class="dlg-foot-note">Approbation r&eacute;serv&eacute;e &agrave; cette fen&ecirc;tre (session locale). Rien n'est persist&eacute; : un red&eacute;marrage redemande tout.</span>
+    <div class="row"><button onclick="refreshAccess()">Rafra&icirc;chir</button></div>
   </div>
 </dialog>
 
@@ -994,5 +1038,251 @@ mod tests {
             h.contains("netDown()"),
             "postAction doit signaler l'erreur réseau par netDown()"
         );
+    }
+
+    // ---------- Lot M3 : écran « Accès » ------------------------------------
+
+    /// Le bloc JS de l'écran « Accès » — de son en-tête au bloc de polling.
+    fn bloc_acces() -> &'static str {
+        let debut = APP_JS
+            .find("Écran « Accès »")
+            .expect("en-tête du bloc Accès absent de app.js");
+        let fin = APP_JS[debut..]
+            .find("Polling arm")
+            .map(|i| debut + i)
+            .expect("fin du bloc Accès introuvable");
+        &APP_JS[debut..fin]
+    }
+
+    /// Référence Rust de `esc()` : mêmes caractères dangereux, mêmes entités,
+    /// mêmes caractères de contrôle retirés. Ce n'est pas une réécriture de la
+    /// page : c'est la règle que la page doit appliquer, figée ici pour qu'un
+    /// libellé hostile ne puisse pas passer.
+    fn esc_html(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            if c.is_control() {
+                continue;
+            }
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '"' => out.push_str("&quot;"),
+                '\'' => out.push_str("&#39;"),
+                autre => out.push(autre),
+            }
+        }
+        out
+    }
+
+    /// **Le test exigé par le lot M3** : un libellé hostile (balise, guillemets,
+    /// très long, caractères de contrôle) ne peut jamais atterrir dans le HTML.
+    #[test]
+    fn libelle_hostile_jamais_dans_le_html() {
+        // 1) la règle d'échappement de la page est bien celle vérifiée ici
+        let esc = APP_JS
+            .lines()
+            .find(|l| l.starts_with("const esc = "))
+            .expect("définition de esc() absente");
+        assert!(esc.contains(r#"[&<>"']/g"#), "caractères échappés : {esc}");
+        assert!(
+            esc.contains(r"[\u0000-\u001f\u007f]"),
+            "les caractères de contrôle doivent être retirés par esc() : {esc}"
+        );
+        for entite in ["&amp;", "&lt;", "&gt;", "&quot;", "&#39;"] {
+            assert!(esc.contains(entite), "entité manquante : {entite}");
+        }
+        // 2) les quatre familles hostiles du critère
+        let tres_long = "A".repeat(4096);
+        let hostiles: [&str; 5] = [
+            "<script>alert('x')</script>",
+            "\"><img src=x onerror=alert(1)>",
+            "l'équipe \"rouge\" & <b>gras</b>",
+            tres_long.as_str(),
+            "ligne\u{0}nulle\u{1b}[31m\u{7f}cloche",
+        ];
+        for brut in hostiles {
+            let rendu = esc_html(brut);
+            assert!(!rendu.contains('<') && !rendu.contains('>'), "{rendu}");
+            assert!(!rendu.contains('"'), "guillemet non échappé : {rendu}");
+            assert!(!rendu.contains('\''), "apostrophe non échappée : {rendu}");
+            assert!(
+                !rendu.chars().any(|c| c.is_control()),
+                "caractère de contrôle dans le rendu : {rendu:?}"
+            );
+            // rien n'est perdu hors les caractères dangereux (esc() ALLONGE le
+            // texte : une entité vaut plusieurs caractères)
+            let attendus = brut.chars().filter(|c| !c.is_control()).count();
+            assert!(rendu.chars().count() >= attendus, "texte tronqué : {rendu}");
+        }
+        assert_eq!(
+            esc_html(&"A".repeat(4096)).matches('A').count(),
+            4096,
+            "un libellé très long est conservé (c'est la page qui tronque à l'affichage)"
+        );
+        // le cas exact du critère : <script> ne survit jamais tel quel
+        assert!(!esc_html("<script>").contains("script>"));
+    }
+
+    /// Statique : dans l'écran « Accès », **aucune** interpolation de gabarit
+    /// n'insère un texte venu d'un client sans passer par `esc()` / `js()`.
+    #[test]
+    fn ecran_acces_echappe_tout_champ_venu_d_un_client() {
+        let bloc = bloc_acces();
+        // fragments locaux construits avec esc()/js() — vérifiés juste après
+        let permis = [
+            "esc(",
+            "js(",
+            "ic(",
+            "effectHtml(",
+            "boutons",
+            "btnRevoque",
+            "badgeRevoque",
+            "cases",
+            "classeOn",
+            "classeOff",
+        ];
+        let mut i = 0usize;
+        let mut total = 0usize;
+        while let Some(k) = bloc[i..].find("${").map(|p| i + p) {
+            let mut prof = 1usize;
+            let mut m = k + 2;
+            let mut quote: Option<char> = None;
+            let octets = bloc.as_bytes();
+            while m < bloc.len() && prof > 0 {
+                let c = bloc[m..].chars().next().unwrap();
+                match quote {
+                    Some(q) => {
+                        if c == '\\' {
+                            m += 2;
+                            continue;
+                        }
+                        if c == q {
+                            quote = None;
+                        }
+                    }
+                    None => match c {
+                        '\'' | '"' | '`' => quote = Some(c),
+                        '{' => prof += 1,
+                        '}' => prof -= 1,
+                        _ => {}
+                    },
+                }
+                m += c.len_utf8();
+            }
+            assert!(
+                prof == 0,
+                "interpolation non fermée près de : {}",
+                &bloc[k..]
+            );
+            let expr = bloc[k + 2..m - 1].trim();
+            assert!(
+                permis.iter().any(|p| expr.starts_with(p)),
+                "texte non échappé dans l'écran Accès : ${{{expr}}}"
+            );
+            let _ = octets;
+            total += 1;
+            i = m;
+        }
+        assert!(
+            total >= 30,
+            "l'inventaire des interpolations doit rester consistant (trouvé {total})"
+        );
+        // les fragments autorisés sont eux-mêmes construits avec esc()/js()
+        for (nom, extrait) in [
+            ("boutons", "const boutons ="),
+            ("cases", "const cases ="),
+            ("btnRevoque", "const btnRevoque ="),
+            ("badgeRevoque", "const badgeRevoque ="),
+            ("classeOn", "const classeOn ="),
+        ] {
+            let pos = bloc
+                .find(extrait)
+                .unwrap_or_else(|| panic!("fragment {nom} introuvable"));
+            let fin = (pos + 700).min(bloc.len());
+            let corps = &bloc[pos..fin];
+            assert!(
+                corps.contains("esc(") || corps.contains("js("),
+                "le fragment {nom} doit échapper ce qu'il contient : {corps}"
+            );
+        }
+        // et aucun champ de client n'est interpolé nu
+        for champ in [
+            "label",
+            "keyid",
+            "fingerprint",
+            "fingerprint_court",
+            "address",
+            "code",
+            "tool",
+            "paired_from",
+            "created_at",
+            "last_used_at",
+            "verdict",
+            "reason",
+            "resume",
+            "note",
+        ] {
+            for motif in [
+                format!("${{{champ}}}"),
+                format!("${{p.{champ}}}"),
+                format!("${{c.{champ}}}"),
+                format!("${{g.{champ}}}"),
+                format!("${{x.{champ}}}"),
+            ] {
+                assert!(
+                    !bloc.contains(&motif),
+                    "champ venu d'un client interpolé sans esc() : {motif}"
+                );
+            }
+        }
+    }
+
+    /// L'écran « Accès » parle aux quatre actions locales du lot M3 (jamais un
+    /// fetch direct : le contrat « un seul fetch d'action » tient toujours).
+    #[test]
+    fn ecran_acces_branche_sur_les_actions_locales() {
+        let bloc = bloc_acces();
+        for action in [
+            "access_list",
+            "confirm_approve",
+            "confirm_deny",
+            "grant_revoke",
+            "pair_approve",
+            "pair_reject",
+            "client_set_scopes",
+            "client_revoke",
+        ] {
+            assert!(
+                bloc.contains(&format!("action: '{action}'")),
+                "action locale absente de l'écran Accès : {action}"
+            );
+            assert!(
+                crate::manage::ACTIONS.contains(&action),
+                "action absente du dispatcher : {action}"
+            );
+            assert!(
+                crate::auth::action_reservee_admin(action),
+                "action non réservée à la session locale : {action}"
+            );
+        }
+        // trois boutons de décision pour une confirmation : une fois, permis, refus
+        for bouton in [
+            "confirmApprove(${js(p.id)},'once')",
+            "confirmApprove(${js(p.id)},'window')",
+            "confirmDeny(${js(p.id)})",
+        ] {
+            assert!(
+                bloc.contains(bouton),
+                "bouton de décision manquant : {bouton}"
+            );
+        }
+        // le bandeau et la pastille lisent les compteurs de /api/state
+        assert!(
+            APP_JS.contains("state.access"),
+            "le bandeau doit lire state.access"
+        );
+        assert!(APP_JS.contains("tbAccessN"), "pastille de compteur absente");
     }
 }

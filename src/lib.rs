@@ -1330,7 +1330,9 @@ pub(crate) fn handle_conn(mut stream: TcpStream, state: Arc<AppState>, guard: Co
         // socket déjà durci ; cf. gateway::serve). `legacy_ok` n'ouvre que la
         // LECTURE (code hérité, §10) — la signature, elle, est obligatoire.
         Ok(()) if path.split('?').next() == Some("/mcp") => {
-            gateway::serve(&method, &path, &headers, &body, legacy_ok)
+            // `peer_ip` : l'adresse source figure sur la demande de confirmation
+            // (docs/auth.md §5) — le transport est le seul à la connaître.
+            gateway::serve(&method, &path, &headers, &body, legacy_ok, peer_ip)
         }
         Ok(()) => route_peer(&state, &method, &path, &body, peer_ip),
     };

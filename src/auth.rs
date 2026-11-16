@@ -19,6 +19,7 @@
 //! aucune primitive cryptographique écrite à la main (Ed25519 vient de la lib).
 
 pub mod cli;
+pub mod confirm;
 pub mod pair;
 pub mod registry;
 pub mod secret;
@@ -36,7 +37,11 @@ pub use registry::{
 /// n'existent QUE sur l'API locale du moteur — jamais sur `/mcp`, jamais
 /// depuis le LAN. Leur présence ici est la liste de référence du dispatcher, du
 /// test d'exclusion du gateway et du contrôle d'origine de `route_peer`.
-pub const ADMIN_ACTIONS: [&str; 7] = [
+///
+/// Lot M3 : `access_list` (état de l'écran « Accès »), `confirm_approve`,
+/// `confirm_deny` et `grant_revoke` (décisions de confirmation, §5) rejoignent
+/// les sept actions d'appairage et de registre du lot M1.
+pub const ADMIN_ACTIONS: [&str; 11] = [
     "pair_list",
     "pair_approve",
     "pair_reject",
@@ -44,6 +49,10 @@ pub const ADMIN_ACTIONS: [&str; 7] = [
     "client_set_scopes",
     "client_revoke",
     "client_rotate",
+    "access_list",
+    "confirm_approve",
+    "confirm_deny",
+    "grant_revoke",
 ];
 
 /// Cette action est-elle réservée à la session locale (`admin`) ?

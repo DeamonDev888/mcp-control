@@ -695,3 +695,71 @@ input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 
 .empty-note{font:11px/1.4 var(--sans);color:var(--t4);padding:10px 0;font-style:italic}
 .empty-indent{padding-left:23px}
 .dot.dot-lg{width:10px;height:10px}
+
+/* ===== Écran « Accès » (lot M3, docs/auth.md §5) ==========================
+   Bandeau d'attente (sous la barre de titre), pastille de compteur dans la
+   barre d'outils, et les quatre volets du dialogue : confirmations, clients,
+   appairage, journal. Les cartes reprennent .machine-row : mêmes surfaces,
+   mêmes filets, mêmes rayons. */
+#accessBanner{display:flex;align-items:center;justify-content:center;gap:8px;padding:5px 12px;
+  font:12px/1.4 var(--sans);color:var(--warn);background:rgba(192,133,50,.12);
+  border-bottom:1px solid rgba(192,133,50,.35);flex-shrink:0;cursor:pointer}
+#accessBanner:hover{background:rgba(192,133,50,.20);color:#e0a34a}
+#accessBanner[hidden]{display:none}
+#accessBanner .ic{width:13px;height:13px}
+/* Pastille de compteur : nombre de demandes qui attendent une décision. */
+.tb-count{display:inline-flex;align-items:center;justify-content:center;min-width:15px;height:15px;
+  padding:0 4px;margin-left:4px;font:10px/1 var(--mono);font-variant-numeric:tabular-nums;
+  color:#fff;background:var(--bad);border-radius:var(--rpill)}
+.tb-count[hidden]{display:none}
+.nav-count{display:inline-flex;align-items:center;justify-content:center;min-width:15px;height:15px;
+  padding:0 4px;margin-left:auto;font:10px/1 var(--mono);color:#fff;background:var(--bad);
+  border-radius:var(--rpill)}
+.nav-count[hidden]{display:none}
+.access-dlg{width:min(880px,95vw)}
+.acc-panes{max-height:min(66vh,600px)}
+.acc-list{padding:12px 14px;display:flex;flex-direction:column;gap:9px}
+.acc-card{background:var(--sidebar);border:1px solid var(--border-soft);border-radius:var(--r3);
+  padding:10px 12px}
+.acc-card.warn{background:rgba(192,133,50,.07);border-color:rgba(192,133,50,.36)}
+.acc-card.ok{background:rgba(85,165,131,.06);border-color:rgba(85,165,131,.30)}
+.acc-card.off{opacity:.62}
+.acc-h{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.acc-tool{font:12.5px/1.35 var(--mono);color:var(--t1);font-weight:600}
+.acc-tag{font:10.5px/1 var(--mono);color:var(--t3);border:1px solid var(--border-soft);
+  border-radius:var(--r2);padding:2px 6px}
+.acc-tag.bad{color:var(--bad);border-color:rgba(231,94,120,.35)}
+.acc-ttl{margin-left:auto;font:10.5px/1 var(--mono);color:var(--t3);white-space:nowrap}
+.acc-who{font:11px/1.5 var(--mono);color:var(--t3);margin:5px 0 4px;word-break:break-word}
+.acc-who b{color:var(--t2);font-weight:600}
+.acc-fp{color:var(--t4)}
+.acc-what{font:12px/1.45 var(--mono);color:var(--t1);word-break:break-word}
+.acc-kv{display:flex;gap:8px;font:11px/1.5 var(--mono);margin-top:3px;word-break:break-word}
+.acc-k{flex:0 0 128px;color:var(--t4)}
+.acc-v{flex:1;min-width:0;color:var(--t2)}
+.acc-acts{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:9px}
+.acc-acts button{height:var(--h-ctl)}
+/* Droits d'un client : bouton bascule, allumé quand le droit est détenu. */
+.acc-right{min-width:74px;justify-content:center;border:1px solid var(--border-soft);
+  color:var(--t4);background:transparent;font:11px/1 var(--mono)}
+.acc-right:hover{border-color:var(--border);color:var(--t2)}
+.acc-right.on{color:var(--accent);border-color:rgba(74,132,254,.55);background:var(--active)}
+.acc-chk{display:inline-flex;align-items:center;gap:5px;height:var(--h-ctl);padding:0 8px;
+  font:11px/1 var(--mono);color:var(--t2);border:1px solid var(--border-soft);border-radius:var(--r2)}
+.acc-chk input{margin:0}
+.acc-code{font:15px/1 var(--mono);letter-spacing:2px;color:var(--accent);font-variant-numeric:tabular-nums}
+.acc-sub{font:11px/1 var(--sans);color:var(--t4);text-transform:uppercase;letter-spacing:.6px;
+  margin:6px 0 2px}
+.acc-line{display:flex;gap:9px;align-items:baseline;font:11px/1.5 var(--mono);
+  padding:3px 0;border-bottom:1px solid var(--border-soft)}
+.acc-line:last-child{border-bottom:none}
+.acc-when{flex:0 0 74px;color:var(--t4);font-variant-numeric:tabular-nums}
+.acc-verdict{flex:0 0 132px;color:var(--t2)}
+.acc-who-sm{flex:0 0 200px;color:var(--t4);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.acc-reason{flex:1;min-width:0;color:var(--t3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+:root[data-theme="light"] .acc-card{background:var(--card);border:1px solid var(--border-soft)}
+:root[data-theme="light"] .acc-card.warn{background:rgba(192,133,50,.10);border-color:rgba(143,92,16,.40)}
+:root[data-theme="light"] .acc-card.ok{background:rgba(46,122,92,.08);border-color:rgba(46,122,92,.35)}
+:root[data-theme="light"] #accessBanner{color:#8f5c10;background:rgba(192,133,50,.16);
+  border-bottom:1px solid rgba(143,92,16,.40)}
+:root[data-theme="light"] #accessBanner:hover{background:rgba(192,133,50,.26);color:#7a4d0c}
