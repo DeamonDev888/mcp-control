@@ -197,6 +197,10 @@ pub struct Settings {
     pub autostart: bool,
     /// Notifications (desktop + webhook) sur incident serveur.
     pub notify: crate::notify::NotifyConfig,
+    /// Authentification forte (lot M1) : identité publique du serveur, registre
+    /// des clients (`auth.clients[]`) et demandes d'appairage en cours. Persisté
+    /// dans `config.json` sous la clé `auth` — aucune clé privée n'y figure.
+    pub auth: crate::auth::AuthState,
 }
 
 impl Default for Settings {
@@ -220,6 +224,7 @@ impl Default for Settings {
             server_order: vec![],
             autostart: true,
             notify: crate::notify::NotifyConfig::default(),
+            auth: crate::auth::AuthState::default(),
         }
     }
 }

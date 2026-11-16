@@ -7,6 +7,12 @@
 use mcp_control::manage;
 
 fn main() {
+    // Sous-commandes `auth` (lot M1) : elles n'ouvrent AUCUN moteur — elles
+    // parlent au moteur local (ou lisent config.json) et sortent.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("auth") {
+        std::process::exit(mcp_control::auth::cli::run(&args[2..]));
+    }
     // MCC_CONFIG override ; sinon résolution runtime (dev → manifest, release → exe dir)
     let _config_path =
         manage::resolve_config_path(env!("CARGO_MANIFEST_DIR"), std::env::var("MCC_CONFIG").ok());

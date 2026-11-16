@@ -10,6 +10,12 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 serde_json = "1"
+# Trousseau du système (lot M1, docs/auth.md §9) : Windows Credential Manager
+# (DPAPI), Keychain macOS, Secret Service Linux — couverts par la feature `v1`.
+# Version ÉPINGLÉE, `default-features = false`, et feature Cargo optionnelle :
+# sans elle, le moteur compile et se rabat sur le fichier 0600 (repli
+# journalisé). Activable par defaut : le produit livré protège la clé.
+keyring = { version = "=4.2.0", default-features = false, features = ["v1"], optional = true }
 # Gateway MCP : la console elle-même devient un serveur MCP (POST /mcp sur le
 # port UI) — dispatch MCP 2026-07-28 embarqué (ServerCore::dispatch), catalogues
 # dynamiques. Dépendance **par chemin** : la 0.12.0 (features `auth-sign`,
@@ -17,6 +23,12 @@ serde_json = "1"
 # reste actif : les macros servent (`litemcp::zod`). Retour à une version
 # publiée au lot D.
 litemcp = { path = "../litemcp", features = ["auth-sign"] }
+
+[features]
+# `keyring` actif = clé privée au trousseau du système. Sans lui : repli fichier
+# 0600 / ACL utilisateur seule, journalisé à chaque démarrage.
+default = ["keyring"]
+keyring = ["dep:keyring"]
 
 [[bin]]
 name = "mcp-control"

@@ -97,12 +97,22 @@ pub struct Engine {
     pub code: Option<String>,
     /// Port UI RÉEL (base ou base+offset après repli du moteur).
     pub port: u16,
+    /// Bind demandé — conservé pour relancer le moteur (`restart`).
+    bind: &'static str,
 }
 
 /// Lance le binaire mcp-control avec une config isolée dans un tmp unique.
 pub fn spawn(cfg: EngineCfg) -> std::io::Result<Engine> {
     let n = NEXT_TMP.fetch_add(1, Ordering::SeqCst);
-    let tmp = std::env::temp_dir().join(format!("mcc-e2e-{}-{}", std::process::id(), n));
+    spawn_in(
+        cfg,
+        std::env::temp_dir().join(format!("mcc-e2e-{}-{}", std::process::id(), n)),
+    )
+}
+
+/// Variante interne : répertoire de données imposé (utilisée par `restart` pour
+/// repartir sur le MÊME `config.json`, registre d'authentification compris).
+fn spawn_in(cfg: EngineCfg, tmp: PathBuf) -> std::io::Result<Engine> {
     std::fs::create_dir_all(&tmp)?;
     let cfg_path = tmp.join("config.json");
 
@@ -110,6 +120,8 @@ pub fn spawn(cfg: EngineCfg) -> std::io::Result<Engine> {
     // autostart false (jamais de clé Run réelle), network_enabled false
     // (jamais de scan LAN à +30 s), refresh_secs 5 (plancher) pour des
     // cycles de sondage rapides. removed_seeds neutralise les seeds embarqués.
+    // Un `data_dir` réutilisé (redémarrage) garde SON config.json : le registre
+    // d'authentification doit survivre, c'est précisément ce qu'on vérifie.
     let doc = json!({
         "servers": [],
         "settings": {
@@ -128,14 +140,21 @@ pub fn spawn(cfg: EngineCfg) -> std::io::Result<Engine> {
             "ssh_hosts": []
         }
     });
-    std::fs::write(
-        &cfg_path,
-        serde_json::to_string_pretty(&doc).unwrap_or_default(),
-    )?;
+    if !cfg_path.exists() {
+        std::fs::write(
+            &cfg_path,
+            serde_json::to_string_pretty(&doc).unwrap_or_default(),
+        )?;
+    }
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-control"));
     // mcc.log + state-cache.json sont écrits À CÔTÉ du config.json → tmp isolé.
     cmd.env("MCC_CONFIG", &cfg_path);
+    // Trousseau : les moteurs de test ne doivent JAMAIS écrire dans le
+    // gestionnaire d'identifiants de l'utilisateur (une entrée par moteur, et
+    // une identité de test à la place de la sienne). Valeur vide = repli
+    // fichier 0600, le chemin qu'on veut précisément éprouver ici.
+    cmd.env("MCC_KEYRING_SERVICE", "");
     match &cfg.api_access {
         Some(code) => {
             cmd.env("MCC_API_ACCESS", code);
@@ -164,6 +183,7 @@ pub fn spawn(cfg: EngineCfg) -> std::io::Result<Engine> {
         tmp,
         code: cfg.api_access,
         port: cfg.ui_port,
+        bind: cfg.ui_bind,
     })
 }
 
@@ -171,6 +191,22 @@ impl Engine {
     /// Port demandé à la config (avant repli éventuel).
     pub fn tmp_dir(&self) -> &PathBuf {
         &self.tmp
+    }
+
+    /// Arrête ce moteur et le relance sur le MÊME répertoire de données (donc le
+    /// même `config.json` : registre des clients, identité du serveur). Lot M1 :
+    /// c'est ce qui prouve qu'un client appairé le reste après redémarrage.
+    pub fn restart(&mut self) -> Result<(), String> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let cfg = EngineCfg {
+            ui_port: self.port,
+            ui_bind: self.bind,
+            api_access: self.code.clone(),
+        };
+        let neuf = spawn_in(cfg, self.tmp.clone()).map_err(|e| e.to_string())?;
+        *self = neuf;
+        self.wait_ready(Duration::from_secs(30))
     }
 
     /// Attend que le moteur réponde GET /api/hello → 200 avec un nonce, sur le

@@ -41,6 +41,16 @@ pub const ACTIONS: &[&str] = &[
     "download_update",
     "open_path",
     "test_notify",
+    // Lot M1 — actions LOCALES d'authentification (droit `admin`). Jamais
+    // exposées au gateway : ni la liste des tools, ni un champ `action`
+    // injecté ne peut les atteindre (test `injections_interdites`).
+    "pair_list",
+    "pair_approve",
+    "pair_reject",
+    "client_list",
+    "client_set_scopes",
+    "client_revoke",
+    "client_rotate",
 ];
 
 /// Asset de la release correspondant à (type de binaire, OS) — table blanche
@@ -1448,6 +1458,161 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
         "import_mcp" => {
             let raw = req.get("text").and_then(|x| x.as_str()).unwrap_or("");
             import_mcp_text(state, raw)
+        }
+        "pair_list" => crate::auth::pair::list(state, crate::types::now_ts()),
+        // ---- actions LOCALES d'authentification (droit `admin`, jamais au gateway)
+        "pair_approve" => {
+            let pair_id = req
+                .get("pair_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let rights: Vec<String> = req
+                .get("rights")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            match crate::auth::pair::approve(
+                state,
+                &pair_id,
+                rights.clone(),
+                crate::types::now_ts(),
+            ) {
+                Ok(v) => {
+                    save_config(state);
+                    add_log(
+                        state,
+                        "info",
+                        &format!(
+                            "[auth] appairage approuvé : {} — droits {:?}",
+                            v.get("keyid").and_then(|x| x.as_str()).unwrap_or("?"),
+                            rights
+                        ),
+                    );
+                    v
+                }
+                Err(e) => json!({"ok": false, "error": e}),
+            }
+        }
+        "pair_reject" => {
+            let pair_id = req.get("pair_id").and_then(|x| x.as_str()).unwrap_or("");
+            match crate::auth::pair::reject(state, pair_id, crate::types::now_ts()) {
+                Ok(v) => {
+                    add_log(state, "info", "[auth] appairage refusé localement");
+                    v
+                }
+                Err(e) => json!({"ok": false, "error": e}),
+            }
+        }
+        "client_list" => {
+            let settings = lockv(&state.settings);
+            let clients: Vec<Value> = settings
+                .auth
+                .clients
+                .iter()
+                .map(|c| {
+                    let mut v = c.to_json();
+                    if let Value::Object(o) = &mut v {
+                        o.insert(
+                            "fingerprint".into(),
+                            json!(crate::auth::registry::fingerprint_of(&c.public_key)
+                                .unwrap_or_default()),
+                        );
+                        o.insert(
+                            "fingerprint_court".into(),
+                            json!(crate::auth::registry::short_fingerprint_of(&c.public_key)
+                                .unwrap_or_default()),
+                        );
+                    }
+                    v
+                })
+                .collect();
+            json!({ "ok": true, "clients": clients })
+        }
+        "client_set_scopes" => {
+            let keyid = req.get("keyid").and_then(|x| x.as_str()).unwrap_or("");
+            let rights: Vec<String> = req
+                .get("rights")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let res = lockv(&state.settings)
+                .auth
+                .set_rights(keyid, rights.clone());
+            match res {
+                Ok(()) => {
+                    save_config(state);
+                    add_log(
+                        state,
+                        "info",
+                        &format!("[auth] droits de {} : {:?}", keyid, rights),
+                    );
+                    json!({"ok": true, "keyid": keyid, "rights": rights})
+                }
+                Err(e) => json!({"ok": false, "error": e.motif()}),
+            }
+        }
+        "client_revoke" => {
+            let keyid = req.get("keyid").and_then(|x| x.as_str()).unwrap_or("");
+            let res = lockv(&state.settings).auth.revoke(keyid);
+            match res {
+                Ok(()) => {
+                    let revoked_at = lockv(&state.settings)
+                        .auth
+                        .find(keyid)
+                        .and_then(|c| c.revoked_at.clone())
+                        .unwrap_or_default();
+                    save_config(state);
+                    add_log(
+                        state,
+                        "info",
+                        &format!(
+                            "[auth] client révoqué : {} — refus à la requête suivante",
+                            keyid
+                        ),
+                    );
+                    json!({"ok": true, "keyid": keyid, "revoked_at": revoked_at})
+                }
+                Err(e) => json!({"ok": false, "error": e.motif()}),
+            }
+        }
+        "client_rotate" => {
+            let keyid = req.get("keyid").and_then(|x| x.as_str()).unwrap_or("");
+            let new_keyid = req
+                .get("new_keyid")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let public_key = req
+                .get("public_key")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let res = lockv(&state.settings)
+                .auth
+                .rotate(keyid, new_keyid, public_key);
+            match res {
+                Ok(rec) => {
+                    save_config(state);
+                    add_log(
+                        state,
+                        "info",
+                        &format!("[auth] rotation {} → {}", keyid, rec.keyid),
+                    );
+                    json!({"ok": true, "keyid": rec.keyid, "rights": rec.rights, "rotated_from": keyid})
+                }
+                Err(e) => json!({"ok": false, "error": e.motif()}),
+            }
         }
         _ => json!({"ok": false, "error": format!("action inconnue: {}", action)}),
     }

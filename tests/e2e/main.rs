@@ -14,6 +14,7 @@
 //!   scénarios réels par action)
 //! - scenarios_gateway   : la console comme serveur MCP (POST /mcp : tools de
 //!   supervision, proxy call_server_tool, ressources, transport, auth)
+//! - scenarios_auth      : identités, registre des clients et appairage (lot M1)
 //!
 //! Les scénarios sont SÉRIALISÉS par le verrou global harness::E2E_LOCK
 //! (serial_guard en première ligne de chaque test) : `cargo test --test e2e`
@@ -21,6 +22,7 @@
 
 mod harness;
 mod scenarios_actions;
+mod scenarios_auth;
 mod scenarios_boot;
 mod scenarios_gateway;
 mod scenarios_lifecycle;

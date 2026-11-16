@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod crypto;
 pub mod frameworks;
 pub mod gateway;
@@ -225,7 +226,7 @@ pub fn effective_require_access(bind_is_loopback: bool, peer_is_loopback: bool) 
 /// les deux sources OS sont toujours disponibles) : hash semé aléatoirement
 /// mélangé à l'horloge et à un compteur atomique — strictement mieux que
 /// RandomState seul, et le résultat reste improvisible entre processus.
-fn random_hex(words: usize) -> String {
+pub(crate) fn random_hex(words: usize) -> String {
     let mut out = String::with_capacity(words * 16);
     let mut buf = [0u8; 8];
     for _ in 0..words {
@@ -341,21 +342,33 @@ fn hello_rate_slot() -> &'static Mutex<HashMap<IpAddr, Vec<u64>>> {
     SLOT.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Décision pure du limiteur de débit : à partir des horodatages précédents,
-/// renvoie (décision, liste à conserver). La liste est d'abord purgée des
-/// timestamps hors fenêtre, puis comparée à HELLO_RATE_MAX.
-fn hello_rate_decide(now: u64, prior: &[u64]) -> (Result<(), ()>, Vec<u64>) {
+/// Décision pure d'un limiteur à fenêtre glissante : à partir des horodatages
+/// précédents, renvoie (décision, liste à conserver). Partagé par `/api/hello`
+/// (30 req/min) et `/auth/pair` (5 req/min) — même algorithme, seaux distincts.
+pub(crate) fn rate_decide(
+    now: u64,
+    prior: &[u64],
+    max: usize,
+    window_secs: u64,
+) -> (Result<(), ()>, Vec<u64>) {
     let vivants: Vec<u64> = prior
         .iter()
         .copied()
-        .filter(|t| now.saturating_sub(*t) < HELLO_RATE_WINDOW_SECS)
+        .filter(|t| now.saturating_sub(*t) < window_secs)
         .collect();
-    if vivants.len() >= HELLO_RATE_MAX {
+    if vivants.len() >= max {
         return (Err(()), vivants);
     }
     let mut next = vivants;
     next.push(now);
     (Ok(()), next)
+}
+
+/// Décision pure du limiteur de débit /api/hello : à partir des horodatages
+/// précédents, renvoie (décision, liste à conserver). La liste est d'abord purgée
+/// des timestamps hors fenêtre, puis comparée à `HELLO_RATE_MAX`.
+fn hello_rate_decide(now: u64, prior: &[u64]) -> (Result<(), ()>, Vec<u64>) {
+    rate_decide(now, prior, HELLO_RATE_MAX, HELLO_RATE_WINDOW_SECS)
 }
 
 /// Limiteur de débit /api/hello par adresse : true = requête admise (et
@@ -691,6 +704,12 @@ pub fn run_headless() -> RunOutcome {
     // cache de démarrage : restaure le dernier état connu AVANT la première
     // sonde — l'UI est peuplée instantanément, les sondes corrigent ensuite
     manage::load_cache(&state);
+    // IDENTITÉ DU SERVEUR (lot M1, docs/auth.md §9) : créée au premier
+    // lancement, clé privée au trousseau du système (repli fichier 0600
+    // journalisé), clé PUBLIQUE persistée dans config.json (`auth.server`).
+    // Avant le listener : un `auth pair` reçu au premier instant trouve une
+    // identité prête.
+    crate::auth::secret::ensure_server_identity(&state);
 
     let mut ui_port = settings.ui_port;
     let ui_bind = settings.ui_bind.clone();
@@ -1179,7 +1198,7 @@ pub(crate) fn handle_conn(mut stream: TcpStream, state: Arc<AppState>, guard: Co
         Ok(()) if path.split('?').next() == Some("/mcp") => {
             gateway::serve(&method, &headers, &body)
         }
-        Ok(()) => route(&state, &method, &path, &body),
+        Ok(()) => route_peer(&state, &method, &path, &body, peer_ip),
     };
     // ACAO dynamique : on reflète UNIQUEMENT une origine autorisée (jamais *),
     // sinon aucun site tiers ne peut lire nos réponses (/api/state inclu).
@@ -1229,7 +1248,44 @@ pub fn route(
     path: &str,
     body: &[u8],
 ) -> (u16, &'static str, Vec<u8>) {
+    route_peer(state, method, path, body, None)
+}
+
+/// Routage avec l'adresse de l'appelant — seul `route_peer` la connaît, et deux
+/// décisions en dépendent : le quota d'appairage (par adresse) et le refus des
+/// actions `admin` depuis le LAN (elles sont LOCALES par construction).
+pub fn route_peer(
+    state: &Arc<AppState>,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    peer: Option<IpAddr>,
+) -> (u16, &'static str, Vec<u8>) {
     let bare_path = path.split('?').next().unwrap_or(path);
+    // ---- Appairage (docs/auth.md §3.4) : les deux seules routes non
+    // authentifiées ajoutées par le lot M1. Le sas de `check_access` ne les
+    // couvre pas (elles ne sont ni /api ni /mcp) : leur protection est le quota
+    // par adresse, l'expiration à 2 minutes et le fait qu'elles n'accordent RIEN.
+    if bare_path == "/auth/pair" {
+        if method != "POST" {
+            return (
+                405,
+                "application/json",
+                br#"{"ok":false,"error":"method not allowed"}"#.to_vec(),
+            );
+        }
+        return crate::auth::pair::handle_post(state, body, peer, crate::types::now_ts());
+    }
+    if let Some(pair_id) = bare_path.strip_prefix("/auth/pair/") {
+        if method != "GET" {
+            return (
+                405,
+                "application/json",
+                br#"{"ok":false,"error":"method not allowed"}"#.to_vec(),
+            );
+        }
+        return crate::auth::pair::handle_get(state, pair_id, crate::types::now_ts());
+    }
     if method == "GET" && bare_path == "/" {
         // SÉCURITÉ (audit 2026-10-24) : le code d'accès n'est PLUS injecté dans la
         // page — quiconque joint le port pouvait le lire sur / et contourner toute
@@ -1301,6 +1357,21 @@ pub fn route(
         return (200, "application/json", j.to_string().into_bytes());
     }
     if method == "POST" && bare_path == "/api/action" {
+        // Les actions d'authentification sont LOCALES (droit `admin`, §4) : un
+        // appel venu du LAN est refusé AVANT le dispatcher, même avec le code
+        // d'accès hérité. La session locale du lot M2 renforcera ce contrôle.
+        let nom = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(String::from))
+            .unwrap_or_default();
+        let local = peer.is_some_and(|ip| ip.is_loopback());
+        if crate::auth::action_reservee_admin(&nom) && !local {
+            return (
+                403,
+                "application/json",
+                br#"{"ok":false,"error":"action locale uniquement"}"#.to_vec(),
+            );
+        }
         let text = String::from_utf8_lossy(body).to_string();
         let j = manage::handle_action(state, &text);
         return (200, "application/json", j.to_string().into_bytes());
@@ -1742,6 +1813,112 @@ mod tests {
             update_latest: Mutex::new(None),
             lan_ok: Mutex::new(None),
         })
+    }
+
+    /// (lot M1) Les deux routes d'appairage sont joignables SANS identité (c'est
+    /// leur objet), bornées par le quota d'appairage, et les actions `admin`
+    /// sont refusées dès qu'elles viennent du LAN.
+    #[test]
+    fn appairage_ouvert_mais_borne_et_actions_admin_interdites_au_lan() {
+        let state = test_state_with_access(None);
+        lockv(&state.settings).auth.server = Some(crate::auth::ServerIdentity {
+            keyid: crate::auth::SERVER_KEYID.to_string(),
+            public_key: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+                .to_string(),
+            created_at: "2026-11-15 12:00:00".to_string(),
+        });
+        let loopback = Some("127.0.0.1".parse().unwrap());
+        let corps = serde_json::json!({
+            "keyid": "mcc-a-0000000000000001",
+            "label": "portable",
+            "public_key": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+            "created": crate::types::now_ts(),
+        })
+        .to_string();
+        let (s, ctype, body) = route_peer(&state, "POST", "/auth/pair", corps.as_bytes(), loopback);
+        assert_eq!(
+            s,
+            200,
+            "POST /auth/pair doit être ouvert : {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(ctype, "application/json");
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["api"], "mcc-auth-v1");
+        assert_eq!(v["server_keyid"], crate::auth::SERVER_KEYID);
+        assert_eq!(v["tls_fp"], "");
+        let pair_id = v["pair_id"].as_str().unwrap_or("").to_string();
+        assert_eq!(pair_id.len(), 32);
+        // le statut se lit sans identité ; un identifiant inconnu rend 404
+        let (s, _, body) = route_peer(
+            &state,
+            "GET",
+            &format!("/auth/pair/{pair_id}"),
+            b"",
+            loopback,
+        );
+        assert_eq!(s, 200);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "pending");
+        assert_eq!(
+            route_peer(
+                &state,
+                "GET",
+                &format!("/auth/pair/{}", "0".repeat(32)),
+                b"",
+                loopback
+            )
+            .0,
+            404
+        );
+        // méthodes inattendues : refus explicite, jamais un dispatch
+        assert_eq!(
+            route_peer(&state, "GET", "/auth/pair", b"", loopback).0,
+            405
+        );
+        assert_eq!(
+            route_peer(
+                &state,
+                "POST",
+                &format!("/auth/pair/{pair_id}"),
+                b"{}",
+                loopback
+            )
+            .0,
+            405
+        );
+
+        // actions `admin` : la session locale n'existe pas encore (M2), mais un
+        // appel venu du LAN est déjà refusé AVANT le dispatcher.
+        let action = br#"{"action":"client_list"}"#;
+        assert_eq!(
+            route_peer(&state, "POST", "/api/action", action, loopback).0,
+            200
+        );
+        assert_eq!(
+            route_peer(
+                &state,
+                "POST",
+                "/api/action",
+                action,
+                Some("192.0.2.30".parse().unwrap())
+            )
+            .0,
+            403,
+            "une action d'authentification ne doit jamais être joignable du LAN"
+        );
+        // une action ordinaire reste joignable (comportement inchangé)
+        assert_eq!(
+            route_peer(
+                &state,
+                "POST",
+                "/api/action",
+                br#"{"action":"client_inconnu_xyz"}"#,
+                Some("192.0.2.30".parse().unwrap())
+            )
+            .0,
+            200
+        );
     }
 
     #[test]

@@ -579,6 +579,11 @@ pub(super) fn parse_settings(v: &Value, mut st: crate::types::Settings) -> crate
                 .collect();
         }
     }
+    // Authentification forte (lot M1) : identité PUBLIQUE du serveur et registre
+    // des clients, à la racine du document (`auth.server`, `auth.clients[]`).
+    if let Some(a) = v.get("auth") {
+        st.auth = crate::auth::AuthState::from_json(a);
+    }
     st
 }
 
@@ -701,6 +706,10 @@ pub fn save_config(state: &AppState) {
         },
         // runtime : backoff d'autoboot + historique des crashs (persiste)
         "runtime": crate::runtime::to_json(&lockv(&state.runtime)),
+        // Authentification forte (lot M1) : clé PUBLIQUE du serveur et registre
+        // des clients. Aucune clé privée, aucune graine, aucun secret ici — la
+        // clé privée vit au trousseau (`auth::secret`).
+        "auth": settings.auth.to_json(),
     });
     let pretty = serde_json::to_string_pretty(&doc).unwrap_or_default();
     // tmp UNIQUE par écriture (pid + séquence) : même sous le verrou global,
@@ -732,17 +741,66 @@ pub fn save_config(state: &AppState) {
             ),
         );
     } else {
-        #[cfg(unix)]
-        {
-            // (lot 3, audit 05 constat 10) config.json contient api_access et
-            // les valeurs env en clair : droits 0600 à l'écriture sous Unix
-            // (std::os::unix, PermissionsExt). Sur Windows : no-op volontaire
-            // (ACL héritées — comportement inchangé), noté au rapport lot 3.
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &state.config_path,
-                std::fs::Permissions::from_mode(0o600),
+        // (lot 3, audit 05 constat 10, fini au lot M1) `config.json` contient le
+        // code d'accès hérité et les valeurs `env` en clair : permissions
+        // réduites à l'utilisateur — 0600 sous Unix, ACL `icacls` sous Windows.
+        // Les clés PUBLIQUES du registre `auth` justifient la même règle.
+        if let Err(e) = restrict_permissions(&state.config_path) {
+            add_log(
+                state,
+                "error",
+                &format!(
+                    "config : permissions réduites impossibles sur {} ({} ) — le fichier reste lisible par d'autres comptes",
+                    state.config_path, e
+                ),
             );
         }
+    }
+}
+
+/// Restreint un fichier au seul compte de l'utilisateur courant : `0600` sous
+/// Unix, ACL `icacls` (héritage supprimé, une seule autorisation explicite)
+/// sous Windows. C'est la correction complète de l'audit 05 #10 : le lot 3
+/// n'avait traité que le cas Unix.
+pub fn restrict_permissions(path: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(windows)]
+    {
+        // Aucune crate, aucun `unsafe` : l'outil système `icacls` est présent
+        // sur toutes les éditions de Windows. `/inheritance:r` coupe les ACE
+        // héritées (dont BUILTIN\Users), `/grant:r` remplace la liste par une
+        // seule autorisation explicite pour le compte courant.
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        if user.is_empty() {
+            return Err(std::io::Error::other("USERNAME introuvable"));
+        }
+        let who = match std::env::var("USERDOMAIN") {
+            Ok(d) if !d.is_empty() => format!("{d}\\{user}"),
+            _ => user,
+        };
+        let out = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(format!("{who}:F"))
+            .output()?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "icacls a échoué ({}) : {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )))
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(())
     }
 }

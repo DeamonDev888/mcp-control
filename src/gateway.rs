@@ -2002,9 +2002,11 @@ mod tests {
         ]
     }
 
-    /// Les 6 actions NON exposées, avec un argument qui les rend observables
-    /// si l'injection passait. open_path : chemin inexistant → même sans
+    /// Les actions NON exposées, avec un argument qui les rend observables si
+    /// l'injection passait. open_path : chemin inexistant → même sans
     /// correctif, explorer ne s'ouvre pas sur la machine de test.
+    /// Lot M1 : les 7 actions LOCALES d'authentification (droit `admin`) sont
+    /// ajoutées ici — elles ne doivent être atteignables par AUCUN tool.
     fn injections_interdites() -> Vec<(&'static str, Value)> {
         vec![
             (
@@ -2019,6 +2021,28 @@ mod tests {
             ("reset_state", json!({ "what": "tout" })),
             ("reset_runtime", json!({})),
             ("open_path", json!({ "path": "Z:\\inexistant-pour-test" })),
+            ("pair_list", json!({})),
+            (
+                "pair_approve",
+                json!({ "pair_id": "00000000000000000000000000000000", "rights": ["execution"] }),
+            ),
+            (
+                "pair_reject",
+                json!({ "pair_id": "00000000000000000000000000000000" }),
+            ),
+            ("client_list", json!({})),
+            (
+                "client_set_scopes",
+                json!({ "keyid": "mcc-a-0000000000000001", "rights": ["execution"] }),
+            ),
+            (
+                "client_revoke",
+                json!({ "keyid": "mcc-a-0000000000000001" }),
+            ),
+            (
+                "client_rotate",
+                json!({ "keyid": "mcc-a-0000000000000001", "new_keyid": "mcc-a-0000000000000002", "public_key": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a" }),
+            ),
         ]
     }
 
@@ -2105,7 +2129,11 @@ mod tests {
                 );
             }
         }
-        assert_eq!(essais, 17 * 6, "17 tools × 6 injections");
+        assert_eq!(
+            essais,
+            17 * injections_interdites().len(),
+            "17 tools × toutes les injections interdites"
+        );
         let apres = (
             reglages_json(&state),
             fingerprint(&state),
