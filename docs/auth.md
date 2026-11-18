@@ -361,7 +361,7 @@ tableau n'existe pas ; tout ajout DOIT modifier ce tableau dans la même révisi
 - **Fichier** : `auth-audit.log`, à côté de `config.json`, distinct de `mcc.log`. Une ligne par décision d'accès,
   écrite avant que la réponse ne parte.
 - **Format** (une ligne, champs séparés par une espace, valeurs sans espace) :
-  `seq=000042 ts=2026-11-15T12:00:00Z keyid=mcc-ai-3f9a1c07b2d84e51 fp=ed25519:3f9a1c07b2d84e51 ip=192.168.40.7
+  `seq=000042 ts=2026-11-15T12:00:00Z keyid=mcc-ai-3f9a1c07b2d84e51 fp=ed25519:3f9a1c07b2d84e51 ip=192.0.2.7
   method=tools/call tool=start_server verdict=approval_pending reason=- prev=<64 hex> mac=<64 hex>`
 - **Chaînage** : `mac = HMAC-SHA256(k_audit, prev ‖ ligne_sans_mac)`, `prev` = `mac` de la ligne précédente,
   `prev` de la première ligne = 32 zéros. `mcp-control auth verify-log` recalcule toute la chaîne et rend non nul sur
