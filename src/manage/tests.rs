@@ -1857,6 +1857,83 @@ fn release_asset_table_blanche_couvre_toutes_les_plateformes() {
 }
 
 #[test]
+fn sha256sums_somme_presente_est_lue_et_normalisee() {
+    // Format exact de release.yml : `sha256sum * | sort -k2` → « somme  nom ».
+    // La ligne binaire (`somme *nom`) et les majuscules restent acceptées.
+    let a = "a".repeat(64);
+    let sums = format!(
+        "{a}  mcp-control-cli-linux-x86_64\n{} *mcp-control-desktop-windows-x86_64-setup.exe\n",
+        "B".repeat(64)
+    );
+    assert_eq!(
+        sha256_for_asset(&sums, "mcp-control-cli-linux-x86_64"),
+        Sha256Lookup::Found(a)
+    );
+    assert_eq!(
+        sha256_for_asset(&sums, "mcp-control-desktop-windows-x86_64-setup.exe"),
+        Sha256Lookup::Found("b".repeat(64)),
+        "ligne binaire `*nom` tolérée, majuscules normalisées"
+    );
+}
+
+#[test]
+fn sha256sums_somme_absente_ou_fichier_vide() {
+    // Actif non listé = Absent, PAS une erreur : le fichier a été lu, la somme
+    // manque — à distinguer d'un échec réseau (Err).
+    let sums = format!("{}  mcp-control-cli-linux-x86_64\n", "c".repeat(64));
+    assert_eq!(
+        sha256_for_asset(&sums, "mcp-control-desktop-macos-universal"),
+        Sha256Lookup::Absent
+    );
+    assert_eq!(
+        sha256_for_asset("", "mcp-control-cli-linux-x86_64"),
+        Sha256Lookup::Absent
+    );
+    assert_eq!(
+        sha256_for_asset("\n\n  \n", "mcp-control-cli-linux-x86_64"),
+        Sha256Lookup::Absent
+    );
+}
+
+#[test]
+fn sha256sums_somme_malformee_est_signalee() {
+    let asset = "mcp-control-cli-windows-x86_64.exe";
+    // somme tronquée (63 caractères)
+    assert_eq!(
+        sha256_for_asset(&format!("{}  {asset}\n", "d".repeat(63)), asset),
+        Sha256Lookup::Malformed
+    );
+    // 64 caractères mais pas hexadécimaux
+    assert_eq!(
+        sha256_for_asset(&format!("{}z  {asset}\n", "d".repeat(63)), asset),
+        Sha256Lookup::Malformed
+    );
+    // deux lignes contradictoires pour le même actif : on ne choisit pas
+    let conflit = format!("{}  {asset}\n{}  {asset}\n", "d".repeat(64), "e".repeat(64));
+    assert_eq!(sha256_for_asset(&conflit, asset), Sha256Lookup::Malformed);
+    // ligne sans nom : ignorée, donc Absent et non Malformed
+    assert_eq!(
+        sha256_for_asset(&format!("{}\n", "d".repeat(64)), asset),
+        Sha256Lookup::Absent
+    );
+}
+
+#[test]
+fn sha256sums_url_refuse_un_tag_hors_gabarit() {
+    assert_eq!(
+        sha256sums_url("v0.7.21").as_deref(),
+        Some(
+            "https://github.com/DeamonDev888/mcp-control/releases/download/v0.7.21/SHA256SUMS.txt"
+        )
+    );
+    for mauvais in ["", "v1/../x", "v1?x=1", "v1#f", "v 1", &"9".repeat(65)] {
+        assert_eq!(sha256sums_url(mauvais), None, "tag refusé : {mauvais:?}");
+    }
+    // Tag refusé ≠ réseau : l'échec est immédiat, sans lancer curl.
+    assert!(expected_sha256("v1/../x", "mcp-control-cli-linux-x86_64").is_err());
+}
+
+#[test]
 fn surface_actions_sans_doublon_et_dispatch_connu() {
     // La const partagée (UI / gateway / tests) ne doit jamais dériver du
     // dispatcher : pas de doublon, et un échantillon dispatché doit
