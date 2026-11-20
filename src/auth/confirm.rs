@@ -847,6 +847,18 @@ pub fn note_decision(state: &Arc<AppState>, ev: &AuthDecisionEvent<'_>) {
         AuthVerdict::Unauthenticated => ("non authentifié", ev.reason.unwrap_or("unauthenticated")),
         _ => ("décision", ev.reason.unwrap_or("-")),
     };
+    // Journal d'audit CHAÎNÉ (lot M5, docs/auth.md §11) : la décision part au
+    // transport, seul à connaître l'adresse source et le `keyid` revendiqué.
+    // Vocabulaire machine, aligné sur `AuthVerdict`.
+    let jeton = match ev.verdict {
+        AuthVerdict::Allowed => "allowed",
+        AuthVerdict::RightMissing => "right_missing",
+        AuthVerdict::ApprovalDenied => "approval_denied",
+        AuthVerdict::ApprovalPending => "approval_pending",
+        AuthVerdict::Unauthenticated => "unauthenticated",
+        _ => "decision",
+    };
+    crate::audit::note(jeton, motif, ev.client, ev.method, ev.name.unwrap_or("-"));
     let keyid = ev.client.unwrap_or("-");
     let outil = ev.name.unwrap_or("-");
     let now = now_ts();

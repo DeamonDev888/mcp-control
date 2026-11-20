@@ -1980,3 +1980,938 @@ fn bandeau_sans_texte_de_client_et_ecran_local_seulement() {
         .any(|c| c["label"] == json!(hostile)));
     e.action(&json!({ "action": "kill", "id": id }));
 }
+
+// =====================================================================
+// Lot M5 — pont stdio, journal d'audit chaîné, anti-force brute,
+// uniformité des refus
+// =====================================================================
+
+fn spawn_hidden_cmd(bin: &str) -> Command {
+    let mut cmd = Command::new(bin);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
+}
+
+/// Appaire un poste client via le vrai CLI `mcp-control auth pair` dans un
+/// répertoire isolé (`MCC_CONFIG` + `MCC_KEYRING_SERVICE=""`) et rend son `keyid`.
+fn appairer_cli(e: &Engine, client_cfg: &std::path::Path, rights: &[&str]) -> String {
+    let enfant = spawn_hidden_cmd(env!("CARGO_BIN_EXE_mcp-control"))
+        .args(["auth", "pair", e.base_url()])
+        .env("MCC_CONFIG", client_cfg)
+        .env("MCC_KEYRING_SERVICE", "")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("lancement auth pair");
+
+    let limite = Instant::now() + Duration::from_secs(20);
+    let pair = loop {
+        let v = e.action(&json!({ "action": "pair_list" }));
+        if let Some(p) = v["pending"].as_array().and_then(|a| a.first()) {
+            break p.clone();
+        }
+        assert!(Instant::now() < limite, "demande d'appairage absente : {v}");
+        std::thread::sleep(Duration::from_millis(150));
+    };
+    let keyid = pair["keyid"].as_str().unwrap_or("").to_string();
+    let pair_id = pair["pair_id"].as_str().unwrap_or("").to_string();
+    let ok = e.action(&json!({
+        "action": "pair_approve",
+        "pair_id": pair_id,
+        "rights": rights,
+    }));
+    assert_eq!(ok["ok"], json!(true), "pair_approve refusé : {ok}");
+    let sortie = enfant.wait_with_output().expect("attente auth pair");
+    assert!(
+        sortie.status.success(),
+        "auth pair doit réussir : stderr={}",
+        String::from_utf8_lossy(&sortie.stderr)
+    );
+    keyid
+}
+
+/// (Lot M5 point 1) Pont stdio `mcp-control bridge` :
+/// - négatif : non appairé → stdout vide, message clair sur stderr (`auth pair`)
+/// - positif : `initialize`, `notifications/initialized` (muet sur stdout),
+///   `tools/list` (10 outils `lecture`), `tools/call` `list_servers` (200),
+///   `tools/call` `add_server` (403 `right_missing`) ; stdout = JSON-RPC seul
+/// - positif sans `--url` : lit `ui_port` dans `config.json`
+/// - négatif : client révoqué → erreur JSON-RPC `-32023` explicite sur stdout
+#[test]
+fn pont_stdio_pilote_le_gateway_sans_cle_et_stdout_jsonrpc_seul() {
+    use std::io::Write as _;
+    let _garde = serial_guard();
+    let e = engine_ready();
+    let client_dir =
+        std::env::temp_dir().join(format!("mcc-e2e-bridge-{}-{}", std::process::id(), e.port));
+    let _ = std::fs::remove_dir_all(&client_dir);
+    std::fs::create_dir_all(&client_dir).unwrap();
+    let client_cfg = client_dir.join("config.json");
+    // Config client minimale UTF-8 sans BOM (sert aussi au lancement sans --url).
+    std::fs::write(
+        &client_cfg,
+        json!({ "settings": { "ui_port": e.port } }).to_string(),
+    )
+    .unwrap();
+
+    // 1. Négatif : non appairé → sortie non nulle, stdout VIDE, diagnostic clair sur stderr.
+    let non_appaire = spawn_hidden_cmd(env!("CARGO_BIN_EXE_mcp-control"))
+        .args(["bridge", "--url", e.base_url()])
+        .env("MCC_CONFIG", &client_cfg)
+        .env("MCC_KEYRING_SERVICE", "")
+        .stdin(Stdio::null())
+        .output()
+        .expect("lancement bridge non appairé");
+    assert!(
+        !non_appaire.status.success(),
+        "un pont non appairé doit échouer"
+    );
+    assert!(
+        non_appaire.stdout.is_empty(),
+        "stdout doit être vide si non appairé : {:?}",
+        String::from_utf8_lossy(&non_appaire.stdout)
+    );
+    let err_txt = String::from_utf8_lossy(&non_appaire.stderr);
+    assert!(
+        err_txt.contains("mcp-control auth pair"),
+        "message actionnable attendu sur stderr : {err_txt}"
+    );
+
+    // 2. Appairage `lecture` avec le vrai CLI, puis échange complet via `bridge --url`.
+    let keyid = appairer_cli(&e, &client_cfg, &["lecture"]);
+    let mut pont = spawn_hidden_cmd(env!("CARGO_BIN_EXE_mcp-control"))
+        .args(["bridge", "--url", e.base_url()])
+        .env("MCC_CONFIG", &client_cfg)
+        .env("MCC_KEYRING_SERVICE", "")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("lancement bridge");
+    {
+        let mut entree = pont.stdin.take().expect("stdin du pont");
+        let messages = [
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "e2e-stdio", "version": "0.1" }
+                }
+            }),
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+            json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": { "name": "list_servers", "arguments": {} }
+            }),
+            json!({
+                "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": { "name": "add_server", "arguments": { "transport": "http", "port": 30_955 } }
+            }),
+        ];
+        for m in messages {
+            writeln!(entree, "{}", m).unwrap();
+        }
+        let _ = entree.flush();
+    }
+    let out = pont.wait_with_output().expect("sortie bridge");
+    assert!(
+        out.status.success(),
+        "bridge doit sortir en 0 : stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout_txt = String::from_utf8_lossy(&out.stdout);
+    let stderr_txt = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr_txt.contains("bridge : stdio"),
+        "diagnostics attendus sur stderr : {stderr_txt}"
+    );
+    let lignes: Vec<&str> = stdout_txt
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    assert_eq!(
+        lignes.len(),
+        4,
+        "4 réponses attendues (notification muette) sur stdout :\n{stdout_txt}"
+    );
+    let parsed: Vec<Value> = lignes
+        .iter()
+        .map(|l| {
+            let v: Value = serde_json::from_str(l)
+                .unwrap_or_else(|err| panic!("ligne stdout non JSON-RPC ({err}) : {l}"));
+            assert_eq!(v["jsonrpc"], json!("2.0"), "pas JSON-RPC 2.0 : {l}");
+            v
+        })
+        .collect();
+    assert_eq!(parsed[0]["id"], json!(1));
+    assert!(
+        parsed[0].get("result").is_some(),
+        "initialize : {}",
+        parsed[0]
+    );
+    assert_eq!(parsed[1]["id"], json!(2));
+    assert_eq!(
+        parsed[1]["result"]["tools"].as_array().map(Vec::len),
+        Some(10),
+        "tools/list lecture = 10 outils : {}",
+        parsed[1]
+    );
+    assert_eq!(parsed[2]["id"], json!(3));
+    assert!(
+        parsed[2].get("result").is_some(),
+        "list_servers : {}",
+        parsed[2]
+    );
+    assert_eq!(parsed[3]["id"], json!(4));
+    assert_eq!(parsed[3]["error"]["code"], json!(-32023));
+    assert_eq!(parsed[3]["error"]["data"]["reason"], json!("right_missing"));
+
+    // 3. Positif sans `--url` : le pont lit `settings.ui_port` dans config.json.
+    let mut pont_auto = spawn_hidden_cmd(env!("CARGO_BIN_EXE_mcp-control"))
+        .arg("bridge")
+        .env("MCC_CONFIG", &client_cfg)
+        .env("MCC_KEYRING_SERVICE", "")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("lancement bridge sans --url");
+    {
+        let mut entree = pont_auto.stdin.take().unwrap();
+        writeln!(
+            entree,
+            "{}",
+            json!({"jsonrpc":"2.0","id":9,"method":"tools/list"})
+        )
+        .unwrap();
+    }
+    let out_auto = pont_auto.wait_with_output().unwrap();
+    assert!(out_auto.status.success());
+    let rep_auto: Value =
+        serde_json::from_str(String::from_utf8_lossy(&out_auto.stdout).trim()).unwrap();
+    assert_eq!(rep_auto["id"], json!(9));
+    assert_eq!(
+        rep_auto["result"]["tools"].as_array().map(Vec::len),
+        Some(10)
+    );
+
+    // 4. Négatif : révocation immédiate → le pont rend -32023 `unauthenticated`.
+    let rev = e.action(&json!({ "action": "client_revoke", "keyid": keyid }));
+    assert_eq!(rev["ok"], json!(true), "{rev}");
+    let mut pont_rev = spawn_hidden_cmd(env!("CARGO_BIN_EXE_mcp-control"))
+        .args(["bridge", "--url", e.base_url()])
+        .env("MCC_CONFIG", &client_cfg)
+        .env("MCC_KEYRING_SERVICE", "")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("lancement bridge révoqué");
+    {
+        let mut entree = pont_rev.stdin.take().unwrap();
+        writeln!(
+            entree,
+            "{}",
+            json!({"jsonrpc":"2.0","id":77,"method":"tools/list"})
+        )
+        .unwrap();
+    }
+    let out_rev = pont_rev.wait_with_output().unwrap();
+    let v_rev: Value =
+        serde_json::from_str(String::from_utf8_lossy(&out_rev.stdout).trim()).unwrap();
+    assert_eq!(v_rev["id"], json!(77));
+    assert_eq!(v_rev["error"]["code"], json!(-32023));
+    assert_eq!(v_rev["error"]["data"]["reason"], json!("unauthenticated"));
+    assert!(
+        v_rev["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("mcp-control auth pair"),
+        "{v_rev}"
+    );
+    let _ = std::fs::remove_dir_all(&client_dir);
+}
+
+/// (Lot M5 point 2) Journal d'audit chaîné `auth-audit.log` + `auth verify-log` :
+/// - distinct de `mcc.log`, repli `auth/audit.key` journalisé et ACL restreinte,
+///   aucun argument d'outil ni secret dans le journal
+/// - `mcp-control auth verify-log` vert sur journal intact, rouge sur les 3
+///   falsifications (ligne modifiée, ligne supprimée, ligne insérée)
+#[test]
+fn journal_audit_chaine_et_verify_log_trois_falsifications() {
+    let _garde = serial_guard();
+    let mut e = engine_ready();
+    e.set_auto_approve(false);
+
+    let c_lec = client_appaire(&e, &["lecture"]);
+    let c_exec = client_appaire(&e, &["execution"]);
+    let c_rev = client_appaire(&e, &["lecture"]);
+    let keyid_rev = clients(&e)
+        .last()
+        .and_then(|c| c["keyid"].as_str())
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        e.action(&json!({ "action": "client_revoke", "keyid": keyid_rev }))["ok"],
+        json!(true)
+    );
+    let c_inconnu = Signer::new(SigningKey::generate()).with_keyid(nouveau_keyid());
+
+    // Décisions variées : allowed, right_missing, approval_pending, unauthenticated (×4)
+    let r_ok = post_mcp_signe(
+        &e,
+        &c_lec,
+        "127.0.0.1",
+        &corps_tool("list_servers", json!({}), 1),
+        None,
+        None,
+    );
+    assert_eq!(r_ok.status, 200);
+    let r_right = post_mcp_signe(
+        &e,
+        &c_lec,
+        "127.0.0.1",
+        &corps_tool("refresh", json!({}), 2),
+        None,
+        None,
+    );
+    assert!(est_refus_droit(&r_right));
+    let r_pend = post_mcp_signe(
+        &e,
+        &c_exec,
+        "127.0.0.1",
+        &corps_tool(
+            "add_server",
+            json!({ "transport": "http", "port": 30_988, "label": "SECRET_ARG_M5" }),
+            3,
+        ),
+        None,
+        None,
+    );
+    assert!(demande_confirmation(&r_pend));
+    assert_eq!(
+        post_mcp_sans_signature(&e, "127.0.0.1", &corps_tools_list(4)).status,
+        401
+    );
+    assert_eq!(
+        signature_alteree(&c_lec, "127.0.0.1", &e, &corps_tools_list(5)).status,
+        401
+    );
+    assert_eq!(
+        post_mcp_signe(
+            &e,
+            &c_inconnu,
+            "127.0.0.1",
+            &corps_tools_list(6),
+            None,
+            None
+        )
+        .status,
+        401
+    );
+    assert_eq!(
+        post_mcp_signe(&e, &c_rev, "127.0.0.1", &corps_tools_list(7), None, None).status,
+        401
+    );
+
+    let audit_path = e.tmp_dir().join("auth-audit.log");
+    let mcc_log_path = e.tmp_dir().join("mcc.log");
+    let audit_key_path = e.tmp_dir().join("auth").join("audit.key");
+    assert!(audit_path.exists(), "auth-audit.log attendu");
+    assert!(mcc_log_path.exists(), "mcc.log attendu");
+    assert!(audit_key_path.exists(), "auth/audit.key repli attendu");
+
+    let mcc_log = std::fs::read_to_string(&mcc_log_path).unwrap();
+    assert!(
+        mcc_log.contains("[audit] clé HMAC du journal"),
+        "le repli fichier de la clé audit doit être journalisé : {mcc_log}"
+    );
+    let audit_txt = std::fs::read_to_string(&audit_path).unwrap();
+    for attendu in [
+        "verdict=allowed",
+        "verdict=right_missing",
+        "verdict=approval_pending",
+        "verdict=unauthenticated",
+        "reason=signature_invalid",
+        "reason=key_unknown",
+        "reason=key_revoked",
+    ] {
+        assert!(
+            audit_txt.contains(attendu),
+            "{attendu} absent :\n{audit_txt}"
+        );
+    }
+    for interdit in ["30988", "SECRET_ARG_M5", "PRIVATE KEY", "nonce=", "sig1=:"] {
+        assert!(
+            !audit_txt.contains(interdit),
+            "fuite « {interdit} » interdite dans auth-audit.log :\n{audit_txt}"
+        );
+    }
+
+    // `verify-log` via MCC_CONFIG et via `--path` : tous deux verts.
+    let cfg_path = e.tmp_dir().join("config.json");
+    let v_ok = spawn_hidden_cmd(env!("CARGO_BIN_EXE_mcp-control"))
+        .args(["auth", "verify-log"])
+        .env("MCC_CONFIG", &cfg_path)
+        .env("MCC_KEYRING_SERVICE", "")
+        .output()
+        .expect("verify-log");
+    assert!(
+        v_ok.status.success(),
+        "verify-log doit réussir : {}",
+        String::from_utf8_lossy(&v_ok.stderr)
+    );
+    assert!(String::from_utf8_lossy(&v_ok.stdout).contains("INTACTE"));
+
+    let v_path = spawn_hidden_cmd(env!("CARGO_BIN_EXE_mcp-control"))
+        .args(["auth", "verify-log", "--path"])
+        .arg(&audit_path)
+        .env("MCC_KEYRING_SERVICE", "")
+        .output()
+        .expect("verify-log --path");
+    assert!(v_path.status.success());
+
+    // Les 3 falsifications dans un dossier isolé (copie du journal + clé).
+    let run_tamper = |nom: &str, lignes: Vec<String>| -> std::process::Output {
+        let d = e.tmp_dir().join(format!("tamper-{nom}"));
+        std::fs::create_dir_all(d.join("auth")).unwrap();
+        std::fs::copy(&audit_key_path, d.join("auth").join("audit.key")).unwrap();
+        let p = d.join("auth-audit.log");
+        std::fs::write(&p, format!("{}\n", lignes.join("\n"))).unwrap();
+        spawn_hidden_cmd(env!("CARGO_BIN_EXE_mcp-control"))
+            .args(["auth", "verify-log", "--path"])
+            .arg(&p)
+            .env("MCC_KEYRING_SERVICE", "")
+            .output()
+            .expect("verify-log falsifié")
+    };
+    let orig: Vec<String> = audit_txt.lines().map(String::from).collect();
+    assert!(
+        orig.len() >= 5,
+        "au moins 5 lignes attendues : {}",
+        orig.len()
+    );
+
+    // 1. Ligne modifiée
+    let mut mod_l = orig.clone();
+    mod_l[1] = mod_l[1].replace("verdict=right_missing", "verdict=allowed");
+    let out1 = run_tamper("mod", mod_l);
+    assert!(!out1.status.success(), "modification non détectée");
+    let s1 = String::from_utf8_lossy(&out1.stderr);
+    assert!(s1.contains("MODIFIÉE") && s1.contains("FALSIFIÉ"), "{s1}");
+
+    // 2. Ligne supprimée (milieu + première)
+    let mut del_l = orig.clone();
+    del_l.remove(2);
+    let out2 = run_tamper("del", del_l);
+    assert!(!out2.status.success(), "suppression non détectée");
+    let s2 = String::from_utf8_lossy(&out2.stderr);
+    assert!(s2.contains("SUPPRIMÉE") && s2.contains("FALSIFIÉ"), "{s2}");
+
+    let mut del_first = orig.clone();
+    del_first.remove(0);
+    let out2b = run_tamper("del1", del_first);
+    assert!(!out2b.status.success(), "suppression ligne 1 non détectée");
+
+    // 3. Ligne insérée
+    let mut ins_l = orig.clone();
+    let dup = ins_l[1].clone();
+    ins_l.insert(2, dup);
+    let out3 = run_tamper("ins", ins_l);
+    assert!(!out3.status.success(), "insertion non détectée");
+    let s3 = String::from_utf8_lossy(&out3.stderr);
+    assert!(s3.contains("INSÉRÉE") && s3.contains("FALSIFIÉ"), "{s3}");
+}
+
+fn percentile_us(sorted: &[u128], num: usize, den: usize) -> u128 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = (sorted.len() - 1) * num / den;
+    sorted[idx]
+}
+
+/// (Lot M5 point 3) Anti-force brute :
+/// - compteurs par IP et par `keyid`, 405/415 pré-auth ne remet jamais à zéro
+/// - délai croissant à partir du 8e échec, blocage `429` + `Retry-After` au 40e
+/// - loopback jamais bloqué par les échecs LAN sur le même `keyid`
+/// - tempête soutenue pendant 60 s et mesure de la fluidité de la fenêtre locale
+#[test]
+fn anti_force_brute_lan_et_tempete_60s_fenetre_locale_fluide() {
+    let _garde = serial_guard();
+    let mut e = spawn(EngineCfg {
+        ui_port: free_port(),
+        ui_bind: "0.0.0.0",
+        api_access: None,
+    })
+    .expect("spawn moteur LAN");
+    e.wait_ready(Duration::from_secs(30)).expect("moteur prêt");
+    let Some(lan) = e.lan_ip() else {
+        eprintln!("SKIP anti_force_brute LAN : aucune IP LAN non-loopback");
+        return;
+    };
+
+    let c_victim = client_appaire(&e, &["lecture"]);
+    let corps_tl = corps_tools_list(1);
+    let body_bytes = corps_tl.to_string().into_bytes();
+
+    // 1. 10 échecs depuis le LAN sur `c_victim` : les 2 derniers subissent le délai (>= 20 ms).
+    for i in 0..10 {
+        let t0 = Instant::now();
+        let r = signature_alteree(&c_victim, &lan, &e, &corps_tl);
+        let dt = t0.elapsed();
+        assert_eq!(r.status, 401, "échec {i} : {}", r.text());
+        if i >= 8 {
+            assert!(
+                dt >= Duration::from_millis(20),
+                "délai attendu après le 8e échec (échec {i}, mesuré {dt:?})"
+            );
+        }
+    }
+
+    // 2. Un 405 (`GET /mcp`) et un 415 (`text/plain`) ne remettent PAS le compteur à zéro.
+    assert_eq!(
+        e.send(&lan, e.port, "GET", "/mcp", &[], None, SignMode::None)
+            .status,
+        405
+    );
+    assert_eq!(
+        e.send(
+            &lan,
+            e.port,
+            "POST",
+            "/mcp",
+            &[("Content-Type", "text/plain")],
+            Some(b"nope"),
+            SignMode::None
+        )
+        .status,
+        415
+    );
+
+    // 3. 30 échecs de plus (total = 40) → blocage 429 avec Retry-After au 41e.
+    for i in 10..40 {
+        let r = signature_alteree(&c_victim, &lan, &e, &corps_tl);
+        assert_eq!(r.status, 401, "échec {i} : {}", r.text());
+    }
+    let bloque = signature_alteree(&c_victim, &lan, &e, &corps_tl);
+    assert_eq!(
+        bloque.status,
+        429,
+        "blocage 429 attendu : {}",
+        bloque.text()
+    );
+    assert!(
+        bloque
+            .header("retry-after")
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|s| s >= 1),
+        "Retry-After attendu : {:?}",
+        bloque.headers
+    );
+
+    // 4. La MÊME clé depuis `127.0.0.1` passe toujours en 200 (loopback exempté).
+    let local_ok = post_mcp_signe(&e, &c_victim, "127.0.0.1", &corps_tl, None, None);
+    assert_eq!(
+        local_ok.status,
+        200,
+        "loopback bloqué par le LAN : {}",
+        local_ok.text()
+    );
+    // Une autre clé depuis la MÊME adresse LAN bloquée est aussi refusée en 429.
+    let c_autre = client_appaire(&e, &["lecture"]);
+    let autre_bloque = post_mcp_signe(&e, &c_autre, &lan, &corps_tl, None, None);
+    assert_eq!(
+        autre_bloque.status,
+        429,
+        "adresse LAN bloquée doit bloquer toute clé : {}",
+        autre_bloque.text()
+    );
+
+    // 5. Mesure soutenue pendant 60 s sur un moteur LAN neuf + sonde continue de la fenêtre locale.
+    drop(e);
+    let mut e2 = spawn(EngineCfg {
+        ui_port: free_port(),
+        ui_bind: "0.0.0.0",
+        api_access: None,
+    })
+    .expect("spawn moteur LAN 60s");
+    e2.wait_ready(Duration::from_secs(30)).expect("moteur prêt");
+    let c_atk = SigningKey::generate();
+    let atk_signer = Signer::new(c_atk).with_keyid(nouveau_keyid());
+    let lan_addr: std::net::SocketAddr = format!("{}:{}", lan, e2.port).parse().unwrap();
+    let local_addr: std::net::SocketAddr = format!("127.0.0.1:{}", e2.port).parse().unwrap();
+
+    // Pré-construit une requête signée altérée vers le LAN.
+    let authority_lan = format!("{}:{}", lan, e2.port);
+    let base_headers = [
+        ("Content-Type", "application/json"),
+        ("Mcp-Method", "tools/list"),
+    ];
+    let a_signer = RequestToSign::new("POST", "/mcp", &authority_lan, &base_headers, &body_bytes);
+    let signes = atk_signer.headers(&a_signer);
+    let mut raw_atk = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {authority_lan}\r\nContent-Type: application/json\r\nMcp-Method: tools/list\r\n"
+    );
+    for (n, v) in signes.iter() {
+        let mut val = v.to_string();
+        if n.eq_ignore_ascii_case("signature") {
+            let dernier = if val.ends_with(':') { '"' } else { 'A' };
+            val.pop();
+            val.push(dernier);
+        }
+        raw_atk.push_str(&format!("{n}: {val}\r\n"));
+    }
+    raw_atk.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body_bytes.len()
+    ));
+    let mut raw_bytes = raw_atk.into_bytes();
+    raw_bytes.extend_from_slice(&body_bytes);
+
+    let cookie = e2.session_cookie().unwrap().to_string();
+    let secret = e2.session_secret().unwrap().to_string();
+    let raw_local = format!(
+        "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nCookie: mcc_session={cookie}\r\nX-MCC-Session: {secret}\r\nConnection: close\r\n\r\n",
+        e2.port
+    )
+    .into_bytes();
+
+    let fin = Instant::now() + Duration::from_secs(60);
+    let atk_401 = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let atk_429 = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let atk_other = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let lat_429 = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u128>::new()));
+
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let req = raw_bytes.clone();
+        let c401 = std::sync::Arc::clone(&atk_401);
+        let c429 = std::sync::Arc::clone(&atk_429);
+        let coth = std::sync::Arc::clone(&atk_other);
+        let l429 = std::sync::Arc::clone(&lat_429);
+        handles.push(std::thread::spawn(move || {
+            use std::io::Write as _;
+            while Instant::now() < fin {
+                let t0 = Instant::now();
+                let mut status = 0u16;
+                if let Ok(mut s) =
+                    std::net::TcpStream::connect_timeout(&lan_addr, Duration::from_secs(2))
+                {
+                    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+                    let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
+                    if s.write_all(&req).is_ok() {
+                        let mut buf = [0u8; 512];
+                        if let Ok(n) = s.read(&mut buf) {
+                            let head = String::from_utf8_lossy(&buf[..n]);
+                            status = head
+                                .lines()
+                                .next()
+                                .and_then(|l| l.split_whitespace().nth(1))
+                                .and_then(|p| p.parse::<u16>().ok())
+                                .unwrap_or(0);
+                        }
+                    }
+                }
+                let us = t0.elapsed().as_micros();
+                match status {
+                    401 => {
+                        c401.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    429 => {
+                        c429.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Ok(mut g) = l429.lock() {
+                            g.push(us);
+                        }
+                        // Cadence soutenue (~120 req/s sur 2 fils) sans saturer les ports TIME_WAIT OS.
+                        std::thread::sleep(Duration::from_millis(15));
+                    }
+                    _ => {
+                        coth.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        std::thread::sleep(Duration::from_millis(15));
+                    }
+                }
+            }
+        }));
+    }
+
+    // Sonde continue de la fenêtre locale (/api/state) pendant les 60 s.
+    let mut local_ok_n = 0u64;
+    let mut local_ko_n = 0u64;
+    let mut local_us = Vec::<u128>::new();
+    while Instant::now() < fin {
+        let t0 = Instant::now();
+        let mut status = 0u16;
+        if let Ok(mut s) = std::net::TcpStream::connect_timeout(&local_addr, Duration::from_secs(2))
+        {
+            use std::io::Write as _;
+            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+            if s.write_all(&raw_local).is_ok() {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while let Ok(n) = s.read(&mut tmp) {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                let head = String::from_utf8_lossy(&buf);
+                status = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .unwrap_or(0);
+            }
+        }
+        let us = t0.elapsed().as_micros();
+        if status == 200 {
+            local_ok_n += 1;
+            local_us.push(us);
+        } else {
+            local_ko_n += 1;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+
+    let n401 = atk_401.load(std::sync::atomic::Ordering::Relaxed);
+    let n429 = atk_429.load(std::sync::atomic::Ordering::Relaxed);
+    let noth = atk_other.load(std::sync::atomic::Ordering::Relaxed);
+    let mut l429 = lat_429.lock().unwrap().clone();
+    l429.sort_unstable();
+    local_us.sort_unstable();
+    let local_p50 = percentile_us(&local_us, 50, 100);
+    let local_p95 = percentile_us(&local_us, 95, 100);
+    let local_max = local_us.last().copied().unwrap_or(0);
+    let p50_429 = percentile_us(&l429, 50, 100);
+    let p95_429 = percentile_us(&l429, 95, 100);
+    eprintln!(
+        "[M5 pt3 60s] LAN: 401={n401}, 429={n429} (p50={} us, p95={} us), autres={noth} | Fenêtre locale: 200={local_ok_n}, ko={local_ko_n}, p50={local_p50} us, p95={local_p95} us, max={local_max} us",
+        p50_429, p95_429
+    );
+
+    assert!((40..=120).contains(&n401), "401 hors plage : {n401}");
+    assert!(n429 >= 1000, "trop peu de 429 en 60 s : {n429}");
+    assert_eq!(noth, 0, "statuts inattendus sur le LAN : {noth}");
+    assert_eq!(
+        local_ko_n, 0,
+        "la fenêtre locale a échoué {local_ko_n} fois"
+    );
+    assert!(
+        local_ok_n >= 400,
+        "trop peu de sondes locales : {local_ok_n}"
+    );
+    assert!(
+        local_p95 < 200_000,
+        "fenêtre locale non fluide : p95={local_p95} us"
+    );
+}
+
+/// (Lot M5 point 4) Uniformité des refus sur 1 000 requêtes de chaque sorte :
+/// `key_unknown`, `signature_invalid`, `key_revoked`.
+/// Même statut (401), même en-tête `WWW-Authenticate`, même corps octet pour
+/// octet, et temps de réponse comparable.
+#[test]
+fn uniformite_refus_corps_statut_et_temps_1000_requetes() {
+    let _garde = serial_guard();
+    let e = engine_ready();
+
+    let c_inconnu = Signer::new(SigningKey::generate()).with_keyid(nouveau_keyid());
+    let c_actif = client_appaire(&e, &["lecture"]);
+    let keyid_actif = clients(&e)
+        .last()
+        .and_then(|c| c["keyid"].as_str())
+        .unwrap()
+        .to_string();
+    // Mauvaise clé privée signant sous le `keyid` de `c_actif` : passe tous
+    // les contrôles amont (en-têtes, digest, horloge, nonce, lookup) et paie
+    // la vraie vérification Ed25519 à l'étape 8 (`signature_invalid`).
+    let c_fausse_sig = Signer::new(SigningKey::generate()).with_keyid(keyid_actif);
+    let _ = c_actif;
+    let c_revoque = client_appaire(&e, &["lecture"]);
+    let keyid_rev = clients(&e)
+        .last()
+        .and_then(|c| c["keyid"].as_str())
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        e.action(&json!({ "action": "client_revoke", "keyid": keyid_rev }))["ok"],
+        json!(true)
+    );
+
+    let authority = format!("127.0.0.1:{}", e.port);
+    let body = corps_tools_list(1).to_string();
+    let body_bytes = body.as_bytes();
+    let base = [
+        ("Content-Type", "application/json"),
+        ("Mcp-Method", "tools/list"),
+    ];
+
+    let created_base = now() + 30;
+    let build_raw = |signer: &Signer, idx: usize| -> Vec<u8> {
+        let req = RequestToSign::new("POST", "/mcp", &authority, &base, body_bytes);
+        let mut nonce = [0u8; 16];
+        nonce[..8].copy_from_slice(&(idx as u64).to_le_bytes());
+        nonce[8..].copy_from_slice(&0xA5A5_5A5A_u64.to_le_bytes());
+        let signes = signer.headers_at(&req, created_base, &nonce);
+        let mut s = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nMcp-Method: tools/list\r\n"
+        );
+        for (n, v) in signes.iter() {
+            s.push_str(&format!("{n}: {v}\r\n"));
+        }
+        s.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body_bytes.len()
+        ));
+        let mut bytes = s.into_bytes();
+        bytes.extend_from_slice(body_bytes);
+        bytes
+    };
+
+    const WARMUP: usize = 30;
+    const N: usize = 1000;
+    let mut reqs_unknown = Vec::with_capacity(WARMUP + N);
+    let mut reqs_invalid = Vec::with_capacity(WARMUP + N);
+    let mut reqs_revoked = Vec::with_capacity(WARMUP + N);
+    for i in 0..(WARMUP + N) {
+        reqs_unknown.push(build_raw(&c_inconnu, i));
+        reqs_invalid.push(build_raw(&c_fausse_sig, i));
+        reqs_revoked.push(build_raw(&c_revoque, i));
+    }
+
+    let addr: std::net::SocketAddr = authority.parse().unwrap();
+    let send_measure = |raw: &[u8]| -> (Resp, u128) {
+        use std::io::Write as _;
+        let t0 = Instant::now();
+        let mut s = std::net::TcpStream::connect(addr).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        s.write_all(raw).expect("write");
+        let mut data = Vec::new();
+        let _ = s.read_to_end(&mut data);
+        let us = t0.elapsed().as_micros();
+        // Parse minimal identique à harness::Resp
+        let raw_txt = String::from_utf8_lossy(&data);
+        let (head, body_part) = raw_txt.split_once("\r\n\r\n").unwrap_or((&raw_txt, ""));
+        let mut lines = head.split("\r\n");
+        let status = lines
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(1)
+            .and_then(|x| x.parse::<u16>().ok())
+            .unwrap_or(0);
+        let mut headers = Vec::new();
+        for l in lines {
+            if let Some((n, v)) = l.split_once(':') {
+                headers.push((n.trim().to_ascii_lowercase(), v.trim().to_string()));
+            }
+        }
+        (
+            Resp {
+                status,
+                headers,
+                body: body_part.as_bytes().to_vec(),
+            },
+            us,
+        )
+    };
+
+    // Chauffe
+    for i in 0..WARMUP {
+        assert_eq!(send_measure(&reqs_unknown[i]).0.status, 401);
+        assert_eq!(send_measure(&reqs_invalid[i]).0.status, 401);
+        assert_eq!(send_measure(&reqs_revoked[i]).0.status, 401);
+    }
+
+    let mut t_unknown = Vec::with_capacity(N);
+    let mut t_invalid = Vec::with_capacity(N);
+    let mut t_revoked = Vec::with_capacity(N);
+    let mut ref_body: Option<Vec<u8>> = None;
+
+    for i in WARMUP..(WARMUP + N) {
+        for (req, bucket, nom) in [
+            (&reqs_unknown[i], &mut t_unknown, "key_unknown"),
+            (&reqs_invalid[i], &mut t_invalid, "signature_invalid"),
+            (&reqs_revoked[i], &mut t_revoked, "key_revoked"),
+        ] {
+            let (resp, us) = send_measure(req);
+            assert_eq!(resp.status, 401, "{nom} statut != 401");
+            assert_eq!(
+                resp.header("www-authenticate").as_deref(),
+                Some("Signature realm=\"litemcp\", tag=\"litemcp-auth-v1\""),
+                "{nom} WWW-Authenticate inattendu"
+            );
+            match &ref_body {
+                None => ref_body = Some(resp.body),
+                Some(b) => assert_eq!(&resp.body, b, "{nom} corps différent des autres refus 401"),
+            }
+            bucket.push(us);
+        }
+    }
+
+    let stats = |v: &mut Vec<u128>| -> (u128, u128, f64, u128, f64) {
+        v.sort_unstable();
+        let min = v[0];
+        let p50 = percentile_us(v, 50, 100);
+        let p95 = percentile_us(v, 95, 100);
+        let mean = v.iter().map(|&x| x as f64).sum::<f64>() / (v.len() as f64);
+        let var = v
+            .iter()
+            .map(|&x| {
+                let d = x as f64 - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / (v.len() as f64);
+        (min, p50, mean, p95, var.sqrt())
+    };
+
+    let s_unk = stats(&mut t_unknown);
+    let s_inv = stats(&mut t_invalid);
+    let s_rev = stats(&mut t_revoked);
+    eprintln!(
+        "[M5 pt4 3x1000] key_unknown: min={} p50={} mean={:.1} p95={} sd={:.1} us",
+        s_unk.0, s_unk.1, s_unk.2, s_unk.3, s_unk.4
+    );
+    eprintln!(
+        "[M5 pt4 3x1000] sig_invalid: min={} p50={} mean={:.1} p95={} sd={:.1} us",
+        s_inv.0, s_inv.1, s_inv.2, s_inv.3, s_inv.4
+    );
+    eprintln!(
+        "[M5 pt4 3x1000] key_revoked: min={} p50={} mean={:.1} p95={} sd={:.1} us",
+        s_rev.0, s_rev.1, s_rev.2, s_rev.3, s_rev.4
+    );
+
+    let p50_min = s_unk.1.min(s_inv.1).min(s_rev.1).max(1);
+    let p50_max = s_unk.1.max(s_inv.1).max(s_rev.1);
+    assert!(
+        p50_max * 100 <= p50_min * 150,
+        "écart temporel médian excessif entre motifs 401 : unk={} inv={} rev={}",
+        s_unk.1,
+        s_inv.1,
+        s_rev.1
+    );
+    // Preuve que chaque lot a bien exercé son motif exact (pas de clock_skew ni nonce_replay).
+    let audit_txt = std::fs::read_to_string(e.tmp_dir().join("auth-audit.log")).unwrap();
+    for motif in [
+        "reason=key_unknown",
+        "reason=signature_invalid",
+        "reason=key_revoked",
+    ] {
+        let count = audit_txt.lines().filter(|l| l.contains(motif)).count();
+        assert!(
+            count >= N,
+            "motif {motif} attendu >= {N} fois dans auth-audit.log, vu {count}"
+        );
+    }
+}
