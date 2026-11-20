@@ -56,8 +56,7 @@ fn main() {
     // passent par le moteur, action open_release_page → navigateur système).
     let ui_target: tauri::Url = ui_url.parse().expect("URL UI invalide");
     let ui_origin = ui_target.origin();
-    let ui_cap_origin = (ui_target.scheme() == "http"
-        && ui_target.host_str() == Some("127.0.0.1"))
+    let ui_cap_origin = (ui_target.scheme() == "http" && ui_target.host_str() == Some("127.0.0.1"))
         .then(|| ui_origin.ascii_serialization());
 
     tauri::Builder::default()
