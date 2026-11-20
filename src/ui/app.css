@@ -506,6 +506,17 @@ button.tile:hover{border-color:var(--border-strong)}
 .tag.fastmcp{color:#8fd3dE;border-color:#6f9ba688;background:#6f9ba61f;box-shadow:0 0 8px rgba(111,155,166,.45)}
 /* autres frameworks MCP détectés par nom (rmcp, mcp-go, Spring AI, xmcp…) */
 .tag.fw{color:#a5b4fc;border-color:#a5b4fc55;background:#a5b4fc11}
+/* Couleur du badge = celle du LANGAGE du framework, en classes statiques :
+   lot S2 — plus aucun style= en ligne (CSP style-src 'self' sans
+   'unsafe-inline'). Une classe inconnue retombe sur la teinte neutre ci-dessus. */
+.tag.fw.fw-node{color:#dcc94f;border-color:#dcc94f66;background:#dcc94f14}
+.tag.fw.fw-python{color:#3fb950;border-color:#3fb95066;background:#3fb95014}
+.tag.fw.fw-rust{color:#f97316;border-color:#f9731666;background:#f9731614}
+.tag.fw.fw-go{color:#00add8;border-color:#00add866;background:#00add814}
+.tag.fw.fw-java{color:#e76f00;border-color:#e76f0066;background:#e76f0014}
+.tag.fw.fw-dotnet{color:#512bd4;border-color:#512bd466;background:#512bd414}
+.tag.fw.fw-ruby{color:#cc342d;border-color:#cc342d66;background:#cc342d14}
+.tag.fw.fw-php{color:#777bb4;border-color:#777bb466;background:#777bb414}
 /* Icônes SVG (jeu unique, trait 1.5, couleur courante — aucun emoji) :
    rendu identique quelle que soit la version d'Windows, alignement
    typographique propre, cohérence avec l'interface monochrome. */

@@ -37,6 +37,15 @@ fn main() {
     };
     // lancé au boot de Windows (entrée autostart) → pas de fenêtre, tray seulement
     let hidden = std::env::args().any(|a| a == "--hidden");
+    // SEULE origine navigable : celle que le moteur vient de servir. Le
+    // fragment #t=<jeton> ne compte pas dans l'origine. Toute autre navigation
+    // est refusée : la fenêtre ne peut pas quitter l'UI (les liens externes
+    // passent par le moteur, action open_release_page → navigateur système).
+    let ui_target: tauri::Url = ui_url.parse().expect("URL UI invalide");
+    let ui_origin = ui_target.origin();
+    let ui_cap_origin = (ui_target.scheme() == "http"
+        && ui_target.host_str() == Some("127.0.0.1"))
+        .then(|| ui_origin.ascii_serialization());
 
     tauri::Builder::default()
         // deuxième lancement pendant que l'app tourne : réafficher la fenêtre
@@ -49,11 +58,33 @@ fn main() {
             }
         }))
         .setup(move |app| {
+            // S-5 : capacité distante réduite à l'UNIQUE origine réellement
+            // servie par ce moteur (127.0.0.1:<port>) — aucune autre origine
+            // locale ou distante ne reçoit les contrôles de fenêtre.
+            if let Some(ref cap_origin) = ui_cap_origin {
+                app.add_capability(
+                    tauri::ipc::CapabilityBuilder::new("main-remote-ui-origin")
+                        .local(false)
+                        .remote(cap_origin.clone())
+                        .window("main")
+                        .permission("core:window:allow-start-dragging")
+                        .permission("core:window:allow-minimize")
+                        .permission("core:window:allow-toggle-maximize")
+                        .permission("core:window:allow-internal-toggle-maximize")
+                        .permission("core:window:allow-close"),
+                )?;
+            }
             let win = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
-                tauri::WebviewUrl::External(ui_url.parse().expect("URL UI invalide")),
+                tauri::WebviewUrl::External(ui_target),
             )
+            // Confinement de navigation : seul le tuple (http, 127.0.0.1, port
+            // du moteur) est navigable — aucune redirection sortante ni popup
+            // ne peut embarquer la webview ; les liens externes passent par le
+            // moteur (navigateur système).
+            .on_navigation(move |url| url.origin() == ui_origin)
+            .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny)
             .title("MCP Control")
             .inner_size(1320.0, 880.0)
             .min_inner_size(940.0, 620.0)

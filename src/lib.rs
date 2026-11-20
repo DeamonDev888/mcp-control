@@ -42,12 +42,16 @@ const MAX_CONNS_PER_ADDR: usize = 16;
 const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 /// CSP de la page UI (servie en en-tête HTTP par CE serveur — le webview Tauri
 /// charge une URL externe, la config `csp` de tauri.conf.json ne s'y applique
-/// pas). Depuis le split en assets servis (v0.7.19), scripts et styles sont
-/// des fichiers même origine ('self') ; 'unsafe-inline' reste nécessaire pour
-/// les attributs on* des gabarits (la délégation d'événements est le chantier
-/// suivant) et pour les styles inline générés par le JS. Une XSS future ne
-/// peut toujours ni charger du code externe ni exfiltrer (connect-src 'self').
-const UI_CSP: &str = "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+/// pas). Lot S2 : plus AUCUN script ni style en ligne — la page ne porte que
+/// des attributs data-act traités par la délégation d'événements de app.js,
+/// et les couleurs dynamiques sont des classes CSS. 'self' seul, ni
+/// 'unsafe-inline' ni 'unsafe-eval', aucun nonce de contournement. Une XSS
+/// future ne peut ni s'exécuter en ligne, ni charger du code externe, ni
+/// exfiltrer (connect-src 'self').
+const UI_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+/// En-têtes de durcissement appliqués à TOUTES les réponses HTTP (HTML, JSON,
+/// assets et refus précoces 413/503).
+const SECURITY_HEADERS: &str = "X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Resource-Policy: same-origin\r\n";
 
 /// Version de spec annoncée par litemcp — premier signal du fingerprint :
 /// litemcp répond initialize avec 2026-07-28 même quand le client demande
@@ -178,10 +182,11 @@ fn admit_conn(peer_ip: Option<IpAddr>) -> Result<ConnGuard, &'static str> {
 fn write_conn_rejected(mut stream: TcpStream, status: u16, message: &str) {
     let j = serde_json::json!({"ok": false, "error": message}).to_string();
     let resp = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Cache-Control: no-store\r\nConnection: close\r\n\r\n{}",
         status,
         reason_phrase(status),
         j.len(),
+        SECURITY_HEADERS,
         j
     );
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
@@ -1177,8 +1182,9 @@ pub(crate) fn handle_conn(mut stream: TcpStream, state: Arc<AppState>, guard: Co
     if body.len() > MAX_BODY {
         let j = serde_json::json!({"ok": false, "error": "body trop grand (max 2 Mo)"}).to_string();
         let resp = format!(
-            "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Cache-Control: no-store\r\nConnection: close\r\n\r\n{}",
             j.len(),
+            SECURITY_HEADERS,
             j
         );
         let _ = stream.write_all(resp.as_bytes());
@@ -1345,11 +1351,12 @@ pub(crate) fn handle_conn(mut stream: TcpStream, state: Arc<AppState>, guard: Co
     // ACAO dynamique : on reflète UNIQUEMENT une origine autorisée (jamais *),
     // sinon aucun site tiers ne peut lire nos réponses (/api/state inclu).
     let mut resp = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}",
         status,
         reason_phrase(status),
         ctype,
-        payload.len()
+        payload.len(),
+        SECURITY_HEADERS
     );
     // En-têtes portés par la route (lot M2) : `Set-Cookie` de la session et
     // `WWW-Authenticate` du 401 de litemcp. Leurs noms et valeurs sont cons-
@@ -2025,6 +2032,34 @@ mod tests {
             .status,
             200
         );
+    }
+
+    #[test]
+    fn csp_stricte_sans_script_ni_style_en_ligne() {
+        // Lot S2 : la page ne doit plus rien pouvoir exécuter « en ligne ».
+        // Une régression qui réintroduit 'unsafe-inline' ou un nonce casse ici.
+        assert!(UI_CSP.contains("script-src 'self'"), "{UI_CSP}");
+        assert!(UI_CSP.contains("style-src 'self'"), "{UI_CSP}");
+        assert!(!UI_CSP.contains("unsafe-inline"), "{UI_CSP}");
+        assert!(!UI_CSP.contains("unsafe-eval"), "{UI_CSP}");
+        assert!(!UI_CSP.contains("nonce-"), "{UI_CSP}");
+        // coquille : ni <style>, ni <script> en ligne (uniquement des src=)
+        assert!(
+            !crate::ui::INDEX_HTML.contains("<style"),
+            "<style> en ligne"
+        );
+        assert!(
+            !crate::ui::INDEX_HTML.contains("<script>"),
+            "<script> en ligne"
+        );
+        for h in [
+            "X-Content-Type-Options: nosniff",
+            "Referrer-Policy: no-referrer",
+            "Cross-Origin-Opener-Policy: same-origin",
+            "Cross-Origin-Resource-Policy: same-origin",
+        ] {
+            assert!(SECURITY_HEADERS.contains(h), "en-tête manquant : {h}");
+        }
     }
 
     #[test]

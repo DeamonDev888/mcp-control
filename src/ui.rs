@@ -26,35 +26,35 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
   </span>
   <span class="tb-badge ok" title="Serveurs MCP qui répondent, sur le total suivi">UP <b id="stUp">0</b>/<b id="stTotal">0</b></span>
   <span class="tb-badge" title="Outils MCP exposés par les serveurs UP">outils <b id="stTools">0</b></span>
-  <button id="tbLogout" class="tb-logout" hidden onclick="logout()"
+  <button id="tbLogout" class="tb-logout" hidden data-act="logout"
           title="Oublier le code d'accès enregistré dans ce navigateur"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='4.5' y='10.5' width='15' height='10' rx='2'/><path d='M8 10.5V7a4 4 0 0 1 8 0v3.5'/></svg></button>
   <span class="tb-spacer" data-tauri-drag-region></span>
   <div class="tb-actions">
-    <button class="primary" onclick="doScan()" title="Balayer les ports locaux pour d&eacute;couvrir les serveurs MCP"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='11' cy='11' r='7'/><path d='m21 21-4.3-4.3'/></svg><span class="tb-lbl">Scanner les ports</span></button>
-    <button onclick="doScanNet()" title="Balayer le r&eacute;seau local pour d&eacute;couvrir les serveurs MCP distants"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='8.5'/><path d='M3.5 12h17M12 3.5c2.4 2.4 3.8 5.3 3.8 8.5s-1.4 6.1-3.8 8.5c-2.4-2.4-3.8-5.3-3.8-8.5s1.4-6.1 3.8-8.5Z'/></svg><span class="tb-lbl">Scanner le r&eacute;seau</span></button>
-    <button onclick="openMachineDlg()" title="Machines distantes (SSH) et d&eacute;tection des moteurs MCP Control du LAN"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='2.5' y='4' width='19' height='13' rx='2'/><path d='M8 21h8M12 17v4'/></svg><span class="tb-lbl">Machines</span></button>
-    <button onclick="openStore()" title="Catalogue de serveurs MCP pr&ecirc;ts &agrave; installer"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='9' cy='20' r='1.4'/><circle cx='17' cy='20' r='1.4'/><path d='M2.5 3.5h2.2l2.5 11.5h10.3l2-8H6'/></svg><span class="tb-lbl">Boutique</span></button>
-    <button id="tbAccess" onclick="openAccessDlg()" title="Acc&egrave;s &mdash; clients appair&eacute;s, demandes d'appairage et confirmations avant ex&eacute;cution"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 3 4.5 6v5.5c0 4.4 3.1 8.3 7.5 9.5 4.4-1.2 7.5-5.1 7.5-9.5V6L12 3Z'/><path d='m8.8 11.8 2.2 2.2 4.2-4.4'/></svg><span class="tb-lbl">Acc&egrave;s</span><span id="tbAccessN" class="tb-count" hidden>0</span></button>
-    <button onclick="openSettingsDlg()" title="R&eacute;glages du client"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='3.1'/><path d='M12 2.8v2.6M12 18.6v2.6M2.8 12h2.6M18.6 12h2.6M5.5 5.5l1.9 1.9M16.6 16.6l1.9 1.9M18.5 5.5l-1.9 1.9M7.4 16.6l-1.9 1.9'/></svg><span class="tb-lbl">R&eacute;glages</span></button>
-    <button onclick="refreshAll()" title="Re-sonder tous les serveurs connus et d&eacute;couvrir les nouveaux (tous ports en &eacute;coute)"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M21 12a9 9 0 1 1-2.6-6.4L21 8'/><path d='M21 3v5h-5'/></svg></button>
+    <button class="primary" data-act="scan" title="Balayer les ports locaux pour d&eacute;couvrir les serveurs MCP"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='11' cy='11' r='7'/><path d='m21 21-4.3-4.3'/></svg><span class="tb-lbl">Scanner les ports</span></button>
+    <button data-act="scan-net" title="Balayer le r&eacute;seau local pour d&eacute;couvrir les serveurs MCP distants"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='8.5'/><path d='M3.5 12h17M12 3.5c2.4 2.4 3.8 5.3 3.8 8.5s-1.4 6.1-3.8 8.5c-2.4-2.4-3.8-5.3-3.8-8.5s1.4-6.1 3.8-8.5Z'/></svg><span class="tb-lbl">Scanner le r&eacute;seau</span></button>
+    <button data-act="machines" title="Machines distantes (SSH) et d&eacute;tection des moteurs MCP Control du LAN"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='2.5' y='4' width='19' height='13' rx='2'/><path d='M8 21h8M12 17v4'/></svg><span class="tb-lbl">Machines</span></button>
+    <button data-act="store" title="Catalogue de serveurs MCP pr&ecirc;ts &agrave; installer"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='9' cy='20' r='1.4'/><circle cx='17' cy='20' r='1.4'/><path d='M2.5 3.5h2.2l2.5 11.5h10.3l2-8H6'/></svg><span class="tb-lbl">Boutique</span></button>
+    <button id="tbAccess" data-act="access-open" title="Acc&egrave;s &mdash; clients appair&eacute;s, demandes d'appairage et confirmations avant ex&eacute;cution"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 3 4.5 6v5.5c0 4.4 3.1 8.3 7.5 9.5 4.4-1.2 7.5-5.1 7.5-9.5V6L12 3Z'/><path d='m8.8 11.8 2.2 2.2 4.2-4.4'/></svg><span class="tb-lbl">Acc&egrave;s</span><span id="tbAccessN" class="tb-count" hidden>0</span></button>
+    <button data-act="settings-open" title="R&eacute;glages du client"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='3.1'/><path d='M12 2.8v2.6M12 18.6v2.6M2.8 12h2.6M18.6 12h2.6M5.5 5.5l1.9 1.9M16.6 16.6l1.9 1.9M18.5 5.5l-1.9 1.9M7.4 16.6l-1.9 1.9'/></svg><span class="tb-lbl">R&eacute;glages</span></button>
+    <button data-act="refresh-all" title="Re-sonder tous les serveurs connus et d&eacute;couvrir les nouveaux (tous ports en &eacute;coute)"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M21 12a9 9 0 1 1-2.6-6.4L21 8'/><path d='M21 3v5h-5'/></svg></button>
   </div>
   <div id="winCtrls">
-    <button class="wbtn" id="wMin" title="R&eacute;duire">&#x2500;</button>
-    <button class="wbtn" id="wMax" title="Agrandir / restaurer">&#x25A1;</button>
-    <button class="wbtn wclose" id="wClose" title="Fermer">&#x2715;</button>
+    <button class="wbtn" id="wMin" data-act="win-min" title="R&eacute;duire">&#x2500;</button>
+    <button class="wbtn" id="wMax" data-act="win-max" title="Agrandir / restaurer">&#x25A1;</button>
+    <button class="wbtn wclose" id="wClose" data-act="win-close" title="Fermer">&#x2715;</button>
   </div>
 </div>
 
 <div id="deadBanner" hidden></div>
 
-<div id="accessBanner" hidden onclick="openAccessDlg(true)"
+<div id="accessBanner" hidden data-act="access-open" data-pending="1"
   title="Une demande attend une d&eacute;cision locale &mdash; cliquer pour ouvrir l'&eacute;cran Acc&egrave;s"></div>
 
 <div id="main">
   <aside id="explorer">
     <div class="sec-label" title="Glisser-déposer une ligne pour r&eacute;ordonner (pr&eacute;f&eacute;rence d'affichage et priorit&eacute; de sondage) — ou reclasser via le menu : l'ordre appliqué est persisté">
       <span>Serveurs MCP</span>
-      <select id="sortSel" onchange="applySort(this.value)" title="Reclasser les serveurs — « manuel » rend l'ordre pos&eacute; au glisser-déposer avant le tri">
+      <select id="sortSel" data-act="sort" title="Reclasser les serveurs — « manuel » rend l'ordre pos&eacute; au glisser-déposer avant le tri">
         <option value="manuel">⇅ manuel</option>
         <option value="az">A→Z</option>
         <option value="etat">état</option>
@@ -68,13 +68,13 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     <div id="srvFilterWrap">
       <input id="srvFilter" placeholder="Filtrer les serveurs&hellip;"
         title="Filtre par nom, port, framework ou &eacute;tat &mdash; raccourcis : / ou Ctrl+K, &Eacute;chap efface"
-        oninput="renderServers()">
-      <button id="srvFilterClear" hidden onclick="clearFilter()" title="Effacer le filtre">&times;</button>
+        data-act="srv-filter">
+      <button id="srvFilterClear" hidden data-act="clear-filter" title="Effacer le filtre">&times;</button>
     </div>
-    <div id="hiddenBar" hidden onclick="showHiddenServers()"
+    <div id="hiddenBar" hidden data-act="show-hidden"
       title="Les serveurs masqu&eacute;s ne le restent que pour cette session : ils reviennent &agrave; la r&eacute;ouverture de l'application (ou d'un rechargement de la page)"></div>
     <div id="localSec">
-      <div class="grphead" id="localHead" onclick="toggleGroup('local')"
+      <div class="grphead" id="localHead" data-act="group-toggle" data-key="local"
         title="Serveurs MCP locaux &agrave; cette machine (loopback) — cliquer pour replier/d&eacute;plier">
         <span class="gchev">&#9662;</span><span class="gname">Serveurs locaux</span><span class="gcount" id="localCount"></span>
       </div>
@@ -84,22 +84,22 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     <div id="remoteGroups"></div>
     <div class="sec-label">Machines &amp; pairs</div>
     <div id="peerList"></div>
-    <div id="addWrap"><button onclick="toggleAdd()">+ Ajouter un serveur</button></div>
+    <div id="addWrap"><button data-act="add-server">+ Ajouter un serveur</button></div>
   </aside>
   <div id="grip" title="Glisser pour ajuster la largeur"></div>
   <section id="content"></section>
 </div>
 
 <div id="logpanel">
-  <div id="loghead" onclick="toggleLog()">
+  <div id="loghead" data-act="log-toggle">
     <span class="arrow">&#9662;</span><span class="lbl">Journal</span>
-    <button id="netWarn" class="tb-badge netwarn" hidden onclick="event.stopPropagation();showNetDetail()"
+    <button id="netWarn" class="tb-badge netwarn" hidden data-act="net-detail"
       title="Les serveurs distants ne peuvent pas &ecirc;tre sond&eacute;s &mdash; VPN actif ? (Proton VPN : activer &laquo;&nbsp;autoriser les connexions LAN&nbsp;&raquo;)"></button>
-    <button id="stAuto" class="sb-auto tb-push" onclick="event.stopPropagation();toggleAutostart()"
+    <button id="stAuto" class="sb-auto tb-push" data-act="autostart"
       title="Lancer l'application au d&eacute;marrage de l'OS (tray silencieux)"></button>
     <span class="tb-badge">auto-d&eacute;tection : HTTP streamable &middot; stdio JSON-RPC</span>
     <span class="sb-ver" title="Version install&eacute;e">v__MCC_VERSION__</span>
-    <button id="stUpdate" class="sb-upd" hidden onclick="event.stopPropagation();downloadUpdate()"
+    <button id="stUpdate" class="sb-upd" hidden data-act="update-download"
       title="T&eacute;l&eacute;charge directement la mise &agrave; jour pour cette machine"></button>
   </div>
   <div id="logbody"></div>
@@ -108,13 +108,13 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 <dialog id="dlg">
   <div class="dlg-head">
     <h2>Ajouter un serveur MCP</h2>
-    <button class="close" onclick="dlg.close()">&times;</button>
+    <button class="close" data-act="close-dialog">&times;</button>
   </div>
   <div class="dlg-body">
-    <form onsubmit="return addServer(event)">
+    <form data-act="add-submit">
       <div class="row">
         <div><label>Transport</label>
-          <select id="fTransport" onchange="transportChanged()">
+          <select id="fTransport" data-act="transport">
             <option value="http">HTTP (streamable)</option>
             <option value="stdio">STDIO (process)</option>
           </select></div>
@@ -142,14 +142,14 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
         <div class="stack"><label>Args (s&eacute;par&eacute;s par espace)</label><input id="fArgs" placeholder="dist/index.js --port 3000"></div>
       </div>
       <div class="row row-end">
-        <button type="button" onclick="dlg.close()">Annuler</button>
+        <button type="button" data-act="close-dialog">Annuler</button>
         <button type="submit" class="primary">Ajouter &amp; sonder</button>
       </div>
       <div class="dlg-import">
         <label>Coller un bloc mcpServers ou une URL</label>
         <textarea id="fImport" rows="4" placeholder='{"mcpServers": {"nom": {"command": "npx", "args": ["-y", "paquet"]}}} &#8212; ou http://127.0.0.1:3099/mcp &#8212; ou claude mcp add nom npx paquet'></textarea>
         <div class="row row-end">
-          <button type="button" class="primary" onclick="importMcp()">Importer</button>
+          <button type="button" class="primary" data-act="import-mcp">Importer</button>
         </div>
         <div id="importMsg" class="machine-msg"></div>
       </div>
@@ -160,17 +160,17 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 <dialog id="storeDlg">
   <div class="dlg-head">
     <h2><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='9' cy='20' r='1.4'/><circle cx='17' cy='20' r='1.4'/><path d='M2.5 3.5h2.2l2.5 11.5h10.3l2-8H6'/></svg> Boutique &mdash; serveurs MCP <span id="storeCount" class="store-count"></span></h2>
-    <button class="close" onclick="storeDlg.close()">&times;</button>
+    <button class="close" data-act="close-dialog">&times;</button>
   </div>
   <div class="dlg-body dlg-body-tight">
     <div class="store-head">
       <div class="store-bar">
-        <input id="storeSearch" placeholder="Rechercher dans la boutique&hellip;" oninput="renderStoreItems()">
-        <select id="storeSort" onchange="renderStoreItems()" title="Trier les r&eacute;sultats">
+        <input id="storeSearch" placeholder="Rechercher dans la boutique&hellip;" data-act="store-search">
+        <select id="storeSort" data-act="store-sort" title="Trier les r&eacute;sultats">
           <option value="cat">Ordre du catalogue</option>
           <option value="az">A→Z</option>
         </select>
-        <button id="storeHideInst" class="scat" onclick="toggleHideInst()"
+        <button id="storeHideInst" class="scat" data-act="store-hide-inst"
           title="Masquer les serveurs d&eacute;j&agrave; pr&eacute;sents dans ta liste">Masquer les install&eacute;s</button>
       </div>
       <div id="storeCats" class="store-cats"></div>
@@ -183,7 +183,7 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 <dialog id="machineDlg">
   <div class="dlg-head">
     <h2><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='2.5' y='4' width='19' height='13' rx='2'/><path d='M8 21h8M12 17v4'/></svg> Machines distantes</h2>
-    <button class="close" onclick="machineDlg.close()">&times;</button>
+    <button class="close" data-act="close-dialog">&times;</button>
   </div>
   <div class="dlg-body">
     <div class="conf-note">Connexion SSH par cl&eacute; (BatchMode — aucun mot de passe possible) : la machine
@@ -192,12 +192,12 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     <div class="machine-form">
       <input id="mIp" placeholder="IP ou h&ocirc;te (ex. 192.168.1.42)">
       <input id="mUser" placeholder="Utilisateur SSH">
-      <button class="primary" onclick="sshDiscover()"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7'/><path d='M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7'/></svg> SSH &amp; d&eacute;couvrir</button>
-      <button onclick="sshSave()"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M5 3.5h11L20.5 8v11a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 19V5A1.5 1.5 0 0 1 5 3.5Z'/><path d='M8 3.5V8h7V3.5M7.5 20.5v-6h9v6'/></svg> Enregistrer</button>
+      <button class="primary" data-act="ssh-discover"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7'/><path d='M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7'/></svg> SSH &amp; d&eacute;couvrir</button>
+      <button data-act="ssh-save"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M5 3.5h11L20.5 8v11a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 19V5A1.5 1.5 0 0 1 5 3.5Z'/><path d='M8 3.5V8h7V3.5M7.5 20.5v-6h9v6'/></svg> Enregistrer</button>
     </div>
     <div id="machineMsg" class="machine-msg"></div>
     <div id="machineList"></div>
-    <div class="stack"><button onclick="doPeers();setTimeout(renderMachines,3000)"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M21 12a9 9 0 1 1-2.6-6.4L21 8'/><path d='M21 3v5h-5'/></svg> D&eacute;tecter les moteurs MCP Control sur le LAN</button></div>
+    <div class="stack"><button data-act="peers-scan"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M21 12a9 9 0 1 1-2.6-6.4L21 8'/><path d='M21 3v5h-5'/></svg> D&eacute;tecter les moteurs MCP Control sur le LAN</button></div>
   </div>
 </dialog>
 
@@ -214,17 +214,17 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
         <p>Pr&eacute;f&eacute;rences du client MCP Control</p>
       </div>
     </div>
-    <button class="close" onclick="closeSettings()" title="Fermer">&times;</button>
+    <button class="close" data-act="settings-close" title="Fermer">&times;</button>
   </div>
   <div class="set-shell">
     <nav class="set-nav" id="setNav" aria-label="Sections des r&eacute;glages">
-      <button class="set-nav-btn sel" data-pane="general" onclick="setPane('general')"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='3.1'/><path d='M12 2.8v2.6M12 18.6v2.6M2.8 12h2.6M18.6 12h2.6M5.5 5.5l1.9 1.9M16.6 16.6l1.9 1.9M18.5 5.5l-1.9 1.9M7.4 16.6l-1.9 1.9'/></svg>G&eacute;n&eacute;ral</button>
-      <button class="set-nav-btn" data-pane="decouverte" onclick="setPane('decouverte')"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='11' cy='11' r='7'/><path d='m21 21-4.3-4.3'/></svg>D&eacute;couverte</button>
-      <button class="set-nav-btn" data-pane="interface" onclick="setPane('interface')"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='2.5' y='4' width='19' height='13' rx='2'/><path d='M8 21h8M12 17v4'/></svg>Interface</button>
-      <button class="set-nav-btn" data-pane="notifications" onclick="setPane('notifications')"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M6 9a6 6 0 0 1 12 0c0 5 2 6.5 2 6.5H4S6 14 6 9Z'/><path d='M10 19.5a2.2 2.2 0 0 0 4 0'/></svg>Notifications</button>
-      <button class="set-nav-btn" data-pane="updates" onclick="setPane('updates')"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 15.5V4m0 0L7.5 8.5M12 4l4.5 4.5'/><path d='M4 16.5V19a1.5 1.5 0 0 0 1.5 1.5h13A1.5 1.5 0 0 0 20 19v-2.5'/></svg>Mises &agrave; jour</button>
+      <button class="set-nav-btn sel" data-pane="general" data-act="set-pane"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='3.1'/><path d='M12 2.8v2.6M12 18.6v2.6M2.8 12h2.6M18.6 12h2.6M5.5 5.5l1.9 1.9M16.6 16.6l1.9 1.9M18.5 5.5l-1.9 1.9M7.4 16.6l-1.9 1.9'/></svg>G&eacute;n&eacute;ral</button>
+      <button class="set-nav-btn" data-pane="decouverte" data-act="set-pane"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='11' cy='11' r='7'/><path d='m21 21-4.3-4.3'/></svg>D&eacute;couverte</button>
+      <button class="set-nav-btn" data-pane="interface" data-act="set-pane"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='2.5' y='4' width='19' height='13' rx='2'/><path d='M8 21h8M12 17v4'/></svg>Interface</button>
+      <button class="set-nav-btn" data-pane="notifications" data-act="set-pane"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M6 9a6 6 0 0 1 12 0c0 5 2 6.5 2 6.5H4S6 14 6 9Z'/><path d='M10 19.5a2.2 2.2 0 0 0 4 0'/></svg>Notifications</button>
+      <button class="set-nav-btn" data-pane="updates" data-act="set-pane"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 15.5V4m0 0L7.5 8.5M12 4l4.5 4.5'/><path d='M4 16.5V19a1.5 1.5 0 0 0 1.5 1.5h13A1.5 1.5 0 0 0 20 19v-2.5'/></svg>Mises &agrave; jour</button>
       <div class="set-nav-sep"></div>
-      <button class="set-nav-btn danger" data-pane="reset" onclick="setPane('reset')"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 3.5 2.5 20h19L12 3.5Z'/><path d='M12 10v4.5M12 17.1v.1'/></svg>R&eacute;initialiser</button>
+      <button class="set-nav-btn danger" data-pane="reset" data-act="set-pane"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 3.5 2.5 20h19L12 3.5Z'/><path d='M12 10v4.5M12 17.1v.1'/></svg>R&eacute;initialiser</button>
     </nav>
     <div class="set-panes">
       <section class="set-pane sel" data-pane="general">
@@ -240,8 +240,8 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
             <div class="set-label"><span>Th&egrave;me</span>
               <em>Apparence de l'interface. Conserv&eacute; sur ce poste.</em></div>
             <div class="set-ctrl seg" role="group" aria-label="Th&egrave;me">
-              <button id="tDark" class="seg-btn" onclick="applyThemeAndSave('dark')" title="Th&egrave;me sombre (d&eacute;faut)">Sombre</button>
-              <button id="tLight" class="seg-btn" onclick="applyThemeAndSave('light')" title="Th&egrave;me clair">Clair</button>
+              <button id="tDark" class="seg-btn" data-act="theme" data-theme="dark" title="Th&egrave;me sombre (d&eacute;faut)">Sombre</button>
+              <button id="tLight" class="seg-btn" data-act="theme" data-theme="light" title="Th&egrave;me clair">Clair</button>
             </div>
           </div>
         </div>
@@ -347,7 +347,7 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
           <div class="set-row">
             <div class="set-label"><span>Test</span>
               <em>Enregistre la section puis &eacute;met une notification sur chaque canal activ&eacute;.</em></div>
-            <div class="set-ctrl"><button onclick="testNotify()"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M6 9a6 6 0 0 1 12 0c0 5 2 6.5 2 6.5H4S6 14 6 9Z'/><path d='M10 19.5a2.2 2.2 0 0 0 4 0'/></svg> Tester</button></div>
+            <div class="set-ctrl"><button data-act="test-notify"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M6 9a6 6 0 0 1 12 0c0 5 2 6.5 2 6.5H4S6 14 6 9Z'/><path d='M10 19.5a2.2 2.2 0 0 0 4 0'/></svg> Tester</button></div>
           </div>
           <div class="set-row" hidden id="notifyMsgRow">
             <div class="set-ctrl set-ctrl-wide"><span id="notifyMsg" class="set-note"></span></div>
@@ -367,9 +367,9 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
               <em id="updMsg">&nbsp;</em></div>
             <div class="set-ctrl">
               <span class="set-static" id="sLatest">&ndash;</span>
-              <button onclick="checkUpdateNow()" title="Interroge l'API GitHub releases/latest maintenant"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M21 12a9 9 0 1 1-2.6-6.4L21 8'/><path d='M21 3v5h-5'/></svg> V&eacute;rifier</button>
-              <button class="primary" onclick="downloadUpdate()" title="T&eacute;l&eacute;charge directement l'installateur pour cette machine"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 15.5V4m0 0L7.5 8.5M12 4l4.5 4.5'/><path d='M4 16.5V19a1.5 1.5 0 0 0 1.5 1.5h13A1.5 1.5 0 0 0 20 19v-2.5'/></svg> Mettre &agrave; jour</button>
-              <button onclick="openReleasePage()" title="Toutes les versions et archives"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M14 4h6v6M20 4l-9 9'/><path d='M19 14v5a1.5 1.5 0 0 1-1.5 1.5h-12A1.5 1.5 0 0 1 4 19V7.5A1.5 1.5 0 0 1 5.5 6H10'/></svg> Releases</button>
+              <button data-act="check-update" title="Interroge l'API GitHub releases/latest maintenant"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M21 12a9 9 0 1 1-2.6-6.4L21 8'/><path d='M21 3v5h-5'/></svg> V&eacute;rifier</button>
+              <button class="primary" data-act="update-download" title="T&eacute;l&eacute;charge directement l'installateur pour cette machine"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 15.5V4m0 0L7.5 8.5M12 4l4.5 4.5'/><path d='M4 16.5V19a1.5 1.5 0 0 0 1.5 1.5h13A1.5 1.5 0 0 0 20 19v-2.5'/></svg> Mettre &agrave; jour</button>
+              <button data-act="release-page" title="Toutes les versions et archives"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M14 4h6v6M20 4l-9 9'/><path d='M19 14v5a1.5 1.5 0 0 1-1.5 1.5h-12A1.5 1.5 0 0 1 4 19V7.5A1.5 1.5 0 0 1 5.5 6H10'/></svg> Releases</button>
             </div>
           </div>
         </div>
@@ -387,7 +387,7 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
                 <option value="oublis">Oublis (seeds + machines)</option>
                 <option value="tout">Tout</option>
               </select>
-              <button class="danger" onclick="resetState(document.getElementById('sResetWhat').value)">R&eacute;initialiser</button>
+              <button class="danger" data-act="reset-state">R&eacute;initialiser</button>
             </div>
           </div>
           <div class="set-row" id="resetMsgRow" hidden>
@@ -396,7 +396,7 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
           <div class="set-row">
             <div class="set-label"><span>Historique runtime</span>
               <em>Efface crashs, relances et compteurs d'&eacute;chec enregistr&eacute;s par serveur. Ne touche ni la liste ni les r&eacute;glages.</em></div>
-            <div class="set-ctrl"><button class="danger" onclick="resetRuntime()">Effacer</button></div>
+            <div class="set-ctrl"><button class="danger" data-act="reset-runtime">Effacer</button></div>
           </div>
           <div class="set-row" hidden id="runtimeMsgRow">
             <div class="set-ctrl set-ctrl-wide"><span id="runtimeMsg" class="set-note"></span></div>
@@ -410,8 +410,8 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     <span id="settingsDirty" class="set-dirty" hidden>&#9679; Modifications non enregistr&eacute;es</span>
     <span class="dlg-foot-note" id="settingsFootNote"></span>
     <div class="row">
-      <button onclick="closeSettings()">Annuler</button>
-      <button class="primary" onclick="saveSettings()">Enregistrer</button>
+      <button data-act="settings-close">Annuler</button>
+      <button class="primary" data-act="save-settings">Enregistrer</button>
     </div>
   </div>
 </dialog>
@@ -430,14 +430,14 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
         <p>Clients appair&eacute;s, demandes d'appairage et confirmations avant ex&eacute;cution</p>
       </div>
     </div>
-    <button class="close" onclick="closeAccessDlg()" title="Fermer">&times;</button>
+    <button class="close" data-act="access-close" title="Fermer">&times;</button>
   </div>
   <div class="set-shell">
     <nav class="set-nav" id="accessNav" aria-label="Sections de l'&eacute;cran Acc&egrave;s">
-      <button class="set-nav-btn sel" data-atab="confirmations" onclick="setAccessTab('confirmations')"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 3 4.5 6v5.5c0 4.4 3.1 8.3 7.5 9.5 4.4-1.2 7.5-5.1 7.5-9.5V6L12 3Z'/><path d='m8.8 11.8 2.2 2.2 4.2-4.4'/></svg>Confirmations<span class="nav-count" id="accCountPending" hidden>0</span></button>
-      <button class="set-nav-btn" data-atab="clients" onclick="setAccessTab('clients')"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='8' r='3.4'/><path d='M5 20c0-3.6 3.1-6 7-6s7 2.4 7 6'/></svg>Clients</button>
-      <button class="set-nav-btn" data-atab="appairage" onclick="setAccessTab('appairage')"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M9.5 14.5 14.5 9.5'/><path d='M8 11 5.8 13.2a3.6 3.6 0 0 0 5 5L13 16'/><path d='M16 13l2.2-2.2a3.6 3.6 0 0 0-5-5L11 8'/></svg>Appairage<span class="nav-count" id="accCountPairs" hidden>0</span></button>
-      <button class="set-nav-btn" data-atab="journal" onclick="setAccessTab('journal')"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M5 4.5h14v15H5z'/><path d='M8.5 8.5h7M8.5 12h7M8.5 15.5h4'/></svg>Journal</button>
+      <button class="set-nav-btn sel" data-atab="confirmations" data-act="access-tab"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 3 4.5 6v5.5c0 4.4 3.1 8.3 7.5 9.5 4.4-1.2 7.5-5.1 7.5-9.5V6L12 3Z'/><path d='m8.8 11.8 2.2 2.2 4.2-4.4'/></svg>Confirmations<span class="nav-count" id="accCountPending" hidden>0</span></button>
+      <button class="set-nav-btn" data-atab="clients" data-act="access-tab"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='8' r='3.4'/><path d='M5 20c0-3.6 3.1-6 7-6s7 2.4 7 6'/></svg>Clients</button>
+      <button class="set-nav-btn" data-atab="appairage" data-act="access-tab"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M9.5 14.5 14.5 9.5'/><path d='M8 11 5.8 13.2a3.6 3.6 0 0 0 5 5L13 16'/><path d='M16 13l2.2-2.2a3.6 3.6 0 0 0-5-5L11 8'/></svg>Appairage<span class="nav-count" id="accCountPairs" hidden>0</span></button>
+      <button class="set-nav-btn" data-atab="journal" data-act="access-tab"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M5 4.5h14v15H5z'/><path d='M8.5 8.5h7M8.5 12h7M8.5 15.5h4'/></svg>Journal</button>
     </nav>
     <div class="set-panes acc-panes">
       <section class="set-pane sel" data-atab="confirmations">
@@ -452,7 +452,7 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
   <div id="accessMsg" class="machine-msg set-msgline"></div>
   <div class="dlg-foot">
     <span class="dlg-foot-note">Approbation r&eacute;serv&eacute;e &agrave; cette fen&ecirc;tre (session locale). Rien n'est persist&eacute; : un red&eacute;marrage redemande tout.</span>
-    <div class="row"><button onclick="refreshAccess()">Rafra&icirc;chir</button></div>
+    <div class="row"><button data-act="access-refresh">Rafra&icirc;chir</button></div>
   </div>
 </dialog>
 
@@ -464,12 +464,12 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     <div class="conf-note">Cette UI est expos&eacute;e au r&eacute;seau : saisis le <b>code d'acc&egrave;s API</b>
     du serveur (<b>settings.api_access</b> de son config.json, ou variable <b>MCC_API_ACCESS</b>).
     Il reste dans ce navigateur uniquement — le serveur ne l'envoie jamais dans la page.</div>
-    <form onsubmit="return loginSubmit(event)">
+    <form data-act="login-submit">
       <label>Code d'acc&egrave;s</label>
       <input id="loginCode" type="password" autocomplete="off" placeholder="code d'acc&egrave;s">
       <div id="loginMsg" class="machine-msg"></div>
       <div class="row row-between">
-        <button type="button" onclick="forgetCode()" title="Supprime le code enregistr&eacute; dans ce navigateur">Oublier le code enregistr&eacute;</button>
+        <button type="button" data-act="forget-code" title="Supprime le code enregistr&eacute; dans ce navigateur">Oublier le code enregistr&eacute;</button>
         <button type="submit" class="primary">D&eacute;verrouiller</button>
       </div>
     </form>
@@ -496,29 +496,31 @@ mod tests {
     use super::{APP_BOOT_JS, APP_CSS, APP_JS, INDEX_HTML};
 
     // ---------- contrat « tout bouton est câblé » --------------------------
-    // Chaque handler référencé par un attribut on* du HTML (coquille + gabarits
-    // JS de app.js : lignes de serveur, menus contextuels, boutique…) doit être
-    // défini dans la page. Un handler référencé et absent = bouton mort : ce
-    // test le fait échouer au compile test, pas devant l'utilisateur.
-    // Depuis le split en assets servis, le « code de la page » = coquille
-    // HTML + app.js — les deux sont scannés partout ci-dessous.
+    // Depuis le lot S2 il n'y a PLUS aucun attribut on* : chaque contrôle porte
+    // data-act (clé de la table ACT de app.js) et la délégation centrale
+    // l'aiguille. Le contrat a deux sens : aucune clé data-act orpheline dans
+    // la page (bouton mort) et aucune action de la table jamais câblée
+    // (code mort, ou faute de frappe dans un gabarit).
 
     /// Texte complet de l'UI : coquille HTML + script principal.
     fn ui_all() -> String {
         format!("{}\n{}", INDEX_HTML, APP_JS)
     }
 
+    /// Attributs de gestionnaire en ligne : AUCUN n'est toléré (sonde).
     const ON_ATTRS: &[&str] = &[
-        "onclick=\"",
-        "onsubmit=\"",
-        "onchange=\"",
-        "oninput=\"",
-        "ontoggle=\"",
-        "ondragstart=\"",
-        "ondragover=\"",
-        "ondrop=\"",
-        "ondragleave=\"",
-        "ondragend=\"",
+        "onclick=",
+        "onsubmit=",
+        "onchange=",
+        "oninput=",
+        "ontoggle=",
+        "ondragstart=",
+        "ondragover=",
+        "ondrop=",
+        "ondragleave=",
+        "ondragend=",
+        "onerror=",
+        "onload=",
     ];
 
     /// Mots-clés JS et fonctions natives : jamais des handlers applicatifs.
@@ -583,21 +585,50 @@ mod tests {
         }
     }
 
-    fn handlers_referenced() -> Vec<String> {
+    /// Clés `data-act` présentes dans la page (coquille + gabarits régénérés
+    /// par app.js) : chaque contrôle de l'UI passe par là.
+    fn data_act_referenced() -> Vec<String> {
         let page = ui_all();
-        let mut names = Vec::new();
-        for attr in ON_ATTRS {
-            let mut rest: &str = &page;
-            while let Some(i) = rest.find(attr) {
-                let start = i + attr.len();
-                let end = rest[start..].find('"').map(|e| start + e).unwrap_or(start);
-                calls_in(&rest[start..end], &mut names);
-                rest = &rest[end..];
+        let mut out = Vec::new();
+        let mut rest: &str = &page;
+        while let Some(i) = rest.find("data-act=\"") {
+            let start = i + "data-act=\"".len();
+            let end = rest[start..].find('"').map(|e| start + e).unwrap_or(start);
+            let name = &rest[start..end];
+            if !name.is_empty() {
+                out.push(name.to_string());
             }
+            rest = &rest[end..];
         }
-        names.sort();
-        names.dedup();
-        names
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Table action → fonction de app.js : lignes `'clé': code,` du bloc
+    /// `const ACT = {` jusqu'à la première ligne `};`.
+    fn act_table() -> Vec<(String, String)> {
+        let src = APP_JS.replace("\r\n", "\n");
+        let start = src
+            .find("const ACT = {")
+            .expect("table ACT absente de app.js");
+        let rest = &src[start..];
+        let end = rest.find("\n};").expect("fin de la table ACT introuvable");
+        let mut out = Vec::new();
+        for line in rest[..end].lines() {
+            let line = line.trim();
+            let Some(h) = line.strip_prefix('\'') else {
+                continue;
+            };
+            let Some(q) = h.find('\'') else { continue };
+            let Some(colon) = h[q..].find(':') else {
+                continue;
+            };
+            let key = &h[..q];
+            let code = h[q + colon + 1..].trim().trim_end_matches(',').trim();
+            out.push((key.to_string(), code.to_string()));
+        }
+        out
     }
 
     fn defined_in_page(name: &str) -> bool {
@@ -608,17 +639,81 @@ mod tests {
     }
 
     #[test]
-    fn chaque_gestionnaire_inline_est_defini() {
-        let names = handlers_referenced();
+    fn aucun_gestionnaire_en_ligne_dans_la_page() {
+        let page = ui_all();
+        let mut trouves = Vec::new();
+        for attr in ON_ATTRS {
+            let mut rest: &str = &page;
+            while let Some(i) = rest.find(attr) {
+                let line_start = rest[..i].rfind('\n').map(|n| n + 1).unwrap_or(0);
+                let stop = (i + attr.len()).min(rest.len());
+                trouves.push(format!("{} → {}", attr, rest[line_start..stop].trim()));
+                rest = &rest[i + attr.len()..];
+            }
+        }
         assert!(
-            names.len() > 40,
-            "l'inventaire doit rester consistant (une refonte qui casse le \
-             parseur doit être vue), trouvé : {names:?}"
+            trouves.is_empty(),
+            "gestionnaires en ligne subsistants (refusés par script-src 'self') : {trouves:?}"
         );
-        let morts: Vec<&String> = names.iter().filter(|n| !defined_in_page(n)).collect();
+        // style-src 'self' sans 'unsafe-inline' : aucun attribut style= ne doit
+        // rester (les couleurs de frameworks sont passées en classes CSS).
+        assert!(
+            !page.contains("style=\""),
+            "attribut style= subsistant : bloqué par la CSP style-src 'self'"
+        );
+        // aucun code construit à l'exécution depuis une valeur reçue
+        for interdit in ["eval(", "new Function(", "javascript:"] {
+            assert!(
+                !APP_JS.contains(interdit) && !APP_BOOT_JS.contains(interdit),
+                "construction de code interdite dans les scripts UI : {interdit}"
+            );
+        }
+        assert!(
+            !APP_BOOT_JS.contains("style=\""),
+            "app-boot.js ne doit pas injecter de style= en ligne"
+        );
+        assert!(
+            !APP_JS.contains("const js ="),
+            "le helper de construction de littéraux JS js() ne doit plus exister"
+        );
+    }
+
+    #[test]
+    fn chaque_data_act_est_dans_la_table_et_reciproquement() {
+        let page = data_act_referenced();
+        let table: Vec<String> = act_table().into_iter().map(|(k, _)| k).collect();
+        assert!(
+            page.len() >= 40,
+            "l'inventaire data-act doit rester large (une refonte qui casse le \
+             parseur doit être vue), trouvé : {page:?}"
+        );
+        let inconnues: Vec<&String> = page.iter().filter(|a| !table.contains(a)).collect();
+        assert!(
+            inconnues.is_empty(),
+            "data-act sans entrée dans la table ACT (boutons morts) : {inconnues:?}"
+        );
+        let orphelines: Vec<&String> = table.iter().filter(|a| !page.contains(a)).collect();
+        assert!(
+            orphelines.is_empty(),
+            "actions de la table câblées nulle part : {orphelines:?}"
+        );
+    }
+
+    #[test]
+    fn chaque_action_de_la_table_est_definie() {
+        let mut morts = Vec::new();
+        for (key, code) in act_table() {
+            let mut names = Vec::new();
+            calls_in(&code, &mut names);
+            for n in names {
+                if !defined_in_page(&n) {
+                    morts.push(format!("{key} → {n}"));
+                }
+            }
+        }
         assert!(
             morts.is_empty(),
-            "handlers référencés mais jamais définis (boutons morts) : {morts:?}"
+            "actions branchées sur une fonction absente : {morts:?}"
         );
     }
 
@@ -1267,17 +1362,24 @@ mod tests {
                 "action non réservée à la session locale : {action}"
             );
         }
-        // trois boutons de décision pour une confirmation : une fois, permis, refus
+        // trois boutons de décision pour une confirmation : une fois, permis, refus —
+        // tous par la table ACT (plus aucun on*) et paramétrés par data-mode.
         for bouton in [
-            "confirmApprove(${js(p.id)},'once')",
-            "confirmApprove(${js(p.id)},'window')",
-            "confirmDeny(${js(p.id)})",
+            "data-act=\"confirm-approve\" data-id=\"${esc(p.id)}\" data-mode=\"once\"",
+            "data-act=\"confirm-approve\" data-id=\"${esc(p.id)}\" data-mode=\"window\"",
+            "data-act=\"confirm-deny\" data-id=\"${esc(p.id)}\"",
         ] {
             assert!(
                 bloc.contains(bouton),
                 "bouton de décision manquant : {bouton}"
             );
         }
+        // les identifiants de requête/permis viennent du moteur : ils ne
+        // voyagent que dans data-id, échappés — jamais dans du code JS.
+        assert!(
+            !bloc.contains("js("),
+            "l'écran Accès ne doit plus construire de littéral JS depuis une valeur reçue"
+        );
         // le bandeau et la pastille lisent les compteurs de /api/state
         assert!(
             APP_JS.contains("state.access"),
