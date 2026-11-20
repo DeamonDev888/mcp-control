@@ -20,6 +20,13 @@ pub const ACTIONS: &[&str] = &[
     "import_peer",
     "add",
     "remove",
+    // Lot S4 : arrêt explicite d'un process qui n'a PAS été lancé par l'app
+    // (le port est tenu par un tiers) — geste distinct, après refus motivé de
+    // `kill`. Jamais exposé au gateway.
+    "stop_server_force",
+    // Lot S4 : annonces litemcp du dossier de l'utilisateur courant, en
+    // LECTURE SEULE (« détecté, non suivi »). Jamais exposée au gateway.
+    "litemcp_announcements",
     "toggle_tool",
     "set_start_cmd",
     "set_host",
@@ -58,6 +65,57 @@ pub const ACTIONS: &[&str] = &[
     "grant_revoke",
 ];
 
+/// Port HTTP LOCAL d'un serveur (None : stdio, ou serveur distant). Un hôte
+/// explicite de loopback (127.0.0.1, ::1, localhost) reste LOCAL : les serveurs
+/// découverts et la plupart des serveurs ajoutés portent cet hôte.
+fn local_port_of(state: &Arc<AppState>, id: &str) -> Option<u16> {
+    let servers = lockv(&state.servers);
+    servers
+        .iter()
+        .find(|s| s.id == id)
+        .and_then(|s| match &s.transport {
+            Transport::Http { host, port, .. }
+                if host.as_deref().map(crate::is_loopback_bind).unwrap_or(true) =>
+            {
+                Some(*port)
+            }
+            _ => None,
+        })
+}
+
+/// Process lancé par l'APPLICATION pour ce serveur : `Some((pid, vivant))`.
+/// `vivant` = handle encore ouvert (le watcher n'a pas récolté la sortie) ET
+/// date de création identique à celle enregistrée au spawn — un PID recyclé
+/// par l'OS n'est donc jamais pris pour le nôtre. `None` = l'app n'a rien lancé.
+fn processus_lance(state: &Arc<AppState>, id: &str) -> Option<(u32, bool)> {
+    let children = lockv(&state.children);
+    let h = children.get(id)?;
+    let en_cours = lockv(&h.exit).is_none();
+    if !en_cours {
+        return Some((h.pid, false));
+    }
+    let identique = h
+        .started
+        .map(|t| probe::process_creation(h.pid) == Some(t))
+        .unwrap_or(true);
+    Some((h.pid, identique))
+}
+
+/// Process qui écoutent sur `port` sans être celui lancé par l'application.
+fn etrangers_sur_port(port: u16, pid_lance: u32, vivant: bool) -> Vec<(u32, String)> {
+    probe::port_listeners(port)
+        .into_iter()
+        .filter(|(pid, _)| !(vivant && *pid == pid_lance))
+        .collect()
+}
+
+/// « node.exe (pid 5508), python.exe (pid 4242) » — pour un refus lisible.
+fn decrire_processus(v: &[(u32, String)]) -> String {
+    v.iter()
+        .map(|(pid, img)| format!("{img} (pid {pid})"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 /// Asset de la release correspondant à (type de binaire, OS) — table blanche
 /// pure et testée. `None` = plateforme inconnue (jamais d'URL fabriquée hors
 /// de cette table). Les assets n'embarquent pas la version : l'URL
@@ -103,15 +161,17 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                             None => return json!({"ok": false, "error": "serveur inconnu"}),
                         }
                     };
-                    save_config(state);
+                    if let Err(e) = save_config_checked(state) {
+                        return json!({"ok": false, "error": format!("config non écrite : {e}")});
+                    }
                     if !now_enabled {
-                        // OFF réel : tuer le process lancé par MCP Control (stdio ou HTTP)
-                        let mut children = lockv(&state.children);
-                        if let Some(h) = children.get(&id) {
-                            probe::kill_tree(h.pid);
+                        // OFF réel : tuer le SEUL process lancé par MCP Control
+                        // (identité vérifiée — jamais un process tiers qui
+                        // aurait pris le port).
+                        if let Some((pid, true)) = processus_lance(state, &id) {
+                            probe::kill_tree(pid);
                         }
-                        children.remove(&id);
-                        drop(children);
+                        lockv(&state.children).remove(&id);
                         let mut servers = lockv(&state.servers);
                         if let Some(s) = servers.iter_mut().find(|s| s.id == id) {
                             s.pid = None;
@@ -159,74 +219,158 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                             None => return json!({"ok": false, "error": "serveur inconnu"}),
                         }
                     }
-                    save_config(state);
+                    if let Err(e) = save_config_checked(state) {
+                        return json!({"ok": false, "error": format!("config non écrite : {e}")});
+                    }
                     poll_one(state, &id);
                     json!({"ok": true})
                 }
                 "kill_stdio" | "kill" => {
-                    // Lot F point 5 : id inconnu = refus EXPLICITE. L'ancien
-                    // {ok:true} (kill) et le {ok:false} sans `error` (remove)
-                    // ne laissaient à l'interface qu'un toast « échec »
-                    // générique — même forme de refus que les autres actions.
-                    // kill_stdio est le même geste (alias historique) : même
-                    // contrat. refresh reste un no-op silencieux (ok:true).
+                    // Lot F point 5 : id inconnu = refus EXPLICITE.
                     if !lockv(&state.servers).iter().any(|s| s.id == id) {
                         return json!({"ok": false, "error": "serveur inconnu"});
                     }
-                    let local_port = {
-                        let servers = lockv(&state.servers);
-                        servers
-                            .iter()
-                            .find(|s| s.id == id)
-                            .and_then(|s| match &s.transport {
-                                Transport::Http {
-                                    host: None, port, ..
-                                } => Some(*port),
-                                _ => None,
-                            })
-                    };
+                    let local_port = local_port_of(state, &id);
+                    // AUDIT S4, point 1 : on ne tue QUE le process lancé par
+                    // l'application (pid enregistré au spawn, vérifié vivant ET
+                    // identique par sa date de création). Un process tiers qui
+                    // tient le port n'est jamais tué : refus motivé, avec le nom,
+                    // et action distincte `stop_server_force`.
+                    let (pid_lance, vivant) = processus_lance(state, &id).unwrap_or((0, false));
+                    if let Some(port) = local_port {
+                        let etrangers = etrangers_sur_port(port, pid_lance, vivant);
+                        if !etrangers.is_empty() {
+                            let desc = decrire_processus(&etrangers);
+                            add_log(
+                                state,
+                                "warn",
+                                &format!(
+                                    "[{id}] arrêt refusé : port {port} tenu par {desc} — ce process n'a pas été lancé par l'application (action « arrêter quand même » pour forcer)"
+                                ),
+                            );
+                            return json!({
+                                "ok": false,
+                                "error": format!(
+                                    "port {port} tenu par {desc} — process non lancé par l'application ; utilisez stop_server_force pour l'arrêter quand même"
+                                ),
+                                "needs_force": true,
+                                "occupants": etrangers
+                                    .iter()
+                                    .map(|(p, i)| json!({"pid": p, "process": i}))
+                                    .collect::<Vec<_>>(),
+                            });
+                        }
+                    }
+                    // Arrêt du process de l'app (arbre compris : lanceur → serveur).
+                    if vivant {
+                        probe::kill_tree(pid_lance);
+                    }
+                    lockv(&state.children).remove(&id);
+                    // Attente bornée de la libération du port (le serveur réel met
+                    // 1-3 s à sortir) ; s'il reste tenu par un AUTRE process, on
+                    // le signale sans le tuer.
+                    let mut restants: Vec<(u32, String)> = Vec::new();
+                    if let Some(port) = local_port {
+                        for _ in 0..10 {
+                            restants = probe::port_listeners(port);
+                            if restants.is_empty() {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        }
+                    }
                     {
                         let mut servers = lockv(&state.servers);
                         if let Some(s) = servers.iter_mut().find(|s| s.id == id) {
                             s.auto_restart = false;
-                            // feedback immédiat : sinon le pid fantôme reste affiché
                             s.pid = None;
                             s.state = SState::Down;
                         }
                     }
-                    let mut children = lockv(&state.children);
-                    if let Some(h) = children.get(&id) {
-                        probe::kill_tree(h.pid);
-                    }
-                    children.remove(&id);
-                    drop(children);
-                    // Le launcher détache le vrai serveur : child.kill() ne tue que le
-                    // lanceur. On tue aussi le process qui écoute sur le port (local only).
-                    if let Some(p) = local_port {
-                        probe::kill_port(p);
-                    }
-                    // Le serveur réel (node/fastmcp) met 1-3 s à libérer le port :
-                    // on re-polle jusqu'à DOWN (borné à 10 s) pour un feedback UI exact.
-                    for _ in 0..20 {
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                        poll_one(state, &id);
-                        let encore_up = {
-                            let servers = lockv(&state.servers);
-                            servers
+                    if !restants.is_empty() {
+                        let desc = decrire_processus(&restants);
+                        add_log(
+                            state,
+                            "warn",
+                            &format!("[{id}] port toujours tenu par {desc} — process non lancé par l'application, non tué"),
+                        );
+                        return json!({
+                            "ok": false,
+                            "error": format!(
+                                "le process de l'application est arrêté, mais le port reste tenu par {desc} (non tué) ; utilisez stop_server_force pour l'arrêter quand même"
+                            ),
+                            "needs_force": true,
+                            "occupants": restants
                                 .iter()
-                                .find(|s| s.id == id)
-                                .map(|s| s.state == SState::Up)
-                                .unwrap_or(false)
-                        };
-                        if !encore_up {
-                            break;
-                        }
+                                .map(|(p, i)| json!({"pid": p, "process": i}))
+                                .collect::<Vec<_>>(),
+                        });
                     }
-                    add_log(state, "info", &format!("[{}] stdio arrêté", id));
+                    add_log(state, "info", &format!("[{id}] arrêté"));
                     json!({"ok": true})
                 }
                 _ => unreachable!(),
             }
+        }
+        // Lot S4, point 1 : « arrêter quand même » — SEUL chemin qui tue un
+        // process que l'application n'a PAS lancé. Geste explicite, consécutif
+        // au refus motivé de `kill` ; jamais exposé au gateway.
+        "stop_server_force" => {
+            let Some(id) = id else {
+                return json!({"ok": false, "error": "id manquant"});
+            };
+            if !lockv(&state.servers).iter().any(|s| s.id == id) {
+                return json!({"ok": false, "error": "serveur inconnu"});
+            }
+            let Some(port) = local_port_of(state, &id) else {
+                return json!({
+                    "ok": false,
+                    "error": "serveur sans port local : aucun process à arrêter"
+                });
+            };
+            let occupants = probe::port_listeners(port);
+            let pids: Vec<u32> = occupants.iter().map(|(p, _)| *p).collect();
+            if !pids.is_empty() {
+                probe::kill_pids(&pids);
+            }
+            // le handle éventuel de l'app ne correspond plus au process du port
+            lockv(&state.children).remove(&id);
+            {
+                let mut servers = lockv(&state.servers);
+                if let Some(s) = servers.iter_mut().find(|s| s.id == id) {
+                    s.auto_restart = false;
+                    s.pid = None;
+                    s.state = SState::Down;
+                }
+            }
+            add_log(
+                state,
+                "warn",
+                &format!(
+                    "[{id}] arrêt FORCÉ : port {port} — {} process tué(s) : {}",
+                    pids.len(),
+                    decrire_processus(&occupants)
+                ),
+            );
+            json!({
+                "ok": true,
+                "forced": true,
+                "port": port,
+                "killed": occupants
+                    .iter()
+                    .map(|(p, i)| json!({"pid": p, "process": i}))
+                    .collect::<Vec<_>>(),
+            })
+        }
+        // Lot S4, point 2 : annonces litemcp — LECTURE SEULE. Le dossier
+        // `%TEMP%\litemcp-registry` n'est jamais écrit, aucun champ d'annonce
+        // n'est exécuté, aucun serveur n'est créé ni adopté.
+        "litemcp_announcements" => {
+            let mut v = litemcp_announcements(state);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("ok".into(), json!(true));
+            }
+            v
         }
         "add" => {
             let transport = req
@@ -373,7 +517,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             let label = srv.label.clone();
             let sid = srv.id.clone();
             lockv(&state.servers).push(srv);
-            save_config(state);
+            if let Err(e) = save_config_checked(state) {
+                return json!({"ok": false, "error": format!("config non écrite : {e}")});
+            }
             add_log(
                 state,
                 "info",
@@ -392,41 +538,36 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 .get("durable")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false);
-            // (lot 3, audit 03 constat 9) un serveur lancé par l'app via un
-            // lanceur qui détache son enfant (cas bin/launch.cjs) survit au
-            // kill_tree → process orphelin et port occupé après suppression.
-            // On libère aussi le port — SEULEMENT si l'app a elle-même lancé ce
-            // serveur (handle présent dans children) et qu'il est HTTP local :
-            // jamais le process d'un serveur distant ou importé sans lancement
-            // par l'app.
-            let was_managed = lockv(&state.children).contains_key(&id);
-            let local_port = {
-                let servers = lockv(&state.servers);
-                servers
-                    .iter()
-                    .find(|s| s.id == id)
-                    .and_then(|s| match &s.transport {
-                        Transport::Http {
-                            host: None, port, ..
-                        } => Some(*port),
-                        _ => None,
-                    })
-            };
-            let mut children = lockv(&state.children);
-            if let Some(h) = children.get(&id) {
-                probe::kill_tree(h.pid);
+            // (lot 3, audit 03 constat 9 / lot S4 point 1) un serveur lancé par
+            // l'app via un lanceur qui détache son enfant (bin/launch.cjs)
+            // survit au kill_tree. On arrête le process que l'app a lancé
+            // (identité vérifiée) ; si le port reste tenu par un AUTRE process,
+            // il n'est PAS tué — supprimer une entrée ne doit jamais tuer un
+            // tiers, même pour libérer le port (action explicite
+            // stop_server_force).
+            let (pid_lance, vivant) = processus_lance(state, &id).unwrap_or((0, false));
+            let local_port = local_port_of(state, &id);
+            if vivant {
+                probe::kill_tree(pid_lance);
             }
-            children.remove(&id);
-            drop(children);
-            if was_managed {
-                if let Some(p) = local_port {
-                    probe::kill_port(p);
+            lockv(&state.children).remove(&id);
+            if let Some(p) = local_port {
+                for _ in 0..4 {
+                    if probe::port_listeners(p).is_empty() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                let restants = probe::port_listeners(p);
+                if !restants.is_empty() {
                     add_log(
                         state,
-                        "info",
+                        "warn",
                         &format!(
-                            "[{}] port {} libéré après suppression (lanceur détaché)",
-                            id, p
+                            "[{}] port {} toujours tenu par {} après suppression — process non lancé par l'application, non tué",
+                            id,
+                            p,
+                            decrire_processus(&restants)
                         ),
                     );
                 }
@@ -446,7 +587,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             if removed {
                 lockv(&state.settings).server_order.retain(|x| x != &id);
             }
-            save_config(state);
+            if let Err(e) = save_config_checked(state) {
+                return json!({"ok": false, "error": format!("config non écrite : {e}")});
+            }
             add_log(
                 state,
                 "info",
@@ -541,7 +684,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 st.ssh_hosts.push(crate::types::SshHost { ip, user });
             }
             drop(st);
-            save_config(state);
+            if let Err(e) = save_config_checked(state) {
+                return json!({"ok": false, "error": format!("config non écrite : {e}")});
+            }
             add_log(state, "info", "[machines] machine enregistrée");
             json!({"ok": true})
         }
@@ -596,7 +741,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 srv.start_cmd = None;
                 srv.auto_restart = false;
                 drop(servers);
-                save_config(state);
+                if let Err(e) = save_config_checked(state) {
+                    return json!({"ok": false, "error": format!("config non écrite : {e}")});
+                }
                 add_log(
                     state,
                     "info",
@@ -623,7 +770,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             // manual pour que commande et boutons survivent au redémarrage.
             srv.origin = Origin::Manual;
             drop(servers);
-            save_config(state);
+            if let Err(e) = save_config_checked(state) {
+                return json!({"ok": false, "error": format!("config non écrite : {e}")});
+            }
             add_log(
                 state,
                 "info",
@@ -663,7 +812,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             drop(servers);
             // Un serveur seed ne doit PAS être réécrit : au boot suivant la
             // config par défaut réimposerait son host. Refus + restauration.
-            save_config(state);
+            if let Err(e) = save_config_checked(state) {
+                return json!({"ok": false, "error": format!("config non écrite : {e}")});
+            }
             if is_seed {
                 let mut servers = lockv(&state.servers);
                 if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
@@ -672,7 +823,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     }
                 }
                 drop(servers);
-                save_config(state);
+                if let Err(e) = save_config_checked(state) {
+                    return json!({"ok": false, "error": format!("config non écrite : {e}")});
+                }
                 add_log(
                     state,
                     "warn",
@@ -704,7 +857,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 st.ssh_hosts.retain(|h| h.ip != ip);
                 before != st.ssh_hosts.len()
             };
-            save_config(state);
+            if let Err(e) = save_config_checked(state) {
+                return json!({"ok": false, "error": format!("config non écrite : {e}")});
+            }
             json!({"ok": removed})
         }
         "open_path" => {
@@ -726,7 +881,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             }
             #[cfg(windows)]
             let mut cmd = {
-                let mut c = std::process::Command::new("explorer.exe");
+                let mut c = std::process::Command::new(probe::system_tool("explorer"));
                 if pb.is_file() {
                     c.arg(format!("/select,{}", pb.display()));
                 } else {
@@ -775,7 +930,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 }
             }
             lockv(&state.settings).server_order = new_order.clone();
-            save_config(state);
+            if let Err(e) = save_config_checked(state) {
+                return json!({"ok": false, "error": format!("config non écrite : {e}")});
+            }
             add_log(
                 state,
                 "info",
@@ -841,8 +998,31 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     changed.push("network_ports");
                 }
             }
+            // Découverte locale (lot S4, point 3) : « ne sonder que ces ports »
+            // et « exclure ces ports ». Validation identique au chargement
+            // (1-65535, doublons retirés, 512 max) ; un tableau VIDE efface le
+            // réglage, contrairement à network_ports.
+            if let Some(arr) = req.get("discovery_ports_only").and_then(|x| x.as_array()) {
+                let v = parse_port_list(arr, 512);
+                if st.discovery_ports_only != v {
+                    st.discovery_ports_only = v;
+                    changed.push("discovery_ports_only");
+                }
+            }
+            if let Some(arr) = req
+                .get("discovery_ports_excluded")
+                .and_then(|x| x.as_array())
+            {
+                let v = parse_port_list(arr, 512);
+                if st.discovery_ports_excluded != v {
+                    st.discovery_ports_excluded = v;
+                    changed.push("discovery_ports_excluded");
+                }
+            }
             drop(st);
-            save_config(state);
+            if let Err(e) = save_config_checked(state) {
+                return json!({"ok": false, "error": format!("config non écrite : {e}")});
+            }
             add_log(
                 state,
                 "info",
@@ -903,7 +1083,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 c.min_interval_secs = i.clamp(0, 86400);
             }
             lockv(&state.settings).notify = c.clone();
-            save_config(state);
+            if let Err(e) = save_config_checked(state) {
+                return json!({"ok": false, "error": format!("config non écrite : {e}")});
+            }
             add_log(state, "info", "[notif] configuration enregistrée");
             // LOT B point 2 : la réponse porte la forme MASQUÉE (to_api_json) —
             // les en-têtes du webhook ne sortent JAMAIS en clair, pas même à
@@ -962,7 +1144,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             rt.clear();
             drop(rt);
             lockv(&state.spawn_fails).clear();
-            save_config(state);
+            if let Err(e) = save_config_checked(state) {
+                return json!({"ok": false, "error": format!("config non écrite : {e}")});
+            }
             add_log(
                 state,
                 "info",
@@ -998,7 +1182,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 "https://github.com/DeamonDev888/mcp-control/releases/latest";
             #[cfg(windows)]
             let mut cmd = {
-                let mut c = std::process::Command::new("rundll32");
+                let mut c = std::process::Command::new(probe::system_tool("rundll32"));
                 c.args(["url.dll,FileProtocolHandler", RELEASES_URL]);
                 c
             };
@@ -1081,7 +1265,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             );
             #[cfg(windows)]
             let mut cmd = {
-                let mut c = std::process::Command::new("rundll32");
+                let mut c = std::process::Command::new(probe::system_tool("rundll32"));
                 c.args(["url.dll,FileProtocolHandler", &url]);
                 c
             };
@@ -1184,7 +1368,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             if cleared.is_empty() {
                 return json!({"ok": false, "error": "what inconnu (placement | detection | oublis | tout)"});
             }
-            save_config(state);
+            if let Err(e) = save_config_checked(state) {
+                return json!({"ok": false, "error": format!("config non écrite : {e}")});
+            }
             add_log(
                 state,
                 "info",
@@ -1204,9 +1390,31 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
         }
         "set_autostart" => {
             let enable = req.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
+            let confirm = req
+                .get("confirm")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
+            // AUDIT S4, point 6 : une instance qui n'est PAS l'installation
+            // enregistrée (build de dev, autre dossier, instance de test) ne
+            // réécrit pas l'entrée Run d'une autre installation sans geste
+            // explicite (`confirm:true`).
+            let current = std::env::current_exe()
+                .map(|e| e.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let recorded = autostart_recorded_path();
+            if autostart_needs_confirm(recorded.as_deref(), &current) && !confirm {
+                return json!({
+                    "ok": false,
+                    "needs_confirm": true,
+                    "recorded": recorded,
+                    "error": "l'entrée de démarrage appartient à une autre installation : confirmez pour la réécrire (confirm:true)",
+                });
+            }
             lockv(&state.settings).autostart = enable;
             apply_autostart(state, enable);
-            save_config(state);
+            if let Err(e) = save_config_checked(state) {
+                return json!({"ok": false, "error": format!("config non écrite : {e}")});
+            }
             json!({"ok": true, "autostart": enable, "active": autostart_active()})
         }
         // Autoboot PAR SERVEUR : « ce serveur est relancé automatiquement au
@@ -1234,7 +1442,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             if !found {
                 return json!({"ok": false, "error": "serveur inconnu"});
             }
-            save_config(state);
+            if let Err(e) = save_config_checked(state) {
+                return json!({"ok": false, "error": format!("config non écrite : {e}")});
+            }
             add_log(
                 state,
                 "info",
@@ -1272,7 +1482,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             if !found {
                 return json!({"ok": false, "error": "serveur inconnu"});
             }
-            save_config(state);
+            if let Err(e) = save_config_checked(state) {
+                return json!({"ok": false, "error": format!("config non écrite : {e}")});
+            }
             add_log(
                 state,
                 "info",
@@ -1351,7 +1563,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     None => return json!({"ok": false, "error": "serveur inconnu"}),
                 }
             };
-            save_config(state);
+            if let Err(e) = save_config_checked(state) {
+                return json!({"ok": false, "error": format!("config non écrite : {e}")});
+            }
             add_log(
                 state,
                 "info",
@@ -1444,7 +1658,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     if already {
                         return json!({"ok": true, "added": 0, "note": "déjà installé"});
                     }
-                    save_config(state);
+                    if let Err(e) = save_config_checked(state) {
+                        return json!({"ok": false, "error": format!("config non écrite : {e}")});
+                    }
                     add_log(state, "info", &format!("[boutique] installé : {}", it.name));
                     poll_one(state, &id);
                     let st = {
@@ -1489,7 +1705,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 crate::types::now_ts(),
             ) {
                 Ok(v) => {
-                    save_config(state);
+                    if let Err(e) = save_config_checked(state) {
+                        return json!({"ok": false, "error": format!("config non écrite : {e}")});
+                    }
                     add_log(
                         state,
                         "info",
@@ -1532,7 +1750,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 .set_rights(keyid, rights.clone());
             match res {
                 Ok(()) => {
-                    save_config(state);
+                    if let Err(e) = save_config_checked(state) {
+                        return json!({"ok": false, "error": format!("config non écrite : {e}")});
+                    }
                     add_log(
                         state,
                         "info",
@@ -1553,7 +1773,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                         .find(keyid)
                         .and_then(|c| c.revoked_at.clone())
                         .unwrap_or_default();
-                    save_config(state);
+                    if let Err(e) = save_config_checked(state) {
+                        return json!({"ok": false, "error": format!("config non écrite : {e}")});
+                    }
                     add_log(
                         state,
                         "info",
@@ -1584,7 +1806,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 .rotate(keyid, new_keyid, public_key);
             match res {
                 Ok(rec) => {
-                    save_config(state);
+                    if let Err(e) = save_config_checked(state) {
+                        return json!({"ok": false, "error": format!("config non écrite : {e}")});
+                    }
                     add_log(
                         state,
                         "info",

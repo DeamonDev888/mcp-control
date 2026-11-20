@@ -19,7 +19,7 @@
 //! Chaque `#[test]` démarre SON propre moteur ; attentes bornées par
 //! `wait_until`, sérialisation via `--test-threads=1`.
 
-use crate::harness::{free_port, spawn_loopback, wait_until, Engine, Fixture};
+use crate::harness::{free_port, spawn_loopback_avec_decouverte, wait_until, Engine, Fixture};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -40,7 +40,9 @@ const DEUX_CYCLES: Duration = Duration::from_secs(12);
 // ---------- helpers locaux ----------
 
 fn moteur() -> Engine {
-    spawn_loopback()
+    // Découverte locale ACTIVE : ces scénarios éprouvent précisément le scan
+    // (le harnais la coupe par défaut — audit S4, point 3).
+    spawn_loopback_avec_decouverte()
 }
 
 fn serveurs_etat(eng: &Engine) -> Vec<Value> {
@@ -378,4 +380,127 @@ fn scan_terminates_bounded() {
         "la fixture doit apparaître exactement une fois : {disc:?}"
     );
     assert_eq!(champ(&disc[0], "state"), "UP", "{:?}", disc[0]);
+}
+
+/// Scénario 13 (audit S4, point 2) — une annonce litemcp trouvée sur le disque
+/// est « détectée, non suivie » : elle apparaît dans la réponse de
+/// `litemcp_announcements`, AUCUN serveur n'est créé ni écrit dans config.json,
+/// et aucun champ de l'annonce n'est exécuté. Le dossier d'annonces est celui
+/// du moteur de test (`MCC_LITEMP_REGISTRY`), jamais %TEMP% réel.
+#[test]
+fn annonces_litemcp_detectees_non_suivies() {
+    let _garde = crate::harness::serial_guard();
+    let eng = moteur();
+    let dir = eng.tmp_dir().join("litemcp-registry");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("moltbook.json"),
+        r#"{"name":"moltbook","port":8787,"version":"0.3.0","exe":"C:/Windows/System32/calc.exe","args":["calc.exe"],"cwd":"C:/ws"}"#,
+    )
+    .unwrap();
+
+    let rep = eng.action(&json!({"action": "litemcp_announcements"}));
+    assert_eq!(rep.get("ok").and_then(|o| o.as_bool()), Some(true), "{rep}");
+    let ann = rep
+        .get("announcements")
+        .and_then(|a| a.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let molt = ann
+        .iter()
+        .find(|a| champ(a, "name") == "moltbook")
+        .unwrap_or_else(|| panic!("annonce moltbook absente : {rep}"));
+    assert_eq!(molt.get("port").and_then(|p| p.as_u64()), Some(8787));
+    assert_eq!(
+        molt.get("followed").and_then(|f| f.as_bool()),
+        Some(false),
+        "une annonce n'est jamais « suivie » automatiquement : {molt}"
+    );
+    assert!(
+        molt.get("exe").is_none() && molt.get("args").is_none(),
+        "les champs exécutables ne doivent pas sortir : {molt}"
+    );
+
+    // Rien n'a été adopté : ni serveur, ni config.json, ni process lancé.
+    assert!(
+        serveurs_etat(&eng).iter().all(|s| !meme_port(s, 8787)),
+        "aucun serveur litemcp ne doit être créé : {:?}",
+        serveurs_etat(&eng)
+    );
+    assert!(
+        serveurs_config(&eng)
+            .iter()
+            .all(|c| c.get("port") != Some(&json!(8787))),
+        "aucune annonce ne doit être écrite dans config.json : {:?}",
+        config_du_moteur(&eng)
+    );
+}
+
+/// Scénario 14 (audit S4, point 3) — `MCC_NO_LOCAL_DISCOVERY=1` coupe la
+/// découverte locale ET le scan par plage : même avec une fixture MCP vivante,
+/// aucun serveur n'est importé (c'est ce qui protège les instances de test des
+/// serveurs réels de la machine).
+#[test]
+fn decouverte_coupee_par_variable_environnement() {
+    let _garde = crate::harness::serial_guard();
+    // Moteur STANDARD du harnais : découverte coupée (MCC_NO_LOCAL_DISCOVERY=1).
+    let eng = crate::harness::spawn_loopback();
+    let fx = Fixture::spawn_mcp();
+    let rep = scan_local(&eng);
+    assert_eq!(rep.get("ok").and_then(|o| o.as_bool()), Some(true), "{rep}");
+    let rep = scan_plage(&eng, fx.port(), fx.port());
+    assert_eq!(
+        rep.get("found").and_then(|f| f.as_u64()),
+        Some(0),
+        "le scan par plage doit être neutralisé : {rep}"
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        serveurs_etat(&eng).iter().all(|s| !meme_port(s, fx.port())),
+        "aucune découverte ne doit avoir lieu : {:?}",
+        serveurs_etat(&eng)
+    );
+}
+
+/// Scénario 15 (audit S4, point 3) — réglages « ports à sonder / ports exclus » :
+/// un port exclu n'est jamais sondé, un port imposé l'est (et lui seul).
+#[test]
+fn decouverte_port_exclu_puis_port_impose() {
+    let _garde = crate::harness::serial_guard();
+    let eng = moteur(); // découverte ACTIVE pour ce module
+    let fx = Fixture::spawn_mcp();
+
+    // 1. port EXCLU : la fixture ne doit pas apparaître
+    let rep = eng.action(&json!({
+        "action": "set_settings",
+        "discovery_ports_excluded": [fx.port()]
+    }));
+    assert_eq!(rep.get("ok").and_then(|o| o.as_bool()), Some(true), "{rep}");
+    scan_local(&eng);
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        serveurs_etat(&eng).iter().all(|s| !meme_port(s, fx.port())),
+        "un port exclu ne doit pas être sondé : {:?}",
+        serveurs_etat(&eng)
+    );
+
+    // 2. port IMPOSÉ : seul ce port est sondé, la fixture apparaît
+    let rep = eng.action(&json!({
+        "action": "set_settings",
+        "discovery_ports_excluded": [],
+        "discovery_ports_only": [fx.port()]
+    }));
+    assert_eq!(rep.get("ok").and_then(|o| o.as_bool()), Some(true), "{rep}");
+    scan_local(&eng);
+    let trouve = wait_until(DELAI_SCAN, || {
+        serveurs_etat(&eng)
+            .iter()
+            .any(|s| meme_port(s, fx.port()))
+            .then_some(true)
+    });
+    assert!(
+        trouve,
+        "un port imposé doit être sondé : {:?}",
+        serveurs_etat(&eng)
+    );
 }

@@ -7,8 +7,11 @@
 //!   state-cache.json sont écrits à côté (même répertoire temporaire) ;
 //! - `"autostart": false` — sinon le moteur écrit une VRAIE clé Run (HKCU) ;
 //! - `"network_enabled": false` — sinon il scanne le LAN à +30 s ;
-//! - `removed_seeds` liste les 8 seeds embarqués — sinon le premier cycle du
-//!   poller AUTO-LANCE les vrais serveurs node de la machine (start_cmd) ;
+//! - `MCC_NO_LOCAL_DISCOVERY=1` — la découverte locale est coupée (l'instance
+//!   de test n'importe plus les serveurs réels de la machine) ; les scénarios
+//!   scan la réactivent explicitement (`spawn_avec_decouverte`) ;
+//! - `MCC_AUTOSTART_KEY` — clé Run de TEST, jamais l'entrée réelle ;
+//! - `MCC_LITEMP_REGISTRY` — dossier d'annonces du tmp, jamais %TEMP% réel ;
 //! - `MCC_API_ACCESS` sème le code d'accès quand le scénario en demande un.
 //!
 //! API partagée par tous les modules de scénarios (certains helpers ne servent
@@ -53,20 +56,8 @@ pub fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
     }
 }
 
-/// Les 8 seeds embarqués par `default_servers()` — chaque seed porte une vraie
-/// `start_cmd` (node / hello.exe) + auto_restart : sans retrait explicite, le
-/// poller du moteur les AUTO-LANCE au premier cycle. On les retire au chargement
-/// (load_config filtre les seeds listés dans settings.removed_seeds).
-pub const SEED_IDS: &[&str] = &[
-    "seed-overmind",
-    "seed-discord",
-    "seed-postgresql",
-    "seed-debats",
-    "seed-x",
-    "seed-news-btc",
-    "seed-news",
-    "seed-litemcp",
-];
+// Aucun serveur par défaut depuis le lot S4 (installation neuve = liste
+// vide) : plus rien à retirer au chargement, `removed_seeds` reste vide.
 
 /// Configuration de démarrage d'un moteur de test.
 pub struct EngineCfg {
@@ -112,6 +103,13 @@ pub struct Engine {
     /// Approbation automatique des demandes de confirmation (lot M3) — voir
     /// [`Engine::set_auto_approve`].
     auto_approve: bool,
+    /// Découverte locale active pour ce moteur (`MCC_NO_LOCAL_DISCOVERY`
+    /// absent). Faux par défaut : une instance de test n'importe plus les
+    /// serveurs réels de la machine (audit S4, point 3).
+    discovery: bool,
+    /// Clé Run de TEST (`MCC_AUTOSTART_KEY`) : jamais l'entrée réelle de la
+    /// machine. Supprimée au Drop.
+    reg_key: String,
 }
 
 /// Mode de signature d'une requête `/mcp`.
@@ -129,19 +127,31 @@ pub fn spawn(cfg: EngineCfg) -> std::io::Result<Engine> {
     spawn_in(
         cfg,
         std::env::temp_dir().join(format!("mcc-e2e-{}-{}", std::process::id(), n)),
+        false,
+    )
+}
+
+/// Variante avec la découverte locale ACTIVE (scénarios scan uniquement : sans
+/// cela, la découverte est coupée par `MCC_NO_LOCAL_DISCOVERY=1`).
+pub fn spawn_avec_decouverte(cfg: EngineCfg) -> std::io::Result<Engine> {
+    let n = NEXT_TMP.fetch_add(1, Ordering::SeqCst);
+    spawn_in(
+        cfg,
+        std::env::temp_dir().join(format!("mcc-e2e-{}-{}", std::process::id(), n)),
+        true,
     )
 }
 
 /// Variante interne : répertoire de données imposé (utilisée par `restart` pour
 /// repartir sur le MÊME `config.json`, registre d'authentification compris).
-fn spawn_in(cfg: EngineCfg, tmp: PathBuf) -> std::io::Result<Engine> {
+fn spawn_in(cfg: EngineCfg, tmp: PathBuf, discovery: bool) -> std::io::Result<Engine> {
     std::fs::create_dir_all(&tmp)?;
     let cfg_path = tmp.join("config.json");
 
     // Config générée : les trois réglages SÛRS sont obligatoires —
     // autostart false (jamais de clé Run réelle), network_enabled false
     // (jamais de scan LAN à +30 s), refresh_secs 5 (plancher) pour des
-    // cycles de sondage rapides. removed_seeds neutralise les seeds embarqués.
+    // cycles de sondage rapides. Plus de seed embarqué (lot S4) : liste vide.
     // Un `data_dir` réutilisé (redémarrage) garde SON config.json : le registre
     // d'authentification doit survivre, c'est précisément ce qu'on vérifie.
     let doc = json!({
@@ -156,7 +166,7 @@ fn spawn_in(cfg: EngineCfg, tmp: PathBuf) -> std::io::Result<Engine> {
             "network_ports": [5090, 5091],
             "api_access": cfg.api_access,
             "allowed_origins": [],
-            "removed_seeds": SEED_IDS,
+            "removed_seeds": [],
             "server_order": [],
             "autostart": false,
             "ssh_hosts": []
@@ -177,6 +187,29 @@ fn spawn_in(cfg: EngineCfg, tmp: PathBuf) -> std::io::Result<Engine> {
     // une identité de test à la place de la sienne). Valeur vide = repli
     // fichier 0600, le chemin qu'on veut précisément éprouver ici.
     cmd.env("MCC_KEYRING_SERVICE", "");
+    // DÉCOUVERTE LOCALE (audit S4, point 3) : coupée par défaut pour une
+    // instance de test — elle n'importe plus les serveurs réels de la machine
+    // (scan local au boot, scan réseau à +30 s). Les scénarios scan demandent
+    // explicitement la découverte (`spawn_avec_decouverte`).
+    if discovery {
+        cmd.env_remove("MCC_NO_LOCAL_DISCOVERY");
+    } else {
+        cmd.env("MCC_NO_LOCAL_DISCOVERY", "1");
+    }
+    // REGISTRE (audit S4, point 6) : clé Run de TEST, jamais l'entrée réelle
+    // de la machine. Supprimée au Drop du moteur.
+    let reg_key = format!(
+        r"HKCU\Software\mcp-control-e2e-{}",
+        tmp.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("{}", std::process::id()))
+    );
+    cmd.env("MCC_AUTOSTART_KEY", &reg_key);
+    // ANNONCES LITEMP (audit S4, point 2) : dossier de test au lieu de
+    // %TEMP%\litemcp-registry (qui appartient à l'utilisateur réel).
+    let annonces = tmp.join("litemcp-registry");
+    std::fs::create_dir_all(&annonces)?;
+    cmd.env("MCC_LITEMP_REGISTRY", &annonces);
     match &cfg.api_access {
         Some(code) => {
             cmd.env("MCC_API_ACCESS", code);
@@ -222,6 +255,8 @@ fn spawn_in(cfg: EngineCfg, tmp: PathBuf) -> std::io::Result<Engine> {
         signer: None,
         keyid: String::new(),
         auto_approve: true,
+        discovery,
+        reg_key,
     })
 }
 
@@ -229,6 +264,12 @@ impl Engine {
     /// Port demandé à la config (avant repli éventuel).
     pub fn tmp_dir(&self) -> &PathBuf {
         &self.tmp
+    }
+
+    /// Clé Run de TEST de ce moteur (`MCC_AUTOSTART_KEY`) — jamais l'entrée
+    /// réelle de la machine. Supprimée au Drop.
+    pub fn reg_key(&self) -> &str {
+        &self.reg_key
     }
 
     /// Arrête ce moteur et le relance sur le MÊME répertoire de données (donc le
@@ -242,7 +283,7 @@ impl Engine {
             ui_bind: self.bind,
             api_access: self.code.clone(),
         };
-        let neuf = spawn_in(cfg, self.tmp.clone()).map_err(|e| e.to_string())?;
+        let neuf = spawn_in(cfg, self.tmp.clone(), self.discovery).map_err(|e| e.to_string())?;
         *self = neuf;
         self.wait_ready(Duration::from_secs(30))
     }
@@ -769,6 +810,12 @@ impl Drop for Engine {
         // pistage post-mortem des logs mcc-*.log).
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Clé Run de TEST : supprimée systématiquement (jamais l'entrée réelle).
+        let _ = Command::new("reg")
+            .args(["delete", &self.reg_key, "/f"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
@@ -1004,6 +1051,15 @@ pub fn wait_until(timeout: Duration, mut f: impl FnMut() -> Option<bool>) -> boo
 /// Moteur loopback sans code, prêt (wait_ready 15 s) — le cas le plus courant.
 pub fn spawn_loopback() -> Engine {
     let mut e = spawn(EngineCfg::default()).expect("spawn moteur loopback");
+    e.wait_ready(Duration::from_secs(15))
+        .expect("moteur loopback prêt");
+    e
+}
+
+/// Moteur loopback avec la découverte locale ACTIVE (scénarios scan).
+pub fn spawn_loopback_avec_decouverte() -> Engine {
+    let mut e =
+        spawn_avec_decouverte(EngineCfg::default()).expect("spawn moteur loopback/découverte");
     e.wait_ready(Duration::from_secs(15))
         .expect("moteur loopback prêt");
     e

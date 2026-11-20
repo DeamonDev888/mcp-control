@@ -819,3 +819,103 @@ fn cycle_supervision_non_bloque_par_un_crashloop() {
         vus.len()
     );
 }
+
+/// Scénario 14 (audit S4, point 1) — `stop_server` ne tue QUE le process lancé
+/// par l'application. Un tiers (process node du test) tient le port :
+/// - `kill` REFUSE (ok:false, `needs_force`, nom + pid dans le message) ;
+/// - le tiers est toujours vivant et le port toujours ouvert ;
+/// - `stop_server_force`, geste explicite, l'arrête et libère le port.
+#[test]
+fn stop_server_ne_tue_pas_un_tiers_qui_tient_le_port() {
+    let _garde = crate::harness::serial_guard();
+    if !node_disponible() {
+        eprintln!("SKIP stop_server_ne_tue_pas_un_tiers_qui_tient_le_port : node indisponible");
+        return;
+    }
+    let eng = moteur();
+    let port = free_port();
+    let script = format!(
+        "require('http').createServer((q,s)=>{{s.writeHead(200);s.end('ok')}}).listen({port},'127.0.0.1')"
+    );
+    let mut tiers = std::process::Command::new("node")
+        .args(["-e", &script])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("node (tiers)");
+    let ouvert = |p: u16| {
+        std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], p)),
+            Duration::from_millis(400),
+        )
+        .is_ok()
+    };
+    let dispo = wait_until(Duration::from_secs(15), || ouvert(port).then_some(true));
+    assert!(dispo, "le tiers n'écoute pas sur {port}");
+
+    let rep = ajoute_http(&eng, port, "tiers-e2e");
+    let id = rep
+        .get("id")
+        .and_then(|i| i.as_str())
+        .expect("id du serveur ajouté")
+        .to_string();
+
+    let rep = eng.action(&json!({"action": "kill", "id": id}));
+    assert_eq!(
+        rep.get("ok").and_then(|o| o.as_bool()),
+        Some(false),
+        "stop_server doit refuser de tuer un process qu'il n'a pas lancé : {rep}"
+    );
+    assert_eq!(rep.get("needs_force"), Some(&json!(true)), "{rep}");
+    let err = rep.get("error").and_then(|e| e.as_str()).unwrap_or("");
+    assert!(
+        err.contains(&port.to_string()) && err.contains("pid"),
+        "le refus doit nommer le port et le process : {err}"
+    );
+    assert!(
+        ouvert(port),
+        "le tiers ne doit PAS être tué par stop_server"
+    );
+    assert!(
+        tiers.try_wait().ok().flatten().is_none(),
+        "le process tiers doit être encore vivant"
+    );
+
+    // Même refus via l'outil MCP `stop_server` (POST /mcp signé).
+    let mcp_rep = eng
+        .post_json(
+            "/mcp",
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "tools/call",
+                "params": {"name": "stop_server", "arguments": {"id": id}}
+            }),
+        )
+        .json();
+    let mcp_err = mcp_rep.to_string();
+    assert!(
+        mcp_rep["result"]["isError"] == json!(true) || mcp_rep.get("error").is_some(),
+        "stop_server (/mcp) doit refuser sur un tiers : {mcp_rep}"
+    );
+    assert!(
+        mcp_err.contains(&port.to_string()) && mcp_err.contains("pid"),
+        "stop_server (/mcp) doit nommer le port et le process : {mcp_err}"
+    );
+    assert!(
+        ouvert(port) && tiers.try_wait().ok().flatten().is_none(),
+        "le tiers ne doit PAS être tué par stop_server (/mcp)"
+    );
+
+    // « Arrêter quand même » : action distincte, explicite.
+    let rep = eng.action(&json!({"action": "stop_server_force", "id": id}));
+    assert_eq!(
+        rep.get("ok").and_then(|o| o.as_bool()),
+        Some(true),
+        "stop_server_force doit réussir : {rep}"
+    );
+    let libere = wait_until(Duration::from_secs(20), || (!ouvert(port)).then_some(true));
+    assert!(libere, "stop_server_force doit libérer le port {port}");
+    let _ = tiers.kill();
+    let _ = tiers.wait();
+}
