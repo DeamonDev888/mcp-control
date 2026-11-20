@@ -442,6 +442,29 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
 /// plage issue des réglages — un balayage synchrone séquentiel de plage large
 /// figeait l'API (~313 ms/port mesurés, soit 5 min pour 1 000 ports).
 pub const SCAN_MAX_PORTS: usize = 512;
+/// Découverte locale DÉSACTIVÉE par l'environnement (`MCC_NO_LOCAL_DISCOVERY=1`).
+/// Réservé aux instances de test : sans cela, un moteur de test importe les
+/// serveurs réels de la machine (scan local au boot + scan réseau à +30 s).
+pub fn local_discovery_disabled() -> bool {
+    std::env::var("MCC_NO_LOCAL_DISCOVERY")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Ce port doit-il être sondé par la découverte locale ?
+/// `excluded` gagne toujours ; `only` vide = tous les ports.
+pub(super) fn discovery_port_allowed(port: u16, only: &[u16], excluded: &[u16]) -> bool {
+    !excluded.contains(&port) && (only.is_empty() || only.contains(&port))
+}
+
+/// Réglages de découverte lus en une fois (only, excluded).
+fn discovery_ports(state: &Arc<AppState>) -> (Vec<u16>, Vec<u16>) {
+    let s = lockv(&state.settings);
+    (
+        s.discovery_ports_only.clone(),
+        s.discovery_ports_excluded.clone(),
+    )
+}
 
 /// Taille du pool std éphémère du balayage. Le pool PERSISTANT du cycle de vie
 /// (poll_one) reste inchangé — ici un pool est créé et joint à chaque scan.
@@ -479,6 +502,14 @@ pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) -> u32 {
         return 0;
     }
     let (from, to) = scan_plafonne(brut.0, brut.1);
+    if local_discovery_disabled() {
+        add_log(
+            state,
+            "info",
+            "scan local ignoré : MCC_NO_LOCAL_DISCOVERY=1 (instance de test)",
+        );
+        return 0;
+    }
     if (from, to) != brut {
         add_log(
             state,
@@ -539,6 +570,7 @@ pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) -> u32 {
     open.sort();
     open.dedup();
     let own_ui = lockv(&state.settings).ui_port;
+    let (seulement, exclus) = discovery_ports(state);
     let known: Vec<u16> = lockv(&state.servers)
         .iter()
         .filter_map(|s| match &s.transport {
@@ -558,6 +590,13 @@ pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) -> u32 {
     let candidats: Vec<(u16, String)> = open
         .into_iter()
         .filter(|(p, _)| *p != own_ui && !known.contains(p))
+        .filter(|(p, _)| {
+            // « ports exclus » vaut aussi pour une plage explicite ; « ports à
+            // sonder » ne s'applique qu'au balayage des réglages (range=None),
+            // sinon une plage explicite ne trouverait jamais rien.
+            !exclus.contains(p)
+                && (range.is_some() || seulement.is_empty() || seulement.contains(p))
+        })
         .collect();
     let (mtx, mrx) = std::sync::mpsc::channel::<(u16, String, &'static str, probe::McpProbe)>();
     std::thread::scope(|scope| {
@@ -655,7 +694,19 @@ pub(super) fn discovery_candidates(ports: &[u16], known_local: &[u16], own_ui: u
 /// découverts (non persistés : re-découverts à chaque boot, comme le range scan).
 #[allow(unused_must_use)]
 pub fn scan_listening(state: &Arc<AppState>) {
-    let ports = probe::local_listening_ports();
+    if local_discovery_disabled() {
+        add_log(
+            state,
+            "info",
+            "scan local ignoré : MCC_NO_LOCAL_DISCOVERY=1 (instance de test)",
+        );
+        return;
+    }
+    let (seulement, exclus) = discovery_ports(state);
+    let ports: Vec<u16> = probe::local_listening_ports()
+        .into_iter()
+        .filter(|p| discovery_port_allowed(*p, &seulement, &exclus))
+        .collect();
     let own_ui = lockv(&state.settings).ui_port;
     let known_local: Vec<u16> = lockv(&state.servers)
         .iter()
@@ -763,6 +814,14 @@ pub fn scan_listening(state: &Arc<AppState>) {
 
 #[allow(unused_must_use)]
 pub fn scan_network(state: &Arc<AppState>, range: Option<(u16, u16)>) {
+    if local_discovery_disabled() {
+        add_log(
+            state,
+            "info",
+            "scan réseau ignoré : MCC_NO_LOCAL_DISCOVERY=1 (instance de test)",
+        );
+        return;
+    }
     let (from, to) = match range {
         Some(r) => r,
         None => {
@@ -907,10 +966,10 @@ pub(super) fn prune_dead_network_servers(state: &Arc<AppState>) {
 pub fn local_ips() -> Vec<String> {
     let mut ips = std::collections::BTreeSet::new();
     let output = if cfg!(windows) {
-        let mut c = Command::new("ipconfig");
+        let mut c = Command::new(probe::system_tool("ipconfig"));
         probe::hidden(&mut c).output()
     } else {
-        let mut c = Command::new("hostname");
+        let mut c = Command::new(probe::system_tool("hostname"));
         probe::hidden(&mut c).arg("-I").output()
     };
     if let Ok(o) = output {

@@ -6,6 +6,17 @@ use super::*;
 #[cfg_attr(not(windows), allow(dead_code))] // utilisé par le registre Run (Windows)
 const AUTOSTART_RUN_NAME: &str = "MCP Control";
 
+/// Clé Run utilisée : `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+/// par défaut. `MCC_AUTOSTART_KEY` la remplace — c'est ce qui permet à l'E2E
+/// d'écrire dans une clé de test au lieu de l'entrée RÉELLE de la machine.
+fn run_key() -> String {
+    std::env::var("MCC_AUTOSTART_KEY")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run".to_string())
+}
+
 /// Arguments de l'entrée de démarrage automatique (compilé hors tests seulement :
 /// en build test le corps réel est neutralisé, la fonction deviendrait du code mort).
 #[cfg(not(test))]
@@ -20,19 +31,14 @@ fn autostart_entry_args() -> String {
 pub fn autostart_active() -> bool {
     #[cfg(windows)]
     {
-        let mut c = Command::new("reg");
+        let mut c = Command::new(probe::system_tool("reg"));
         probe::probe_hidden_cmd(&mut c);
-        c.args([
-            "query",
-            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-            "/v",
-            AUTOSTART_RUN_NAME,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        c.args(["query", &run_key(), "/v", AUTOSTART_RUN_NAME])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
     #[cfg(not(windows))]
     {
@@ -63,13 +69,13 @@ fn apply_autostart_os(state: &Arc<AppState>, enable: bool) {
     let args = autostart_entry_args();
     #[cfg(windows)]
     {
-        let root = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-        let mut c = Command::new("reg");
+        let root = run_key();
+        let mut c = Command::new(probe::system_tool("reg"));
         probe::probe_hidden_cmd(&mut c);
         let status = if enable {
             c.args([
                 "add",
-                root,
+                &root,
                 "/v",
                 AUTOSTART_RUN_NAME,
                 "/t",
@@ -82,7 +88,7 @@ fn apply_autostart_os(state: &Arc<AppState>, enable: bool) {
             .stderr(Stdio::null())
             .status()
         } else {
-            c.args(["delete", root, "/v", AUTOSTART_RUN_NAME, "/f"])
+            c.args(["delete", &root, "/v", AUTOSTART_RUN_NAME, "/f"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
@@ -185,36 +191,122 @@ fn run_value_exe_path(value: &str) -> Option<String> {
     (!candidate.is_empty()).then(|| candidate.to_string())
 }
 
-/// Données brutes de la valeur Run dans la SORTIE de `reg query` (ligne
-/// `    MCP Control    REG_SZ    "..." --hidden`) — None si absente.
-#[cfg_attr(not(windows), allow(dead_code))] // lecteur du registre Run (Windows)
-fn run_value_from_reg_query(output: &str) -> Option<String> {
-    output
-        .lines()
-        .find(|l| l.contains("REG_SZ"))
-        .and_then(|l| l.split("REG_SZ").nth(1))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+/// Lit la valeur `name` d'une sous-clé HKCU par l'API Windows
+/// (`RegOpenKeyExW` + `RegQueryValueExW`, advapi32) — plus de parsing du texte
+/// de `reg query`, dont le format dépend de la langue et des espaces du
+/// chemin. `key` doit être `HKCU\...` : toute autre racine est refusée.
+#[cfg(windows)]
+fn read_run_value(key: &str, name: &str) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            root: isize,
+            sub: *const u16,
+            options: u32,
+            access: u32,
+            out: *mut isize,
+        ) -> i32;
+        fn RegQueryValueExW(
+            key: isize,
+            name: *const u16,
+            reserved: *mut u32,
+            ty: *mut u32,
+            data: *mut u8,
+            len: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(key: isize) -> i32;
+    }
+    const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as isize;
+    const KEY_QUERY_VALUE: u32 = 0x0001;
+    const REG_SZ: u32 = 1;
+    const REG_EXPAND_SZ: u32 = 2;
+    let sub = key
+        .strip_prefix("HKCU\\")
+        .or_else(|| key.strip_prefix("HKCU/"))?;
+    let wide_sub: Vec<u16> = std::ffi::OsStr::new(sub)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let wide_name: Vec<u16> = std::ffi::OsStr::new(name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mut hkey: isize = 0;
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            wide_sub.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut hkey,
+        ) != 0
+        {
+            return None;
+        }
+        let mut ty: u32 = 0;
+        let mut len: u32 = 0;
+        let rc = RegQueryValueExW(
+            hkey,
+            wide_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut ty,
+            std::ptr::null_mut(),
+            &mut len,
+        );
+        if rc != 0 || (ty != REG_SZ && ty != REG_EXPAND_SZ) {
+            RegCloseKey(hkey);
+            return None;
+        }
+        let mut buf = vec![0u8; len.max(2) as usize];
+        let rc = RegQueryValueExW(
+            hkey,
+            wide_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut ty,
+            buf.as_mut_ptr(),
+            &mut len,
+        );
+        RegCloseKey(hkey);
+        if rc != 0 || (ty != REG_SZ && ty != REG_EXPAND_SZ) {
+            return None;
+        }
+        // REG_SZ : UTF-16LE terminé par NUL (la longueur rendue est en OCTETS)
+        let used = (len as usize).min(buf.len());
+        let (paires, _) = buf[..used].as_chunks::<2>();
+        let units: Vec<u16> = paires
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .take_while(|u| *u != 0)
+            .collect();
+        let s = String::from_utf16_lossy(&units);
+        (!s.trim().is_empty()).then_some(s)
+    }
 }
 
 /// Valeur ACTUELLE de l'entrée Run (Windows) — None si absente/illisible.
-/// Lecture seule : le boot ne doit JAMAIS écrire le registre d'après le lot B.
+/// Lecture seule : le boot ne doit JAMAIS écrire le registre (lot B).
 #[cfg(windows)]
 fn recorded_run_value() -> Option<String> {
-    let mut c = Command::new("reg");
-    probe::probe_hidden_cmd(&mut c);
-    c.args([
-        "query",
-        "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-        "/v",
-        AUTOSTART_RUN_NAME,
-    ])
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null())
-    .output()
-    .ok()
-    .filter(|o| o.status.success())
-    .and_then(|o| run_value_from_reg_query(&String::from_utf8_lossy(&o.stdout)))
+    read_run_value(&run_key(), AUTOSTART_RUN_NAME)
+}
+
+/// Chemin d'exécutable actuellement enregistré dans l'entrée de démarrage
+/// (None si absente/illisible). Public : l'action `set_autostart` s'en sert
+/// pour demander confirmation quand l'entrée appartient à une AUTRE
+/// installation (audit S4, point 6).
+pub fn autostart_recorded_path() -> Option<String> {
+    recorded_entry_path()
+}
+
+/// L'entrée enregistrée appartient-elle à une AUTRE installation que
+/// `current_exe` ? Dans ce cas `set_autostart` exige `confirm:true` avant de
+/// la réécrire (audit S4, point 6) — une instance de test ou de développement
+/// ne peut plus écraser le démarrage automatique de l'installation réelle.
+pub fn autostart_needs_confirm(recorded: Option<&str>, current_exe: &str) -> bool {
+    recorded
+        .map(|r| !entry_points_to_own_exe(r, current_exe))
+        .unwrap_or(false)
 }
 
 /// Chemin d'exécutable inscrit dans le CONTENU d'un fichier autostart
@@ -427,20 +519,88 @@ mod tests {
         assert_eq!(autostart_file_exe_path("format inconnu"), None);
     }
 
+    #[test]
+    fn confirmation_exigee_si_entree_d_une_autre_installation() {
+        // audit S4, point 6 : set_autostart ne réécrit pas l'entrée d'une autre
+        // installation sans `confirm:true`.
+        assert!(
+            autostart_needs_confirm(Some(REEL), DEV),
+            "une entrée qui pointe sur l'installation réelle exige confirmation depuis un build de dev"
+        );
+        assert!(
+            !autostart_needs_confirm(Some(REEL), REEL),
+            "notre propre entrée : aucune confirmation"
+        );
+        assert!(
+            !autostart_needs_confirm(None, DEV),
+            "entrée absente : création directe, rien à écraser"
+        );
+    }
+
+    /// Lecture par l'API Windows (`RegQueryValueExW`) sur une clé de TEST :
+    /// aucune écriture dans l'entrée Run réelle de la machine. La clé est
+    /// supprimée à la fin, même si les assertions échouent (garde de nettoyage).
     #[cfg(windows)]
     #[test]
-    fn valeur_run_extraite_de_la_sortie_reg_query() {
-        let sortie = concat!(
-            "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\r\n",
-            "    MCP Control    REG_SZ    \"C:\\Users\\Op\\AppData\\Local\\MCP Control\\mcp-control-desktop.exe\" --hidden\r\n\r\n",
-        );
-        let v = run_value_from_reg_query(sortie).expect("données REG_SZ extraites");
-        assert!(v.starts_with('"'), "données brutes conservées : {v}");
+    fn lecture_du_registre_par_api_sur_cle_de_test() {
+        let cle = format!(r"HKCU\Software\mcp-control-selftest-{}", std::process::id());
+        let valeur = format!("\"{REEL}\" --hidden");
+        let ajout = probe::system_command("reg")
+            .args([
+                "add",
+                &cle,
+                "/v",
+                "MCP Control",
+                "/t",
+                "REG_SZ",
+                "/d",
+                &valeur,
+                "/f",
+            ])
+            .output()
+            .expect("reg add");
+        assert!(ajout.status.success(), "reg add a échoué : {ajout:?}");
+        let lu = read_run_value(&cle, "MCP Control");
+        // Négatif : un type REG_DWORD est ignoré (seuls REG_SZ / REG_EXPAND_SZ sont lus)
+        let ajout_dword = probe::system_command("reg")
+            .args([
+                "add",
+                &cle,
+                "/v",
+                "NonChaine",
+                "/t",
+                "REG_DWORD",
+                "/d",
+                "1",
+                "/f",
+            ])
+            .output()
+            .expect("reg add dword");
+        let lu_dword = if ajout_dword.status.success() {
+            read_run_value(&cle, "NonChaine")
+        } else {
+            None
+        };
+        // nettoyage AVANT les assertions : la clé de test ne doit pas survivre
+        let _ = probe::system_command("reg")
+            .args(["delete", &cle, "/f"])
+            .output();
+        assert!(lu_dword.is_none(), "REG_DWORD ne doit pas être lu");
+        let lu = lu.expect("valeur lue par l'API");
+        assert_eq!(lu, valeur, "la valeur REG_SZ doit être rendue telle quelle");
         assert_eq!(
-            run_value_exe_path(&v).as_deref(),
+            run_value_exe_path(&lu).as_deref(),
             Some(REEL),
             "chemin extrait de la valeur quotée"
         );
-        assert!(run_value_from_reg_query("sortie sans REG_SZ").is_none());
+        assert!(
+            read_run_value(&cle, "MCP Control").is_none(),
+            "clé supprimée : plus aucune valeur"
+        );
+        assert!(read_run_value(r"HKCU\Software", "MCP Control").is_none());
+        assert!(
+            read_run_value(r"HKLM\Software", "MCP Control").is_none(),
+            "seule la racine HKCU est acceptée"
+        );
     }
 }

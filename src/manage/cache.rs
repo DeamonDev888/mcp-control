@@ -56,16 +56,13 @@ pub fn save_cache(state: &Arc<AppState>) {
         }
         *slot = Some(body.clone());
     }
-    let tmp = format!("{}.tmp", path);
-    if let Err(e) = std::fs::write(&tmp, &body) {
-        add_log(
-            state,
-            "warn",
-            &format!("cache : écriture impossible ({}): {}", tmp, e),
-        );
+    // tmp UNIQUE par écriture (pid + séquence) dans le même dossier, supprimé
+    // en cas d'échec, puis ACL explicite après renommage (audit S4, point 4).
+    if let Err(msg) = write_atomic_with(&path, "cache", |tmp| std::fs::write(tmp, &body)) {
+        add_log(state, "warn", &msg);
         return;
     }
-    let _ = std::fs::rename(&tmp, &path);
+    let _ = restrict_permissions(&path);
 }
 
 /// Au boot, avant la première sonde : restaure les champs d'affichage des

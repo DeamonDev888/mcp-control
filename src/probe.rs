@@ -84,6 +84,9 @@ impl McpProbe {
 pub struct StdioHandle {
     /// PID du process lancé (kill_tree, affichage).
     pub pid: u32,
+    /// Date de création du process au moment du spawn (identité : un PID
+    /// recyclé n'a jamais la même date). `None` si l'API n'a pas répondu.
+    pub started: Option<u64>,
     /// Code de sortie ; None tant que le process est en cours. Récolté par le
     /// watcher (signal non exprimable → -1).
     pub exit: std::sync::Arc<std::sync::Mutex<Option<i32>>>,
@@ -94,6 +97,7 @@ pub struct StdioHandle {
 /// Construit le handle et démarre le watcher qui récolte la sortie du process.
 fn handle_de_child(mut child: Child, stdin: Option<ChildStdin>) -> StdioHandle {
     let pid = child.id();
+    let started = process_creation(pid);
     let exit = std::sync::Arc::new(std::sync::Mutex::new(None));
     let slot = std::sync::Arc::clone(&exit);
     std::thread::spawn(move || {
@@ -102,7 +106,12 @@ fn handle_de_child(mut child: Child, stdin: Option<ChildStdin>) -> StdioHandle {
             *slot = Some(code);
         }
     });
-    StdioHandle { pid, exit, stdin }
+    StdioHandle {
+        pid,
+        started,
+        exit,
+        stdin,
+    }
 }
 
 fn resolve_windows_cmd(program: &str) -> String {
@@ -134,12 +143,288 @@ pub fn hidden(cmd: &mut std::process::Command) -> &mut std::process::Command {
     cmd
 }
 
+// ---------- outils système par chemin ABSOLU (lot S4, point 5) ----------
+
+/// Chemin absolu d'un outil système Windows : un `netstat.exe` (ou `reg.exe`,
+/// `taskkill.exe`…) déposé dans le dossier courant ne peut plus être pris à la
+/// place de l'outil du système, quel que soit le PATH ou le cwd de l'app.
+/// Hors Windows, les outils (`ss`, `lsof`, `kill`, `ip`…) restent résolus par
+/// le PATH : la convention y est `/usr/bin` ou `/bin`, sans dossier courant.
+pub fn system_tool(name: &str) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let root = std::path::PathBuf::from(root);
+        match name {
+            // PowerShell 5.1 n'est pas à la racine de System32
+            "powershell" => root
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe"),
+            // explorer.exe vit à la racine de %SystemRoot%, pas dans System32
+            "explorer" => root.join("explorer.exe"),
+            // OpenSSH Windows vit dans System32\OpenSSH (repli PATH si absent)
+            "ssh" => {
+                let p = root.join("System32").join("OpenSSH").join("ssh.exe");
+                if p.exists() {
+                    p
+                } else {
+                    std::path::PathBuf::from("ssh")
+                }
+            }
+            other => root.join("System32").join(format!("{other}.exe")),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::path::PathBuf::from(name)
+    }
+}
+
+/// `Command` sur un outil système, chemin absolu sous Windows (voir
+/// [`system_tool`]). Tous les appels hors tests passent par ici.
+pub fn system_command(name: &str) -> Command {
+    Command::new(system_tool(name))
+}
+
+// ---------- identité d'un process (lot S4, point 1) ----------
+
+/// Date de création d'un process (ticks FILETIME Windows, 100 ns depuis 1601).
+/// Sert d'identité : un PID recyclé par l'OS n'a pas la même date de création,
+/// donc un arrêt ne peut plus viser un process différent de celui lancé.
+/// `None` = process inexistant ou information indisponible (hors Windows).
+#[cfg(windows)]
+pub fn process_creation(pid: u32) -> Option<u64> {
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn GetProcessTimes(
+            handle: isize,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    // PROCESS_QUERY_LIMITED_INFORMATION : suffit pour GetProcessTimes, et
+    // n'exige pas plus de droits que l'affichage de l'état du process.
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h == 0 {
+            return None;
+        }
+        let mut creation = FileTime { low: 0, high: 0 };
+        let mut exit = FileTime { low: 0, high: 0 };
+        let mut kernel = FileTime { low: 0, high: 0 };
+        let mut user = FileTime { low: 0, high: 0 };
+        let ok = GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user);
+        CloseHandle(h);
+        if ok == 0 {
+            return None;
+        }
+        Some(((creation.high as u64) << 32) | creation.low as u64)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn process_creation(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Nom d'image d'un PID (`tasklist` sous Windows, `ps` ailleurs) — pour NOMMER
+/// le process qui tient un port dans un refus, jamais pour l'exécuter.
+pub fn process_image_name(pid: u32) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let mut c = system_command("tasklist");
+        let out = hidden(&mut c)
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let first = text.lines().next()?.trim();
+        if !first.starts_with('"') {
+            return None;
+        }
+        Some(first.split('"').nth(1)?.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        let mut c = Command::new("ps");
+        let out = c
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+            .ok()?;
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+}
+
+/// Tue une liste de PID (taskkill /F sous Windows, kill -9 ailleurs).
+pub fn kill_pids(pids: &[u32]) {
+    for pid in pids {
+        kill_tree(*pid);
+    }
+}
+
+// ---------- SID utilisateur / propriétaire d'un fichier (points 2 et 4) ----------
+
+/// SID du compte qui exécute l'application (`S-1-5-21-…`). Sert à écrire des
+/// ACL indépendantes de la langue du système (`Administrateurs` /
+/// `Administrators`).
+#[cfg(windows)]
+pub fn current_user_sid() -> Option<String> {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(process: isize, access: u32, token: *mut isize) -> i32;
+        fn GetTokenInformation(
+            token: isize,
+            class: u32,
+            info: *mut u8,
+            len: u32,
+            ret: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const TOKEN_QUERY: u32 = 0x0008;
+    // TOKEN_USER = 1 : SID_AND_ATTRIBUTES, le SID commence au premier champ.
+    const TOKEN_USER_CLASS: u32 = 1;
+    unsafe {
+        let mut token: isize = 0;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let mut len: u32 = 0;
+        GetTokenInformation(token, TOKEN_USER_CLASS, std::ptr::null_mut(), 0, &mut len);
+        let mut buf = vec![0u8; len.max(64) as usize];
+        let ok = GetTokenInformation(
+            token,
+            TOKEN_USER_CLASS,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            &mut len,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            return None;
+        }
+        let sid = std::ptr::read_unaligned(buf.as_ptr() as *const *mut u8);
+        sid_to_string(sid)
+    }
+}
+
+#[cfg(windows)]
+unsafe fn sid_to_string(sid: *mut u8) -> Option<String> {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn ConvertSidToStringSidW(sid: *mut u8, out: *mut *mut u16) -> i32;
+        fn LocalFree(mem: isize) -> isize;
+    }
+    if sid.is_null() {
+        return None;
+    }
+    let mut wide: *mut u16 = std::ptr::null_mut();
+    if ConvertSidToStringSidW(sid, &mut wide) == 0 || wide.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    while *wide.add(len) != 0 {
+        len += 1;
+    }
+    let s = String::from_utf16_lossy(std::slice::from_raw_parts(wide, len));
+    LocalFree(wide as isize);
+    Some(s)
+}
+
+#[cfg(not(windows))]
+pub fn current_user_sid() -> Option<String> {
+    None
+}
+
+/// SID du PROPRIÉTAIRE d'un fichier. `None` = illisible ou non pris en charge
+/// (hors Windows) — l'appelant refuse alors par prudence.
+#[cfg(windows)]
+pub fn file_owner_sid(path: &std::path::Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn GetNamedSecurityInfoW(
+            object: *const u16,
+            object_type: u32,
+            security_info: u32,
+            owner: *mut *mut u8,
+            group: *mut *mut u8,
+            dacl: *mut *mut u8,
+            sacl: *mut *mut u8,
+            descriptor: *mut *mut u8,
+        ) -> u32;
+        fn LocalFree(mem: isize) -> isize;
+    }
+    const SE_FILE_OBJECT: u32 = 1;
+    const OWNER_SECURITY_INFORMATION: u32 = 1;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mut owner: *mut u8 = std::ptr::null_mut();
+        let mut descriptor: *mut u8 = std::ptr::null_mut();
+        let rc = GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        if rc != 0 {
+            return None;
+        }
+        let sid = sid_to_string(owner);
+        if !descriptor.is_null() {
+            LocalFree(descriptor as isize);
+        }
+        sid
+    }
+}
+
+/// Hors Windows : propriétaire comparé à l'uid effectif quand il est lisible
+/// (`/proc/self` sous Linux) ; inconnu ailleurs.
+#[cfg(not(windows))]
+pub fn file_owner_sid(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(path).ok()?.uid();
+    let me = std::fs::metadata("/proc/self").ok().map(|m| m.uid());
+    me.filter(|u| *u == owner).map(|u| u.to_string())
+}
+
+/// Le fichier appartient-il au compte courant ? `None` = impossible à établir.
+pub fn file_owned_by_current_user(path: &std::path::Path) -> Option<bool> {
+    let (file, me) = (file_owner_sid(path)?, current_user_sid()?);
+    Some(file == me)
+}
+
 /// Tue l'arbre complet d'un PID (cmd.exe → node.exe). `Child::kill()` ne tue que
 /// le lanceur .cmd : les serveurs détachés survivent et gardent leur console.
 pub fn kill_tree(pid: u32) {
     #[cfg(windows)]
     {
-        let mut c = std::process::Command::new("taskkill");
+        let mut c = std::process::Command::new(system_tool("taskkill"));
         let _ = hidden(&mut c)
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .stdout(Stdio::null())
@@ -179,11 +464,11 @@ pub fn pids_listening_on(netstat_text: &str, port: u16) -> Vec<u32> {
 
 #[cfg(windows)]
 pub fn kill_port(port: u16) {
-    let mut c = Command::new("netstat");
+    let mut c = Command::new(system_tool("netstat"));
     if let Ok(out) = hidden(&mut c).args(["-ano"]).output() {
         let text = String::from_utf8_lossy(&out.stdout);
         for pid in pids_listening_on(&text, port) {
-            let mut t = Command::new("taskkill");
+            let mut t = Command::new(system_tool("taskkill"));
             let _ = hidden(&mut t)
                 .args(["/F", "/PID", &pid.to_string()])
                 .stdout(Stdio::null())
@@ -191,6 +476,55 @@ pub fn kill_port(port: u16) {
                 .status();
         }
     }
+}
+
+/// PIDs qui écoutent sur `port` (notre propre PID exclu) + nom d'image.
+pub fn port_listeners(port: u16) -> Vec<(u32, String)> {
+    #[cfg(windows)]
+    let pids = {
+        let mut c = system_command("netstat");
+        match hidden(&mut c).args(["-ano"]).output() {
+            Ok(out) => pids_listening_on(&String::from_utf8_lossy(&out.stdout), port),
+            Err(_) => Vec::new(),
+        }
+    };
+    #[cfg(not(windows))]
+    let pids = listening_pids_unix(port);
+    pids.into_iter()
+        .map(|pid| {
+            let image = process_image_name(pid).unwrap_or_else(|| "process".to_string());
+            (pid, image)
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn listening_pids_unix(port: u16) -> Vec<u32> {
+    let mut c = Command::new("ss");
+    probe_hidden_cmd(&mut c);
+    if let Ok(out) = c.args(["-tlnp"]).output() {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let pids = pids_listening_on_ss(&text, port);
+        if !pids.is_empty() {
+            return pids;
+        }
+    }
+    let mut out = Vec::new();
+    let mut c = Command::new("lsof");
+    probe_hidden_cmd(&mut c);
+    if let Ok(o) = c
+        .args(["-ti", &format!(":{}", port), "-sTCP:LISTEN"])
+        .output()
+    {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            if let Ok(pid) = line.trim().parse::<u32>() {
+                if pid != std::process::id() && !out.contains(&pid) {
+                    out.push(pid);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Parse la sortie `ss -tlnp` : PIDs (notre propre PID exclu) des listeners sur
@@ -427,7 +761,7 @@ fn build_port_owner_map() -> std::collections::HashMap<u16, String> {
     use std::collections::HashMap;
     use std::process::Command;
     let mut ports: Vec<(u16, u32)> = Vec::new();
-    let mut c = Command::new("netstat");
+    let mut c = Command::new(system_tool("netstat"));
     if let Ok(out) = hidden(&mut c).args(["-ano"]).output() {
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             let toks: Vec<&str> = line.split_whitespace().collect();
@@ -444,7 +778,7 @@ fn build_port_owner_map() -> std::collections::HashMap<u16, String> {
         }
     }
     let mut names: HashMap<u32, String> = HashMap::new();
-    let mut t = Command::new("tasklist");
+    let mut t = Command::new(system_tool("tasklist"));
     if let Ok(out) = hidden(&mut t).args(["/FO", "CSV", "/NH"]).output() {
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             let cols: Vec<&str> = line.split("\",\"").collect();
@@ -650,7 +984,7 @@ fn push_gateway(out: &mut Vec<String>, cand: &str) {
 pub fn default_gateways() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if cfg!(windows) {
-        let mut c = Command::new("ipconfig");
+        let mut c = Command::new(system_tool("ipconfig"));
         hidden(&mut c);
         if let Ok(o) = c.output() {
             let text = String::from_utf8_lossy(&o.stdout).to_string();
@@ -681,7 +1015,7 @@ pub fn default_gateways() -> Vec<String> {
         }
         if out.is_empty() {
             // macOS
-            let mut c2 = Command::new("netstat");
+            let mut c2 = Command::new(system_tool("netstat"));
             probe_hidden_cmd(&mut c2);
             if let Ok(o) = c2.args(["-rn"]).output() {
                 let text = String::from_utf8_lossy(&o.stdout).to_string();
@@ -703,7 +1037,7 @@ pub fn default_gateways() -> Vec<String> {
 /// la passerelle LAN ; jamais bloquant au-delà de `timeout_ms`.
 pub fn ping_ok(host: &str, timeout_ms: u64) -> bool {
     let ms = timeout_ms.clamp(200, 3000);
-    let mut c = Command::new("ping");
+    let mut c = Command::new(system_tool("ping"));
     hidden(&mut c);
     let status = if cfg!(windows) {
         c.args(["-n", "1", "-w", &ms.to_string(), host]).output()
@@ -928,7 +1262,7 @@ fn ssh_exec(
 ) -> Result<String, String> {
     let host = ssh_safe(host).ok_or_else(|| "hôte invalide".to_string())?;
     let user = ssh_safe(user).ok_or_else(|| "utilisateur SSH invalide".to_string())?;
-    let mut cmd = Command::new("ssh");
+    let mut cmd = system_command("ssh");
     cmd.args([
         "-o",
         "BatchMode=yes",
@@ -984,12 +1318,12 @@ pub fn ssh_netstat(host: &str, user: &str, timeout_secs: u64) -> Result<Vec<u16>
 /// invisible avec scan_from/scan_to = 3000-3200).
 pub fn local_listening_ports() -> Vec<u16> {
     let out = if cfg!(windows) {
-        let mut c = Command::new("netstat");
+        let mut c = Command::new(system_tool("netstat"));
         hidden(&mut c).args(["-ano"]).output()
     } else if cfg!(target_os = "macos") {
         // BSD netstat : ni `ss` ni `-tln` — `-an -p tcp` liste les sockets TCP
         // et le parseur filtre sur l'état LISTEN (format à séparateur '.').
-        let mut c = Command::new("netstat");
+        let mut c = Command::new(system_tool("netstat"));
         probe_hidden_cmd(&mut c);
         c.args(["-an", "-p", "tcp"]).output()
     } else {
@@ -999,7 +1333,7 @@ pub fn local_listening_ports() -> Vec<u16> {
         match c.args(["-tln"]).output() {
             Ok(o) if o.status.success() => Ok(o),
             _ => {
-                let mut c2 = Command::new("netstat");
+                let mut c2 = Command::new(system_tool("netstat"));
                 probe_hidden_cmd(&mut c2);
                 c2.args(["-tln"]).output()
             }
@@ -2569,7 +2903,7 @@ pub fn probe_peer(ip: &str, port: u16, access: Option<&str>) -> PeerProbe {
 /// IPs voisines depuis le cache ARP local (Windows: arp -a, Linux/mac: arp -a).
 /// Filtrées sur le /24 demandé, sans self.
 pub fn arp_hosts(prefix: &str, self_ip: &str) -> Vec<String> {
-    let mut c = Command::new("arp");
+    let mut c = Command::new(system_tool("arp"));
     let out = hidden(&mut c).arg("-a").output();
     let stdout = match out {
         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
@@ -3770,6 +4104,49 @@ tcp4       0      0  127.0.0.1.135          *.*                    LISTEN\n";
         assert!(
             !err.contains("réponse non JSON"),
             "l'ancien message trompeur ne doit plus apparaître : {err}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system_tool_utilise_chemin_absolu_et_ignore_le_dossier_courant() {
+        for nom in [
+            "netstat",
+            "tasklist",
+            "taskkill",
+            "reg",
+            "icacls",
+            "powershell",
+            "explorer",
+            "rundll32",
+            "ipconfig",
+            "ping",
+            "arp",
+        ] {
+            let p = system_tool(nom);
+            assert!(p.is_absolute(), "{nom} doit être un chemin absolu : {p:?}");
+            assert!(
+                p.exists(),
+                "{nom} introuvable à l'emplacement système : {p:?}"
+            );
+        }
+        // Négatif : un faux reg.exe déposé dans le dossier de travail n'est pas
+        // pris par system_command (seul System32\reg.exe est exécuté).
+        let dir = std::env::temp_dir().join(format!("mcc-systool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let leurre = dir.join("reg.exe");
+        std::fs::write(&leurre, b"ceci n'est pas un executable valide").unwrap();
+        assert_ne!(system_tool("reg"), leurre);
+        let out = system_command("reg")
+            .arg("/?")
+            .current_dir(&dir)
+            .output()
+            .expect("reg.exe système");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            out.status.success(),
+            "le vrai reg.exe doit répondre même avec un leurre dans cwd"
         );
     }
 }
