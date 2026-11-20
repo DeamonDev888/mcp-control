@@ -31,7 +31,7 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
 /// sans tag ; `Err` = réseau/API/outil indisponible — la distinction permet au
 /// bouton « Vérifier » de ne plus prétendre « à jour » quand le check a raté.
 fn github_latest_tag() -> Result<Option<String>, &'static str> {
-    let mut c = Command::new("curl");
+    let mut c = crate::probe::system_command("curl");
     probe::probe_hidden_cmd(&mut c);
     if let Ok(out) = c
         .args([
@@ -52,7 +52,7 @@ fn github_latest_tag() -> Result<Option<String>, &'static str> {
             }
         }
     }
-    let mut cmd = Command::new("powershell");
+    let mut cmd = crate::probe::system_command("powershell");
     cmd.args([
         "-NoProfile",
         "-Command",
@@ -239,7 +239,7 @@ pub fn sha256sums_url(tag: &str) -> Option<String> {
 /// SHA256SUMS.txt fait quelques centaines d'octets.
 fn fetch_text(url: &str) -> Result<String, &'static str> {
     const MAX: usize = 64 * 1024;
-    let mut c = Command::new("curl");
+    let mut c = crate::probe::system_command("curl");
     probe::probe_hidden_cmd(&mut c);
     if let Ok(out) = c
         .args(["-fsSL", "-m", "6", "-H", "User-Agent: mcp-control", url])
@@ -251,7 +251,7 @@ fn fetch_text(url: &str) -> Result<String, &'static str> {
     }
     // `url` est construit uniquement par `sha256sums_url` (tag validé) : aucune
     // donnée extérieure n'entre dans la commande.
-    let mut cmd = Command::new("powershell");
+    let mut cmd = crate::probe::system_command("powershell");
     cmd.args([
         "-NoProfile",
         "-Command",

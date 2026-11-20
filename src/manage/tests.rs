@@ -3514,3 +3514,32 @@ fn kill_et_remove_id_inconnu_refusent_avec_motif() {
         "aucun serveur ne doit être créé par un refus"
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn system_tool_curl_utilise_chemin_absolu_et_ignore_le_dossier_courant() {
+    let p = probe::system_tool("curl");
+    assert!(p.is_absolute(), "curl doit être un chemin absolu : {p:?}");
+    assert!(
+        p.exists(),
+        "curl introuvable à l'emplacement système : {p:?}"
+    );
+    // Négatif : un faux curl.exe déposé dans le dossier de travail n'est pas
+    // pris par system_command (seul System32\curl.exe est exécuté).
+    let dir = std::env::temp_dir().join(format!("mcc-systool-curl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let leurre = dir.join("curl.exe");
+    std::fs::write(&leurre, b"ceci n'est pas un executable valide").unwrap();
+    assert_ne!(probe::system_tool("curl"), leurre);
+    let out = probe::system_command("curl")
+        .arg("--version")
+        .current_dir(&dir)
+        .output()
+        .expect("curl.exe système");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success(),
+        "le vrai curl.exe doit répondre même avec un leurre dans cwd"
+    );
+}
