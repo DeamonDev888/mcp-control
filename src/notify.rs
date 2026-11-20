@@ -416,7 +416,7 @@ pub fn desktop_toast(title: &str, message: &str) -> Result<(), String> {
     if !cfg!(windows) {
         return Err("notifications desktop : non supporté hors Windows".to_string());
     }
-    let mut c = std::process::Command::new("powershell");
+    let mut c = crate::probe::system_command("powershell");
     // UN SEUL -Command, script constant.
     c.args(["-NoProfile", "-NonInteractive", "-Command", TOAST_SCRIPT]);
     c.env("MCC_TOAST_TITLE", title);
