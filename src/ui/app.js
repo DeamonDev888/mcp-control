@@ -102,7 +102,7 @@ function showLogin() {
   if (d && !d.open) { d.showModal(); document.getElementById('loginCode').focus(); }
 }
 async function loginSubmit(ev) {
-  ev.preventDefault();
+  if (ev && ev.preventDefault) ev.preventDefault();
   const code = document.getElementById('loginCode').value.trim();
   const msg = document.getElementById('loginMsg');
   // fetch brut (pas l'intercepteur) : pas de boucle 401 pendant la vérif
@@ -149,7 +149,6 @@ let detailTab = 'outils';
 // contrôle (C0 et DEL) sont retirés : un libellé hostile ne doit ni sortir de
 // son contexte ni injecter de séquence de terminal (lot M3).
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])).replace(/[\u0000-\u001f\u007f]/g, '');
-const js = s => esc(JSON.stringify(String(s ?? '')));
 let overviewFilter = null; // filtre de tuile d'accueil : 'up' = ne montrer que les UP
 
 /* ===== Icônes =============================================================
@@ -317,11 +316,9 @@ function srvRow(s) {
      Ligne 2 : état textuel, transport, badges langage/transport/framework,
      compteur d'outils. Les badges sont non rétractables : à très faible
      largeur la fin de la ligne 2 se coupe, jamais le nom ni les actions. */
-  return `<div class="srow ${selectedId===s.id?'sel':''} ${s.enabled?'':'off'}" draggable="true" data-id="${esc(s.id)}"
-    onclick="select(${js(s.id)})"
-    ondragstart="rowDragStart(event,${js(s.id)})" ondragover="rowDragOver(event)"
-    ondragleave="rowDragLeave(event)" ondrop="rowDrop(event)" ondragend="rowDragEnd(event)">
-    <div class="l1"><span class="dot ${s.state}"></span><span class="nm" title="${esc(s.label)}">${esc(s.label)}</span>${rowFav(s)}${rowAuto(s)}${rowCtl(s)}${rowToggle(s)}</div>
+  return `<div class="srow ${selectedId===s.id?'sel':''} ${s.enabled?'':'off'}" draggable="true"
+    data-act="select" data-id="${esc(s.id)}">
+    <div class="l1"><span class="dot ${esc(s.state)}"></span><span class="nm" title="${esc(s.label)}">${esc(s.label)}</span>${rowFav(s)}${rowAuto(s)}${rowCtl(s)}${rowToggle(s)}</div>
     <div class="l2"><span class="st ${esc(s.state)}">${esc(s.state)}</span> ${ti}${off}${langChip(s)}${typeBadge(s)}${frameworkBadge(s)}${s.transport==='stdio'?'<span class="legacy" title="Legacy : serveur stdio uniquement (pas de transport HTTP)">legacy</span>':''}<span class="cnt">${s.tools_count}</span></div>
   </div>`;
 }
@@ -338,9 +335,8 @@ function groupHeadHtml(key, label, up, total, machine) {
     ? `Machine distante ${esc(label)} &mdash; cliquer pour replier/d&eacute;plier`
     : 'Serveurs MCP locaux &agrave; cette machine (loopback) &mdash; cliquer pour replier/d&eacute;plier';
   const act = machine
-    ? `<button class="gact" title="Oublier cette machine (les serveurs d&eacute;j&agrave; import&eacute;s restent)" onclick="event.stopPropagation();sshForget(${js(label)})">${ic('trash')}</button>` : '';
-  return `<div class="grphead ${groupClosed(key)?'closed':''}" onclick="toggleGroup(${js(key)})"
-    ondragover="groupDragOver(event)" ondragleave="groupDragLeave(event)" ondrop="groupDrop(event,${js(key)})"
+    ? `<button class="gact" title="Oublier cette machine (les serveurs d&eacute;j&agrave; import&eacute;s restent)" data-act="ssh-forget" data-id="${esc(label)}">${ic('trash')}</button>` : '';
+  return `<div class="grphead ${groupClosed(key)?'closed':''}" data-act="group-toggle" data-key="${esc(key)}"
     title="${tip}"><span class="gchev">&#9662;</span><span class="gname">${esc(label)}</span>${act}<span class="gcount">${up}/${total}</span></div>`;
 }
 /* Filtre courant de l'explorateur : texte (champ #srvFilter) + filtre de tuile
@@ -500,10 +496,11 @@ function frameworkBadge(s) {
     return `<span class="tag litemcp" title="${tip}">${esc(f.label)}</span>`;
   }
   // Les autres badges prennent la couleur du LANGAGE du framework, comme les
-  // puces de code : Rust orange, Python vert, JS jaune, Go cyan…
-  const m = LANG_META[f.lang] || LANG_META[s.lang];
-  if (!m) return `<span class="tag fw" title="${tip}">${esc(f.label)}</span>`;
-  return `<span class="tag fw" style="color:${m.c};border-color:${m.c}66;background:${m.c}14" title="${tip}">${esc(f.label)}</span>`;
+  // puces de code : la classe .fw-<lang> porte couleur, bordure et fond (fin des
+  // styles en ligne — CSP style-src 'self').
+  const lk = LANG_META[f.lang] ? f.lang : (LANG_META[s.lang] ? s.lang : '');
+  if (!lk) return `<span class="tag fw" title="${tip}">${esc(f.label)}</span>`;
+  return `<span class="tag fw fw-${lk}" title="${tip}">${esc(f.label)}</span>`;
 }
 
 function rowFav(s) {
@@ -511,17 +508,17 @@ function rowFav(s) {
   return `<button class="rowbtn fav ${on?'on':'off'}" title="${on
     ? 'Retirer des favoris (l\u2019\u00e9pingle maintient la ligne en haut de sa section)'
     : '\u00c9pingler en favori : la ligne passe en haut de sa section, quel que soit le tri'}"
-    onclick="event.stopPropagation();setFavorite(${js(s.id)},${on?'false':'true'})">${ic('star')}</button>`;
+    data-act="set-fav" data-id="${esc(s.id)}" data-on="${on ? '0' : '1'}">${ic('star')}</button>`;
 }
 
 function rowToggle(s) {
-  return `<button class="sw ${s.enabled?'on':'off'}" title="${s.enabled?'D\u00e9sactiver ce serveur (arr\u00eate son process)':'Activer ce serveur (le d\u00e9marre si commande connue)'}" onclick="event.stopPropagation();act('toggle',${js(s.id)})">${s.enabled?'ON':'OFF'}</button>`;
+  return `<button class="sw ${s.enabled?'on':'off'}" title="${s.enabled?'D\u00e9sactiver ce serveur (arr\u00eate son process)':'Activer ce serveur (le d\u00e9marre si commande connue)'}" data-act="row-act" data-op="toggle" data-id="${esc(s.id)}">${s.enabled?'ON':'OFF'}</button>`;
 }
 
 function rowCtl(s) {
   if (!s.can_start) return '';
   const up = s.state === 'UP';
-  return `<button class="rowbtn" title="${up?'Arr\u00eater':'D\u00e9marrer'} ce serveur" onclick="event.stopPropagation();act('${up?'kill':'start'}',${js(s.id)})">${up?ic('stop'):ic('play')}</button>`;
+  return `<button class="rowbtn" title="${up?'Arr\u00eater':'D\u00e9marrer'} ce serveur" data-act="row-act" data-op="${up?'kill':'start'}" data-id="${esc(s.id)}">${up?ic('stop'):ic('play')}</button>`;
 }
 
 // Autoboot PAR SERVEUR : relance automatique de CE serveur au démarrage
@@ -532,7 +529,7 @@ function rowAuto(s) {
   return `<button class="rowbtn auto ${on?'on':'off'}" title="${on
     ? 'Autoboot ACTIV\u00c9 : ce serveur est relanc\u00e9 au d\u00e9marrage et apr\u00e8s un crash \u2014 cliquer pour d\u00e9sactiver'
     : 'Autoboot D\u00c9SACTIV\u00c9 : ce serveur ne sera pas relanc\u00e9 automatiquement \u2014 cliquer pour activer'}"
-    onclick="event.stopPropagation();setAuto(${js(s.id)},${on?'false':'true'})">${ic('zap')}</button>`;
+    data-act="set-auto" data-id="${esc(s.id)}" data-on="${on ? '0' : '1'}">${ic('zap')}</button>`;
 }
 
 /* État des replis du détail (mémorisé entre les cycles et les sessions) */
@@ -547,19 +544,19 @@ async function toggleAutostart() {
 
 /* ===== Drag & drop : réordonner les serveurs (préférence / priorité) ===== */
 let dragId = null;
-function rowDragStart(ev, id) {
+function rowDragStart(ev, el, id) {
   dragId = id;
   ev.dataTransfer.effectAllowed = 'move';
   try { ev.dataTransfer.setData('text/plain', id); } catch (e) {}
-  ev.currentTarget.classList.add('dragging');
+  el.classList.add('dragging');
 }
-function rowDragOver(ev) {
+function rowDragOver(ev, el) {
   if (!dragId) return;
   // un serveur distant ne se déplace pas dans la zone plate locale
   if (hostOf(byId(dragId)) !== 'local') return;
   ev.preventDefault();
   ev.dataTransfer.dropEffect = 'move';
-  const row = ev.currentTarget;
+  const row = el;
   if (row.dataset.id === dragId) return;
   const rect = row.getBoundingClientRect();
   const above = ev.clientY < rect.top + rect.height / 2;
@@ -567,12 +564,12 @@ function rowDragOver(ev) {
   row.classList.toggle('drop-below', !above);
   row._dropAbove = above;
 }
-function rowDragLeave(ev) {
-  ev.currentTarget.classList.remove('drop-above', 'drop-below');
+function rowDragLeave(ev, el) {
+  el.classList.remove('drop-above', 'drop-below');
 }
-function rowDrop(ev) {
+function rowDrop(ev, el) {
   ev.preventDefault();
-  const row = ev.currentTarget;
+  const row = el;
   row.classList.remove('drop-above', 'drop-below');
   const moved = dragId;
   dragId = null;
@@ -594,18 +591,18 @@ function rowDrop(ev) {
    serveur (sa clé de groupe = le host du groupe). Cas d'usage : une machine a
    changé d'IP, ou une importation a posé le mauvais host — on déplace la ligne
    vers la bonne machine sans réimporter. */
-function groupDragOver(ev) {
+function groupDragOver(ev, el) {
   if (!dragId) return;
   ev.preventDefault();
   ev.dataTransfer.dropEffect = 'move';
-  ev.currentTarget.classList.add('drag-over-group');
+  el.classList.add('drag-over-group');
 }
-function groupDragLeave(ev) {
-  ev.currentTarget.classList.remove('drag-over-group');
+function groupDragLeave(ev, el) {
+  el.classList.remove('drag-over-group');
 }
-async function groupDrop(ev, key) {
+async function groupDrop(ev, el, key) {
   ev.preventDefault();
-  ev.currentTarget.classList.remove('drag-over-group');
+  el.classList.remove('drag-over-group');
   const moved = dragId;
   dragId = null;
   if (!moved) return;
@@ -673,8 +670,8 @@ async function postReorder(ids) {
   await postAction({action: 'reorder', ids});
   await load();
 }
-function rowDragEnd(ev) {
-  ev.currentTarget.classList.remove('dragging');
+function rowDragEnd(ev, el) {
+  el.classList.remove('dragging');
   document.querySelectorAll('.srow').forEach(r => r.classList.remove('drop-above', 'drop-below'));
   dragId = null;
 }
@@ -687,7 +684,7 @@ function renderPeers() {
     return `<div class="peer-row">
       <div class="l1"><span class="dot UP"></span><span class="nm">${esc(p.ip)}</span></div>
       <div class="l2">UI :${esc(p.ui_port)} &mdash; ${esc(st.up ?? '?')} UP / ${esc(st.total ?? '?')} serveurs</div>
-      <button onclick="importPeer(${js(p.ip)})">Importer ses serveurs</button>
+      <button data-act="import-peer" data-id="${esc(p.ip)}">Importer ses serveurs</button>
     </div>`;
   }).join('');
 }
@@ -726,16 +723,16 @@ function renderOverview() {
   const nbMachines = (state.settings.ssh_hosts || []).length;
   document.getElementById('content').innerHTML = `
     <div class="tiles">
-      <button class="tile${overviewFilter === 'up' ? ' sel' : ''}" onclick="tileFilter('up')"
+      <button class="tile${overviewFilter === 'up' ? ' sel' : ''}" data-act="tile" data-mode="up"
         title="Cliquer : ne montrer que les serveurs UP dans l'explorateur (re-cliquer pour tout afficher)">
         <div class="n ok">${s.up}</div><div class="lbl">serveurs UP</div></button>
-      <button class="tile${overviewFilter ? '' : ' sel'}" onclick="tileFilter('all')"
+      <button class="tile${overviewFilter ? '' : ' sel'}" data-act="tile" data-mode="all"
         title="Cliquer : réafficher tous les serveurs dans l'explorateur">
         <div class="n">${s.total}</div><div class="lbl">serveurs suivis</div></button>
-      <button class="tile" onclick="tileSortTools()"
+      <button class="tile" data-act="tile-tools"
         title="Cliquer : trier l'explorateur par nombre d'outils">
         <div class="n">${s.tools}</div><div class="lbl">tools actifs</div></button>
-      <button class="tile" onclick="openMachineDlg()"
+      <button class="tile" data-act="machines"
         title="Cliquer : gérer les machines distantes (SSH)">
         <div class="n">${nbMachines}</div><div class="lbl">machines distantes</div></button>
     </div>
@@ -743,9 +740,9 @@ function renderOverview() {
       <div class="big">Centre de contr&ocirc;le de tes serveurs MCP</div>
       <div class="hint">S&eacute;lectionne un serveur dans l'explorateur pour voir ses tools, ses infos et les basculer ON/OFF un par un.</div>
       <div class="qa">
-        <button onclick="doScan()">${ic('search')} Scanner les ports locaux</button>
-        <button onclick="doScanNet()">${ic('globe')} Scanner le r&eacute;seau</button>
-        <button onclick="openMachineDlg()">${ic('monitor')} Choisir une machine</button>
+        <button data-act="scan">${ic('search')} Scanner les ports locaux</button>
+        <button data-act="scan-net">${ic('globe')} Scanner le r&eacute;seau</button>
+        <button data-act="machines">${ic('monitor')} Choisir une machine</button>
       </div>
       <div class="hint hint-gap">Le scan utilise la plage configur&eacute;e. Pour une machine du LAN : connexion SSH par cl&eacute;,
       l'app liste ses ports en &eacute;coute, y sonde les serveurs MCP et les importe ici.</div>
@@ -789,7 +786,7 @@ function copyConf(btn) {
   setTimeout(() => btn.textContent = 'copier', 1500);
 }
 function confAgent(s) {
-  const blk = (t, code) => '<div class="conf-block"><div class="conf-head">' + t + '<button onclick="copyConf(this)">copier</button></div><pre>' + esc(code) + '</pre></div>';
+  const blk = (t, code) => '<div class="conf-block"><div class="conf-head">' + t + '<button data-act="copy-conf">copier</button></div><pre>' + esc(code) + '</pre></div>';
   return '<h4 class="sec">Connecter ce serveur &agrave; un agent</h4>' +
     '<div class="conf-note">Copie le bloc de ton agent &mdash; Hermes : colle sous <b>mcp_servers:</b> dans <b>~/.hermes/config.yaml</b>. Cl&eacute;s API : bloc <b>env:</b> (Hermes) ou <b>"env"</b> (JSON) &mdash; voir la desc du serveur.</div>' +
     blk('Hermes &mdash; config.yaml', hermesYaml(s)) +
@@ -818,7 +815,7 @@ function renderDetail() {
   const kvRow = (k, v) => {
     const cpy = v && v !== '—';
     return `<div class="k">${k}</div><div class="v${cpy ? ' cpy' : ''}"${cpy
-      ? ' title="Cliquer pour copier dans le presse-papiers" onclick="copyText(this.textContent)"' : ''}>${esc(v)}</div>`;
+      ? ' title="Cliquer pour copier dans le presse-papiers" data-act="copy-self"' : ''}>${esc(v)}</div>`;
   };
   const kv = [
     ['id', s.id], ['transport', ti],
@@ -866,7 +863,7 @@ function renderDetail() {
     return name === 'demarrage'; // défauts : Démarrage ouvert, Informations fermé
   };
   const fold = (name, title, inner) =>
-    `<details class="fold" data-fold="${name}"${foldOpen(name) ? ' open' : ''} ontoggle="saveFold(this)"><summary>${title}</summary>${inner}</details>`;
+    `<details class="fold" data-fold="${name}"${foldOpen(name) ? ' open' : ''}><summary>${title}</summary>${inner}</details>`;
   /* Rendu « markdown inline » minimal pour les descriptions d'outils : les
      serveurs MCP renvoient souvent **gras** et `code` — affichés bruts, les
      astérisques cassent la lecture. Le texte est ÉCHAPPÉ d'abord (aucun < >
@@ -880,7 +877,7 @@ function renderDetail() {
        <code>${esc(t.name)}</code>
        <span class="desc" title="${esc(t.desc)}">${t.desc ? mdInline(t.desc) : '&mdash;'}</span>
        <button class="tgl ${t.disabled?'off':'on'}" title="${t.disabled?'R&eacute;activer ce tool':'D&eacute;sactiver ce tool'}"
-               onclick="toggleTool(${js(s.id)},${js(t.name)})">
+               data-act="tool-toggle" data-id="${esc(s.id)}" data-tool="${esc(t.name)}">
          ${t.disabled ? 'OFF' : 'ON'}
        </button>
      </div>`).join('');
@@ -900,20 +897,20 @@ function renderDetail() {
       ${s.transport === 'stdio' ? '<span class="legacy" title="Legacy : serveur stdio uniquement (pas de transport HTTP)">legacy</span>' : ''}
       <span class="sub">${s.server_name ? esc(s.server_name) + ' v' + esc(s.version || '?') : ''}${s.latency_ms != null ? ' &middot; ' + s.latency_ms + ' ms' : ''}</span>
       <div class="d-actions">
-        ${s.can_start && s.state !== 'UP' ? `<button class="primary" onclick="act('start',${js(s.id)})">${ic('play')} Start</button>` : ''}
-        ${s.can_start && s.state === 'UP' ? `<button class="danger" onclick="act('kill',${js(s.id)})">${ic('stop')} Stop</button>` : ''}
-        <button onclick="act('refresh',${js(s.id)})">${ic('activity')} Sonder</button>
-        ${s.can_start ? `<button class="autobtn ${s.auto_restart?'on':''}" onclick="setAuto(${js(s.id)},${s.auto_restart?'false':'true'})"
+        ${s.can_start && s.state !== 'UP' ? `<button class="primary" data-act="row-act" data-op="start" data-id="${esc(s.id)}">${ic('play')} Start</button>` : ''}
+        ${s.can_start && s.state === 'UP' ? `<button class="danger" data-act="row-act" data-op="kill" data-id="${esc(s.id)}">${ic('stop')} Stop</button>` : ''}
+        <button data-act="row-act" data-op="refresh" data-id="${esc(s.id)}">${ic('activity')} Sonder</button>
+        ${s.can_start ? `<button class="autobtn ${s.auto_restart?'on':''}" data-act="set-auto" data-id="${esc(s.id)}" data-on="${s.auto_restart?'0':'1'}"
           title="Autoboot : relance automatique de ce serveur au d&eacute;marrage de MCP Control et apr&egrave;s un crash">${ic('zap')} Autoboot ${s.auto_restart?'ON':'OFF'}</button>` : ''}
-        <button class="favbtn ${s.favorite?'on':''}" onclick="setFavorite(${js(s.id)},${s.favorite?'false':'true'})"
+        <button class="favbtn ${s.favorite?'on':''}" data-act="set-fav" data-id="${esc(s.id)}" data-on="${s.favorite?'0':'1'}"
           title="Favori : &eacute;pingle ce serveur en haut de sa section dans l'explorateur (persist&eacute;)">${ic('star')} Favori ${s.favorite?'ON':'OFF'}</button>
-        <button onclick="hideServer(${js(s.id)})" title="Masquer ce serveur de l'affichage (session seulement : il revient &agrave; la r&eacute;ouverture de l'app)">${ic('eyeOff')} Masquer</button>
-        <button onclick="act('toggle',${js(s.id)})" title="${s.enabled
+        <button data-act="hide-server" data-id="${esc(s.id)}" title="Masquer ce serveur de l'affichage (session seulement : il revient &agrave; la r&eacute;ouverture de l'app)">${ic('eyeOff')} Masquer</button>
+        <button data-act="row-act" data-op="toggle" data-id="${esc(s.id)}" title="${s.enabled
           ? 'Mettre en pause : le process est arr&ecirc;t&eacute; et le serveur n&#39;est plus sond&eacute; (il reste dans la liste, r&eacute;activable d&#39;un clic)'
           : 'Reprendre la supervision : le serveur sera sond&eacute; et d&eacute;marr&eacute; si une commande est connue'}">${s.enabled ? ic('pause') + ' Mettre en pause' : ic('play') + ' Reprendre'}</button>
         ${s.origin !== 'seed'
-          ? `<button class="danger" onclick="removeSrv(${js(s.id)})">${ic('trash')} Supprimer</button>`
-          : `<button class="danger" onclick="removeSeedForever(${js(s.id)})" title="Supprime ce seed de la config : il ne sera pas r&eacute;inject&eacute; au red&eacute;marrage">${ic('trash')} Supprimer d&eacute;finitivement</button>`}
+          ? `<button class="danger" data-act="remove-srv" data-id="${esc(s.id)}">${ic('trash')} Supprimer</button>`
+          : `<button class="danger" data-act="remove-seed" data-id="${esc(s.id)}" title="Supprime ce seed de la config : il ne sera pas r&eacute;inject&eacute; au red&eacute;marrage">${ic('trash')} Supprimer d&eacute;finitivement</button>`}
       </div>
     </div>
     ${s.origin === 'seed' ? '<div class="seed-note">Serveur seed : <b>Retirer durablement</b> l&rsquo;efface m&ecirc;me apr&egrave;s red&eacute;marrage (consign&eacute; dans config.json) ; <b>D&eacute;sactiver</b> l&rsquo;&eacute;teint sans le supprimer.</div>' : ''}
@@ -921,8 +918,8 @@ function renderDetail() {
     ${fold('demarrage', 'D&eacute;marrage', `<div class="kv">${kvd}</div>${startCmdForm(s)}`)}
     ${fold('infos', 'Informations', `<div class="kv">${kv}</div>`)}
     <div class="tabs">
-      <button class="tab ${detailTab === 'outils' ? 'sel' : ''}" onclick="detailTab='outils';renderDetail()">Outils (${nTot})</button>
-      <button class="tab ${detailTab === 'conf' ? 'sel' : ''}" onclick="detailTab='conf';renderDetail()">Conf agent</button>
+      <button class="tab ${detailTab === 'outils' ? 'sel' : ''}" data-act="detail-tab" data-tab="outils">Outils (${nTot})</button>
+      <button class="tab ${detailTab === 'conf' ? 'sel' : ''}" data-act="detail-tab" data-tab="conf">Conf agent</button>
     </div>
     ${detailTab === 'conf' ? confAgent(s) : toolsHtml}`;
   // Restaure la saisie en cours du formulaire Démarrage (set_start_cmd) :
@@ -949,7 +946,7 @@ function startCmdForm(s) {
       <input id="scProgram" placeholder="programme (node, python, C:\\chemin\\serveur.exe)">
       <input id="scArgs" placeholder="arguments (ex : server.js --port ${esc(String(port))})">
       <input id="scWorkdir" placeholder="dossier de travail (optionnel)">
-      <button class="primary" onclick="setStartCmd(${js(s.id)})">Enregistrer</button>
+      <button class="primary" data-act="set-start-cmd" data-id="${esc(s.id)}">Enregistrer</button>
     </div>
   </div>`;
 }
@@ -980,6 +977,10 @@ function removeSeedForever(id) {
 /* ===== Actions ===== */
 /* ---- Menu contextuel (clic droit sur une ligne de serveur) ---------------- */
 let ctxId = null;
+/* Entrées du menu contextuel courant : les items ne portent qu'un index
+   (data-i), la table ACT relit la fermeture dans ce tableau — aucun code
+   n'est jamais construit depuis une valeur reçue. */
+let ctxItems = [];
 function ctxClose() {
   const m = document.getElementById('ctxmenu');
   if (m) { m.hidden = true; m.innerHTML = ''; }
@@ -1113,18 +1114,10 @@ function rowCtx(ev, id) {
 // '—' insère un séparateur. Une seule mécanique pour les lignes serveur et outil.
 function showMenu(ev, items) {
   const m = document.getElementById('ctxmenu');
+  ctxItems = items;
   m.innerHTML = items.map((it, i) => it.lbl === '—'
     ? '<div class="ctxsep"></div>'
-    : '<div class="ctxitem' + (it.dis ? ' dis' : '') + '" data-i="' + i + '">' + it.lbl + '</div>').join('');
-  m.querySelectorAll('.ctxitem').forEach(el => {
-    el.onclick = (e) => {
-      e.stopPropagation();
-      const it = items[+el.dataset.i];
-      if (!it || it.dis) return;
-      ctxClose();
-      it.fn();
-    };
-  });
+    : '<div class="ctxitem' + (it.dis ? ' dis' : '') + '" data-act="ctx-item" data-i="' + i + '">' + it.lbl + '</div>').join('');
   m.hidden = false;
   const w = m.offsetWidth, h = m.offsetHeight;
   m.style.left = Math.max(6, Math.min(ev.clientX, window.innerWidth - w - 8)) + 'px';
@@ -1155,8 +1148,7 @@ function toolCtx(ev, id, name) {
 }
 // Clic droit : délégation (plus fiable que des attributs inline sur du HTML
 // régénéré à chaque rendu). Ligne serveur → menu serveur, ligne outil → menu outil.
-document.addEventListener('contextmenu', (ev) => {
-  const t = ev.target && ev.target.closest ? ev.target : null;
+document.addEventListener('contextmenu', (ev) => {  const t = ev.target && ev.target.closest ? ev.target : null;
   if (!t) return;
   const row = t.closest('.srow');
   if (row && row.dataset.id) { ev.preventDefault(); ev.stopPropagation(); rowCtx(ev, row.dataset.id); return; }
@@ -1174,7 +1166,55 @@ window.addEventListener('error', (e) => {
 window.addEventListener('unhandledrejection', (e) => {
   try { document.title = 'JSERR promesse ' + ((e.reason && e.reason.message) || e.reason || 'inconnu'); } catch (_) {}
 });
-document.addEventListener('click', ctxClose);
+/* Délégation centrale (lot S2) : un écouteur par TYPE d'événement sur le
+   document — plus aucun attribut on* dans la page. Le menu contextuel se
+   ferme au clic hors de lui ; l'action du contrôle cliqué passe par la table
+   ACT (plus bas). Les plis <details> n'ont pas d'événement `toggle` qui
+   bouillonne : on enregistre leur état après le clic sur <summary>.
+   Ordre : tous les gestionnaires sont des déclarations hoistées, et ACT
+   n'est lue qu'à l'événement — après l'exécution complète du script. */
+document.addEventListener('click', (ev) => {
+  const t = ev.target;
+  if (!t || !t.closest) return;
+  if (!t.closest('#ctxmenu')) ctxClose();
+  runAction(ev);
+});
+document.addEventListener('toggle', (ev) => {
+  const d = ev.target;
+  if (d && d.matches && d.matches('details.fold[data-fold]')) saveFold(d);
+}, true);
+document.addEventListener('change', runAction);
+document.addEventListener('input', runAction);
+document.addEventListener('submit', (ev) => { ev.preventDefault(); runAction(ev); });
+// Glisser-déposer : les événements HTML5 bouillonnent, on résout la cible au
+// plus proche porteur de la classe attendue (ligne serveur ou en-tête de groupe).
+const closestOf = (ev, sel) => (ev.target && ev.target.closest ? ev.target.closest(sel) : null);
+document.addEventListener('dragstart', (ev) => {
+  const r = closestOf(ev, '.srow[data-id]');
+  if (r) rowDragStart(ev, r, r.dataset.id);
+});
+document.addEventListener('dragover', (ev) => {
+  const r = closestOf(ev, '.srow[data-id]');
+  if (r) { rowDragOver(ev, r); return; }
+  const g = closestOf(ev, '.grphead[data-key]');
+  if (g) groupDragOver(ev, g);
+});
+document.addEventListener('dragleave', (ev) => {
+  const r = closestOf(ev, '.srow[data-id]');
+  if (r) rowDragLeave(ev, r);
+  const g = closestOf(ev, '.grphead[data-key]');
+  if (g) groupDragLeave(ev, g);
+});
+document.addEventListener('drop', (ev) => {
+  const r = closestOf(ev, '.srow[data-id]');
+  if (r) { rowDrop(ev, r); return; }
+  const g = closestOf(ev, '.grphead[data-key]');
+  if (g) groupDrop(ev, g, g.dataset.key);
+});
+document.addEventListener('dragend', (ev) => {
+  const r = closestOf(ev, '.srow[data-id]');
+  if (r) rowDragEnd(ev, r);
+});
 /* Échap ferme le menu contextuel PUIS efface le filtre de l'explorateur ;
    « / » et Ctrl+K posent le focus dans le champ de filtre (raccourci
    standard : recherche instantanée depuis n'importe où). */
@@ -1292,7 +1332,7 @@ let scanBusy = false;
 async function doScan() {
   if (scanBusy) return;
   scanBusy = true;
-  const btns = [...document.querySelectorAll('button[onclick*="doScan("]')];
+  const btns = [...document.querySelectorAll('button[data-act="scan"]')];
   btns.forEach(b => { b.disabled = true; });
   try {
     const j = await postAction({action: 'scan'}, {quiet: true}); // refus toasté plus bas avec son préfixe
@@ -1683,9 +1723,9 @@ function renderMachines() {
       <div class="l1"><span class="dot UP"></span><span class="nm">${esc(h.ip)}</span><span class="tag http">${esc(h.user)}</span>${peer ? '<span class="tag sse">pair</span>' : ''}</div>
       <div class="l2">${st}</div>
       <div class="macts">
-        <button class="primary" onclick="sshDiscover(${js(h.ip)},${js(h.user)})">${ic('link')} SSH &amp; d&eacute;couvrir</button>
-        ${peer ? `<button onclick="importPeer(${js(h.ip)})">Importer ses serveurs</button>` : ''}
-        <button class="danger" onclick="sshForget(${js(h.ip)})">Oublier</button>
+        <button class="primary" data-act="ssh-discover" data-id="${esc(h.ip)}" data-user="${esc(h.user)}">${ic('link')} SSH &amp; d&eacute;couvrir</button>
+        ${peer ? `<button data-act="import-peer" data-id="${esc(h.ip)}">Importer ses serveurs</button>` : ''}
+        <button class="danger" data-act="ssh-forget" data-id="${esc(h.ip)}">Oublier</button>
       </div>
     </div>`;
   }).join('');
@@ -1693,7 +1733,7 @@ function renderMachines() {
   html += autres.map(p => `<div class="machine-row">
       <div class="l1"><span class="dot UP"></span><span class="nm">${esc(p.ip)}</span><span class="tag sse">pair</span></div>
       <div class="l2">UI :${esc(p.ui_port)} &mdash; ${esc((p.stats||{}).up ?? '?')} UP / ${esc((p.stats||{}).total ?? '?')} serveurs</div>
-      <div class="macts"><button onclick="importPeer(${js(p.ip)})">Importer ses serveurs</button></div>
+      <div class="macts"><button data-act="import-peer" data-id="${esc(p.ip)}">Importer ses serveurs</button></div>
     </div>`).join('');
   box.innerHTML = html;
 }
@@ -1778,7 +1818,7 @@ async function importMcp() {
 }
 
 async function addServer(ev) {
-  ev.preventDefault();
+  if (ev && ev.preventDefault) ev.preventDefault();
   const t = document.getElementById('fTransport').value;
   const body = {action: 'add', transport: t, label: document.getElementById('fLabel').value};
   if (t === 'http') {
@@ -1818,7 +1858,7 @@ async function openStore() {
     }).catch(() => {});
     const cats = ['Tout', ...new Set(storeItems.map(i => i.cat))];
     document.getElementById('storeCats').innerHTML = cats.map(c =>
-      `<button class="scat ${c===storeCat?'sel':''}" onclick="storeCat=${js(c)};renderStoreItems()">${esc(c)}</button>`).join('');
+      `<button class="scat ${c===storeCat?'sel':''}" data-act="store-cat" data-cat="${esc(c)}">${esc(c)}</button>`).join('');
   }
   renderStoreItems();
 }
@@ -1888,7 +1928,7 @@ function renderStoreItems() {
       <div class="scard-desc">${esc(i.desc)}</div>
       ${isInst
         ? `<button class="btn-inst" disabled title="Ce serveur est d&eacute;j&agrave; dans ta liste">${ic('check')} D&eacute;j&agrave; install&eacute;</button>`
-        : `<button class="primary" onclick="installStore(${js(i.id)}, this)">${ic('download')} Installer</button>`}
+        : `<button class="primary" data-act="install-store" data-id="${esc(i.id)}">${ic('download')} Installer</button>`}
     </div>`;
   }).join('') || '<div class="empty-sec">aucun r&eacute;sultat</div>';
 }
@@ -1935,19 +1975,43 @@ async function installStore(id, btn) {
 })();
 
 /* ===== Contrôles de fenêtre (desktop Tauri uniquement : ni data-tauri-drag-region
-   ni __TAURI__ n'ont d'effet dans un navigateur classique, les boutons y restent masqués) ===== */
-(function () {
+   ni IPC Tauri n'ont d'effet dans un navigateur classique, les boutons y restent masqués) ===== */
+function tauriInvoke() {
   try {
+    const I = window.__TAURI_INTERNALS__;
+    if (I && typeof I.invoke === 'function') {
+      return cmd => I.invoke(cmd, {});
+    }
     const W = window.__TAURI__ && window.__TAURI__.window;
-    if (!W) return;
+    if (!W) return null;
     const tw = W.getCurrentWindow ? W.getCurrentWindow() : (W.getCurrent ? W.getCurrent() : null);
-    if (!tw) return;
-    document.getElementById('winCtrls').style.display = 'flex';
-    document.getElementById('wMin').onclick = () => tw.minimize();
-    document.getElementById('wMax').onclick = () => tw.toggleMaximize();
-    document.getElementById('wClose').onclick = () => tw.close();
-  } catch (e) { /* navigateur classique : rien à câbler */ }
+    if (!tw) return null;
+    return cmd => {
+      if (cmd === 'plugin:window|minimize') return tw.minimize();
+      if (cmd === 'plugin:window|toggle_maximize') return tw.toggleMaximize();
+      if (cmd === 'plugin:window|close') return tw.close();
+    };
+  } catch (e) { return null; }
+}
+/* Boutons de fenêtre visibles seulement si l'API fenêtre existe (desktop) :
+   hors Tauri ils resteraient des boutons morts. */
+(function () {
+  if (!tauriInvoke()) return;
+  const box = document.getElementById('winCtrls');
+  if (box) box.style.display = 'flex';
 })();
+function winAction(op) {
+  const inv = tauriInvoke();
+  if (!inv) return;
+  const cmds = {
+    min: 'plugin:window|minimize',
+    max: 'plugin:window|toggle_maximize',
+    close: 'plugin:window|close',
+  };
+  const cmd = cmds[op];
+  if (!cmd) return;
+  try { Promise.resolve(inv(cmd)).catch(() => {}); } catch (e) { /* API refusée : aucun effet */ }
+}
 
 /* Journal replié PAR DÉFAUT (interface épurée) : l'opérateur l'ouvre d'un clic
    sur sa barre et son choix est retenu (localStorage). */
@@ -2084,9 +2148,9 @@ function renderAccPending() {
     <div class="acc-what">${esc((p.effect || {}).resume || '')}</div>
     ${effectHtml(p.effect)}
     <div class="acc-acts">
-      <button class="primary" onclick="confirmApprove(${js(p.id)},'once')">Accepter une fois</button>
-      <button onclick="confirmApprove(${js(p.id)},'window')">Accepter ${esc(Math.round((accessState.window_secs || 600) / 60))} minutes</button>
-      <button class="danger" onclick="confirmDeny(${js(p.id)})">Refuser</button>
+      <button class="primary" data-act="confirm-approve" data-id="${esc(p.id)}" data-mode="once">Accepter une fois</button>
+      <button data-act="confirm-approve" data-id="${esc(p.id)}" data-mode="window">Accepter ${esc(Math.round((accessState.window_secs || 600) / 60))} minutes</button>
+      <button class="danger" data-act="confirm-deny" data-id="${esc(p.id)}">Refuser</button>
     </div>
   </div>`).join('');
   box.innerHTML = html;
@@ -2101,7 +2165,7 @@ function renderAccPending() {
       <span class="acc-ttl">${esc(g.expires_in)} s restantes</span>
     </div>
     <div class="acc-who">${esc(g.label || g.keyid)}</div>
-    <div class="acc-acts"><button class="danger" onclick="grantRevoke(${js(g.id)})">R\u00e9voquer</button></div>
+    <div class="acc-acts"><button class="danger" data-act="grant-revoke" data-id="${esc(g.id)}">R\u00e9voquer</button></div>
   </div>`).join('');
   grantsBox.innerHTML = gh;
 }
@@ -2114,14 +2178,14 @@ function renderAccClients() {
     const droits = c.rights || [];
     const boutons = ['lecture', 'pilotage', 'execution'].map(r => {
       const classeOn = droits.includes(r) ? ' on' : '';
-      return `<button class="acc-right${classeOn}" onclick="clientToggleRight(${js(c.keyid)},${js(r)})"
+      return `<button class="acc-right${classeOn}" data-act="client-right" data-id="${esc(c.keyid)}" data-right="${esc(r)}"
         title="${esc(droits.includes(r) ? 'Retirer' : 'Accorder')} le droit ${esc(r)}">${esc(r)}</button>`;
     }).join('');
     const revoque = c.status === 'revoked';
     const classeOff = revoque ? ' off' : '';
     const badgeRevoque = revoque ? '<span class="acc-tag bad">r\u00e9voqu\u00e9</span>' : '';
     const btnRevoque = revoque ? ''
-      : '<button class="danger" onclick="clientRevokeConfirm(' + js(c.keyid) + ')">R\u00e9voquer</button>';
+      : '<button class="danger" data-act="client-revoke" data-id="' + esc(c.keyid) + '">R\u00e9voquer</button>';
     return `<div class="acc-card${classeOff}">
       <div class="acc-h">
         <span class="acc-tool">${esc(c.label || c.keyid)}</span>
@@ -2150,7 +2214,7 @@ function renderAccPairs() {
     const choisis = pairDroits[p.pair_id];
     const cases = ['lecture', 'pilotage', 'execution'].map(r =>
       `<label class="acc-chk"><input type="checkbox" data-pair="${esc(p.pair_id)}" data-right="${esc(r)}"
-        ${esc(choisis.includes(r) ? 'checked' : '')} onchange="pairRightChange(this)">${esc(r)}</label>`).join('');
+        ${esc(choisis.includes(r) ? 'checked' : '')} data-act="pair-right">${esc(r)}</label>`).join('');
     return `<div class="acc-card">
       <div class="acc-h">
         <span class="acc-code" title="le client affiche le m\u00eame code : s\u2019ils diff\u00e8rent, refusez">${esc(p.code)}</span>
@@ -2159,8 +2223,8 @@ function renderAccPairs() {
       <div class="acc-who">${esc(p.label || p.keyid)} <span class="acc-fp" title="${esc(p.fingerprint)}">${esc(p.fingerprint_court || '')}</span>
         \u00b7 ${esc(p.keyid)} \u00b7 depuis ${esc(p.paired_from || '?')}</div>
       <div class="acc-acts">${cases}
-        <button class="primary" onclick="pairApprove(${js(p.pair_id)})">Accepter</button>
-        <button class="danger" onclick="pairReject(${js(p.pair_id)})">Refuser</button>
+        <button class="primary" data-act="pair-approve" data-id="${esc(p.pair_id)}">Accepter</button>
+        <button class="danger" data-act="pair-reject" data-id="${esc(p.pair_id)}">Refuser</button>
       </div>
     </div>`;
   }).join('');
@@ -2269,6 +2333,130 @@ function armPolling() {
   const secs = Math.max(5, (state && state.settings && state.settings.refresh_secs) || 5);
   scheduleNext(secs * 1000);
 }
+/* ===== Table action → fonction (lot S2) ==================================
+   AUCUN attribut on* nulle part : chaque contrôle porte data-act (clé de
+   cette table) et, au besoin, data-id / data-op / data-on / data-tab /
+   data-mode / data-cat / data-key / data-tool / data-pair / data-right /
+   data-i. Les valeurs data-* sont des CHAÎNES relues dans dataset — jamais
+   évaluées, jamais concaténées dans du code : une valeur venue du moteur ne
+   peut pas devenir du JavaScript. Tout texte affiché passe par esc() au
+   moment où le HTML est écrit. */
+const ACT = {
+  // -- barre de titre, bandeaux, journal
+  'logout': () => logout(),
+  'scan': () => doScan(),
+  'scan-net': () => doScanNet(),
+  'machines': () => openMachineDlg(),
+  'store': () => openStore(),
+  'access-open': el => openAccessDlg(el.dataset.pending === '1'),
+  'settings-open': () => openSettingsDlg(),
+  'refresh-all': () => refreshAll(),
+  'log-toggle': () => toggleLog(),
+  'net-detail': () => showNetDetail(),
+  'autostart': () => toggleAutostart(),
+  'update-download': () => downloadUpdate(),
+  // -- contrôles de fenêtre (desktop Tauri : sans effet dans un navigateur)
+  'win-min': () => winAction('min'),
+  'win-max': () => winAction('max'),
+  'win-close': () => winAction('close'),
+  // -- explorateur
+  'sort': el => applySort(el.value),
+  'srv-filter': () => renderServers(),
+  'clear-filter': () => clearFilter(),
+  'show-hidden': () => showHiddenServers(),
+  'group-toggle': el => toggleGroup(el.dataset.key),
+  'add-server': () => toggleAdd(),
+  'select': el => select(el.dataset.id),
+  'row-act': el => act(el.dataset.op, el.dataset.id),
+  'set-auto': el => setAuto(el.dataset.id, el.dataset.on === '1'),
+  'set-fav': el => setFavorite(el.dataset.id, el.dataset.on === '1'),
+  'hide-server': el => hideServer(el.dataset.id),
+  'remove-srv': el => removeSrv(el.dataset.id),
+  'remove-seed': el => removeSeedForever(el.dataset.id),
+  'ssh-forget': el => sshForget(el.dataset.id),
+  'import-peer': el => importPeer(el.dataset.id),
+  // -- accueil et détail serveur
+  'tile': el => tileFilter(el.dataset.mode),
+  'tile-tools': () => tileSortTools(),
+  'detail-tab': el => { detailTab = el.dataset.tab; renderDetail(); },
+  'tool-toggle': el => toggleTool(el.dataset.id, el.dataset.tool),
+  'copy-self': el => copyText(el.textContent),
+  'copy-conf': el => copyConf(el),
+  'set-start-cmd': el => setStartCmd(el.dataset.id),
+  'ctx-item': el => ctxItem(el),
+  // -- boutique
+  'store-cat': el => { storeCat = el.dataset.cat; renderStoreItems(); },
+  'store-search': () => renderStoreItems(),
+  'store-sort': () => renderStoreItems(),
+  'store-hide-inst': () => toggleHideInst(),
+  'install-store': el => installStore(el.dataset.id, el),
+  // -- machines distantes (SSH)
+  'ssh-discover': el => sshDiscover(el.dataset.id, el.dataset.user),
+  'ssh-save': () => sshSave(),
+  'peers-scan': () => { doPeers().then(() => setTimeout(renderMachines, 3000)); },
+  // -- réglages
+  'set-pane': el => setPane(el.dataset.pane),
+  'theme': el => applyThemeAndSave(el.dataset.theme),
+  'test-notify': () => testNotify(),
+  'check-update': () => checkUpdateNow(),
+  'release-page': () => openReleasePage(),
+  'settings-close': () => closeSettings(),
+  'save-settings': () => saveSettings(),
+  'reset-state': () => resetState(document.getElementById('sResetWhat').value),
+  'reset-runtime': () => resetRuntime(),
+  // -- écran Accès
+  'access-close': () => closeAccessDlg(),
+  'access-tab': el => setAccessTab(el.dataset.atab),
+  'access-refresh': () => refreshAccess(),
+  'confirm-approve': el => confirmApprove(el.dataset.id, el.dataset.mode),
+  'confirm-deny': el => confirmDeny(el.dataset.id),
+  'grant-revoke': el => grantRevoke(el.dataset.id),
+  'client-right': el => clientToggleRight(el.dataset.id, el.dataset.right),
+  'client-revoke': el => clientRevokeConfirm(el.dataset.id),
+  'pair-approve': el => pairApprove(el.dataset.id),
+  'pair-reject': el => pairReject(el.dataset.id),
+  'pair-right': el => pairRightChange(el),
+  // -- formulaires et dialogs
+  'add-submit': (_el, ev) => addServer(ev),
+  'login-submit': (_el, ev) => loginSubmit(ev),
+  'transport': () => transportChanged(),
+  'import-mcp': () => importMcp(),
+  'forget-code': () => forgetCode(),
+  'close-dialog': el => { const d = el.closest('dialog'); if (d) d.close(); },
+};
+
+/* Entrée du menu contextuel : l'index vient de data-i, la fonction du tableau
+   d'items du menu courant — aucune valeur reçue n'est exécutée. */
+function ctxItem(el) {
+  const it = ctxItems[+el.dataset.i];
+  if (!it || it.dis) return;
+  ctxClose();
+  it.fn();
+}
+
+/* Aiguillage unique : le contrôle le plus proche porteur de data-act gagne
+   (un bouton dans une ligne n'arme pas l'action de la ligne), puis la table
+   décide. Une clé inconnue ne fait rien — le test Rust interdit les clés
+   orphelines dans les deux sens.
+   Filtre de type : un <form data-act> n'agit qu'au SUBMIT (sinon un clic dans
+   un champ déclencherait l'envoi) ; un <select>/<input data-act> n'agit qu'au
+   change/input (sinon son clic vaudrait choix). */
+const CHAMPS = ['INPUT', 'SELECT', 'TEXTAREA'];
+const isNonTextChamp = el => el.tagName === 'SELECT'
+  || (el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio'));
+function runAction(ev) {
+  const t = ev.target;
+  const el = t && t.closest ? t.closest('[data-act]') : null;
+  if (!el) return;
+  const tag = el.tagName;
+  if (ev.type === 'click' && (tag === 'FORM' || CHAMPS.includes(tag))) return;
+  if ((ev.type === 'change' || ev.type === 'input') && !CHAMPS.includes(tag)) return;
+  if (ev.type === 'input' && isNonTextChamp(el)) return;
+  const fn = ACT[el.dataset.act];
+  if (!fn) return;
+  fn(el, ev);
+}
+
 loadFrameworks();
 updateLogoutBtn();
 load();
