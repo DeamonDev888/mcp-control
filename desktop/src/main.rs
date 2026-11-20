@@ -28,12 +28,25 @@ fn main() {
     // envoyé au serveur, `app.js` l'échange contre le cookie `mcc_session` puis
     // l'efface. Aucun jeton à demander à l'utilisateur.
     // Si le moteur a été RÉUTILISÉ (un moteur tournait déjà, desktop ou
-    // headless), ce process n'a pas tiré de jeton : on ouvre l'URL nue et
-    // l'UI signalera l'absence de session.
-    let ui_url = if outcome.session_url.is_empty() {
-        outcome.url
+    // headless), le shell demande un jeton par le canal fichier du dossier de
+    // config (S-1 pt 3) : même utilisateur seulement, 2 min, usage unique.
+    let base = outcome.url.clone();
+    let ui_url = if !outcome.session_url.is_empty() {
+        outcome.session_url.clone()
+    } else if outcome.reused {
+        match mcp_control::auth::session::request_bootstrap(
+            &outcome.config_path,
+            std::time::Duration::from_secs(5),
+        ) {
+            Ok(jeton) => format!("{}/#t={}", base.trim_end_matches('/'), jeton),
+            // Aucun jeton journalisé : seule l'absence est signalée.
+            Err(e) => {
+                eprintln!("[session] {e}");
+                base.clone()
+            }
+        }
     } else {
-        outcome.session_url
+        base.clone()
     };
     // lancé au boot de Windows (entrée autostart) → pas de fenêtre, tray seulement
     let hidden = std::env::args().any(|a| a == "--hidden");

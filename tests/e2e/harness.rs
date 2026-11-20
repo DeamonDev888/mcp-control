@@ -104,6 +104,9 @@ pub struct Engine {
     /// Session locale (docs/auth.md §6) : le cookie obtenu en échangeant le
     /// jeton d'amorçage imprimé sur la console du moteur.
     session: Option<String>,
+    /// Secret de session (S-1) : mémoire de la page, jamais cookie. Présenté
+    /// dans `X-MCC-Session` sur chaque requête `/api/*` loopback.
+    session_secret: Option<String>,
     /// Identité du harnais sur `/mcp` (paire Ed25519 appairée au démarrage,
     /// droits `lecture` + `pilotage` + `execution`). None = aucune identité.
     signer: Option<Arc<Signer>>,
@@ -219,6 +222,7 @@ fn spawn_in(cfg: EngineCfg, tmp: PathBuf) -> std::io::Result<Engine> {
         port: cfg.ui_port,
         bind: cfg.ui_bind,
         session: None,
+        session_secret: None,
         signer: None,
         keyid: String::new(),
         auto_approve: true,
@@ -429,18 +433,17 @@ impl Engine {
                 }
             }
         }
-        // CSRF de §6 : toute écriture locale de l'UI porte `X-MCC-Request: 1`.
-        if local
-            && method == "POST"
-            && (path.starts_with("/api/action") || path.starts_with("/api/session"))
-            && !has(&all, "x-mcc-request")
-        {
-            all.push(("X-MCC-Request".to_string(), "1".to_string()));
-        }
+        // CSRF (S-1) : plus d'en-tête constant `X-MCC-Request`. La session
+        // exige cookie ET secret (`X-MCC-Session`), comme `app.js`.
         if local {
             if let Some(cookie) = &self.session {
                 if !has(&all, "cookie") {
                     all.push(("Cookie".to_string(), format!("mcc_session={cookie}")));
+                }
+            }
+            if let Some(secret) = &self.session_secret {
+                if !has(&all, "x-mcc-session") {
+                    all.push(("X-MCC-Session".to_string(), secret.clone()));
                 }
             }
         }
@@ -530,6 +533,11 @@ impl Engine {
         self.session.as_deref()
     }
 
+    /// Secret de session (S-1), `None` avant l'échange.
+    pub fn session_secret(&self) -> Option<&str> {
+        self.session_secret.as_deref()
+    }
+
     /// Signeur du harnais sur `/mcp` (None = aucune identité).
     pub fn signer(&self) -> Option<&Arc<Signer>> {
         self.signer.as_ref()
@@ -593,8 +601,69 @@ impl Engine {
                 valeur.len()
             ));
         }
-        self.session = Some(valeur.to_string());
+        // S-1 : le secret de session arrive dans le corps, la page le garde en
+        // MÉMOIRE et le présente dans `X-MCC-Session`.
+        let secret = r
+            .json()
+            .get("secret")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if secret.len() != 43 {
+            return Err(format!(
+                "secret de session absent de /api/session ({} car.)",
+                secret.len()
+            ));
+        }
+        let cookie = valeur.to_string();
+        self.session = Some(cookie);
+        self.session_secret = Some(secret);
         Ok(())
+    }
+
+    /// Ouvre une SECONDE session (autre fenêtre) sans toucher à la courante, en
+    /// passant par le canal fichier du moteur (S-1 pt 3) : c'est exactement le
+    /// chemin d'une fenêtre rouverte. Rend `(cookie, secret)`.
+    pub fn open_extra_session(&self) -> Result<(String, String), String> {
+        let config = self.tmp.join("config.json").to_string_lossy().to_string();
+        let token =
+            mcp_control::auth::session::request_bootstrap(&config, Duration::from_secs(15))?;
+        let corps = json!({ "token": token }).to_string();
+        let r = self.send(
+            "127.0.0.1",
+            self.port,
+            "POST",
+            "/api/session",
+            &[],
+            Some(corps.as_bytes()),
+            SignMode::None,
+        );
+        if r.status != 200 {
+            return Err(format!(
+                "POST /api/session (2e) → {} : {}",
+                r.status,
+                r.text()
+            ));
+        }
+        let set_cookie = r
+            .header("set-cookie")
+            .ok_or("Set-Cookie absent de /api/session (2e)")?;
+        let cookie = set_cookie
+            .split(';')
+            .next()
+            .and_then(|c| c.trim().strip_prefix("mcc_session="))
+            .ok_or("cookie de session absent (2e)")?
+            .to_string();
+        let secret = r
+            .json()
+            .get("secret")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if cookie.len() != 43 || secret.len() != 43 {
+            return Err("session 2 : cookie ou secret de taille inattendue".to_string());
+        }
+        Ok((cookie, secret))
     }
 
     /// Lit `[session] http://…/#t=<jeton>` dans la console du moteur (stdout

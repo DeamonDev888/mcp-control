@@ -1234,6 +1234,211 @@ fn engine_ready() -> Engine {
 }
 
 // =====================================================================
+// Lot S1 — session locale : cookie ET secret (docs/auth.md §6)
+// =====================================================================
+
+/// GET /api/state avec EXACTEMENT les éléments de session demandés (cas
+/// négatifs de S-1 : ni le harnais ni `app.js` n'ajoutent quoi que ce soit).
+fn statut_avec_session(e: &Engine, cookie: Option<&str>, secret: Option<&str>) -> u16 {
+    let mut req = format!("GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n", e.port);
+    if let Some(c) = cookie {
+        req.push_str(&format!("Cookie: mcc_session={c}\r\n"));
+    }
+    if let Some(s) = secret {
+        req.push_str(&format!("X-MCC-Session: {s}\r\n"));
+    }
+    req.push_str("Connection: close\r\n\r\n");
+    e.raw(req.as_bytes(), 0).status
+}
+
+/// S-1 : le cookie seul n'ouvre plus `/api/*` ; il faut cookie ET secret, et le
+/// secret est comparé (mauvais secret = 401).
+#[test]
+fn session_exige_cookie_et_secret() {
+    let _garde = serial_guard();
+    let e = engine_ready();
+    let cookie = e.session_cookie().expect("session").to_string();
+    let secret = e.session_secret().expect("secret").to_string();
+    assert_eq!(
+        statut_avec_session(&e, Some(&cookie), None),
+        401,
+        "cookie seul : refusé (S-1)"
+    );
+    assert_eq!(
+        statut_avec_session(&e, Some(&cookie), Some(&"B".repeat(43))),
+        401,
+        "cookie + mauvais secret : refusé"
+    );
+    assert_eq!(
+        statut_avec_session(&e, None, Some(&secret)),
+        401,
+        "secret seul : refusé"
+    );
+    assert_eq!(
+        statut_avec_session(&e, Some(&cookie), Some(&secret)),
+        200,
+        "cookie + secret : accepté"
+    );
+}
+
+/// S-1 pt 2 : une 2e fenêtre obtient SA session (canal fichier, jeton à usage
+/// unique) sans invalider la 1re.
+#[test]
+fn deuxieme_fenetre_sans_invalider_la_premiere() {
+    let _garde = serial_guard();
+    let e = engine_ready();
+    let c1 = e.session_cookie().expect("session 1").to_string();
+    let s1 = e.session_secret().expect("secret 1").to_string();
+    let (c2, s2) = e.open_extra_session().expect("2e session");
+    assert_ne!(c1, c2, "deux sessions distinctes");
+    assert_ne!(s1, s2, "deux secrets distincts");
+    assert_eq!(
+        statut_avec_session(&e, Some(&c1), Some(&s1)),
+        200,
+        "la 1re fenêtre reste valide"
+    );
+    assert_eq!(
+        statut_avec_session(&e, Some(&c2), Some(&s2)),
+        200,
+        "la 2e fenêtre est valide"
+    );
+    // le canal fichier ne laisse aucun jeton derrière lui
+    assert!(
+        !e.tmp_dir().join("mcc-session.req").exists(),
+        "demande supprimée dès service"
+    );
+    assert!(
+        !e.tmp_dir().join("mcc-session.grant").exists(),
+        "réponse supprimée dès lecture"
+    );
+}
+
+/// S-1 pt 2 : `POST /api/session/close-others` révoque les autres sessions et
+/// garde la courante. Route locale, hors du dispatcher d'actions.
+#[test]
+fn fermer_les_autres_sessions_garde_la_courante() {
+    let _garde = serial_guard();
+    let e = engine_ready();
+    let c1 = e.session_cookie().expect("session 1").to_string();
+    let s1 = e.session_secret().expect("secret 1").to_string();
+    let (c2, s2) = e.open_extra_session().expect("2e session");
+    let (c3, s3) = e.open_extra_session().expect("3e session");
+    // le harnais présente sa session courante (1re) sur la route
+    let r = e.post_json("/api/session/close-others", &json!({}));
+    assert_eq!(r.status, 200, "close-others : {}", r.text());
+    assert_eq!(r.json()["closed"], json!(2), "{}", r.text());
+    assert_eq!(
+        statut_avec_session(&e, Some(&c1), Some(&s1)),
+        200,
+        "la session courante survit"
+    );
+    for (c, s, nom) in [(&c2, &s2, "2e"), (&c3, &s3, "3e")] {
+        assert_eq!(
+            statut_avec_session(&e, Some(c), Some(s)),
+            401,
+            "la {nom} session doit être révoquée"
+        );
+    }
+}
+
+/// S-1 pt 3 : un SECOND lancement (mode headless) sur le même `config.json`
+/// n'imprime plus une sortie sans session : il obtient un jeton d'amorçage par
+/// le canal fichier du dossier de config, et ce jeton ouvre une session.
+/// C'est le scénario exact de l'audit (« sortie 0, reused:true, session_url
+/// vide »).
+#[test]
+fn second_lancement_headless_obtient_un_jeton_utilisable() {
+    let _garde = serial_guard();
+    let e = engine_ready();
+    let dir = e.tmp_dir().clone();
+    let log = dir.join("second-stdout.log");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-control"));
+    cmd.env("MCC_CONFIG", dir.join("config.json"))
+        .env("MCC_KEYRING_SERVICE", "")
+        .env_remove("MCC_API_ACCESS");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let sortie = std::fs::File::create(&log).expect("log du 2e lancement");
+    let mut enfant = cmd
+        .stdout(Stdio::from(sortie))
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("2e lancement");
+    // Le 2e process rend la main après avoir détecté le moteur et demandé le
+    // jeton : on l'attend borné, puis on le tue s'il s'est trompé de chemin.
+    let limite = Instant::now() + Duration::from_secs(30);
+    let mut fini = false;
+    while Instant::now() < limite {
+        if enfant
+            .try_wait()
+            .expect("attente du 2e lancement")
+            .is_some()
+        {
+            fini = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !fini {
+        let _ = enfant.kill();
+        let _ = enfant.wait();
+        panic!("le 2e lancement ne rend pas la main (moteur doublé ?)");
+    }
+    // Processus déjà terminé : `wait` récolte le statut (zombie évité).
+    let _ = enfant.wait();
+    let texte = std::fs::read_to_string(&log).unwrap_or_default();
+    let url = texte
+        .lines()
+        .find(|l| l.starts_with("[session] http://"))
+        .unwrap_or_else(|| panic!("aucune ligne [session] utilisable dans : {texte}"))
+        .to_string();
+    let jeton = url.rsplit("#t=").next().unwrap_or("").trim().to_string();
+    assert_eq!(jeton.len(), 43, "URL de session inattendue : {url}");
+    // Le jeton du canal fichier est réellement utilisable — une seule fois.
+    let corps = format!("{{\"token\":\"{jeton}\"}}");
+    let r = e.send(
+        "127.0.0.1",
+        e.port,
+        "POST",
+        "/api/session",
+        &[("Content-Type", "application/json")],
+        Some(corps.as_bytes()),
+        SignMode::None,
+    );
+    assert_eq!(r.status, 200, "jeton du 2e lancement refusé : {}", r.text());
+    assert!(
+        r.json()["secret"].as_str().is_some_and(|s| s.len() == 43),
+        "le 2e lancement doit aussi recevoir un secret de session"
+    );
+}
+
+/// S-1 pt 2 : plafond de 8 sessions simultanées — la 9e est refusée, les 8
+/// premières restent vivantes (échec fermé, pas d'éviction silencieuse).
+#[test]
+fn plafond_de_huit_sessions_en_e2e() {
+    let _garde = serial_guard();
+    let e = engine_ready();
+    let c1 = e.session_cookie().expect("session 1").to_string();
+    let s1 = e.session_secret().expect("secret 1").to_string();
+    for n in 2..=8 {
+        e.open_extra_session()
+            .unwrap_or_else(|err| panic!("session {n} : {err}"));
+    }
+    assert!(
+        e.open_extra_session().is_err(),
+        "la 9e session doit être refusée"
+    );
+    assert_eq!(
+        statut_avec_session(&e, Some(&c1), Some(&s1)),
+        200,
+        "les 8 sessions existantes restent valides"
+    );
+}
+
+// =====================================================================
 // Lot M3 — confirmation humaine avant exécution (docs/auth.md §5)
 // =====================================================================
 
