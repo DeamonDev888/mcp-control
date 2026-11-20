@@ -29,12 +29,16 @@ function applyThemeAndSave(t) {
 }
 const _mccFetch = window.fetch.bind(window);
 
-/* Session locale (docs/auth.md §6) : le jeton d'amorçage arrive dans le
+/* Session locale (docs/auth.md §6, lot S1) : le jeton d'amorçage arrive dans le
    FRAGMENT de l'URL — jamais envoyé au serveur, jamais dans Referer, jamais
-   dans mcc.log. On l'échange UNE fois contre le cookie `mcc_session`
-   (HttpOnly, SameSite=Strict), puis on efface le fragment : l'URL redevient
-   celle qu'on peut copier sans rien livrer. Rien n'est stocké côté page (ni
-   localStorage ni en-tête Authorization) : le cookie fait tout. */
+   dans mcc.log. On l'échange UNE fois contre le cookie `mcc_session` ET un
+   secret de session gardé UNIQUEMENT en mémoire (jamais cookie, jamais
+   localStorage/sessionStorage) : il repart dans `X-MCC-Session` à chaque appel
+   /api/*. Le moteur exige les deux (cookie + secret). Puis on efface le
+   fragment : l'URL redevient celle qu'on peut copier sans rien livrer. */
+let sessionSecret = '';
+let sessionLost = false;
+const SESSION_LOST_MSG = 'session expirée — rouvre le lien de démarrage (MCP Control)';
 async function exchangeSession() {
   let token = '';
   try {
@@ -46,10 +50,14 @@ async function exchangeSession() {
   try {
     const r = await _mccFetch('/api/session', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json', 'X-MCC-Request': '1'},
+      headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({token: token})
     });
-    ok = r.ok;
+    const j = await r.json().catch(() => null);
+    if (r.ok && j && typeof j.secret === 'string' && j.secret) {
+      sessionSecret = j.secret; // mémoire seulement : jamais cookie ni stockage
+      ok = true;
+    }
   } catch (e) { ok = false; }
   // fragment effacé DANS TOUS LES CAS : le jeton est à usage unique, le garder
   // dans la barre d'adresse ne ferait que l'afficher.
@@ -62,15 +70,33 @@ const sessionReady = exchangeSession();
 
 window.fetch = async (url, opts = {}) => {
   const isApi = typeof url === 'string' && url.startsWith('/api/');
-  if (isApi) await sessionReady;
-  const code = accessCode();
-  if (isApi && code) {
-    opts.headers = Object.assign({}, opts.headers || {}, {'X-MCC-Access': code});
+  if (isApi) {
+    await sessionReady;
+    // Session perdue : plus AUCUNE requête /api/* ne part (U-9) — sans cela le
+    // polleur rejouerait un 401 à chaque cycle. Réponse synthétique locale.
+    if (sessionLost) {
+      return new Response(JSON.stringify({ok: false, error: SESSION_LOST_MSG}),
+        {status: 401, headers: {'Content-Type': 'application/json'}});
+    }
   }
-  const r = await _mccFetch(url, opts);
-  if (isApi && r.status === 401) showLogin();
+  const h = Object.assign({}, opts.headers || {});
+  const code = accessCode();
+  if (isApi && code) h['X-MCC-Access'] = code;
+  if (isApi && sessionSecret) h['X-MCC-Session'] = sessionSecret;
+  const r = await _mccFetch(url, Object.assign({}, opts, {headers: h}));
+  if (isApi && r.status === 401) onUnauthorized();
   return r;
 };
+/* 401 de session (U-9) : on n'ouvre plus le dialogue de l'ancien code d'accès.
+   Un code hérité réellement stocké (bind LAN, lecture seule) garde son dialogue ;
+   sinon on annonce « session expirée » UNE fois et on cesse d'appeler /api/*. */
+function onUnauthorized() {
+  if (accessCode()) { showLogin(); return; }
+  if (sessionLost) return;
+  sessionLost = true;
+  toast(SESSION_LOST_MSG, 'err', 8000);
+  setDead(true, SESSION_LOST_MSG);
+}
 function showLogin() {
   const d = document.getElementById('loginDlg');
   if (d && !d.open) { d.showModal(); document.getElementById('loginCode').focus(); }
@@ -192,6 +218,8 @@ async function load() {
   if (document.hidden) return; // fenêtre masquée (tray) : polling suspendu — CPU/mémoire au repos
   try {
     const r = await fetch('/api/state');
+    // Un 401 (session expirée) n'est pas un état : ne jamais le rendre.
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     state = await r.json();
     pollFails = 0;
     setDead(false);
@@ -203,8 +231,9 @@ async function load() {
     }
   } catch(e) {
     // moteur injoignable ou redémarrage : signaler au lieu de laisser des
-    // chiffres périmés sans message. Un 401 (code d'accès demandé) n'est pas
-    // une panne : le dialog de déverrouillage est ouvert, on ne compte pas.
+    // chiffres périmés sans message. Un 401 de session (U-9) a déjà posé le
+    // bandeau et coupé les appels : on ne compte pas de panne réseau.
+    if (sessionLost) { setDead(true, SESSION_LOST_MSG); return; }
     if (document.getElementById('loginDlg')?.open) return;
     pollFails++;
     if (state === null) setDead(true, DEAD_BOOT_MSG);
@@ -1202,7 +1231,7 @@ async function postAction(body, opts) {
   let r;
   try {
     r = await fetch('/api/action', {method: 'POST',
-      headers: {'Content-Type': 'application/json', 'X-MCC-Request': '1'},
+      headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body)});
   } catch (e) {
     return netDown(); // erreur réseau : bandeau immédiat (lot C #3)

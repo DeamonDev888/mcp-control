@@ -562,8 +562,14 @@ fn rafraichir_hosts_sur_host_inconnu(state: &Arc<AppState>) -> bool {
 ///    `/api/session` (c'est elle qui crée la session) ;
 /// 6. un appelant HÉRITÉ (`X-MCC-Access` ou preuve de pair, §10) n'obtient que
 ///    la LECTURE : `POST /api/action` → 403 ;
-/// 7. toute écriture (`POST /api/action`, `POST /api/session`) exige
-///    `X-MCC-Request: 1` → 403 sinon (CSRF), et `application/json` → 415 sinon.
+/// 7. toute écriture (`POST /api/action`, `POST /api/session`, `POST
+///    /api/session/close-others`) exige `application/json` → 415 sinon.
+///
+/// CSRF (S-1) : il n'y a plus d'en-tête constant `X-MCC-Request`. Toute requête
+/// `/api/*` authentifiée porte désormais `X-MCC-Session`, un en-tête SECRET à
+/// nom personnalisé : une page tierce ne peut pas le fabriquer, et l'envoyer
+/// impose un préflight CORS que le serveur refuse (403, règle 1). Le cookie
+/// `SameSite=Strict` et les contrôles Host/Origin restent la seconde barrière.
 ///
 /// `/mcp` n'est plus filtré ici : sa porte est la **signature** (`gateway::serve`,
 /// §2.2). Le code hérité n'y est plus exigé — sinon un client signé du LAN sans
@@ -618,25 +624,26 @@ pub fn check_access(
     // /api/session est la seule route qui CRÉE une session : elle n'en exige pas.
     let is_hello = bare_path == "/api/hello";
     let is_session = bare_path == "/api/session";
-    if bare_path.starts_with("/api") && !is_hello && !is_session {
-        if !session_ok {
-            // Code hérité = LECTURE SEULE (§10, DA3 = a). Aucune autre forme
-            // d'accès n'existe plus : ni `?access=` (supprimé au lot M2), ni
-            // l'exemption loopback (DA2 = a).
-            if !legacy_ok {
-                return Err((401, "Unauthorized"));
-            }
-            if method == "POST" && bare_path == "/api/action" {
-                return Err((403, "Forbidden"));
-            }
+    if bare_path.starts_with("/api") && !is_hello && !is_session && !session_ok {
+        // Code hérité = LECTURE SEULE (§10, DA3 = a). Aucune autre forme
+        // d'accès n'existe plus : ni `?access=` (supprimé au lot M2), ni
+        // l'exemption loopback (DA2 = a).
+        if !legacy_ok {
+            return Err((401, "Unauthorized"));
         }
-        // CSRF (§6) : un en-tête personnalisé impose un préflight, que le
-        // serveur refuse — une page web étrangère ne peut pas l'envoyer.
-        if method == "POST" && !crate::auth::session::has_csrf_header(headers) {
+        if method == "POST" && bare_path == "/api/action" {
             return Err((403, "Forbidden"));
         }
+        // CSRF (S-1) : plus d'en-tête constant. L'en-tête secret `X-MCC-Session`
+        // est exigé par `auth::session::authorized_session` (cookie ET secret,
+        // temps constant) : son nom personnalisé impose un préflight, que le
+        // serveur refuse — une page web étrangère ne peut pas l'envoyer.
     }
-    if method == "POST" && (bare_path == "/api/action" || is_session) {
+    if method == "POST"
+        && (bare_path == "/api/action"
+            || bare_path == "/api/session"
+            || bare_path == "/api/session/close-others")
+    {
         let ok = headers
             .iter()
             .find(|(n, _)| n == "content-type")
@@ -720,15 +727,19 @@ fn reason_phrase(status: u16) -> &'static str {
 pub struct RunOutcome {
     pub url: String,
     /// URL à usage unique de la session locale (`http://…/#t=<jeton>`, §6).
-    /// Vide quand le moteur a été RÉUTILISÉ : le jeton appartient au process
-    /// qui a démarré le moteur, un second process ne peut pas en obtenir.
+    /// Vide quand le moteur a été RÉUTILISÉ : le shell demande alors un jeton
+    /// par le canal fichier (`auth::session::request_bootstrap`).
     pub session_url: String,
     pub reused: bool,
+    /// Chemin du `config.json` de CE lancement — le shell en déduit le dossier
+    /// du canal de session quand un moteur tournait déjà (lot S1).
+    pub config_path: String,
 }
 
 pub fn run_headless() -> RunOutcome {
     let config_path =
         manage::resolve_config_path(env!("CARGO_MANIFEST_DIR"), std::env::var("MCC_CONFIG").ok());
+    let config_path_out = config_path.clone();
     // ROBUSTESSE (audit 2026-10-25) : un panic dans un thread (poller, sonde)
     // était TOTALEMENT silencieux en mode desktop (windows_subsystem=windows,
     // aucune console) et tuait la supervision sans trace. Le hook écrit le
@@ -742,6 +753,9 @@ pub fn run_headless() -> RunOutcome {
         // (cible + résultat) dans mcc.log — il n'a pas d'AppState, le chemin
         // lui est branché ici, au seul endroit qui le connaît.
         crate::notify::set_webhook_log_path(&log_file);
+        // Journal de session (S-1) : les refus d'entropie et les demandes du
+        // canal fichier sont tracés dans le même mcc.log, sans aucun secret.
+        crate::auth::session::set_log_path(&log_file);
         std::panic::set_hook(Box::new(move |info| {
             let ts = crate::types::iso_utc(crate::types::now_ts());
             let payload = info
@@ -840,6 +854,7 @@ pub fn run_headless() -> RunOutcome {
                                 url,
                                 session_url: String::new(),
                                 reused: true,
+                                config_path: config_path_out,
                             };
                         }
                         dead_motor = true;
@@ -944,8 +959,27 @@ pub fn run_headless() -> RunOutcome {
     // mcc.log (on n'écrit donc PAS ce jeton dans le journal : seule cette
     // ligne de console le porte). Le shell Tauri navigue vers cette URL ; en
     // headless, l'utilisateur l'ouvre une fois dans son navigateur.
-    let session_url = crate::auth::session::bootstrap_url(&ui_url);
-    println!("[session] {}", session_url);
+    // S-3 : sans entropie OS, AUCUN jeton n'est tiré (pas de repli) — le
+    // moteur démarre sans session et le dit dans le journal.
+    let session_url = match crate::auth::session::bootstrap_url(&ui_url) {
+        Some(u) => {
+            println!("[session] {}", u);
+            u
+        }
+        None => {
+            manage::add_log(
+                &state,
+                "error",
+                "session locale : entropie OS indisponible — aucun jeton d'amorçage, aucune session ne sera ouverte (échec fermé)",
+            );
+            String::new()
+        }
+    };
+    // Fenêtre rouverte sur un moteur déjà lancé (S-1 pt 3) : le shell dépose
+    // une demande dans le dossier de config, ce thread y répond par un jeton
+    // à usage unique de 2 min. Fichiers restreints à l'utilisateur, supprimés
+    // dès lecture, jamais journalisés.
+    crate::auth::session::serve_session_requests(&state.config_path);
     manage::add_log(
         &state,
         "info",
@@ -1089,6 +1123,7 @@ pub fn run_headless() -> RunOutcome {
         url: ui_url,
         session_url,
         reused: false,
+        config_path: config_path_out,
     }
 }
 
@@ -1211,10 +1246,11 @@ pub(crate) fn handle_conn(mut stream: TcpStream, state: Arc<AppState>, guard: Co
             _ => false,
         }
     };
-    // Session locale de la fenêtre (docs/auth.md §6) : cookie `mcc_session`,
-    // HttpOnly + SameSite=Strict, émis par POST /api/session. Valable sur
-    // /api/* UNIQUEMENT — jamais sur /mcp (test du lot M2).
-    let session_ok = crate::auth::session::authorized(&headers);
+    // Session locale de la fenêtre (docs/auth.md §6) : cookie `mcc_session`
+    // + en-tête secret `X-MCC-Session` (S-1), émis par POST /api/session.
+    // Valable sur /api/* UNIQUEMENT — jamais sur /mcp (test du lot M2).
+    let session_id = crate::auth::session::authorized_session(&headers);
+    let session_ok = session_id.is_some();
     // Code hérité (§10, DA3 = a) : toléré en LECTURE SEULE pendant 0.8.x.
     // `?access=` n'existe plus (supprimé au lot M2).
     let legacy_code_ok = api_access
@@ -1334,7 +1370,14 @@ pub(crate) fn handle_conn(mut stream: TcpStream, state: Arc<AppState>, guard: Co
             // (docs/auth.md §5) — le transport est le seul à la connaître.
             gateway::serve(&method, &path, &headers, &body, legacy_ok, peer_ip)
         }
-        Ok(()) => route_peer(&state, &method, &path, &body, peer_ip),
+        Ok(()) => route_peer_session(
+            &state,
+            &method,
+            &path,
+            &body,
+            peer_ip,
+            session_id.as_deref(),
+        ),
     };
     let Reply {
         status,
@@ -1399,16 +1442,32 @@ pub fn route(
     route_peer(state, method, path, body, None).into_parts()
 }
 
-/// Routage avec l'adresse de l'appelant — seul `route_peer` la connaît, et trois
-/// décisions en dépendent : le quota d'appairage (par adresse), le refus des
-/// actions `admin` depuis le LAN (elles sont LOCALES par construction) et
-/// l'échange du jeton de session (`POST /api/session`, loopback seulement).
+/// Routage avec l'adresse de l'appelant — seul `route_peer_session` la
+/// connaît, et trois décisions en dépendent : le quota d'appairage (par
+/// adresse), le refus des actions `admin` depuis le LAN (elles sont LOCALES par
+/// construction) et l'échange du jeton de session (`POST /api/session`,
+/// loopback seulement). Variante sans session pour `route()` et les tests
+/// historiques (aucune route ne l'exige).
 pub fn route_peer(
     state: &Arc<AppState>,
     method: &str,
     path: &str,
     body: &[u8],
     peer: Option<IpAddr>,
+) -> Reply {
+    route_peer_session(state, method, path, body, peer, None)
+}
+
+/// Même routage, avec l'identifiant de la session VIVANTE déjà validée par
+/// `handle_conn` (cookie ET secret) : la route `close-others` en a besoin pour
+/// garder la courante et révoquer les autres.
+pub fn route_peer_session(
+    state: &Arc<AppState>,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    peer: Option<IpAddr>,
+    session: Option<&str>,
 ) -> Reply {
     let bare_path = path.split('?').next().unwrap_or(path);
     // ---- Appairage (docs/auth.md §3.4) : les deux seules routes non
@@ -1451,14 +1510,38 @@ pub fn route_peer(
             .and_then(|v| v.get("token").and_then(|t| t.as_str()).map(String::from))
             .unwrap_or_default();
         return match crate::auth::session::exchange(&token) {
-            Some(id) => Reply::json(200, serde_json::json!({"ok": true}))
-                .with_header("Set-Cookie", crate::auth::session::set_cookie_header(&id)),
+            Some(issued) => Reply::json(
+                200,
+                serde_json::json!({"ok": true, "secret": issued.secret}),
+            )
+            .with_header(
+                "Set-Cookie",
+                crate::auth::session::set_cookie_header(&issued.cookie),
+            ),
             None => Reply::json(
                 401,
                 serde_json::json!({
                     "ok": false,
-                    "error": "jeton d'amorçage refusé (inconnu, déjà utilisé ou expiré)"
+                    "error": "jeton d'amorçage refusé (inconnu, déjà utilisé, expiré ou plafond de sessions atteint)"
                 }),
+            ),
+        };
+    }
+    // ---- Fermeture des autres sessions (S-1) : route locale de la fenêtre.
+    // Elle n'existe PAS dans le dispatcher d'actions (`manage/actions.rs`) :
+    // c'est un contrôle de session, pas une action métier.
+    if method == "POST" && bare_path == "/api/session/close-others" {
+        if !peer.is_some_and(|ip| ip.is_loopback()) {
+            return Reply::json(
+                403,
+                serde_json::json!({"ok": false, "error": "session locale uniquement"}),
+            );
+        }
+        return match session.and_then(crate::auth::session::close_others) {
+            Some(closed) => Reply::json(200, serde_json::json!({"ok": true, "closed": closed})),
+            None => Reply::json(
+                401,
+                serde_json::json!({"ok": false, "error": "session absente ou expirée"}),
             ),
         };
     }
@@ -1712,7 +1795,6 @@ mod tests {
                 &[
                     ("host", "127.0.0.1:5090"),
                     ("content-type", "application/json"),
-                    ("x-mcc-request", "1"),
                 ],
                 false,
                 true,
@@ -1721,20 +1803,19 @@ mod tests {
         );
         // /api/hello reste pré-authentifié ; /api/session crée la session
         assert!(acc("GET", "/api/hello", base, false, false).is_ok());
-        // CSRF : une session valide ne suffit pas sur une écriture (§6)
-        assert_eq!(
-            acc(
-                "POST",
-                "/api/action",
-                &[
-                    ("host", "127.0.0.1:5090"),
-                    ("content-type", "application/json"),
-                ],
-                true,
-                false,
-            ),
-            Err((403, "Forbidden"))
-        );
+        // S-1 : plus d'en-tête CSRF constant — l'en-tête SECRET `X-MCC-Session`
+        // est vérifié en amont (`session_ok`) ; une session valide + JSON passe.
+        assert!(acc(
+            "POST",
+            "/api/action",
+            &[
+                ("host", "127.0.0.1:5090"),
+                ("content-type", "application/json"),
+            ],
+            true,
+            false,
+        )
+        .is_ok());
         // `/mcp` n'est plus filtré ici : sa porte est la signature (§2.2)
         assert!(acc(
             "POST",
@@ -1751,7 +1832,7 @@ mod tests {
 
     #[test]
     fn check_access_action_post_exige_content_type_json() {
-        let base = &[("host", "127.0.0.1:5090"), ("x-mcc-request", "1")] as &[(&str, &str)];
+        let base = &[("host", "127.0.0.1:5090")] as &[(&str, &str)];
         let with_ct = |ct: Option<&'static str>| {
             let mut h: Vec<(&str, &str)> = base.to_vec();
             if let Some(ct) = ct {
