@@ -1,4 +1,6 @@
+pub mod audit;
 pub mod auth;
+pub mod bridge;
 pub mod crypto;
 pub mod frameworks;
 pub mod gateway;
@@ -1372,9 +1374,49 @@ pub(crate) fn handle_conn(mut stream: TcpStream, state: Arc<AppState>, guard: Co
         // socket déjà durci ; cf. gateway::serve). `legacy_ok` n'ouvre que la
         // LECTURE (code hérité, §10) — la signature, elle, est obligatoire.
         Ok(()) if path.split('?').next() == Some("/mcp") => {
-            // `peer_ip` : l'adresse source figure sur la demande de confirmation
-            // (docs/auth.md §5) — le transport est le seul à la connaître.
-            gateway::serve(&method, &path, &headers, &body, legacy_ok, peer_ip)
+            // Anti-force brute (lot M5, docs/auth.md §1.4) : le `keyid`
+            // revendiqué est une donnée PUBLIQUE (jamais une autorisation) ;
+            // la décision est prise AVANT toute cryptographie, et le loopback
+            // n'est jamais freiné ni bloqué par des échecs venus du LAN.
+            let keyid_revendique = crate::audit::claimed_keyid(&headers);
+            let verdict = crate::auth::throttle::check(peer_ip, keyid_revendique.as_deref());
+            match verdict {
+                crate::auth::throttle::Verdict::Block(secondes) => Reply::json(
+                    429,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "trop d'échecs d'authentification — réessayez plus tard"
+                    }),
+                )
+                .with_header("Retry-After", secondes.to_string()),
+                autre => {
+                    if let crate::auth::throttle::Verdict::Delay(delai) = autre {
+                        thread::sleep(delai);
+                    }
+                    // Journal d'audit chaîné (docs/auth.md §11) : la décision
+                    // du hook C4 est posée sur ce fil, le transport y ajoute
+                    // l'adresse source et le keyid revendiqué.
+                    crate::audit::begin_mcp_request();
+                    let reply = gateway::serve(&method, &path, &headers, &body, legacy_ok, peer_ip);
+                    crate::audit::note_http(
+                        &state,
+                        &headers,
+                        &method,
+                        reply.status,
+                        peer_ip,
+                        keyid_revendique.as_deref(),
+                    );
+                    // Seuls un 401 (échec d'auth) ou un succès d'auth signée
+                    // (200/202/403) mettent à jour le compteur anti-force brute :
+                    // un rejet pré-auth (405, 415, 406, 400) ne remet jamais à zéro.
+                    if reply.status == 401 {
+                        crate::auth::throttle::record(peer_ip, keyid_revendique.as_deref(), true);
+                    } else if signature_presente && matches!(reply.status, 200 | 202 | 403) {
+                        crate::auth::throttle::record(peer_ip, keyid_revendique.as_deref(), false);
+                    }
+                    reply
+                }
+            }
         }
         Ok(()) => route_peer_session(
             &state,

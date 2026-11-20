@@ -412,6 +412,40 @@ impl AuthState {
     }
 }
 
+/// Signature du vecteur 1 de la RFC 8032 §7.1 (message **vide**) — donnée
+/// PUBLIQUE, employée uniquement pour payer le même prix qu'une vraie
+/// vérification sur les chemins d'échec (voir [`verification_fantome`]).
+const SIGNATURE_FANTOME: [u8; 64] = [
+    0xe5, 0x56, 0x43, 0x00, 0xc3, 0x60, 0xac, 0x72, 0x90, 0x86, 0xe2, 0xcc, 0x80, 0x6e, 0x82, 0x8a,
+    0x84, 0x87, 0x7f, 0x1e, 0xb8, 0xe5, 0xd9, 0x74, 0xd8, 0x73, 0xe0, 0x65, 0x22, 0x49, 0x01, 0x55,
+    0x5f, 0xb8, 0x82, 0x15, 0x90, 0xa3, 0x3b, 0xac, 0xc6, 0x1e, 0x39, 0x70, 0x1c, 0xf9, 0xb4, 0x6b,
+    0xd2, 0x5b, 0xf5, 0xf0, 0x59, 0x5b, 0xbe, 0x24, 0x65, 0x51, 0x41, 0x43, 0x8e, 0x7a, 0x10, 0x0b,
+];
+
+/// Clé publique du vecteur 1 de la RFC 8032 §7.1 — publique.
+const CLE_FANTOME: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+
+/// Paie une **vraie** vérification Ed25519 sur un chemin d'échec.
+///
+/// `signature_invalid` fait une vérification, `key_unknown` et `key_revoked`
+/// s'arrêteraient avant : sans ce travail, le temps de réponse dirait à
+/// l'attaquant *pourquoi* sa requête a été refusée (oracle temporel). Le
+/// vecteur RFC 8032 est public et son résultat n'est jamais lu — seul le coût
+/// compte. Le tout reste très en dessous d'une requête valide et n'ouvre rien.
+fn verification_fantome_octets(bytes: &[u8; 32]) {
+    let Ok(cle) = litemcp::auth::sign::VerifyingKey::from_bytes(bytes) else {
+        return;
+    };
+    let _ = cle.verify_message(b"", &SIGNATURE_FANTOME);
+}
+
+fn verification_fantome() {
+    let Some(bytes) = decode_public_key(CLE_FANTOME) else {
+        return;
+    };
+    verification_fantome_octets(&bytes);
+}
+
 /// [`litemcp::auth::sign::KeyStore`] branché sur `config.json` : la lib relit la
 /// clé à chaque requête, donc une révocation prend effet immédiatement (§8.2 C6).
 pub struct RegistryStore {
@@ -420,15 +454,33 @@ pub struct RegistryStore {
 
 impl litemcp::auth::sign::KeyStore for RegistryStore {
     fn lookup(&self, keyid: &str) -> Option<litemcp::auth::sign::ClientKey> {
-        let settings = lockv(&self.state.settings);
-        let rec = settings.auth.find(keyid)?;
-        let public_key = decode_public_key(&rec.public_key)?;
+        // Le verrou des réglages n'est PAS tenu pendant la vérification fantôme :
+        // elle coûte un Ed25519, et la fenêtre locale lit les mêmes réglages.
+        let rec = {
+            let settings = lockv(&self.state.settings);
+            settings.auth.find(keyid).cloned()
+        };
+        let Some(rec) = rec else {
+            verification_fantome();
+            return None;
+        };
+        let Some(public_key) = decode_public_key(&rec.public_key) else {
+            verification_fantome();
+            return None;
+        };
+        let actif = rec.is_active();
+        if !actif {
+            // `decode_public_key` a déjà coûté une décompression ; il reste
+            // exactement une seconde décompression + une vérification Ed25519,
+            // comme `SignatureVerifier` sur `signature_invalid`.
+            verification_fantome_octets(&public_key);
+        }
         let mut key = litemcp::auth::sign::ClientKey::new(rec.keyid.clone(), public_key);
         if !rec.label.is_empty() {
             key = key.with_label(rec.label.clone());
         }
         key = key.with_rights(rec.rights.clone());
-        if !rec.is_active() {
+        if !actif {
             key = key.revoked();
         }
         Some(key)

@@ -13,6 +13,11 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("auth") {
         std::process::exit(mcp_control::auth::cli::run(&args[2..]));
     }
+    // Pont stdio (lot M5, DA6 = a) : parle MCP sur stdin/stdout et signe pour
+    // le client local. N'ouvre AUCUN moteur — un client MCP standard le lance.
+    if args.get(1).map(String::as_str) == Some("bridge") {
+        std::process::exit(mcp_control::bridge::run(&args[2..]));
+    }
     // MCC_CONFIG override ; sinon résolution runtime (dev → manifest, release → exe dir)
     let _config_path =
         manage::resolve_config_path(env!("CARGO_MANIFEST_DIR"), std::env::var("MCC_CONFIG").ok());

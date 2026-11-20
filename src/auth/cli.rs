@@ -24,7 +24,8 @@ pub const USAGE: &str = "mcp-control auth <commande>\n\
   pair <url>         appairer ce poste avec un moteur MCP Control (http://hôte:port)\n\
   list               clients appairés du moteur local\n\
   revoke <keyid>     révoquer un client (effet à la requête suivante)\n\
-  fingerprint        empreintes de l'identité du serveur local";
+  fingerprint        empreintes de l'identité du serveur local\n\
+  verify-log [--path <fichier>]  vérifier la chaîne du journal d'audit (auth-audit.log)";
 
 /// Squelette d'URL accepté : `http://hôte[:port][/]`. Aucun `https` (TLS = lot
 /// M4), aucun chemin (l'API d'appairage est à la racine du port UI).
@@ -485,6 +486,69 @@ pub fn premier_secret_du_fichier(texte: &str) -> Option<&'static str> {
         .find(|motif| texte.contains(motif))
 }
 
+/// `auth verify-log [--path <fichier>]` — recalcule la chaîne du journal
+/// d'audit (`docs/auth.md` §11). Code 0 = intacte, 1 = falsifiée ou clé
+/// introuvable, 2 = usage.
+fn cmd_verify_log(chemin: Option<&str>) -> i32 {
+    let path = match chemin {
+        Some(p) => PathBuf::from(p),
+        None => crate::audit::path_for(&config_path()),
+    };
+    if !path.exists() {
+        println!(
+            "verify-log : aucun journal d'audit ({}) — rien à vérifier.",
+            path.display()
+        );
+        return 0;
+    }
+    let key_dir = match chemin {
+        Some(_) => path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(config_dir),
+        None => config_dir(),
+    };
+    let cle = match crate::auth::secret::load_audit_key(
+        &key_dir,
+        crate::auth::secret::service().as_deref(),
+    ) {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            eprintln!(
+                "verify-log : clé du journal introuvable (trousseau `audit-hmac` et auth/audit.key) — la chaîne ne peut pas être vérifiée sur cette machine"
+            );
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("verify-log : {e}");
+            return 1;
+        }
+    };
+    match crate::audit::verify(&path, &cle) {
+        Ok(r) => {
+            println!(
+                "verify-log : chaîne INTACTE — {} ligne(s), {} segment(s), seq {} → {}{}",
+                r.lignes,
+                r.segments,
+                r.premier_seq,
+                r.dernier_seq,
+                if r.partiel {
+                    " (chaîne partielle : segments antérieurs tournés)"
+                } else {
+                    ""
+                }
+            );
+            0
+        }
+        Err(f) => {
+            eprintln!("verify-log : {}", f.message());
+            eprintln!("verify-log : journal FALSIFIÉ ({})", path.display());
+            1
+        }
+    }
+}
+
 /// Point d'entrée : renvoie le code de sortie du process.
 pub fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
@@ -505,6 +569,34 @@ pub fn run(args: &[String]) -> i32 {
             }
         },
         Some("fingerprint") => cmd_fingerprint(),
+        Some("verify-log") => {
+            let mut reste = args.iter().skip(1);
+            let chemin = match reste.next().map(String::as_str) {
+                None => None,
+                Some("-h") | Some("--help") => {
+                    println!("{USAGE}");
+                    return 0;
+                }
+                Some("--path") => match reste.next() {
+                    Some(p) => Some(p.as_str()),
+                    None => {
+                        eprintln!("auth verify-log : --path attend un fichier");
+                        return 2;
+                    }
+                },
+                Some(p) if p.starts_with('-') => {
+                    eprintln!("auth verify-log : option inconnue « {p} »");
+                    eprintln!("{USAGE}");
+                    return 2;
+                }
+                Some(p) => Some(p),
+            };
+            if let Some(extra) = reste.next() {
+                eprintln!("auth verify-log : argument inattendu « {extra} »");
+                return 2;
+            }
+            cmd_verify_log(chemin)
+        }
         _ => {
             eprintln!("{USAGE}");
             2

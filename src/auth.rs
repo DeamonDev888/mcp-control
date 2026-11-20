@@ -24,6 +24,7 @@ pub mod pair;
 pub mod registry;
 pub mod secret;
 pub mod session;
+pub mod throttle;
 
 #[cfg(test)]
 mod tests;

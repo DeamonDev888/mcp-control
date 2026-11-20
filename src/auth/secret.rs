@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 pub const KEYRING_SERVICE: &str = "mcp-control";
 /// Compte de la clé privée du serveur (§9).
 pub const ACCOUNT_SERVER: &str = "server-ed25519";
+/// Compte de la clé HMAC du journal d'audit (§9, §11).
+pub const ACCOUNT_AUDIT: &str = "audit-hmac";
 /// Variable d'environnement d'isolation (tests, instances multiples).
 pub const SERVICE_ENV: &str = "MCC_KEYRING_SERVICE";
 
@@ -64,6 +66,12 @@ pub fn service() -> Option<String> {
 /// Chemin du repli fichier : `auth/server.key` à côté du `config.json`.
 pub fn server_key_path(config_dir: &Path) -> PathBuf {
     config_dir.join("auth").join("server.key")
+}
+
+/// Chemin du repli fichier de la clé du journal d'audit (§9) :
+/// `auth/audit.key`, 32 octets en hexadécimal, permissions utilisateur seul.
+pub fn audit_key_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("auth").join("audit.key")
 }
 
 /// Lit une entrée du trousseau. `Ok(None)` = entrée absente ; `Err` = trousseau
@@ -178,6 +186,108 @@ pub fn load_or_create_server(dir: &Path, service: Option<&str>) -> Result<Loaded
 /// responsabilité de l'appelant, qui connaît le `keyid`.
 pub fn store_client_key(service: &str, account: &str, block: &str) -> Result<(), String> {
     keyring_write(service, account, block)
+}
+
+/// Lit la clé privée d'un client sortant (`auth pair`), trousseau d'abord.
+/// `Ok(None)` = aucune entrée ; `Err` = trousseau indisponible — l'appelant
+/// bascule alors sur le repli fichier `auth/clients/<keyid>.key`.
+pub fn load_client_key(service: Option<&str>, account: &str) -> Result<Option<String>, String> {
+    match service {
+        Some(svc) => keyring_read(svc, account),
+        None => Ok(None),
+    }
+}
+
+/// Décode 32 octets en hexadécimal minuscule (clé du journal).
+fn decode_cle_hex(hex: &str) -> Result<Vec<u8>, String> {
+    let hex = hex.trim();
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err("clé du journal illisible (64 hexadécimaux attendus)".to_string());
+    }
+    let mut out = Vec::with_capacity(32);
+    for i in 0..32 {
+        let pair = hex.get(i * 2..i * 2 + 2).ok_or("clé tronquée")?;
+        out.push(u8::from_str_radix(pair, 16).map_err(|_| "clé illisible")?);
+    }
+    Ok(out)
+}
+
+/// Lit la clé HMAC du journal d'audit, sans jamais la créer : `None` = ni
+/// trousseau ni fichier (le journal ne peut alors pas être vérifié ici).
+pub fn load_audit_key(dir: &Path, service: Option<&str>) -> Result<Option<Vec<u8>>, String> {
+    if let Some(svc) = service {
+        match keyring_read(svc, ACCOUNT_AUDIT) {
+            Ok(Some(hex)) => return decode_cle_hex(&hex).map(Some),
+            Ok(None) => {}
+            Err(_) => {}
+        }
+    }
+    match read_secret_file(&audit_key_path(dir))? {
+        Some(hex) => decode_cle_hex(&hex).map(Some),
+        None => Ok(None),
+    }
+}
+
+pub struct LoadedAuditKey {
+    pub key: Vec<u8>,
+    pub store: SecretStore,
+    pub created: bool,
+}
+
+/// Charge — ou crée — la clé HMAC du journal d'audit (§9 : trousseau compte
+/// `audit-hmac`, repli `auth/audit.key` 0600, journalisé). 32 octets du
+/// système ; jamais dans `config.json`, jamais renvoyée à un client.
+pub fn load_or_create_audit_key(
+    dir: &Path,
+    service: Option<&str>,
+) -> Result<LoadedAuditKey, String> {
+    if let Some(svc) = service {
+        match keyring_read(svc, ACCOUNT_AUDIT) {
+            Ok(Some(hex)) => {
+                return Ok(LoadedAuditKey {
+                    key: decode_cle_hex(&hex)?,
+                    store: SecretStore::Keyring,
+                    created: false,
+                });
+            }
+            Ok(None) => {}
+            // trousseau indisponible : on continue vers le repli, l'appelant
+            // journalise que le fichier est moins protecteur (§9).
+            Err(_) => {}
+        }
+    }
+    let path = audit_key_path(dir);
+    if let Some(hex) = read_secret_file(&path)? {
+        return Ok(LoadedAuditKey {
+            key: decode_cle_hex(&hex)?,
+            store: SecretStore::File,
+            created: false,
+        });
+    }
+    let mut buf = [0u8; 32];
+    if !crate::os_random(&mut buf) {
+        return Err("aléa du système indisponible".to_string());
+    }
+    let hex = crate::crypto::hex(&buf);
+    if let Some(svc) = service {
+        if keyring_write(svc, ACCOUNT_AUDIT, &hex).is_ok() {
+            return Ok(LoadedAuditKey {
+                key: buf.to_vec(),
+                store: SecretStore::Keyring,
+                created: true,
+            });
+        }
+    }
+    write_secret_file(&path, &hex)?;
+    Ok(LoadedAuditKey {
+        key: buf.to_vec(),
+        store: SecretStore::File,
+        created: true,
+    })
 }
 
 /// Premier lancement : crée l'identité du serveur et publie sa clé PUBLIQUE dans
@@ -353,5 +463,21 @@ mod tests {
         if std::env::var(SERVICE_ENV).is_err() {
             assert_eq!(service().as_deref(), Some(KEYRING_SERVICE));
         }
+    }
+
+    #[test]
+    fn cle_audit_creee_puis_relue_en_repli_fichier() {
+        let dir = tmp("audit-key");
+        assert!(load_audit_key(&dir, None).unwrap().is_none());
+        let first = load_or_create_audit_key(&dir, None).expect("création clé audit");
+        assert_eq!(first.store, SecretStore::File);
+        assert!(first.created);
+        assert_eq!(first.key.len(), 32);
+        let second = load_or_create_audit_key(&dir, None).expect("relecture clé audit");
+        assert!(!second.created);
+        assert_eq!(first.key, second.key);
+        let loaded = load_audit_key(&dir, None).unwrap().expect("relue");
+        assert_eq!(loaded, first.key);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
