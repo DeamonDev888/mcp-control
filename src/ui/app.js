@@ -25,7 +25,84 @@ function applyTheme(t) {
 // Choix EXPLICITE de l'utilisateur : applique ET enregistre.
 function applyThemeAndSave(t) {
   applyTheme(t);
-  try { localStorage.setItem('mcc.theme', document.documentElement.dataset.theme); } catch (e) {}
+  try {
+    localStorage.setItem('mcc.theme', document.documentElement.dataset.theme);
+    localStorage.setItem('mcc-theme', document.documentElement.dataset.theme);
+  } catch (e) {}
+}
+
+/* ===== Modale de confirmation accessible (<dialog id="confirmDlg">) =====
+   Remplace tous les alert(), confirm() et prompt() natifs : promesse async,
+   focus sur Annuler par défaut, restauration du focus à la fermeture. */
+let _confirmResolve = null;
+let _lastFocusEl = null;
+function rememberFocus() {
+  if (document.activeElement && document.activeElement !== document.body) {
+    _lastFocusEl = document.activeElement;
+  }
+}
+function restoreFocus() {
+  if (_lastFocusEl && typeof _lastFocusEl.focus === 'function') {
+    try { _lastFocusEl.focus(); } catch (e) {}
+  }
+  _lastFocusEl = null;
+}
+function askConfirm(opts) {
+  const o = typeof opts === 'string' ? {msg: opts} : (opts || {});
+  const dlg = document.getElementById('confirmDlg');
+  if (!dlg) return Promise.resolve(false);
+  rememberFocus();
+  document.getElementById('confirmDlgTitle').textContent = o.title || 'Confirmation';
+  document.getElementById('confirmDlgMsg').textContent = o.msg || '';
+  const det = document.getElementById('confirmDlgDetail');
+  if (o.detail) { det.textContent = o.detail; det.hidden = false; }
+  else { det.textContent = ''; det.hidden = true; }
+  const inpBox = document.getElementById('confirmDlgInputs');
+  if (Array.isArray(o.inputs) && o.inputs.length) {
+    inpBox.hidden = false;
+    inpBox.innerHTML = o.inputs.map(f =>
+      `<div><label for="cdlg_${esc(f.id)}">${esc(f.label)}</label><input id="cdlg_${esc(f.id)}" type="${esc(f.type || 'text')}" placeholder="${esc(f.placeholder || '')}" value="${esc(f.value || '')}"></div>`
+    ).join('');
+  } else {
+    inpBox.hidden = true;
+    inpBox.innerHTML = '';
+  }
+  const btnCancel = document.getElementById('confirmDlgCancel');
+  const btnOk = document.getElementById('confirmDlgOk');
+  btnCancel.textContent = o.cancelLabel || 'Annuler';
+  btnOk.textContent = o.okLabel || 'Confirmer';
+  btnOk.classList.toggle('danger', !!o.danger);
+  btnOk.classList.toggle('primary', !o.danger);
+  if (!dlg.open) dlg.showModal();
+  if (Array.isArray(o.inputs) && o.inputs.length) {
+    const first = document.getElementById('cdlg_' + o.inputs[0].id);
+    if (first) first.focus();
+  } else {
+    btnCancel.focus();
+  }
+  return new Promise(resolve => { _confirmResolve = {resolve, inputs: o.inputs || null}; });
+}
+function finishConfirmDlg(accepted) {
+  const dlg = document.getElementById('confirmDlg');
+  const pending = _confirmResolve;
+  _confirmResolve = null;
+  let val = accepted;
+  if (accepted && pending && pending.inputs) {
+    val = {};
+    pending.inputs.forEach(f => {
+      const el = document.getElementById('cdlg_' + f.id);
+      val[f.id] = el ? el.value.trim() : '';
+    });
+  }
+  if (dlg && dlg.open) dlg.close();
+  restoreFocus();
+  if (pending) pending.resolve(val);
+}
+function confirmDlgOk() {
+  finishConfirmDlg(true);
+}
+function confirmDlgCancel() {
+  finishConfirmDlg(false);
 }
 const _mccFetch = window.fetch.bind(window);
 
@@ -264,6 +341,7 @@ function render() {
   const au = document.getElementById('stAuto');
   if (au) {
     au.innerHTML = ic('power') + '<span>Auto-boot ' + (state.autostart ? 'ON' : 'OFF') + '</span>';
+    au.setAttribute('aria-checked', state.autostart ? 'true' : 'false');
     au.classList.toggle('auto-on', !!state.autostart);
     au.classList.toggle('auto-off', !state.autostart);
   }
@@ -317,6 +395,7 @@ function srvRow(s) {
      compteur d'outils. Les badges sont non rétractables : à très faible
      largeur la fin de la ligne 2 se coupe, jamais le nom ni les actions. */
   return `<div class="srow ${selectedId===s.id?'sel':''} ${s.enabled?'':'off'}" draggable="true"
+    role="listitem" tabindex="0" aria-label="Serveur ${esc(s.label)} (${esc(s.state)})"
     data-act="select" data-id="${esc(s.id)}">
     <div class="l1"><span class="dot ${esc(s.state)}"></span><span class="nm" title="${esc(s.label)}">${esc(s.label)}</span>${rowFav(s)}${rowAuto(s)}${rowCtl(s)}${rowToggle(s)}</div>
     <div class="l2"><span class="st ${esc(s.state)}">${esc(s.state)}</span> ${ti}${off}${langChip(s)}${typeBadge(s)}${frameworkBadge(s)}${lockBadge(s)}${s.transport==='stdio'?'<span class="legacy" title="Legacy : serveur stdio uniquement (pas de transport HTTP)">legacy</span>':''}<span class="cnt">${s.tools_count}</span></div>
@@ -335,7 +414,7 @@ function groupHeadHtml(key, label, up, total, machine) {
     ? `Machine distante ${esc(label)} &mdash; cliquer pour replier/d&eacute;plier`
     : 'Serveurs MCP locaux &agrave; cette machine (loopback) &mdash; cliquer pour replier/d&eacute;plier';
   const act = machine
-    ? `<button class="gact" title="Oublier cette machine (les serveurs d&eacute;j&agrave; import&eacute;s restent)" data-act="ssh-forget" data-id="${esc(label)}">${ic('trash')}</button>` : '';
+    ? `<button class="gact" aria-label="Oublier la machine ${esc(label)}" title="Oublier cette machine (les serveurs d&eacute;j&agrave; import&eacute;s restent)" data-act="ssh-forget" data-id="${esc(label)}">${ic('trash')}</button>` : '';
   return `<div class="grphead ${groupClosed(key)?'closed':''}" data-act="group-toggle" data-key="${esc(key)}"
     title="${tip}"><span class="gchev">&#9662;</span><span class="gname">${esc(label)}</span>${act}<span class="gcount">${up}/${total}</span></div>`;
 }
@@ -516,20 +595,20 @@ function lockBadge(s) {
 
 function rowFav(s) {
   const on = !!s.favorite;
-  return `<button class="rowbtn fav ${on?'on':'off'}" title="${on
+  return `<button class="rowbtn fav ${on?'on':'off'}" aria-label="${on ? 'Retirer des favoris' : 'Ajouter aux favoris'} ${esc(s.label)}" title="${on
     ? 'Retirer des favoris (l\u2019\u00e9pingle maintient la ligne en haut de sa section)'
     : '\u00c9pingler en favori : la ligne passe en haut de sa section, quel que soit le tri'}"
     data-act="set-fav" data-id="${esc(s.id)}" data-on="${on ? '0' : '1'}">${ic('star')}</button>`;
 }
 
 function rowToggle(s) {
-  return `<button class="sw ${s.enabled?'on':'off'}" title="${s.enabled?'D\u00e9sactiver ce serveur (arr\u00eate son process)':'Activer ce serveur (le d\u00e9marre si commande connue)'}" data-act="row-act" data-op="toggle" data-id="${esc(s.id)}">${s.enabled?'ON':'OFF'}</button>`;
+  return `<button class="sw ${s.enabled?'on':'off'}" role="switch" aria-checked="${s.enabled?'true':'false'}" aria-label="${s.enabled?'D\u00e9sactiver':'Activer'} ${esc(s.label)}" title="${s.enabled?'D\u00e9sactiver ce serveur (arr\u00eate son process)':'Activer ce serveur (le d\u00e9marre si commande connue)'}" data-act="row-act" data-op="toggle" data-id="${esc(s.id)}">${s.enabled?'ON':'OFF'}</button>`;
 }
 
 function rowCtl(s) {
   if (!s.can_start) return '';
   const up = s.state === 'UP';
-  return `<button class="rowbtn" title="${up?'Arr\u00eater':'D\u00e9marrer'} ce serveur" data-act="row-act" data-op="${up?'kill':'start'}" data-id="${esc(s.id)}">${up?ic('stop'):ic('play')}</button>`;
+  return `<button class="rowbtn" aria-label="${up?'Arr\u00eater':'D\u00e9marrer'} ${esc(s.label)}" title="${up?'Arr\u00eater':'D\u00e9marrer'} ce serveur" data-act="row-act" data-op="${up?'kill':'start'}" data-id="${esc(s.id)}">${up?ic('stop'):ic('play')}</button>`;
 }
 
 // Autoboot PAR SERVEUR : relance automatique de CE serveur au démarrage
@@ -537,7 +616,7 @@ function rowCtl(s) {
 function rowAuto(s) {
   if (!s.can_start) return '';
   const on = s.auto_restart;
-  return `<button class="rowbtn auto ${on?'on':'off'}" title="${on
+  return `<button class="rowbtn auto ${on?'on':'off'}" aria-label="Autoboot ${on?'activ\u00e9':'d\u00e9sactiv\u00e9'} pour ${esc(s.label)}" title="${on
     ? 'Autoboot ACTIV\u00c9 : ce serveur est relanc\u00e9 au d\u00e9marrage et apr\u00e8s un crash \u2014 cliquer pour d\u00e9sactiver'
     : 'Autoboot D\u00c9SACTIV\u00c9 : ce serveur ne sera pas relanc\u00e9 automatiquement \u2014 cliquer pour activer'}"
     data-act="set-auto" data-id="${esc(s.id)}" data-on="${on ? '0' : '1'}">${ic('zap')}</button>`;
@@ -618,10 +697,16 @@ async function groupDrop(ev, el, key) {
   dragId = null;
   if (!moved) return;
   const s = byId(moved);
-  if (!s || s.transport !== 'http') { alert('Seuls les serveurs HTTP peuvent \u00eatre h\u00e9berg\u00e9s par une machine distante.'); return; }
-  if (!confirm('H\u00e9berger « ' + (s.label || moved) + ' » sur ' + key + ' ? (le host du transport devient ' + key + ')')) return;
+  if (!s || s.transport !== 'http') { toast('Seuls les serveurs HTTP peuvent \u00eatre h\u00e9berg\u00e9s par une machine distante.', 'err', 4000); return; }
+  const ok = await askConfirm({
+    title: 'D\u00e9placer vers une machine distante',
+    msg: 'H\u00e9berger \u00ab ' + (s.label || moved) + ' \u00bb sur ' + key + ' ?',
+    detail: 'Le host du transport HTTP deviendra ' + key + '.',
+    okLabel: 'D\u00e9placer',
+  });
+  if (!ok) return;
   const j = await postAction({action: 'set_host', id: moved, host: key}, {quiet: true});
-  if (!j.ok) alert('set_host : ' + (j.error || '\u00e9chec'));
+  if (!j.ok) toast('set_host : ' + (j.error || '\u00e9chec'), 'err', 4000);
   await load();
 }
 
@@ -887,7 +972,7 @@ function renderDetail() {
     `<div class="tool ${t.disabled?'off':''}" data-tool="${esc(t.name)}">
        <code>${esc(t.name)}</code>
        <span class="desc" title="${esc(t.desc)}">${t.desc ? mdInline(t.desc) : '&mdash;'}</span>
-       <button class="tgl ${t.disabled?'off':'on'}" title="${t.disabled?'R&eacute;activer ce tool':'D&eacute;sactiver ce tool'}"
+       <button class="tgl ${t.disabled?'off':'on'}" role="switch" aria-checked="${t.disabled?'false':'true'}" aria-label="${t.disabled?'R&eacute;activer':'D&eacute;sactiver'} l'outil ${esc(t.name)}" title="${t.disabled?'R&eacute;activer ce tool':'D&eacute;sactiver ce tool'}"
                data-act="tool-toggle" data-id="${esc(s.id)}" data-tool="${esc(t.name)}">
          ${t.disabled ? 'OFF' : 'ON'}
        </button>
@@ -912,9 +997,9 @@ function renderDetail() {
         ${s.can_start && s.state !== 'UP' ? `<button class="primary" data-act="row-act" data-op="start" data-id="${esc(s.id)}">${ic('play')} Start</button>` : ''}
         ${s.can_start && s.state === 'UP' ? `<button class="danger" data-act="row-act" data-op="kill" data-id="${esc(s.id)}">${ic('stop')} Stop</button>` : ''}
         <button data-act="row-act" data-op="refresh" data-id="${esc(s.id)}">${ic('activity')} Sonder</button>
-        ${s.can_start ? `<button class="autobtn ${s.auto_restart?'on':''}" data-act="set-auto" data-id="${esc(s.id)}" data-on="${s.auto_restart?'0':'1'}"
+        ${s.can_start ? `<button class="autobtn ${s.auto_restart?'on':''}" role="switch" aria-checked="${s.auto_restart?'true':'false'}" data-act="set-auto" data-id="${esc(s.id)}" data-on="${s.auto_restart?'0':'1'}"
           title="Autoboot : relance automatique de ce serveur au d&eacute;marrage de MCP Control et apr&egrave;s un crash">${ic('zap')} Autoboot ${s.auto_restart?'ON':'OFF'}</button>` : ''}
-        <button class="favbtn ${s.favorite?'on':''}" data-act="set-fav" data-id="${esc(s.id)}" data-on="${s.favorite?'0':'1'}"
+        <button class="favbtn ${s.favorite?'on':''}" role="switch" aria-checked="${s.favorite?'true':'false'}" data-act="set-fav" data-id="${esc(s.id)}" data-on="${s.favorite?'0':'1'}"
           title="Favori : &eacute;pingle ce serveur en haut de sa section dans l'explorateur (persist&eacute;)">${ic('star')} Favori ${s.favorite?'ON':'OFF'}</button>
         <button data-act="hide-server" data-id="${esc(s.id)}" title="Masquer ce serveur de l'affichage (session seulement : il revient &agrave; la r&eacute;ouverture de l'app)">${ic('eyeOff')} Masquer</button>
         <button data-act="row-act" data-op="toggle" data-id="${esc(s.id)}" title="${s.enabled
@@ -929,11 +1014,13 @@ function renderDetail() {
     ${s.last_error ? `<div class="d-err">${ic('warn')} ${esc(s.last_error)}</div>` : ''}
     ${fold('demarrage', 'D&eacute;marrage', `<div class="kv">${kvd}</div>${startCmdForm(s)}`)}
     ${fold('infos', 'Informations', `<div class="kv">${kv}</div>`)}
-    <div class="tabs">
-      <button class="tab ${detailTab === 'outils' ? 'sel' : ''}" data-act="detail-tab" data-tab="outils">Outils (${nTot})</button>
-      <button class="tab ${detailTab === 'conf' ? 'sel' : ''}" data-act="detail-tab" data-tab="conf">Conf agent</button>
+    <div class="tabs" role="tablist" aria-label="Vues du serveur">
+      <button class="tab ${detailTab === 'outils' ? 'sel' : ''}" role="tab" id="dtab-outils" aria-selected="${detailTab === 'outils' ? 'true' : 'false'}" aria-controls="dpanel-main" tabindex="${detailTab === 'outils' ? '0' : '-1'}" data-act="detail-tab" data-tab="outils">Outils (${nTot})</button>
+      <button class="tab ${detailTab === 'conf' ? 'sel' : ''}" role="tab" id="dtab-conf" aria-selected="${detailTab === 'conf' ? 'true' : 'false'}" aria-controls="dpanel-main" tabindex="${detailTab === 'conf' ? '0' : '-1'}" data-act="detail-tab" data-tab="conf">Conf agent</button>
     </div>
-    ${detailTab === 'conf' ? confAgent(s) : toolsHtml}`;
+    <div id="dpanel-main" role="tabpanel" aria-labelledby="dtab-${esc(detailTab)}">
+      ${detailTab === 'conf' ? confAgent(s) : toolsHtml}
+    </div>`;
   // Restaure la saisie en cours du formulaire Démarrage (set_start_cmd) :
   // le re-rendu périodique régénère ces champs, on ne perd pas ce qui est tapé.
   for (const idOld in typed) {
@@ -966,22 +1053,32 @@ async function setStartCmd(id) {
   const program = (document.getElementById('scProgram').value || '').trim();
   const args = (document.getElementById('scArgs').value || '').split(/\s+/).filter(Boolean);
   const workdir = (document.getElementById('scWorkdir').value || '').trim();
-  if (!program) { alert('Programme requis (ex : node, python, chemin .exe)'); return; }
+  if (!program) { toast('Programme requis (ex : node, python, chemin .exe)', 'err', 3500); return; }
   const j = await postAction({action: 'set_start_cmd', id, program, args, workdir: workdir || null}, {quiet: true});
-  if (!j.ok) alert(j.error || 'erreur');
+  if (!j.ok) toast(j.error || 'erreur', 'err', 4000);
   else { await load(); detailCache = null; if (selectedId) renderDetail(); }
 }
-function removeSrv(id) {
-  // La suppression d'un serveur importé ne demandait aucune confirmation :
-  // un clic loupé coûtait la ligne. Les seeds ont déjà leur confirmation
-  // dédiée (removeSeedForever) car l'effacement est durable.
+async function removeSrv(id) {
   const s = byId(id);
-  if (!confirm('Supprimer « ' + (s ? (s.label || id) : id) + ' » de la liste ? '
-    + 'Un serveur re-détecté par un scan réapparaîtra.')) return;
+  const ok = await askConfirm({
+    title: 'Supprimer ce serveur',
+    msg: 'Supprimer \u00ab ' + (s ? (s.label || id) : id) + ' \u00bb de la liste ?',
+    detail: 'Un serveur re-d\u00e9tect\u00e9 par un scan r\u00e9appara\u00eetra.',
+    okLabel: 'Supprimer',
+    danger: true,
+  });
+  if (!ok) return;
   selectedId = null; detailCache = null; act('remove', id);
 }
-function removeSeedForever(id) {
-  if (!confirm('Retirer ce seed DURABLEMENT ? Il ne sera pas réinjecté au redémarrage de MCP Control.')) return;
+async function removeSeedForever(id) {
+  const ok = await askConfirm({
+    title: 'Retirer ce seed durablement',
+    msg: 'Retirer ce seed DURABLEMENT ?',
+    detail: 'Il ne sera pas r\u00e9inject\u00e9 au red\u00e9marrage de MCP Control.',
+    okLabel: 'Retirer durablement',
+    danger: true,
+  });
+  if (!ok) return;
   selectedId = null; detailCache = null;
   postAction({action: 'remove', id, durable: true}).then(() => load());
 }
@@ -1026,7 +1123,7 @@ function copyText(txt) {
 }
 function copyFallback(txt) {
   const ta = document.createElement('textarea');
-  ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  ta.value = txt; ta.className = 'copy-ta';
   document.body.appendChild(ta); ta.select();
   try { document.execCommand('copy'); } catch (e) {}
   document.body.removeChild(ta);
@@ -1122,18 +1219,28 @@ function rowCtx(ev, id) {
   add(ic('eyeOff') + ' Masquer', () => hideServer(s.id));
   showMenu(ev, items);
 }
-// Affiche un menu d'entrées {lbl, fn, dis} à la position du curseur.
-// '—' insère un séparateur. Une seule mécanique pour les lignes serveur et outil.
+// Affiche un menu d'entrées {lbl, fn, dis} à la position du curseur (via data-x/data-y : 0 style inline).
+const CTX_X_STEPS = [16,48,80,112,144,176,208,240,272,304,336,368,400,448,512,576,640,704,768,832,896,960,1024,1120,1216,1312,1408,1504,1600];
+const CTX_Y_STEPS = [16,48,80,112,144,176,208,240,272,304,336,368,400,448,512,576,640,704,768,832];
+function snapStep(val, steps) {
+  let best = steps[0];
+  for (let i = 0; i < steps.length; i++) {
+    if (Math.abs(steps[i] - val) < Math.abs(best - val)) best = steps[i];
+  }
+  return best;
+}
 function showMenu(ev, items) {
   const m = document.getElementById('ctxmenu');
   ctxItems = items;
   m.innerHTML = items.map((it, i) => it.lbl === '—'
-    ? '<div class="ctxsep"></div>'
-    : '<div class="ctxitem' + (it.dis ? ' dis' : '') + '" data-act="ctx-item" data-i="' + i + '">' + it.lbl + '</div>').join('');
+    ? '<div class="ctxsep" role="separator"></div>'
+    : '<div class="ctxitem' + (it.dis ? ' dis' : '') + '" role="menuitem" tabindex="-1" data-act="ctx-item" data-i="' + i + '">' + it.lbl + '</div>').join('');
   m.hidden = false;
-  const w = m.offsetWidth, h = m.offsetHeight;
-  m.style.left = Math.max(6, Math.min(ev.clientX, window.innerWidth - w - 8)) + 'px';
-  m.style.top = Math.max(6, Math.min(ev.clientY, window.innerHeight - h - 8)) + 'px';
+  const w = m.offsetWidth || 260, h = m.offsetHeight || 220;
+  const x = Math.max(16, Math.min(ev.clientX || 16, window.innerWidth - w - 8));
+  const y = Math.max(16, Math.min(ev.clientY || 16, window.innerHeight - h - 8));
+  m.dataset.x = String(snapStep(x, CTX_X_STEPS));
+  m.dataset.y = String(snapStep(y, CTX_Y_STEPS));
 }
 // Clic droit sur un OUTIL du panneau de détail.
 function toolCtx(ev, id, name) {
@@ -1227,10 +1334,72 @@ document.addEventListener('dragend', (ev) => {
   const r = closestOf(ev, '.srow[data-id]');
   if (r) rowDragEnd(ev, r);
 });
-/* Échap ferme le menu contextuel PUIS efface le filtre de l'explorateur ;
-   « / » et Ctrl+K posent le focus dans le champ de filtre (raccourci
-   standard : recherche instantanée depuis n'importe où). */
+/* Navigation clavier complète (WCAG 2.2 AA) :
+   - Flèches ←/→/↑/↓ dans role="tablist" (Détail, Réglages, Accès)
+   - Flèches ↑/↓, Entrée et Alt+↑/Alt+↓ (réordonner) sur les lignes .srow de l'explorateur
+   - Ctrl+B : replier / déplier l'explorateur
+   - Échap : ferme menu contextuel ou efface filtre et restaure le focus */
 document.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
+    e.preventDefault();
+    toggleExplorer();
+    return;
+  }
+  const el = document.activeElement;
+  if (el && el.getAttribute && el.getAttribute('role') === 'tab') {
+    const tablist = el.closest('[role="tablist"]');
+    if (tablist && (e.key === 'ArrowRight' || e.key === 'ArrowLeft' || e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Home' || e.key === 'End')) {
+      const tabs = [...tablist.querySelectorAll('[role="tab"]:not([disabled])')];
+      const idx = tabs.indexOf(el);
+      if (idx >= 0 && tabs.length > 1) {
+        e.preventDefault();
+        let next = idx;
+        if (e.key === 'ArrowRight' || e.key === 'ArrowDown') next = (idx + 1) % tabs.length;
+        else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') next = (idx - 1 + tabs.length) % tabs.length;
+        else if (e.key === 'Home') next = 0;
+        else if (e.key === 'End') next = tabs.length - 1;
+        const target = tabs[next];
+        target.focus();
+        target.click();
+        return;
+      }
+    }
+  }
+  const row = el && el.closest ? el.closest('.srow[data-id]') : null;
+  if (row) {
+    if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+      e.preventDefault();
+      const id = row.dataset.id;
+      const localRows = [...document.querySelectorAll('#srvList .srow[data-id]')];
+      const ids = localRows.map(r => r.dataset.id);
+      const idx = ids.indexOf(id);
+      const swapIdx = e.key === 'ArrowUp' ? idx - 1 : idx + 1;
+      if (idx >= 0 && swapIdx >= 0 && swapIdx < ids.length) {
+        const tmp = ids[idx]; ids[idx] = ids[swapIdx]; ids[swapIdx] = tmp;
+        manualOrder = null;
+        const sel = document.getElementById('sortSel');
+        if (sel) sel.value = 'manuel';
+        postReorder(ids).then(() => {
+          const movedEl = document.querySelector(`#srvList .srow[data-id="${CSS.escape(id)}"]`);
+          if (movedEl) movedEl.focus();
+        });
+      }
+      return;
+    }
+    if (!e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+      e.preventDefault();
+      const allRows = [...document.querySelectorAll('#explorer .srow[data-id]')];
+      const idx = allRows.indexOf(row);
+      const next = e.key === 'ArrowDown' ? idx + 1 : idx - 1;
+      if (next >= 0 && next < allRows.length) allRows[next].focus();
+      return;
+    }
+    if (e.key === 'Enter' && el === row) {
+      e.preventDefault();
+      select(row.dataset.id);
+      return;
+    }
+  }
   if (e.key === 'Escape') {
     ctxClose();
     const f = document.getElementById('srvFilter');
@@ -1241,12 +1410,10 @@ document.addEventListener('keydown', (e) => {
     }
     return;
   }
-  const el = document.activeElement;
   const typing = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'
     || el.tagName === 'SELECT' || el.isContentEditable);
   if (!typing && (e.key === '/' || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k'))) {
     e.preventDefault();
-    // la boutique ouverte a la priorité : c'est SA recherche qu'on vise
     const d = document.getElementById('storeDlg');
     if (d && d.open) {
       const ss = document.getElementById('storeSearch');
@@ -1407,16 +1574,27 @@ function setDirty(v) {
   const b = document.getElementById('settingsDirty');
   if (b) b.hidden = !v;
 }
-function settingsConfirmDiscard() {
-  return !settingsDirty || confirm('Modifications non enregistr\u00e9es \u2014 fermer quand m\u00eame ?');
-}
-function closeSettings() {
-  if (!settingsConfirmDiscard()) return;
+async function closeSettings() {
+  if (settingsDirty) {
+    const ok = await askConfirm({
+      title: 'Modifications non enregistr\u00e9es',
+      msg: 'Modifications non enregistr\u00e9es \u2014 fermer quand m\u00eame ?',
+      okLabel: 'Abandonner',
+      danger: true,
+    });
+    if (!ok) return;
+  }
   setDirty(false);
   document.getElementById('settingsDlg').close();
+  restoreFocus();
 }
 function setPane(name) {
-  document.querySelectorAll('#settingsDlg .set-nav-btn').forEach(b => b.classList.toggle('sel', b.dataset.pane === name));
+  document.querySelectorAll('#settingsDlg .set-nav-btn').forEach(b => {
+    const sel = b.dataset.pane === name;
+    b.classList.toggle('sel', sel);
+    b.setAttribute('aria-selected', sel ? 'true' : 'false');
+    b.setAttribute('tabindex', sel ? '0' : '-1');
+  });
   document.querySelectorAll('#settingsDlg .set-pane').forEach(p => p.classList.toggle('sel', p.dataset.pane === name));
   try { localStorage.setItem('mcc.setpane', name); } catch (e) {}
 }
@@ -1481,7 +1659,8 @@ function openSettingsDlg() {
   document.getElementById('sLatest').textContent = state.latest_version ? 'v' + state.latest_version : '\u2014';
   const upd = document.getElementById('updMsg');
   upd.textContent = state.update_available ? '\u2b06 v' + state.latest_version + ' disponible' : 'Aucune mise \u00e0 jour connue (auto-v\u00e9rification au boot puis chaque heure).';
-  upd.style.color = state.update_available ? 'var(--warn)' : '';
+  upd.classList.remove('tone-warn', 'tone-ok');
+  if (state.update_available) upd.classList.add('tone-warn');
   const row = document.getElementById('resetMsgRow');
   if (row) row.hidden = true;
   document.getElementById('resetMsg').textContent = '';
@@ -1500,26 +1679,24 @@ function openSettingsDlg() {
   const foot = document.getElementById('settingsFootNote');
   if (foot) foot.textContent = 'Les r\u00e9glages sont enregistr\u00e9s dans config.json.';
   applyTheme(document.documentElement.dataset.theme === 'light' ? 'light' : 'dark');
+  rememberFocus();
   document.getElementById('settingsDlg').showModal();
-  // focus dans le dialog dès l'ouverture : Esc fonctionne immédiatement (le
-  // navigateur ne déclenche le cancel que si le focus est dedans) et la
-  // navigation clavier part du volet actif.
   const nav = document.querySelector('#settingsDlg .set-nav-btn.sel');
   if (nav) nav.focus();
 }
 async function checkUpdateNow() {
   const msg = document.getElementById('updMsg');
-  msg.style.color = '';
+  msg.classList.remove('tone-warn', 'tone-ok');
   msg.textContent = '⏳ vérification de la release GitHub…';
   const j = await postAction({action: 'check_update'}, {quiet: true});
   if (j.ok && j.checked && j.update_available) {
     document.getElementById('sLatest').textContent = 'v' + j.latest;
     msg.textContent = '\u2b06 v' + j.latest + ' disponible (installée : v' + j.current + ') — bouton « Mettre à jour » en bas à droite';
-    msg.style.color = 'var(--warn)';
+    msg.classList.add('tone-warn');
   } else if (j.ok && j.checked) {
     document.getElementById('sLatest').textContent = j.latest ? 'v' + j.latest : '—';
     msg.textContent = '✓ à jour — vérifié à l\u2019instant : v' + j.current + ' est la dernière release';
-    msg.style.color = 'var(--ok)';
+    msg.classList.add('tone-ok');
   } else {
     msg.textContent = j.latest
       ? '✗ vérification impossible (réseau ?) — dernière info connue : v' + j.latest + ' disponible'
@@ -1573,7 +1750,13 @@ async function downloadUpdate() {
 async function resetState(what) {
   const sel = document.getElementById('sResetWhat');
   const label = sel.options[sel.selectedIndex].text;
-  if (!confirm('Réinitialiser « ' + label + ' » ? Action irréversible.')) return;
+  const ok = await askConfirm({
+    title: 'R\u00e9initialiser les donn\u00e9es',
+    msg: 'R\u00e9initialiser \u00ab ' + label + ' \u00bb ? Action irr\u00e9versible.',
+    okLabel: 'R\u00e9initialiser',
+    danger: true,
+  });
+  if (!ok) return;
   const msg = document.getElementById('resetMsg');
   const row = document.getElementById('resetMsgRow');
   if (row) row.hidden = false;
@@ -1701,23 +1884,33 @@ async function testNotify() {
 }
 /* Historique runtime : crashs, relances, backoff — reset_runtime du moteur. */
 async function resetRuntime() {
-  if (!confirm('Effacer l\u2019historique runtime (crashs, relances, backoff) ?')) return;
+  const ok = await askConfirm({
+    title: 'Effacer l\u2019historique runtime',
+    msg: 'Effacer l\u2019historique runtime (crashs, relances, backoff) ?',
+    okLabel: 'Effacer',
+    danger: true,
+  });
+  if (!ok) return;
   const j = await postAction({action: 'reset_runtime'}, {quiet: true});
   showMsg('runtimeMsgRow', 'runtimeMsg',
     j.ok ? '\u2713 historique effac\u00e9 (' + (j.cleared || 0) + ' serveur(s))' : '\u2717 ' + (j.error || '\u00e9chec'));
   await load();
 }
 /* Câblage du dialog (une fois au boot) : dirty state sur toute saisie, et
-   Esc = event cancel — les modifications pendantes ne sont pas jetées en
-   silence, une confirmation les sauvegarde ou les abandonne explicitement. */
+   Esc = event cancel. */
 (function () {
   const d = document.getElementById('settingsDlg');
   if (!d) return;
   d.addEventListener('input', () => setDirty(true));
   d.addEventListener('change', () => setDirty(true));
   d.addEventListener('cancel', (e) => {
-    if (!settingsConfirmDiscard()) e.preventDefault();
-    else setDirty(false);
+    if (settingsDirty) {
+      e.preventDefault();
+      closeSettings();
+    } else {
+      setDirty(false);
+      restoreFocus();
+    }
   });
 })();
 function renderMachines() {
@@ -1757,7 +1950,7 @@ function sshForm() {
 async function sshDiscover(ip, user) {
   const f = sshForm();
   ip = ip || f.ip; user = user || f.user;
-  if (!ip || !user) { alert('IP et utilisateur SSH requis'); return; }
+  if (!ip || !user) { toast('IP et utilisateur SSH requis', 'err', 3500); return; }
   const msg = document.getElementById('machineMsg');
   msg.textContent = '⏳ connexion SSH + netstat distant + sonde des ports… (jusqu\u2019à ~30 s, vois le journal)';
   const j = await postAction({action: 'ssh_discover', ip, user}, {quiet: true});
@@ -1774,7 +1967,7 @@ async function sshDiscover(ip, user) {
 }
 async function sshSave() {
   const f = sshForm();
-  if (!f.ip || !f.user) { alert('IP et utilisateur SSH requis'); return; }
+  if (!f.ip || !f.user) { toast('IP et utilisateur SSH requis', 'err', 3500); return; }
   const j = await postAction({action: 'ssh_save', ip: f.ip, user: f.user}, {quiet: true});
   document.getElementById('machineMsg').textContent = j.ok ? '✓ machine enregistr\u00e9e' : '✗ ' + (j.error || 'erreur');
   await load(); renderMachines();
@@ -1791,10 +1984,10 @@ async function toggleTool(id, name) {
   await load();
 }
 
-function toggleAdd() { document.getElementById('dlg').showModal(); }
+function toggleAdd() { rememberFocus(); document.getElementById('dlg').showModal(); }
 function transportChanged() {
   const stdio = document.getElementById('fTransport').value === 'stdio';
-  document.getElementById('httpFields').style.display = stdio ? 'none' : '';
+  document.getElementById('httpFields').hidden = stdio;
   document.getElementById('stdioFields').hidden = !stdio;
 }
 
@@ -1848,8 +2041,8 @@ async function addServer(ev) {
          body.workdir = document.getElementById('fWorkdir').value || null;
          body.args = document.getElementById('fArgs').value.split(/\s+/).filter(Boolean); }
   const j = await postAction(body, {quiet: true});
-  if (!j.ok) alert(j.error || 'erreur');
-  else { document.getElementById('dlg').close(); selectedId = j.id; await act('refresh', j.id); }
+  if (!j.ok) toast(j.error || 'erreur', 'err', 4000);
+  else { document.getElementById('dlg').close(); restoreFocus(); selectedId = j.id; await act('refresh', j.id); }
   return false;
 }
 
@@ -1915,7 +2108,10 @@ let storeHideInst = false;
 function toggleHideInst() {
   storeHideInst = !storeHideInst;
   const b = document.getElementById('storeHideInst');
-  if (b) b.classList.toggle('sel', storeHideInst);
+  if (b) {
+    b.classList.toggle('sel', storeHideInst);
+    b.setAttribute('aria-checked', storeHideInst ? 'true' : 'false');
+  }
   renderStoreItems();
 }
 function renderStoreItems() {
@@ -1948,35 +2144,55 @@ async function installStore(id, btn) {
   btn.disabled = true; btn.textContent = '\u23f3 Installation\u2026';
   const body = {action: 'install_store', id};
   if (id === 'filesystem') {
-    // le dossier exposé est un choix EXPLICITE (jamais de chemin personnel par défaut)
-    const dir = prompt('Dossier à exposer au serveur Filesystem (chemin complet) :', '');
+    const res = await askConfirm({
+      title: 'Dossier Filesystem',
+      msg: 'Indiquez le dossier \u00e0 exposer au serveur Filesystem (chemin complet) :',
+      inputs: [{id: 'dir', label: 'Chemin du dossier autoris\u00e9', placeholder: 'C:\\Users\\...\\mon-projet'}],
+      okLabel: 'Installer',
+    });
+    const dir = res && typeof res === 'object' ? res.dir : '';
     if (!dir || !dir.trim()) {
-      btn.disabled = false; btn.textContent = '\u23f3 Installer';
+      btn.disabled = false; btn.textContent = 'Installer';
       return;
     }
     body.args = ['-y', '@modelcontextprotocol/server-filesystem', dir.trim()];
   }
   const j = await postAction(body, {quiet: true});
   if (j.ok) {
-    // re-rendu : la carte bascule sur l'état « Déjà installé » (source de
-    // vérité = state.servers, pas un libellé collé sur le bouton)
     await load();
     renderStoreItems();
-  } else { btn.disabled = false; btn.textContent = 'R\u00e9essayer'; alert(j.error || 'erreur'); }
+  } else { btn.disabled = false; btn.textContent = 'R\u00e9essayer'; toast(j.error || 'erreur', 'err', 4000); }
 }
 
-/* ===== Barre latérale ajustable (largeur mémorisée) ===== */
+/* ===== Barre latérale ajustable (largeur mémorisée via data-w, 0 style inline) & repliable (Ctrl+B) ===== */
+const snapExplW = w => Math.round(Math.min(520, Math.max(180, w)) / 10) * 10;
+function toggleExplorer() {
+  const expl = document.getElementById('explorer');
+  const btn = document.getElementById('tbExplToggle');
+  if (!expl) return;
+  const collapsed = expl.classList.toggle('collapsed');
+  if (btn) btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  try { localStorage.setItem('mcc.explorer.collapsed', collapsed ? '1' : '0'); } catch (e) {}
+}
 (function () {
   const grip = document.getElementById('grip'), expl = document.getElementById('explorer');
-  const clamp = w => Math.min(520, Math.max(180, w));
-  try { const saved = +localStorage.getItem('mcc.explorer.w'); if (saved) expl.style.width = clamp(saved) + 'px'; } catch (e) {}
+  if (!grip || !expl) return;
+  try {
+    const saved = +localStorage.getItem('mcc.explorer.w');
+    if (saved) expl.dataset.w = String(snapExplW(saved));
+    if (localStorage.getItem('mcc.explorer.collapsed') === '1') {
+      expl.classList.add('collapsed');
+      const btn = document.getElementById('tbExplToggle');
+      if (btn) btn.setAttribute('aria-expanded', 'false');
+    }
+  } catch (e) {}
   grip.addEventListener('mousedown', e => {
     e.preventDefault();
     grip.classList.add('drag');
     const x0 = e.clientX, w0 = expl.getBoundingClientRect().width;
-    const mv = ev => { expl.style.width = clamp(w0 + ev.clientX - x0) + 'px'; };
+    const mv = ev => { expl.dataset.w = String(snapExplW(w0 + ev.clientX - x0)); };
     const up = () => {
-      try { localStorage.setItem('mcc.explorer.w', String(Math.round(expl.getBoundingClientRect().width))); } catch (e) {}
+      try { localStorage.setItem('mcc.explorer.w', String(snapExplW(expl.getBoundingClientRect().width))); } catch (e) {}
       grip.classList.remove('drag');
       document.removeEventListener('mousemove', mv);
       document.removeEventListener('mouseup', up);
@@ -1986,8 +2202,7 @@ async function installStore(id, btn) {
   });
 })();
 
-/* ===== Contrôles de fenêtre (desktop Tauri uniquement : ni data-tauri-drag-region
-   ni IPC Tauri n'ont d'effet dans un navigateur classique, les boutons y restent masqués) ===== */
+/* ===== Contrôles de fenêtre (desktop Tauri uniquement) ===== */
 function tauriInvoke() {
   try {
     const I = window.__TAURI_INTERNALS__;
@@ -2010,7 +2225,7 @@ function tauriInvoke() {
 (function () {
   if (!tauriInvoke()) return;
   const box = document.getElementById('winCtrls');
-  if (box) box.style.display = 'flex';
+  if (box) box.classList.add('on');
 })();
 function winAction(op) {
   const inv = tauriInvoke();
@@ -2091,10 +2306,16 @@ function closeAccessDlg() {
   if (accessTimer) { clearInterval(accessTimer); accessTimer = null; }
   const d = document.getElementById('accessDlg');
   if (d && d.open) d.close();
+  restoreFocus();
 }
 function setAccessTab(name) {
   accessTab = name;
-  document.querySelectorAll('#accessDlg .set-nav-btn').forEach(b => b.classList.toggle('sel', b.dataset.atab === name));
+  document.querySelectorAll('#accessDlg .set-nav-btn').forEach(b => {
+    const sel = b.dataset.atab === name;
+    b.classList.toggle('sel', sel);
+    b.setAttribute('aria-selected', sel ? 'true' : 'false');
+    b.setAttribute('tabindex', sel ? '0' : '-1');
+  });
   document.querySelectorAll('#accessDlg .set-pane').forEach(p => p.classList.toggle('sel', p.dataset.atab === name));
   try { localStorage.setItem('mcc.acctab', name); } catch (e) {}
 }
@@ -2288,7 +2509,13 @@ async function clientToggleRight(keyid, right) {
   await refreshAccess();
 }
 async function clientRevokeConfirm(keyid) {
-  if (!confirm('R\u00e9voquer ' + keyid + ' ? Ses requ\u00eates seront refus\u00e9es d\u00e8s la suivante.')) return;
+  const ok = await askConfirm({
+    title: 'R\u00e9voquer ce client',
+    msg: 'R\u00e9voquer ' + keyid + ' ? Ses requ\u00eates seront refus\u00e9es d\u00e8s la suivante.',
+    okLabel: 'R\u00e9voquer',
+    danger: true,
+  });
+  if (!ok) return;
   const j = await postAction({action: 'client_revoke', keyid}, {quiet: true});
   if (!j.ok) { accessMsg('\u2717 ' + (j.error || 'refus')); return; }
   await refreshAccess();
@@ -2355,6 +2582,7 @@ function armPolling() {
    moment où le HTML est écrit. */
 const ACT = {
   // -- barre de titre, bandeaux, journal
+  'toggle-explorer': () => toggleExplorer(),
   'logout': () => logout(),
   'scan': () => doScan(),
   'scan-net': () => doScanNet(),
@@ -2434,7 +2662,9 @@ const ACT = {
   'transport': () => transportChanged(),
   'import-mcp': () => importMcp(),
   'forget-code': () => forgetCode(),
-  'close-dialog': el => { const d = el.closest('dialog'); if (d) d.close(); },
+  'confirm-dlg-ok': () => confirmDlgOk(),
+  'confirm-dlg-cancel': () => confirmDlgCancel(),
+  'close-dialog': el => { const d = el.closest('dialog'); if (d) { d.close(); restoreFocus(); } },
 };
 
 /* Entrée du menu contextuel : l'index vient de data-i, la fonction du tableau
