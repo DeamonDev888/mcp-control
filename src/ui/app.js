@@ -313,39 +313,41 @@ function setDead(on, msg) {
 async function load() {
   if (document.hidden) return; // fenêtre masquée (tray) : polling suspendu — CPU/mémoire au repos
   try {
-    const stOpts = _stateEtag ? {headers: {'If-None-Match': _stateEtag}} : {};
+    const stOpts = (state && _stateEtag) ? {headers: {'If-None-Match': _stateEtag}} : {};
     const r = await fetch('/api/state', stOpts);
     if (r.status === 304) {
       pollFails = 0;
       setDead(false);
-      return;
+      armPolling();
+    } else {
+      // Un 401 (session expirée) n'est pas un état : ne jamais le rendre.
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      _stateEtag = r.headers.get('ETag') || null;
+      state = await r.json();
+      pollFails = 0;
+      setDead(false);
+      if (selectedId && !state.servers.find(s => s.id === selectedId)) {
+        selectedId = null; detailCache = null; _lastSelectedSrvSig = ''; _detailEtag = null; _detailEtagId = null; _sigOverview = '';
+      }
+      render();
+      const rev = state && state.access ? state.access.revision : null;
+      if (rev !== _lastAccessRevision) {
+        _lastAccessRevision = rev;
+        const ad = document.getElementById('accessDlg');
+        if (ad && ad.open) refreshAccess();
+      }
     }
-    // Un 401 (session expirée) n'est pas un état : ne jamais le rendre.
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    _stateEtag = r.headers.get('ETag') || null;
-    state = await r.json();
-    pollFails = 0;
-    setDead(false);
-    if (selectedId && !state.servers.find(s => s.id === selectedId)) {
-      selectedId = null; detailCache = null; _lastSelectedSrvSig = ''; _detailEtag = null; _detailEtagId = null; _sigOverview = '';
-    }
-    render();
-    const rev = state && state.access ? state.access.revision : null;
-    if (rev !== _lastAccessRevision) {
-      _lastAccessRevision = rev;
-      const ad = document.getElementById('accessDlg');
-      if (ad && ad.open) refreshAccess();
-    }
-    if (selectedId) {
-      if (_detailEtagId !== selectedId) {
+    if (selectedId && state) {
+      const needFreshDetail = !detailCache || detailCache.id !== selectedId || _detailEtagId !== selectedId;
+      if (needFreshDetail) {
         _detailEtag = null;
         _detailEtagId = selectedId;
       }
       const srvSummary = state.servers.find(s => s.id === selectedId);
       const srvSig = JSON.stringify(srvSummary || null);
-      if (!detailCache || detailCache.id !== selectedId || srvSig !== _lastSelectedSrvSig) {
+      if (needFreshDetail || srvSig !== _lastSelectedSrvSig) {
         _lastSelectedSrvSig = srvSig;
-        const dOpts = _detailEtag ? {headers: {'If-None-Match': _detailEtag}} : {};
+        const dOpts = (!needFreshDetail && _detailEtag) ? {headers: {'If-None-Match': _detailEtag}} : {};
         const r2 = await fetch('/api/detail?id=' + encodeURIComponent(selectedId), dOpts);
         if (r2.status === 304) return;
         if (r2.ok) {
