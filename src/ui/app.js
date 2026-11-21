@@ -1094,7 +1094,7 @@ function copyConf(btn) {
   setTimeout(() => btn.textContent = 'copier', 1500);
 }
 function confAgent(s) {
-  const blk = (t, code) => '<div class="conf-block"><div class="conf-head">' + t + '<button data-act="copy-conf">copier</button></div><pre>' + esc(code) + '</pre></div>';
+  const blk = (t, code) => '<div class="conf-block"><div class="conf-head">' + t + '<button data-act="copy-conf">copier</button></div><pre>' + String(code || '').split('\n').map(esc).join('\n') + '</pre></div>';
   return '<h4 class="sec">Connecter ce serveur &agrave; un agent</h4>' +
     '<div class="conf-note">Copie le bloc de ton agent &mdash; Hermes : colle sous <b>mcp_servers:</b> dans <b>~/.hermes/config.yaml</b>. Cl&eacute;s API : bloc <b>env:</b> (Hermes) ou <b>"env"</b> (JSON) &mdash; voir la desc du serveur.</div>' +
     blk('Hermes &mdash; config.yaml', hermesYaml(s)) +
@@ -2634,7 +2634,7 @@ function pairGuideHtml(uiUrl, sampleKeyId) {
     }
   }, null, 2);
   const blk = (title, code) =>
-    `<div class="conf-block"><div class="conf-head">${esc(title)}<button data-act="copy-conf">copier</button></div><pre>${esc(code)}</pre></div>`;
+    `<div class="conf-block"><div class="conf-head">${esc(title)}<button data-act="copy-conf">copier</button></div><pre>${String(code || '').split('\n').map(esc).join('\n')}</pre></div>`;
   return `<div class="acc-sub">Connecter un client / assistant IA</div>
     <div class="acc-card">
       <div class="acc-who"><b>1. Appairer la machine cliente</b> &mdash; ex&eacute;cutez cette commande puis validez le code &agrave; 6 chiffres ci-dessus :</div>
