@@ -105,18 +105,43 @@ fn keyring_write(_service: &str, _account: &str, _secret: &str) -> Result<(), St
 }
 
 /// Écrit un secret dans un fichier à permissions réduites : dossier créé au
-/// besoin, écriture temporaire + renommage, permissions posées AVANT que la clé
-/// ne soit visible sous son nom définitif.
+/// besoin, fichier temporaire créé vide puis restreint AVANT toute écriture du
+/// secret (ferme la fenêtre TOCTOU), `sync_all`, puis renommage atomique. Tout
+/// échec avant le renommage supprime le fichier temporaire.
 pub fn write_secret_file(path: &Path, secret: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("dossier {} impossible : {}", parent.display(), e))?;
     }
     let tmp = path.with_extension("key.tmp");
-    std::fs::write(&tmp, secret)
-        .map_err(|e| format!("écriture {} impossible : {}", tmp.display(), e))?;
-    crate::manage::restrict_permissions(&tmp.to_string_lossy())
-        .map_err(|e| format!("permissions {} impossibles : {}", tmp.display(), e))?;
+    // 1. Créer le fichier temporaire vide avant d'y poser le moindre octet secret.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)
+        .map_err(|e| format!("création {} impossible : {}", tmp.display(), e))?;
+    // 2. Restreindre les permissions AVANT d'écrire le secret ; nettoyer sur erreur.
+    if let Err(e) = crate::manage::restrict_permissions(&tmp.to_string_lossy()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("permissions {} impossibles : {}", tmp.display(), e));
+    }
+    // 3. Écrire le secret + sync_all ; nettoyer sur toute erreur.
+    let write_res = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(secret.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("écriture {} impossible : {}", tmp.display(), e));
+    }
+    // 4. Renommage atomique vers la destination finale.
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("renommage {} impossible : {}", path.display(), e)
@@ -478,6 +503,39 @@ mod tests {
         assert_eq!(first.key, second.key);
         let loaded = load_audit_key(&dir, None).unwrap().expect("relue");
         assert_eq!(loaded, first.key);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_secret_file_ne_laisse_aucun_tmp_et_restreint_les_permissions() {
+        let dir = tmp("r4-atomic");
+        let chemin = dir.join("auth").join("test.key");
+        let tmp_path = chemin.with_extension("key.tmp");
+        write_secret_file(&chemin, "secret-test-r4").expect("write_secret_file");
+        assert!(chemin.exists(), "le fichier final doit exister");
+        assert!(
+            !tmp_path.exists(),
+            "aucun résidu .key.tmp ne doit subsister après écriture"
+        );
+        assert_eq!(std::fs::read_to_string(&chemin).unwrap(), "secret-test-r4");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&chemin).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "0600 attendu, vu {mode:o}");
+        }
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("icacls")
+                .arg(&chemin)
+                .output()
+                .expect("icacls");
+            let texte = String::from_utf8_lossy(&out.stdout).to_string();
+            assert!(
+                !texte.contains("(I)"),
+                "aucune ACL héritée ne doit subsister : {texte}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

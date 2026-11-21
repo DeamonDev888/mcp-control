@@ -27,6 +27,10 @@ pub const PAIR_DECIDED_TTL_SECS: u64 = 120;
 /// 5 demandes par adresse et par minute (§3.3).
 pub const PAIR_RATE_MAX: usize = 5;
 pub const PAIR_RATE_WINDOW_SECS: u64 = 60;
+/// 60 consultations `GET /auth/pair/{id}` par adresse et par minute (R-6 :
+/// couvre largement le polling toutes les 2 s tout en bornant la charge).
+pub const PAIR_GET_RATE_MAX: usize = 60;
+pub const PAIR_GET_RATE_WINDOW_SECS: u64 = 60;
 /// Adresses suivies au plus par le limiteur (borne mémoire de l'état global).
 pub const PAIR_RATE_KEYS_MAX: usize = 1024;
 /// Nom du protocole, renvoyé au client (il refuse un `api` inconnu).
@@ -112,6 +116,35 @@ pub fn pair_rate_ok(ip: IpAddr, now: u64) -> bool {
     // Purge par ANCIENNETÉ et non par l'horloge de l'appelant : un appel daté
     // plus tard (autre instance, test) ne doit pas effacer l'historique d'une
     // autre adresse. La table reste bornée par la purge du stamp le plus vieux.
+    if slot.len() > PAIR_RATE_KEYS_MAX {
+        if let Some(plus_vieille) = slot
+            .iter()
+            .min_by_key(|(_, stamps)| stamps.last().copied().unwrap_or(0))
+            .map(|(k, _)| *k)
+        {
+            slot.remove(&plus_vieille);
+        }
+    }
+    decision.is_ok()
+}
+
+fn pair_get_rate_slot() -> &'static std::sync::Mutex<std::collections::HashMap<IpAddr, Vec<u64>>> {
+    static SLOT: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<IpAddr, Vec<u64>>>,
+    > = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Limiteur par adresse pour `GET /auth/pair/{pair_id}` (R-6) : 60 req/min/IP
+/// avant l'acquisition de `state.settings`.
+pub fn pair_get_rate_ok(ip: IpAddr, now: u64) -> bool {
+    let mut slot = pair_get_rate_slot()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let prior = slot.get(&ip).map(Vec::as_slice).unwrap_or(&[]);
+    let (decision, next) =
+        crate::rate_decide(now, prior, PAIR_GET_RATE_MAX, PAIR_GET_RATE_WINDOW_SECS);
+    slot.insert(ip, next);
     if slot.len() > PAIR_RATE_KEYS_MAX {
         if let Some(plus_vieille) = slot
             .iter()
@@ -243,7 +276,9 @@ pub fn handle_post(
         });
         return (200, "application/json", resp.to_string().into_bytes());
     }
-    let pair_id = crate::random_hex(2);
+    let Some(pair_id) = crate::random_hex(2) else {
+        return json_error(503, "entropie OS indisponible");
+    };
     let code = comparison_code(&pair_id, public_key, &server.public_key, &tls_fp);
     pairs.push(PairRequest {
         pair_id: pair_id.clone(),
@@ -269,8 +304,22 @@ pub fn handle_post(
 }
 
 /// `GET /auth/pair/{pair_id}` (message 5). `pair_id` inconnu → 404 : les
-/// demandes ne sont pas énumérables sans connaître ces 16 octets.
-pub fn handle_get(state: &Arc<AppState>, pair_id: &str, now: u64) -> (u16, &'static str, Vec<u8>) {
+/// demandes ne sont pas énumérables sans connaître ces 16 octets. Limité par IP
+/// avant l'acquisition de `state.settings` (R-6).
+pub fn handle_get(
+    state: &Arc<AppState>,
+    pair_id: &str,
+    from: Option<IpAddr>,
+    now: u64,
+) -> (u16, &'static str, Vec<u8>) {
+    if let Some(ip) = from {
+        if !pair_get_rate_ok(ip, now) {
+            return json_error(
+                429,
+                "trop de consultations d'appairage pour cette adresse — réessayez dans une minute",
+            );
+        }
+    }
     if pair_id.len() != 32
         || !pair_id
             .bytes()
@@ -654,10 +703,10 @@ mod tests {
         let st = state();
         let now = 1_800_000_000;
         for mauvais in ["", "abc", &"z".repeat(32), &"0".repeat(33)] {
-            let (s, _, _) = handle_get(&st, mauvais, now);
+            let (s, _, _) = handle_get(&st, mauvais, None, now);
             assert_eq!(s, 404, "{mauvais}");
         }
-        let (s, _, _) = handle_get(&st, &"0".repeat(32), now);
+        let (s, _, _) = handle_get(&st, &"0".repeat(32), None, now);
         assert_eq!(s, 404);
     }
 
@@ -686,7 +735,7 @@ mod tests {
             String::from_utf8_lossy(&body)
         );
         let statut = |t: u64| {
-            let (s, _, b) = handle_get(&st, &pair_id, t);
+            let (s, _, b) = handle_get(&st, &pair_id, None, t);
             assert_eq!(s, 200);
             let v: Value = serde_json::from_slice(&b).unwrap();
             v["status"].as_str().unwrap_or("").to_string()
@@ -709,7 +758,7 @@ mod tests {
         assert_eq!(s, 200);
         let pair_id2 = pair_id_of(&body);
         reject(&st, &pair_id2, now + 200).unwrap();
-        let (_, _, b) = handle_get(&st, &pair_id2, now + 200);
+        let (_, _, b) = handle_get(&st, &pair_id2, None, now + 200);
         let v: Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(v["status"], "rejected");
         // une demande refusée ne peut plus être approuvée
@@ -815,7 +864,7 @@ mod tests {
         let pair_id = v["pair_id"].as_str().unwrap();
         assert_eq!(v["tls_fp"].as_str(), Some(fp.as_str()));
 
-        let (_, _, bg) = handle_get(&st, pair_id, now);
+        let (_, _, bg) = handle_get(&st, pair_id, None, now);
         let vg: Value = serde_json::from_slice(&bg).unwrap();
         assert_eq!(vg["tls_fp"].as_str(), Some(fp.as_str()));
 
@@ -826,5 +875,33 @@ mod tests {
         let code_sans_tls = comparison_code(pair_id, CLIENT_PUB, &srv_pub, "");
         assert_eq!(code_serveur, code_attendu);
         assert_ne!(code_serveur, code_sans_tls);
+    }
+
+    #[test]
+    fn get_pair_rate_limite_60_par_minute_renvoie_429() {
+        let st = state();
+        let now = 1_800_000_000;
+        let ip = Some("192.0.2.99".parse().unwrap());
+        let (s, _, body) = handle_post(
+            &st,
+            &corps(now, "mcc-a-00000000000000aa", CLIENT_PUB),
+            ip,
+            now,
+        );
+        assert_eq!(s, 200);
+        let pair_id = pair_id_of(&body);
+        for i in 0..PAIR_GET_RATE_MAX {
+            let (st_code, _, _) = handle_get(&st, &pair_id, ip, now);
+            assert_eq!(st_code, 200, "requête GET #{i} doit passer");
+        }
+        let (st_over, _, _) = handle_get(&st, &pair_id, ip, now);
+        assert_eq!(st_over, 429, "au-delà de {PAIR_GET_RATE_MAX} req/min → 429");
+        // Une autre adresse a son propre seau.
+        let other_ip = Some("192.0.2.100".parse().unwrap());
+        let (st_other, _, _) = handle_get(&st, &pair_id, other_ip, now);
+        assert_eq!(st_other, 200);
+        // Après la fenêtre, le quota est reconstitué.
+        let (st_after, _, _) = handle_get(&st, &pair_id, ip, now + PAIR_GET_RATE_WINDOW_SECS + 1);
+        assert_eq!(st_after, 200);
     }
 }

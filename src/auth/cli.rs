@@ -120,14 +120,16 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "cli".to_string())
 }
 
-/// Requête HTTP minimale (une connexion par appel, `Connection: close`).
-fn http(
+/// Requête HTTP minimale avec en-têtes additionnels (une connexion par appel,
+/// `Connection: close`). Renvoie `(statut, en_tetes_bruts, corps)`.
+fn http_with_headers(
     host: &str,
     port: u16,
     method: &str,
     path: &str,
+    extra_headers: &[(&str, &str)],
     body: Option<&str>,
-) -> Result<(u16, String), String> {
+) -> Result<(u16, String, String), String> {
     let addr = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("résolution {host}:{port} impossible : {e}"))?
@@ -139,6 +141,9 @@ fn http(
     let mut req = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: application/json\r\n"
     );
+    for (name, value) in extra_headers {
+        req.push_str(&format!("{name}: {value}\r\n"));
+    }
     if let Some(b) = body {
         req.push_str(&format!(
             "Content-Type: application/json\r\nContent-Length: {}\r\n",
@@ -171,7 +176,19 @@ fn http(
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse::<u16>().ok())
         .ok_or_else(|| "réponse HTTP illisible".to_string())?;
-    Ok((status, corps.to_string()))
+    Ok((status, head.to_string(), corps.to_string()))
+}
+
+/// Requête HTTP minimale (une connexion par appel, `Connection: close`).
+fn http(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<(u16, String), String> {
+    let (status, _, corps) = http_with_headers(host, port, method, path, &[], body)?;
+    Ok((status, corps))
 }
 
 fn http_json(
@@ -261,12 +278,69 @@ fn local_port() -> Result<u16, String> {
         .ok_or_else(|| "ui_port absent de config.json".to_string())
 }
 
+/// Extrait la valeur du cookie `mcc_session` des en-têtes `Set-Cookie`.
+fn extract_session_cookie(head: &str) -> Option<String> {
+    for line in head.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("set-cookie") {
+            continue;
+        }
+        let first = value.trim().split(';').next().unwrap_or("");
+        if let Some((cname, cval)) = first.split_once('=') {
+            if cname.trim() == crate::auth::session::COOKIE_NAME {
+                let cval = cval.trim();
+                if !cval.is_empty() {
+                    return Some(cval.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Ouvre une session locale S1 via le canal fichier utilisateur puis l'échange
+/// sur `POST /api/session` (R-5). Aucun jeton, cookie ni secret n'est affiché.
+fn local_session(port: u16) -> Result<(String, String), String> {
+    let token = crate::auth::session::request_bootstrap(&config_path(), Duration::from_secs(5))?;
+    let body = json!({ "token": token }).to_string();
+    let (status, head, corps) =
+        http_with_headers("127.0.0.1", port, "POST", "/api/session", &[], Some(&body))?;
+    if status != 200 {
+        return Err(format!(
+            "ouverture de session locale refusée (HTTP {status})"
+        ));
+    }
+    let cookie = extract_session_cookie(&head)
+        .ok_or_else(|| "cookie de session absent de la réponse /api/session".to_string())?;
+    let v: Value = serde_json::from_str(&corps).unwrap_or(Value::Null);
+    let secret = v
+        .get("secret")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "secret de session absent de la réponse /api/session".to_string())?
+        .to_string();
+    Ok((cookie, secret))
+}
+
 fn action(v: Value) -> Result<Value, String> {
     let port = local_port()?;
-    let (status, reponse) = http_json("127.0.0.1", port, "POST", "/api/action", Some(&v))?;
+    let (cookie, secret) = local_session(port)?;
+    let cookie_hdr = format!("{}={cookie}", crate::auth::session::COOKIE_NAME);
+    let body = v.to_string();
+    let (status, _, corps) = http_with_headers(
+        "127.0.0.1",
+        port,
+        "POST",
+        "/api/action",
+        &[("Cookie", &cookie_hdr), ("X-MCC-Session", &secret)],
+        Some(&body),
+    )?;
     if status != 200 {
         return Err(format!("le moteur a répondu {status}"));
     }
+    let reponse: Value = serde_json::from_str(&corps).unwrap_or(Value::Null);
     if reponse.get("ok").and_then(|o| o.as_bool()) != Some(true) {
         return Err(reponse
             .get("error")
@@ -311,7 +385,11 @@ fn cmd_pair(url: &str) -> i32 {
 
     let cle = litemcp::auth::sign::SigningKey::generate();
     let cle_pub = crate::crypto::hex(&cle.verifying_key().to_bytes());
-    let keyid = format!("mcc-{}-{}", keyid_prefix(&hostname()), crate::random_hex(1));
+    let Some(suffix) = crate::random_hex(1) else {
+        eprintln!("auth pair : entropie OS indisponible — abandon");
+        return 1;
+    };
+    let keyid = format!("mcc-{}-{}", keyid_prefix(&hostname()), suffix);
     let corps = json!({
         "keyid": keyid,
         "label": hostname().chars().take(64).collect::<String>(),
@@ -828,11 +906,22 @@ mod tests {
         assert_eq!(keyid_prefix("a"), "a");
         assert_eq!(keyid_prefix("portable-de-test-tres-long"), "portable");
         assert_eq!(keyid_prefix("---"), "cli");
-        let keyid = format!("mcc-{}-{}", keyid_prefix("DEAMON-PC"), crate::random_hex(1));
+        let keyid = format!(
+            "mcc-{}-{}",
+            keyid_prefix("DEAMON-PC"),
+            crate::random_hex(1).expect("entropie OS")
+        );
         assert!(
             crate::auth::registry::valid_keyid(&keyid),
             "keyid généré invalide : {keyid}"
         );
+    }
+
+    #[test]
+    fn extraction_cookie_session_dans_set_cookie() {
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: mcc_session=abc123_XYZ; HttpOnly; SameSite=Strict; Path=/\r\n";
+        assert_eq!(extract_session_cookie(head).as_deref(), Some("abc123_XYZ"));
+        assert_eq!(extract_session_cookie("HTTP/1.1 200 OK\r\n"), None);
     }
 
     #[test]

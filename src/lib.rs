@@ -232,30 +232,23 @@ pub fn effective_require_access(bind_is_loopback: bool, peer_is_loopback: bool) 
     !bind_is_loopback && !peer_is_loopback
 }
 
-/// Hex aléatoire de `words` × 64 bits — CSPRNG de l'OS : les nonces de preuve
-/// de pair et les codes d'accès exigent une imprévisibilité cryptographique.
-/// RandomState (SipHash semé au boot, puis compteur thread-local) ne la
-/// fournit PAS — deux appels successifs y sont corrélables. Zéro dépendance :
-/// BCryptGenRandom sur Windows, /dev/urandom sur Unix. Repli (hors pratique,
-/// les deux sources OS sont toujours disponibles) : hash semé aléatoirement
-/// mélangé à l'horloge et à un compteur atomique — strictement mieux que
-/// RandomState seul, et le résultat reste improvisible entre processus.
-pub(crate) fn random_hex(words: usize) -> String {
+/// Hex aléatoire de `words` × 64 bits — CSPRNG de l'OS exclusivement (R-7).
+/// Aucun repli PRNG non cryptographique : si la source OS échoue, retourne
+/// `None` (échec fermé) pour que les appelants renvoient `503`.
+fn random_hex_with<F: FnMut(&mut [u8]) -> bool>(words: usize, mut rng: F) -> Option<String> {
     let mut out = String::with_capacity(words * 16);
     let mut buf = [0u8; 8];
     for _ in 0..words {
-        if !os_random(&mut buf) {
-            use std::hash::{BuildHasher, Hasher};
-            static FALLBACK_COUNTER: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-            h.write_u64(crate::types::now_ts());
-            h.write_u64(FALLBACK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-            buf = h.finish().to_le_bytes();
+        if !rng(&mut buf) {
+            return None;
         }
         out.push_str(&format!("{:016x}", u64::from_le_bytes(buf)));
     }
-    out
+    Some(out)
+}
+
+pub(crate) fn random_hex(words: usize) -> Option<String> {
+    random_hex_with(words, os_random)
 }
 
 /// Remplit `buf` avec des octets cryptographiquement aléatoires de l'OS.
@@ -291,7 +284,7 @@ pub(crate) fn os_random(buf: &mut [u8]) -> bool {
 /// d'entropie ; plus aucun code partagé n'est généré au démarrage (docs/auth.md §10).
 #[cfg_attr(not(test), allow(dead_code))]
 fn generate_access() -> String {
-    random_hex(2)
+    random_hex(2).expect("entropie OS")
 }
 
 // ---------- preuve de pair (audit 2026-10-24 S-B) ----------
@@ -320,7 +313,8 @@ const HELLO_RATE_MAX: usize = 30;
 /// Fenêtre glissante du limiteur de débit (secondes).
 const HELLO_RATE_WINDOW_SECS: u64 = 60;
 
-fn issue_hello_nonce() -> String {
+fn issue_hello_nonce() -> Option<String> {
+    let nonce = random_hex(4)?;
     let mut slot = hello_nonces_slot()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -332,9 +326,8 @@ fn issue_hello_nonce() -> String {
         // preuves récentes des autres adresses restent valables.
         evict_oldest_nonces(&mut slot, HELLO_NONCE_MAX - 1);
     }
-    let nonce = random_hex(4);
     slot.insert(nonce.clone(), now);
-    nonce
+    Some(nonce)
 }
 
 /// Évince les nonces émis le plus anciennement jusqu'à repasser sous `max`.
@@ -461,6 +454,68 @@ pub fn host_only_of(h: &str) -> String {
     }
     h.trim_matches(|c| c == '[' || c == ']')
         .to_ascii_lowercase()
+}
+
+/// Extrait le port numérique explicite d'un en-tête `Host`, s'il est présent.
+/// `Ok(None)` = pas de port explicite ; `Ok(Some(p))` = port valide ; `Err` =
+/// syntaxe de port invalide (R-1).
+pub fn host_port_of(h: &str) -> Result<Option<u16>, &'static str> {
+    let h = h.trim();
+    if let Some(rest) = h.strip_prefix('[') {
+        let Some(idx) = rest.find(']') else {
+            return Err("Bad Request");
+        };
+        let after = &rest[idx + 1..];
+        if after.is_empty() {
+            return Ok(None);
+        }
+        let Some(port_s) = after.strip_prefix(':') else {
+            return Err("Bad Request");
+        };
+        if port_s.is_empty() || !port_s.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("Bad Request");
+        }
+        let port = port_s.parse::<u16>().map_err(|_| "Bad Request")?;
+        if port == 0 {
+            return Err("Bad Request");
+        }
+        return Ok(Some(port));
+    }
+    if let Some((host, port_s)) = h.rsplit_once(':') {
+        // IPv6 sans crochets : plusieurs ':' → pas de port exploitable.
+        if host.contains(':') {
+            return Ok(None);
+        }
+        if port_s.is_empty() || !port_s.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("Bad Request");
+        }
+        let port = port_s.parse::<u16>().map_err(|_| "Bad Request")?;
+        if port == 0 {
+            return Err("Bad Request");
+        }
+        return Ok(Some(port));
+    }
+    Ok(None)
+}
+
+/// Vérifie que le port de l'en-tête `Host` correspond au `ui_port` écouté par
+/// cette instance (R-1 : ferme le rejeu inter-ports / inter-instances sur `/mcp`).
+/// - Un port explicite différent de `ui_port` est toujours refusé (`403`).
+/// - Sur `/mcp`, un `Host` sans port n'est accepté que si `ui_port` est 80/443.
+pub fn check_host_port(
+    headers: &[(String, String)],
+    ui_port: u16,
+    is_mcp: bool,
+) -> Result<(), (u16, &'static str)> {
+    let Some((_, h)) = headers.iter().find(|(n, _)| n == "host") else {
+        return Err((400, "Bad Request"));
+    };
+    match host_port_of(h) {
+        Err(reason) => Err((400, reason)),
+        Ok(Some(p)) if p != ui_port => Err((403, "Forbidden")),
+        Ok(None) if is_mcp && ui_port != 80 && ui_port != 443 => Err((403, "Forbidden")),
+        Ok(_) => Ok(()),
+    }
 }
 
 /// Hote normalise extrait d'une origine HTTP complete (schema://hote[:port][/...]).
@@ -595,11 +650,10 @@ pub fn check_access(
     if method == "OPTIONS" {
         return Err((403, "Forbidden"));
     }
-    // HTTP/1.1 sans en-tête Host → 400 : sinon le contrôle anti DNS-rebinding
-    // ci-dessous est sauté par une requête qui omet simplement Host (audit 05
-    // #8). La fenêtre desktop, le harnais e2e et les sondes de pairs envoient
-    // tous Host (vérifié au passage du lot 5).
-    if !headers.iter().any(|(n, _)| n == "host") {
+    // HTTP/1.1 : exactement un en-tête Host requis (0 ou ≥ 2 → 400, R-3).
+    // Sinon le contrôle anti DNS-rebinding ci-dessous serait sauté ou ambigu.
+    let host_count = headers.iter().filter(|(n, _)| n == "host").count();
+    if host_count != 1 {
         return Err((400, "Bad Request"));
     }
     if let Some((_, h)) = headers.iter().find(|(n, _)| n == "host") {
@@ -611,15 +665,36 @@ pub fn check_access(
             return Err((403, "Forbidden"));
         }
     }
-    // anti request-smuggling : refuser les en-tetes de cadrage ambigus/dupliques
-    let cl_count = headers
-        .iter()
-        .filter(|(n, _)| n == "content-length")
-        .count();
-    if cl_count > 1 {
-        return Err((400, "Bad Request"));
+    // anti request-smuggling & désynchronisation (R-3) : refuser les en-têtes
+    // critiques dupliqués ou mal formés.
+    let mut cl_count = 0usize;
+    for (n, v) in headers {
+        if n == "content-length" {
+            cl_count += 1;
+            if cl_count > 1
+                || v.is_empty()
+                || !v.bytes().all(|b| b.is_ascii_digit())
+                || v.parse::<usize>().is_err()
+            {
+                return Err((400, "Bad Request"));
+            }
+        }
     }
     if headers.iter().any(|(n, _)| n == "transfer-encoding") {
+        return Err((400, "Bad Request"));
+    }
+    if headers.iter().filter(|(n, _)| n == "origin").count() > 1 {
+        return Err((400, "Bad Request"));
+    }
+    if headers
+        .iter()
+        .filter(|(n, _)| n == crate::auth::session::SESSION_HEADER)
+        .count()
+        > 1
+    {
+        return Err((400, "Bad Request"));
+    }
+    if crate::auth::session::cookie_count(headers) > 1 {
         return Err((400, "Bad Request"));
     }
     if let Some((_, o)) = headers.iter().find(|(n, _)| n == "origin") {
@@ -1402,9 +1477,33 @@ fn handle_conn_stream(
             headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
         }
     }
+    let mut cl_seen = false;
     for (name, value) in &headers {
         if name == "content-length" {
-            content_length = value.parse().unwrap_or(0);
+            let valid = !cl_seen && !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+            let parsed = if valid {
+                value.parse::<usize>().ok()
+            } else {
+                None
+            };
+            match parsed {
+                Some(n) => {
+                    cl_seen = true;
+                    content_length = n;
+                }
+                None => {
+                    let j = serde_json::json!({"ok": false, "error": "Bad Request"}).to_string();
+                    let resp = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Cache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+                        j.len(),
+                        SECURITY_HEADERS,
+                        j
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                    return;
+                }
+            }
         }
     }
     let mut body = buf[head_end + 4..].to_vec();
@@ -1439,7 +1538,10 @@ fn handle_conn_stream(
 
     // contrôle d'accès (session locale, code hérité, Origin, Host, cadrage) puis
     // routage. Lot M2 : le loopback n'est plus une zone de confiance (DA2 = a).
-    let api_access = { lockv(&state.settings).api_access.clone() };
+    let (api_access, ui_port) = {
+        let st = lockv(&state.settings);
+        (st.api_access.clone(), st.ui_port)
+    };
     let (allowed_hosts, allowed_origins) = (
         lockv(&state.allowed_hosts).clone(),
         lockv(&state.allowed_origins).clone(),
@@ -1553,6 +1655,9 @@ fn handle_conn_stream(
         }
         autre => autre,
     };
+    // R-1 : le port de `Host` doit correspondre au `ui_port` de cette instance
+    // (ferme le rejeu inter-ports / inter-instances sur `/mcp`).
+    let gated = gated.and_then(|()| check_host_port(&headers, ui_port, bare_route == "/mcp"));
     // limiteur de débit /api/hello (audit 05 #6) : hors loopback, une adresse
     // ne peut plus remplir la table de nonces à outrance. Le loopback est
     // exempté : la fenêtre locale et le harnais e2e sondent /api/hello en rafale.
@@ -1747,7 +1852,7 @@ pub fn route_peer_session(
                 br#"{"ok":false,"error":"method not allowed"}"#.to_vec(),
             );
         }
-        return crate::auth::pair::handle_get(state, pair_id, crate::types::now_ts()).into();
+        return crate::auth::pair::handle_get(state, pair_id, peer, crate::types::now_ts()).into();
     }
     // ---- Session locale (docs/auth.md §6) : le jeton d'amorçage (32 octets,
     // usage unique, 5 min) s'échange ici contre le cookie `mcc_session`. Route
@@ -1826,12 +1931,21 @@ pub fn route_peer_session(
     }
     if method == "GET" && bare_path == "/api/hello" {
         // amorce de la preuve de pair : identité + nonce à usage unique, aucun secret
+        let Some(nonce) = issue_hello_nonce() else {
+            return Reply::json(
+                503,
+                serde_json::json!({
+                    "ok": false,
+                    "error": "entropie OS indisponible"
+                }),
+            );
+        };
         return Reply::json(
             200,
             serde_json::json!({
                 "app": "mcp-control",
                 "version": env!("CARGO_PKG_VERSION"),
-                "nonce": issue_hello_nonce(),
+                "nonce": nonce,
             }),
         );
     }
@@ -2158,8 +2272,8 @@ mod tests {
         // CSPRNG obligatoire : les mots successifs d'un nonce (et d'un appel au
         // suivant) ne doivent montrer AUCUNE corrélation — RandomState suivait
         // un compteur thread-local, prévisible après observation.
-        let a = random_hex(4);
-        let b = random_hex(4);
+        let a = random_hex(4).expect("entropie OS");
+        let b = random_hex(4).expect("entropie OS");
         assert_eq!(a.len(), 64);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
@@ -2216,7 +2330,7 @@ mod tests {
 
     #[test]
     fn nonce_hello_usage_unique_et_verif_proof() {
-        let nonce = issue_hello_nonce();
+        let nonce = issue_hello_nonce().expect("entropie OS");
         assert_eq!(nonce.len(), 64);
         let proof = crate::crypto::hmac_sha256_hex(
             b"code-partage",
@@ -2226,7 +2340,7 @@ mod tests {
         // usage unique : la même preuve ne repasse pas
         assert!(!verify_proof(&nonce, &proof, "code-partage"));
         // mauvais code partagé → rejet (et le nonce est consommé par le 1er essai)
-        let nonce2 = issue_hello_nonce();
+        let nonce2 = issue_hello_nonce().expect("entropie OS");
         let proof2 = crate::crypto::hmac_sha256_hex(
             b"code-partage",
             format!("mcc-proof-v1:{nonce2}").as_bytes(),
@@ -2669,5 +2783,139 @@ mod tests {
         let (d2, next2) = hello_rate_decide(1000 + HELLO_RATE_WINDOW_SECS, &hist);
         assert!(d2.is_ok(), "fenêtre purgée : requête de nouveau admise");
         assert_eq!(next2, vec![1000 + HELLO_RATE_WINDOW_SECS]);
+    }
+
+    #[test]
+    fn check_host_port_bloque_rejeu_inter_ports_et_mcp_sans_port() {
+        // Port exact → OK (MCP et autres routes)
+        assert!(check_host_port(&hs(&[("host", "127.0.0.1:5591")]), 5591, true).is_ok());
+        assert!(check_host_port(&hs(&[("host", "[::1]:5591")]), 5591, true).is_ok());
+        assert!(check_host_port(&hs(&[("host", "127.0.0.1:5591")]), 5591, false).is_ok());
+        // Port d'une autre instance → 403 (ferme le rejeu inter-instances R-1)
+        assert_eq!(
+            check_host_port(&hs(&[("host", "127.0.0.1:5590")]), 5591, true),
+            Err((403, "Forbidden"))
+        );
+        assert_eq!(
+            check_host_port(&hs(&[("host", "127.0.0.1:5590")]), 5591, false),
+            Err((403, "Forbidden"))
+        );
+        // /mcp sans port explicite : refusé hors 80/443, autorisé sur 80/443
+        assert_eq!(
+            check_host_port(&hs(&[("host", "127.0.0.1")]), 5591, true),
+            Err((403, "Forbidden"))
+        );
+        assert!(check_host_port(&hs(&[("host", "127.0.0.1")]), 80, true).is_ok());
+        assert!(check_host_port(&hs(&[("host", "127.0.0.1")]), 443, true).is_ok());
+        // Hors /mcp sans port explicite : compatibilité des sondes simples
+        assert!(check_host_port(&hs(&[("host", "127.0.0.1")]), 5591, false).is_ok());
+        // Port mal formé → 400
+        assert_eq!(
+            check_host_port(&hs(&[("host", "127.0.0.1:abc")]), 5591, true),
+            Err((400, "Bad Request"))
+        );
+    }
+
+    #[test]
+    fn check_access_rejette_entetes_dupliques_et_content_length_invalide() {
+        // 1. Host dupliqué → 400
+        assert_eq!(
+            acc(
+                "GET",
+                "/",
+                &[("host", "127.0.0.1:5090"), ("host", "evil.example:5090")],
+                false,
+                false,
+            ),
+            Err((400, "Bad Request"))
+        );
+        // 2. Origin dupliqué → 400
+        assert_eq!(
+            acc(
+                "GET",
+                "/",
+                &[
+                    ("host", "127.0.0.1:5090"),
+                    ("origin", "http://127.0.0.1:5090"),
+                    ("origin", "https://evil.example"),
+                ],
+                false,
+                false,
+            ),
+            Err((400, "Bad Request"))
+        );
+        // 3. X-MCC-Session dupliqué → 400
+        assert_eq!(
+            acc(
+                "GET",
+                "/api/state",
+                &[
+                    ("host", "127.0.0.1:5090"),
+                    ("x-mcc-session", "a"),
+                    ("x-mcc-session", "b"),
+                ],
+                true,
+                false,
+            ),
+            Err((400, "Bad Request"))
+        );
+        // 4. Plusieurs cookies mcc_session= (dans un ou plusieurs en-têtes Cookie) → 400
+        assert_eq!(
+            acc(
+                "GET",
+                "/api/state",
+                &[
+                    ("host", "127.0.0.1:5090"),
+                    ("cookie", "mcc_session=a"),
+                    ("cookie", "mcc_session=b"),
+                ],
+                true,
+                false,
+            ),
+            Err((400, "Bad Request"))
+        );
+        assert_eq!(
+            acc(
+                "GET",
+                "/api/state",
+                &[
+                    ("host", "127.0.0.1:5090"),
+                    ("cookie", "mcc_session=a; mcc_session=b"),
+                ],
+                true,
+                false,
+            ),
+            Err((400, "Bad Request"))
+        );
+        // 5. Content-Length non numérique / négatif / vide → 400
+        for bad_cl in ["abc", "-5", "", "+10", "999999999999999999999999999999"] {
+            assert_eq!(
+                acc(
+                    "POST",
+                    "/api/action",
+                    &[
+                        ("host", "127.0.0.1:5090"),
+                        ("content-type", "application/json"),
+                        ("content-length", bad_cl),
+                    ],
+                    true,
+                    false,
+                ),
+                Err((400, "Bad Request")),
+                "Content-Length: {bad_cl} doit rendre 400"
+            );
+        }
+    }
+
+    #[test]
+    fn random_hex_echoue_ferme_si_entropie_os_indisponible() {
+        assert_eq!(random_hex_with(2, |_| false), None);
+        assert_eq!(
+            random_hex_with(1, |b| {
+                b.copy_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+                true
+            }),
+            Some("efcdab8967452301".to_string())
+        );
     }
 }

@@ -149,9 +149,20 @@ pub fn tool_count(core: &ServerCore) -> usize {
     .unwrap_or(0)
 }
 
+/// Horodatage de démarrage du gateway (R-2) : toute requête signée `/mcp`
+/// créée strictement avant `BOOT_TS` (`created < boot_ts`) est refusée en `401`
+/// même si sa signature Ed25519 reste dans la fenêtre ±60 s, afin de fermer le
+/// rejeu d'un nonce après redémarrage du moteur.
+static BOOT_TS: OnceLock<u64> = OnceLock::new();
+
+fn boot_ts() -> u64 {
+    *BOOT_TS.get_or_init(crate::types::now_ts)
+}
+
 /// Construit le gateway du moteur et l'installe dans le slot global.
 /// À appeler **une fois** par moteur (run_headless).
 pub fn install(state: &Arc<AppState>) -> Arc<Gateway> {
+    let _ = boot_ts();
     // `litemcp::Gateway` prend un `ServerBuilder` et publie le premier
     // snapshot — la reconstruction passe désormais par son API `edit`.
     let gw = Arc::new(LiteGateway::new(build_builder_guarded(state)));
@@ -1396,6 +1407,31 @@ fn extract_id(body: &[u8]) -> Value {
 /// dispatche » de la lib (contrat C8). `legacy` n'ouvre que la LECTURE (code
 /// hérité `X-MCC-Access` / preuve de pair, docs/auth.md §10) : il ne remplace
 /// jamais une signature, il donne une identité `lecture` sans plus.
+/// Extrait le paramètre `created=<u64>` d'un en-tête `Signature-Input` unique
+/// (RFC 9421). Retourne `None` si l'en-tête est absent, dupliqué ou mal formé
+/// (le vérificateur `litemcp` rejettera de toute façon ces cas en `401`).
+pub(crate) fn signature_created(headers: &[(String, String)]) -> Option<u64> {
+    let mut vals = headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("signature-input"))
+        .map(|(_, v)| v.as_str());
+    let v = vals.next()?;
+    if vals.next().is_some() {
+        return None;
+    }
+    let params = v.find(')').map(|pos| &v[pos + 1..])?;
+    for part in params.split(';') {
+        if let Some(raw) = part.trim().strip_prefix("created=") {
+            let raw = raw.trim();
+            if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) {
+                return raw.parse::<u64>().ok();
+            }
+            return None;
+        }
+    }
+    None
+}
+
 pub fn serve(
     method: &str,
     path: &str,
@@ -1415,7 +1451,15 @@ pub fn serve(
             br#"{"ok":false,"error":"gateway indisponible"}"#.to_vec(),
         );
     };
-    respond_auth(gw.snapshot().as_ref(), path, method, headers, body, legacy)
+    respond_auth(
+        gw.snapshot().as_ref(),
+        path,
+        method,
+        headers,
+        body,
+        legacy,
+        Some(boot_ts()),
+    )
 }
 
 /// Les règles de transport `/mcp`, appliquées à un noyau explicite — pure et
@@ -1428,7 +1472,7 @@ fn respond(
     headers: &[(String, String)],
     body: &[u8],
 ) -> (u16, &'static str, Vec<u8>) {
-    respond_auth(core, "/mcp", method, headers, body, false).into_parts()
+    respond_auth(core, "/mcp", method, headers, body, false, None).into_parts()
 }
 
 /// Contrôles de transport puis « vérifie et dispatche » (C8).
@@ -1443,6 +1487,7 @@ fn respond_auth(
     headers: &[(String, String)],
     body: &[u8],
     legacy: bool,
+    min_created: Option<u64>,
 ) -> Reply {
     if method != "POST" {
         return Reply::new(
@@ -1567,6 +1612,22 @@ fn respond_auth(
                 Some(reply) => Reply::new(reply.status.code(), "application/json", reply.body),
                 None => Reply::new(202, "application/json", Vec::new()),
             };
+        }
+        // R-2 : refuser en 401 uniforme toute signature créée strictement avant
+        // le démarrage courant du serveur (ferme le rejeu après redémarrage).
+        if let Some(min_ts) = min_created {
+            if signature_created(headers).is_some_and(|c| c < min_ts) {
+                return Reply::new(
+                    401,
+                    "application/json",
+                    br#"{"error":{"code":-32600,"message":"unauthorized"},"id":null,"jsonrpc":"2.0"}"#
+                        .to_vec(),
+                )
+                .with_header(
+                    "WWW-Authenticate",
+                    r#"Signature realm="litemcp", tag="litemcp-auth-v1""#.to_string(),
+                );
+            }
         }
         // C8 : vérifie puis dispatche. 401 de corps constant +
         // `WWW-Authenticate` si la signature manque ou ne vaut rien ; 403
@@ -2867,5 +2928,92 @@ mod tests {
             status == 403 || v["error"].is_object() || v["result"]["isError"] == json!(true),
             "un outil inconnu ne doit jamais rendre un résultat : {v}"
         );
+    }
+
+    #[test]
+    fn signature_created_extrait_horodatage_ou_refuse_doublon() {
+        let ok = vec![(
+            "signature-input".to_string(),
+            r#"sig1=("@method" "@path");created=1763740000;nonce="n1";keyid="mcc-a-0000000000000001";alg="ed25519";tag="litemcp-auth-v1""#.to_string(),
+        )];
+        assert_eq!(signature_created(&ok), Some(1763740000));
+        let doublon = vec![ok[0].clone(), ok[0].clone()];
+        assert_eq!(signature_created(&doublon), None);
+        let invalide = vec![(
+            "signature-input".to_string(),
+            r#"sig1=("@method");created=abc;nonce="n1""#.to_string(),
+        )];
+        assert_eq!(signature_created(&invalide), None);
+        assert_eq!(signature_created(&[]), None);
+    }
+
+    #[test]
+    fn requete_signee_avant_boot_ts_refusee_en_401_uniforme() {
+        use litemcp::auth::sign::{RequestToSign, Signer, SigningKey};
+
+        let state = test_state();
+        let sk = SigningKey::generate();
+        let pub_hex = crate::crypto::hex(&sk.verifying_key().to_bytes());
+        let keyid = "mcc-r2-0000000000000001";
+        {
+            let mut st = lockv(&state.settings);
+            st.auth
+                .insert(crate::auth::registry::ClientRecord::new(
+                    keyid.to_string(),
+                    "test-r2".to_string(),
+                    pub_hex,
+                    vec!["lecture".to_string()],
+                    "127.0.0.1".to_string(),
+                ))
+                .expect("client inséré");
+        }
+        let verifier: Arc<dyn litemcp::auth::Verifier> = Arc::new(SignatureVerifier::new(
+            Arc::new(crate::auth::RegistryStore {
+                state: Arc::clone(&state),
+            }),
+            NonceCache::default(),
+        ));
+        let core = build_builder(&state).verifier(verifier).core();
+        let signer = Signer::new(sk).with_keyid(keyid);
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let now = crate::types::now_ts();
+        let boot = now;
+
+        let sign_at = |ts: u64, nonce: [u8; 16]| -> Vec<(String, String)> {
+            let base = [
+                ("Content-Type", "application/json"),
+                ("Mcp-Method", "tools/list"),
+            ];
+            let req = RequestToSign::new("POST", "/mcp", "127.0.0.1:5090", &base, body);
+            let mut hdrs = vec![
+                ("host".to_string(), "127.0.0.1:5090".to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+                ("mcp-method".to_string(), "tools/list".to_string()),
+            ];
+            for (n, v) in signer.headers_at(&req, ts, &nonce).iter() {
+                hdrs.push((n.to_ascii_lowercase(), v.to_string()));
+            }
+            hdrs
+        };
+
+        // created = boot - 1 : signature valide dans ±60 s, MAIS antérieure au boot → 401
+        let avant = sign_at(boot.saturating_sub(1), [0x11u8; 16]);
+        let rep_avant = respond_auth(&core, "/mcp", "POST", &avant, body, false, Some(boot));
+        assert_eq!(rep_avant.status, 401, "created < boot_ts doit rendre 401");
+        let v_avant: Value = serde_json::from_slice(&rep_avant.body).expect("json 401");
+        assert_eq!(v_avant["error"]["code"], -32600);
+        assert_eq!(v_avant["error"]["message"], "unauthorized");
+        assert!(
+            rep_avant
+                .headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("www-authenticate")),
+            "WWW-Authenticate attendu sur 401"
+        );
+
+        // created == boot : autorisé → 200
+        let egal = sign_at(boot, [0x22u8; 16]);
+        let rep_egal = respond_auth(&core, "/mcp", "POST", &egal, body, false, Some(boot));
+        assert_eq!(rep_egal.status, 200, "created == boot_ts doit passer");
     }
 }

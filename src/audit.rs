@@ -135,8 +135,43 @@ pub fn head_path(base: &Path) -> PathBuf {
 fn write_head(path: &Path, seq: u64, mac: &str, cle: &[u8]) -> Result<(), String> {
     let prefix = format!("head seq={seq} mac={mac} ");
     let hmac = mac_de(cle, &prefix);
-    std::fs::write(path, format!("{prefix}hmac={hmac}\n"))
-        .map_err(|e| format!("écriture {} impossible : {e}", path.display()))
+    let content = format!("{prefix}hmac={hmac}\n");
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("dossier {} impossible : {e}", parent.display()))?;
+        }
+    }
+    let tmp = path.with_extension("head.tmp");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)
+        .map_err(|e| format!("création {} impossible : {e}", tmp.display()))?;
+    if let Err(e) = crate::manage::restrict_permissions(&tmp.to_string_lossy()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("permissions {} impossibles : {e}", tmp.display()));
+    }
+    let write_res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("écriture {} impossible : {e}", tmp.display()));
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("renommage {} impossible : {e}", path.display())
+    })?;
+    let _ = crate::manage::restrict_permissions(&path.to_string_lossy());
+    Ok(())
 }
 
 fn read_head(path: &Path, cle: &[u8]) -> Result<(u64, String), Falsification> {
@@ -1076,5 +1111,27 @@ mod tests {
         ];
         assert_eq!(claimed_keyid(&doublon), None);
         assert_eq!(claimed_keyid(&[]), None);
+    }
+
+    #[test]
+    fn write_head_est_atomique_sans_residu_tmp_et_lisible() {
+        let d = dir("r8-head");
+        let head = d.join("auth-audit.head");
+        let tmp = head.with_extension("head.tmp");
+        let mac = "a".repeat(64);
+        write_head(&head, 42, &mac, CLE).expect("write_head");
+        assert!(head.exists(), "auth-audit.head attendu");
+        assert!(!tmp.exists(), "aucun résidu .head.tmp ne doit subsister");
+        let (seq, read_mac) = read_head(&head, CLE).expect("read_head");
+        assert_eq!(seq, 42);
+        assert_eq!(read_mac, mac);
+        // Second appel (écrasement atomique sur rotation suivante)
+        let mac2 = "b".repeat(64);
+        write_head(&head, 84, &mac2, CLE).expect("second write_head");
+        assert!(!tmp.exists());
+        let (seq2, read_mac2) = read_head(&head, CLE).expect("second read_head");
+        assert_eq!(seq2, 84);
+        assert_eq!(read_mac2, mac2);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
