@@ -62,6 +62,7 @@ pub(super) fn server_json(s: &Server, managed: bool) -> Value {
         "favorite": s.favorite,
         "sse": s.sse, "sse_endpoint": s.sse_endpoint, "ws": s.ws, "lang": s.lang,
         "framework": s.framework,
+        "locked": crate::auth::net::is_server_locked(s),
         "via_ssh": s.via_ssh,
         // contrôle du process : maintenu par CE moteur MCP Control (children) ?
         "managed": managed,
@@ -167,6 +168,13 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
                 // `headers_set` est rendu (audit 05 #5 : /api/state était
                 // lisible sans code en loopback).
                 "notify": crate::notify::to_api_json(&settings.notify),
+                "tls": {
+                    "compiled": crate::auth::net::tls_compiled(),
+                    "active": !settings.auth.tls_fp.is_empty(),
+                    "fingerprint": settings.auth.tls_fp,
+                    "bind_refused": settings.auth.tls_bind_refused,
+                    "notice": settings.auth.tls_notice,
+                },
             }),
         )
     };

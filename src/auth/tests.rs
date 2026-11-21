@@ -190,10 +190,13 @@ fn actions_auth_locales_repondent_et_refusent_le_reste() {
     let state = test_state();
     for action in crate::auth::ADMIN_ACTIONS {
         assert!(
-            ACTIONS.contains(&action),
-            "{action} doit figurer dans la surface ACTIONS"
+            ACTIONS.contains(&action) || action == "server_pair",
+            "{action} doit figurer dans la surface ACTIONS (ou route locale server_pair)"
         );
     }
+    let j_sp =
+        crate::auth::net::handle_server_pair(&state, r#"{"action":"server_pair","id":"inconnu"}"#);
+    assert_eq!(j_sp["ok"], serde_json::json!(false), "{j_sp}");
     let j = handle_action(&state, r#"{"action":"client_list"}"#);
     assert_eq!(j["ok"], serde_json::json!(true), "{j}");
     assert_eq!(j["clients"].as_array().unwrap().len(), 0);

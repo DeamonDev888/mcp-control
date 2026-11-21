@@ -319,7 +319,7 @@ function srvRow(s) {
   return `<div class="srow ${selectedId===s.id?'sel':''} ${s.enabled?'':'off'}" draggable="true"
     data-act="select" data-id="${esc(s.id)}">
     <div class="l1"><span class="dot ${esc(s.state)}"></span><span class="nm" title="${esc(s.label)}">${esc(s.label)}</span>${rowFav(s)}${rowAuto(s)}${rowCtl(s)}${rowToggle(s)}</div>
-    <div class="l2"><span class="st ${esc(s.state)}">${esc(s.state)}</span> ${ti}${off}${langChip(s)}${typeBadge(s)}${frameworkBadge(s)}${s.transport==='stdio'?'<span class="legacy" title="Legacy : serveur stdio uniquement (pas de transport HTTP)">legacy</span>':''}<span class="cnt">${s.tools_count}</span></div>
+    <div class="l2"><span class="st ${esc(s.state)}">${esc(s.state)}</span> ${ti}${off}${langChip(s)}${typeBadge(s)}${frameworkBadge(s)}${lockBadge(s)}${s.transport==='stdio'?'<span class="legacy" title="Legacy : serveur stdio uniquement (pas de transport HTTP)">legacy</span>':''}<span class="cnt">${s.tools_count}</span></div>
   </div>`;
 }
 /* Replis des groupes mémorisés (localStorage) : 'local' + une clé par machine. */
@@ -501,6 +501,17 @@ function frameworkBadge(s) {
   const lk = LANG_META[f.lang] ? f.lang : (LANG_META[s.lang] ? s.lang : '');
   if (!lk) return `<span class="tag fw" title="${tip}">${esc(f.label)}</span>`;
   return `<span class="tag fw fw-${lk}" title="${tip}">${esc(f.label)}</span>`;
+}
+
+// Badge cadenas (lot M4 pt 4) : serveur LiteMCP verrouillé par signature
+// RFC 9421 (appairé = UP, non appairé = 401 WWW-Authenticate LiteMCP).
+function lockBadge(s) {
+  if (!s || !s.locked) return '';
+  const paired = s.state === 'UP';
+  const tip = paired
+    ? 'Serveur LiteMCP verrouill\u00e9 par signature RFC 9421 (appair\u00e9 avec MCP Control)'
+    : 'Serveur LiteMCP joignable mais verrouill\u00e9 (401 Signature) \u2014 appairer MCP Control (action server_pair)';
+  return `<span class="tag lock ${paired ? 'paired' : 'unpaired'}" title="${tip}">${ic('lock')}</span>`;
 }
 
 function rowFav(s) {
@@ -894,6 +905,7 @@ function renderDetail() {
       ${langChip(s)}
       ${typeBadge(s)}
       ${frameworkBadge(s)}
+      ${lockBadge(s)}
       ${s.transport === 'stdio' ? '<span class="legacy" title="Legacy : serveur stdio uniquement (pas de transport HTTP)">legacy</span>' : ''}
       <span class="sub">${s.server_name ? esc(s.server_name) + ' v' + esc(s.version || '?') : ''}${s.latency_ms != null ? ' &middot; ' + s.latency_ms + ' ms' : ''}</span>
       <div class="d-actions">
@@ -1475,7 +1487,7 @@ function openSettingsDlg() {
   document.getElementById('resetMsg').textContent = '';
   ['notifyMsgRow', 'runtimeMsgRow'].forEach(id => { const el = document.getElementById(id); if (el) el.hidden = true; });
   ['notifyMsg', 'runtimeMsg'].forEach(id => { const el = document.getElementById(id); if (el) el.textContent = ''; });
-  document.getElementById('settingsMsg').textContent = '';
+  document.getElementById('settingsMsg').textContent = (s.tls && s.tls.notice) ? s.tls.notice : '';
   clearFieldErrs();
   setDirty(false);
   // dernier volet consulté (préférence locale)

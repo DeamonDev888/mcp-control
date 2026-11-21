@@ -11,6 +11,7 @@ const START_WINDOW_SECS: u64 = 30;
 
 #[allow(unused_must_use)]
 pub fn poll_one(state: &Arc<AppState>, id: &str) {
+    crate::auth::net::set_config_path(&state.config_path);
     let (transport, enabled) = {
         let servers = lockv(&state.servers);
         match servers.iter().find(|s| s.id == id) {
@@ -61,8 +62,8 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
                 }
             };
             // Auto-start : serveur HTTP LOCAL éteint + commande de lancement configurée
-            // (jamais pour un serveur distant, host.is_none() gate)
-            if !res.mcp_up && host.is_none() {
+            // (jamais pour un serveur distant, ni pour un serveur déjà en écoute mais verrouillé 401)
+            if !res.mcp_up && !res.locked && host.is_none() {
                 // État du process lancé par nous, s'il existe : vivant ? code de sortie ?
                 let (child_alive, exit_code) = {
                     let children = lockv(&state.children);
@@ -267,6 +268,17 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
                             } else {
                                 SState::Down
                             };
+                            if res.locked {
+                                if res.host.is_some() {
+                                    srv.bound_host = res.host.clone();
+                                }
+                                if res.framework.is_some() {
+                                    srv.framework = res.framework.clone();
+                                }
+                                if res.lang.is_some() {
+                                    srv.lang = res.lang.clone();
+                                }
+                            }
                             srv.last_error = res.error.clone();
                             srv.latency_ms = None;
                             if !res.port_open && host.is_none() {
@@ -635,7 +647,11 @@ pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) -> u32 {
                 },
                 origin: Origin::Discovered,
                 enabled: true,
-                state: SState::Up,
+                state: if p.mcp_up {
+                    SState::Up
+                } else {
+                    SState::PortOnly
+                },
                 auto_restart: true,
                 favorite: false,
                 pid: p.pid,
@@ -650,9 +666,9 @@ pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) -> u32 {
                 framework: p.framework.clone(),
                 via_ssh: false,
                 tools: p.tools,
-                latency_ms: Some(p.latency_ms),
+                latency_ms: if p.mcp_up { Some(p.latency_ms) } else { None },
                 last_seen_ts: Some(crate::types::now_ts()),
-                last_error: None,
+                last_error: p.error.clone(),
                 start_cmd: None,
                 tools_disabled: vec![],
             });
@@ -769,7 +785,11 @@ pub fn scan_listening(state: &Arc<AppState>) {
             },
             origin: Origin::Discovered,
             enabled: true,
-            state: SState::Up,
+            state: if p.mcp_up {
+                SState::Up
+            } else {
+                SState::PortOnly
+            },
             auto_restart: true,
             favorite: false,
             pid: p.pid,
@@ -784,9 +804,9 @@ pub fn scan_listening(state: &Arc<AppState>) {
             framework: p.framework.clone(),
             via_ssh: false,
             tools: p.tools,
-            latency_ms: Some(p.latency_ms),
+            latency_ms: if p.mcp_up { Some(p.latency_ms) } else { None },
             last_seen_ts: Some(crate::types::now_ts()),
-            last_error: None,
+            last_error: p.error.clone(),
             start_cmd: None,
             tools_disabled: vec![],
         });

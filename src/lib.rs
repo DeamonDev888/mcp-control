@@ -287,7 +287,9 @@ pub(crate) fn os_random(buf: &mut [u8]) -> bool {
     }
 }
 
-/// Code d'accès aléatoire 128 bits (hex).
+/// Code d'accès aléatoire 128 bits (hex) — conservé pour le test unitaire
+/// d'entropie ; plus aucun code partagé n'est généré au démarrage (docs/auth.md §10).
+#[cfg_attr(not(test), allow(dead_code))]
 fn generate_access() -> String {
     random_hex(2)
 }
@@ -811,9 +813,103 @@ pub fn run_headless() -> RunOutcome {
     // Avant le listener : un `auth pair` reçu au premier instant trouve une
     // identité prête.
     crate::auth::secret::ensure_server_identity(&state);
+    crate::auth::net::set_config_path(&state.config_path);
 
+    let local_ips_list = manage::local_ips();
     let mut ui_port = settings.ui_port;
-    let ui_bind = settings.ui_bind.clone();
+    let requested_bind = settings.ui_bind.clone();
+    #[cfg(feature = "tls")]
+    let mut tls_server_config: Option<Arc<rustls::ServerConfig>> = None;
+
+    // Lot M4 (DA5 = a, docs/auth.md §7) : hors loopback, TLS 1.3 est obligatoire.
+    // Sans la feature `tls` (ou si le certificat/la clé sont invalides), le moteur
+    // REFUSE d'écouter hors loopback, reste en 127.0.0.1 et le dit dans le
+    // journal et dans l'interface. Aucun repli silencieux vers HTTP.
+    let ui_bind = if is_loopback_bind(&requested_bind) {
+        requested_bind
+    } else {
+        #[cfg(not(feature = "tls"))]
+        {
+            let msg = crate::auth::net::TLS_MISSING_BIND_MSG.to_string();
+            {
+                let mut st = lockv(&state.settings);
+                st.auth.tls_bind_refused = true;
+                st.auth.tls_notice = Some(msg.clone());
+            }
+            eprintln!("[TLS] {msg}");
+            manage::add_log(&state, "warn", &format!("[tls] {msg}"));
+            "127.0.0.1".to_string()
+        }
+        #[cfg(feature = "tls")]
+        {
+            let cfg_dir = std::path::Path::new(&state.config_path)
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let svc = crate::auth::secret::service();
+            match crate::auth::net::load_or_create_server_tls(
+                &cfg_dir,
+                svc.as_deref(),
+                &local_ips_list,
+            ) {
+                Ok(loaded) => {
+                    {
+                        let mut st = lockv(&state.settings);
+                        st.auth.tls_fp = loaded.fingerprint.clone();
+                        st.auth.tls_bind_refused = false;
+                        st.auth.tls_notice = None;
+                    }
+                    if loaded.created {
+                        manage::add_log(
+                            &state,
+                            "info",
+                            &format!(
+                                "[tls] certificat TLS 1.3 auto-signé créé ({}) — clé privée : {}",
+                                loaded.fingerprint,
+                                loaded.store.as_str()
+                            ),
+                        );
+                    } else if loaded.store == crate::auth::secret::SecretStore::File {
+                        manage::add_log(
+                            &state,
+                            "warn",
+                            &format!(
+                                "[tls] clé privée TLS lue depuis un fichier à permissions restreintes (trousseau indisponible) : {} — empreinte {}",
+                                crate::auth::net::tls_key_path(&cfg_dir).display(),
+                                loaded.fingerprint
+                            ),
+                        );
+                    } else {
+                        manage::add_log(
+                            &state,
+                            "info",
+                            &format!(
+                                "[tls] certificat TLS 1.3 chargé ({}) — clé privée : {}",
+                                loaded.fingerprint,
+                                loaded.store.as_str()
+                            ),
+                        );
+                    }
+                    tls_server_config = Some(loaded.server_config);
+                    requested_bind
+                }
+                Err(e) => {
+                    let msg = format!(
+                        "Écoute réseau ({requested_bind}) refusée : configuration TLS invalide ({e}). Le moteur reste en 127.0.0.1."
+                    );
+                    {
+                        let mut st = lockv(&state.settings);
+                        st.auth.tls_fp.clear();
+                        st.auth.tls_bind_refused = true;
+                        st.auth.tls_notice = Some(msg.clone());
+                    }
+                    eprintln!("[TLS] {msg}");
+                    manage::add_log(&state, "error", &format!("[tls] {msg}"));
+                    "127.0.0.1".to_string()
+                }
+            }
+        }
+    };
     let listener = loop {
         match TcpListener::bind((ui_bind.as_str(), ui_port)) {
             Ok(l) => break l,
@@ -914,20 +1010,20 @@ pub fn run_headless() -> RunOutcome {
         let mut st = lockv(&state.settings);
         st.ui_port = ui_port;
     }
-    // SÉCURITÉ (audit v0.6.6) :
-    // - bind non-loopback → code d'accès API généré au boot si absent (persisté) ;
-    // - origines/hostes autorisés (anti CSRF / DNS-rebinding) calculés au boot,
-    //   puis recalculés à chaud quand un Host inconnu se présente (lot B point 4
-    //   : une IP apparue après le démarrage — VPN, carte virtuelle, Wi-Fi —
-    //   n'est plus refusée en 403 jusqu'au redémarrage de l'app).
-    let local_ips_list = manage::local_ips();
-    let loopback = is_loopback_bind(&ui_bind);
-    let mut generated = false;
-    if !loopback {
-        let mut st = lockv(&state.settings);
-        if st.api_access.as_deref().map(str::is_empty).unwrap_or(true) {
-            st.api_access = Some(generate_access());
-            generated = true;
+    // SÉCURITÉ (docs/auth.md §10, DA3 = a) : aucune nouvelle valeur de code
+    // partagé `api_access` n'est générée au boot ; si une valeur héritée est
+    // présente dans config.json, elle est conservée en lecture seule pour 0.8.x.
+    {
+        let has_legacy = lockv(&state.settings)
+            .api_access
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
+        if has_legacy {
+            manage::add_log(
+                &state,
+                "warn",
+                "[auth] code hérité api_access présent dans config.json — toléré en LECTURE SEULE (DA3, 0.8.x) ; migrer les pairs vers mcp-control auth pair",
+            );
         }
     }
     {
@@ -940,14 +1036,6 @@ pub fn run_headless() -> RunOutcome {
     // (port UI réel après repli +1..+9, IP locales, bind) — une URL de webhook
     // qui les vise est refusée à l'enregistrement comme à l'envoi.
     crate::notify::note_self_listen(ui_port, &local_ips_list, &ui_bind);
-    if generated {
-        manage::save_config(&state);
-        manage::add_log(
-            &state,
-            "info",
-            "code d'accès API généré au boot (persisté dans config.json: settings.api_access) — exigé sur /api/* pour tout accès hors loopback ; pour les pairs, mettre la même valeur des deux côtés",
-        );
-    }
     let ui_host = if ui_bind == "0.0.0.0" {
         "<ip-lan>".to_string()
     } else {
@@ -1105,7 +1193,7 @@ pub fn run_headless() -> RunOutcome {
         });
     }
 
-    // serveur HTTP en tâche de fond : run_headless retourne, l'app hôte décide
+    // serveur HTTP/TLS en tâche de fond : run_headless retourne, l'app hôte décide
     // (main = park forever, desktop = boucle d'événements Tauri)
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -1117,7 +1205,14 @@ pub fn run_headless() -> RunOutcome {
                     match admit_conn(s.peer_addr().ok().map(|a| a.ip())) {
                         Ok(guard) => {
                             let st = state.clone();
-                            thread::spawn(move || handle_conn(s, st, guard));
+                            #[cfg(feature = "tls")]
+                            let tls_cfg = tls_server_config.clone();
+                            thread::spawn(move || {
+                                #[cfg(feature = "tls")]
+                                handle_conn(s, st, guard, tls_cfg);
+                                #[cfg(not(feature = "tls"))]
+                                handle_conn(s, st, guard);
+                            });
                         }
                         Err(raison) => write_conn_rejected(s, 503, raison),
                     }
@@ -1148,12 +1243,125 @@ pub fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-pub(crate) fn handle_conn(mut stream: TcpStream, state: Arc<AppState>, guard: ConnGuard) {
+enum ConnStream {
+    Plain(TcpStream),
+    #[cfg(feature = "tls")]
+    Tls(Box<rustls::StreamOwned<rustls::ServerConnection, TcpStream>>),
+}
+
+impl ConnStream {
+    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            ConnStream::Plain(s) => s.set_read_timeout(dur),
+            #[cfg(feature = "tls")]
+            ConnStream::Tls(s) => s.sock.set_read_timeout(dur),
+        }
+    }
+
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            ConnStream::Plain(s) => s.read(buf),
+            #[cfg(feature = "tls")]
+            ConnStream::Tls(s) => s.read(buf),
+        }
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            ConnStream::Plain(s) => s.write_all(buf),
+            #[cfg(feature = "tls")]
+            ConnStream::Tls(s) => s.write_all(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            ConnStream::Plain(s) => s.flush(),
+            #[cfg(feature = "tls")]
+            ConnStream::Tls(s) => {
+                let res = s.flush();
+                s.conn.send_close_notify();
+                let _ = s.conn.complete_io(&mut s.sock);
+                let _ = s.sock.flush();
+                res
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tls")]
+pub(crate) fn handle_conn(
+    tcp_stream: TcpStream,
+    state: Arc<AppState>,
+    guard: ConnGuard,
+    tls_cfg: Option<Arc<rustls::ServerConfig>>,
+) {
     let _guard = guard;
-    // échéance TOTALE de la requête (en-têtes puis corps) : un client muet ou
-    // lent monopolise au plus REQUEST_DEADLINE — l'ancien read timeout de 30 s
-    // se réarmait à chaque octet reçu (slowloris infini).
     let deadline = Instant::now() + REQUEST_DEADLINE;
+    let peer_ip = tcp_stream.peer_addr().ok().map(|a| a.ip());
+    let peer_is_loopback = peer_ip.map(|ip| ip.is_loopback()).unwrap_or(false);
+
+    // Lot M4 (DA5 = a, docs/auth.md §7) :
+    // - hors loopback (!peer_is_loopback) : TLS 1.3 est OBLIGATOIRE ; une
+    //   requête HTTP en clair ou TLS <= 1.2 échoue à la poignée de main ;
+    // - en loopback (127.0.0.1 / ::1) : reste en HTTP, mais accepte aussi TLS 1.3
+    //   si le client démarre par un ClientHello TLS (0x16) et que TLS est actif.
+    let stream = if !peer_is_loopback {
+        let Some(cfg) = tls_cfg else {
+            return;
+        };
+        match crate::auth::net::accept_tls_stream(tcp_stream, &cfg, deadline) {
+            Ok(tls) => ConnStream::Tls(Box::new(tls)),
+            Err(_) => return,
+        }
+    } else if let Some(cfg) = tls_cfg {
+        let _ = tcp_stream.set_read_timeout(Some(REQUEST_DEADLINE));
+        let mut first = [0u8; 1];
+        let is_tls_client_hello = tcp_stream
+            .peek(&mut first)
+            .map(|n| n == 1 && first[0] == 0x16)
+            .unwrap_or(false);
+        if is_tls_client_hello {
+            match crate::auth::net::accept_tls_stream(tcp_stream, &cfg, deadline) {
+                Ok(tls) => ConnStream::Tls(Box::new(tls)),
+                Err(_) => return,
+            }
+        } else {
+            ConnStream::Plain(tcp_stream)
+        }
+    } else {
+        ConnStream::Plain(tcp_stream)
+    };
+    handle_conn_stream(stream, peer_ip, peer_is_loopback, deadline, state);
+}
+
+#[cfg(not(feature = "tls"))]
+pub(crate) fn handle_conn(tcp_stream: TcpStream, state: Arc<AppState>, guard: ConnGuard) {
+    let _guard = guard;
+    let deadline = Instant::now() + REQUEST_DEADLINE;
+    let peer_ip = tcp_stream.peer_addr().ok().map(|a| a.ip());
+    let peer_is_loopback = peer_ip.map(|ip| ip.is_loopback()).unwrap_or(false);
+    // DA5 = a : sans la feature `tls`, aucune connexion hors loopback n'est
+    // jamais servie (échec fermé en sus du bind 127.0.0.1).
+    if !peer_is_loopback {
+        return;
+    }
+    handle_conn_stream(
+        ConnStream::Plain(tcp_stream),
+        peer_ip,
+        peer_is_loopback,
+        deadline,
+        state,
+    );
+}
+
+fn handle_conn_stream(
+    mut stream: ConnStream,
+    peer_ip: Option<IpAddr>,
+    peer_is_loopback: bool,
+    deadline: Instant,
+    state: Arc<AppState>,
+) {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 16384];
     let mut head_end = None;
@@ -1232,8 +1440,6 @@ pub(crate) fn handle_conn(mut stream: TcpStream, state: Arc<AppState>, guard: Co
     // contrôle d'accès (session locale, code hérité, Origin, Host, cadrage) puis
     // routage. Lot M2 : le loopback n'est plus une zone de confiance (DA2 = a).
     let api_access = { lockv(&state.settings).api_access.clone() };
-    let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
-    let peer_is_loopback = peer_ip.map(|ip| ip.is_loopback()).unwrap_or(false);
     let (allowed_hosts, allowed_origins) = (
         lockv(&state.allowed_hosts).clone(),
         lockv(&state.allowed_origins).clone(),
@@ -1679,6 +1885,9 @@ pub fn route_peer_session(
             );
         }
         let text = String::from_utf8_lossy(body).to_string();
+        if nom == "server_pair" {
+            return Reply::json(200, crate::auth::net::handle_server_pair(state, &text));
+        }
         return Reply::json(200, manage::handle_action(state, &text));
     }
     Reply::new(

@@ -6,20 +6,30 @@ pub fn discover_peers(state: &Arc<AppState>) {
     if !lockv(&state.settings).network_enabled {
         return;
     }
+    crate::auth::net::set_config_path(&state.config_path);
     let ports = lockv(&state.settings).network_ports.clone();
     let own_port = lockv(&state.settings).ui_port;
     let prefixes = network_prefixes();
     let my_ips: Vec<String> = crate::manage::local_ips();
     let mut hosts: Vec<String> = vec!["127.0.0.1".to_string()]; // autres instances locales
-    for (prefix, self_ip) in &prefixes {
-        for h in probe::arp_hosts(prefix, self_ip) {
-            if !hosts.contains(&h) {
-                hosts.push(h);
+    if std::env::var_os("MCC_NO_LOCAL_DISCOVERY").is_none() {
+        for (prefix, self_ip) in &prefixes {
+            for h in probe::arp_hosts(prefix, self_ip) {
+                if !hosts.contains(&h) {
+                    hosts.push(h);
+                }
             }
         }
     }
     // une cible qui est une de NOS ips sur NOTRE port UI = nous-mêmes -> skip
     hosts.retain(|h| !(my_ips.contains(h)));
+    // Pairs déjà appairés (`auth/clients/*.pin.json`) : sondés même s'ils ne
+    // sont pas dans le cache ARP ou s'ils partagent l'IP locale sur un autre port.
+    for h in crate::auth::net::pinned_peer_hosts(&crate::auth::net::current_config_dir()) {
+        if !hosts.contains(&h) {
+            hosts.push(h);
+        }
+    }
     add_log(
         state,
         "info",

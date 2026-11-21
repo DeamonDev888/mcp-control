@@ -3543,3 +3543,50 @@ fn system_tool_curl_utilise_chemin_absolu_et_ignore_le_dossier_courant() {
         "le vrai curl.exe doit répondre même avec un leurre dans cwd"
     );
 }
+
+#[test]
+fn m4_json_expose_locked_et_etat_tls() {
+    let state = test_state();
+    {
+        let mut servers = lockv(&state.servers);
+        let mut s_locked = srv_http(
+            "srv-lock",
+            Some("litemcp-srv"),
+            "LiteMCP",
+            Some("127.0.0.1"),
+            39991,
+            Origin::Manual,
+            Some(100),
+        );
+        s_locked.state = SState::PortOnly;
+        s_locked.last_error = Some(crate::auth::net::LOCKED_SERVER_MSG.to_string());
+        servers.push(s_locked);
+
+        let s_open = srv_http(
+            "srv-open",
+            Some("open-srv"),
+            "Open",
+            Some("127.0.0.1"),
+            39992,
+            Origin::Manual,
+            Some(100),
+        );
+        servers.push(s_open);
+    }
+    {
+        let mut st = lockv(&state.settings);
+        st.auth.tls_bind_refused = true;
+        st.auth.tls_notice = Some("écoute hors loopback refusée sans tls".to_string());
+    }
+    let j = state_json(&state);
+    assert_eq!(j["servers"][0]["locked"], serde_json::json!(true));
+    assert_eq!(j["servers"][1]["locked"], serde_json::json!(false));
+    assert_eq!(
+        j["settings"]["tls"]["bind_refused"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        j["settings"]["tls"]["notice"],
+        serde_json::json!("écoute hors loopback refusée sans tls")
+    );
+}

@@ -20,6 +20,7 @@
 
 pub mod cli;
 pub mod confirm;
+pub mod net;
 pub mod pair;
 pub mod registry;
 pub mod secret;
@@ -42,7 +43,9 @@ pub use registry::{
 /// Lot M3 : `access_list` (état de l'écran « Accès »), `confirm_approve`,
 /// `confirm_deny` et `grant_revoke` (décisions de confirmation, §5) rejoignent
 /// les sept actions d'appairage et de registre du lot M1.
-pub const ADMIN_ACTIONS: [&str; 11] = [
+/// Lot M4 : `server_pair` (appairage sortant de MCP Control avec un serveur
+/// LiteMCP verrouillé, point 5).
+pub const ADMIN_ACTIONS: [&str; 12] = [
     "pair_list",
     "pair_approve",
     "pair_reject",
@@ -54,6 +57,7 @@ pub const ADMIN_ACTIONS: [&str; 11] = [
     "confirm_approve",
     "confirm_deny",
     "grant_revoke",
+    "server_pair",
 ];
 
 /// Cette action est-elle réservée à la session locale (`admin`) ?

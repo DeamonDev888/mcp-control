@@ -1030,6 +1030,13 @@ fn proxy_target(s: &crate::types::Server) -> Result<(String, u16, String), ToolE
         )));
     }
     if s.state != SState::Up {
+        if crate::auth::net::is_server_locked(s) {
+            return Err(ToolError::invalid_input(format!(
+                "serveur '{}' joignable mais verrouillé (401 Signature LiteMCP) : \
+                 appairer d'abord MCP Control avec l'action locale server_pair",
+                s.id
+            )));
+        }
         return Err(ToolError::invalid_input(format!(
             "serveur '{}' à l'état {} : seul un serveur UP répond au proxy \
              (start_server pour le démarrer, refresh pour re-sonder)",
@@ -1093,7 +1100,8 @@ fn proxy_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                     let id = args["server"].as_str().unwrap_or_default();
                     let tool = args["tool"].as_str().unwrap_or_default();
                     let arguments = args.get("arguments").cloned().unwrap_or(json!({}));
-                    let (host, port, path) = {
+                    crate::auth::net::set_config_path(&st.config_path);
+                    let (host, port, path, protocol) = {
                         let servers = lockv(&st.servers);
                         let Some(s) = servers.iter().find(|s| s.id == id) else {
                             return Err(ToolError::invalid_input(format!(
@@ -1106,11 +1114,38 @@ fn proxy_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                                  (toggle_tool pour le rétablir)"
                             )));
                         }
-                        proxy_target(s)?
+                        let (h, p, pth) = proxy_target(s)?;
+                        (h, p, pth, s.protocol.clone())
                     };
+                    // Contrat C1 (`docs/auth.md` §8.2) : journaliser le vrai client
+                    // appelant et non le proxy.
+                    let appelant = litemcp::auth::current()
+                        .map(|ctx| ctx.client().to_string())
+                        .unwrap_or_else(|| "local".to_string());
+                    manage::add_log(
+                        &st,
+                        "info",
+                        &format!("[proxy] call_server_tool {id}.{tool} (client {appelant})"),
+                    );
                     let rpc_id = PROXY_RPC_ID.fetch_add(1, Ordering::Relaxed);
-                    let params = json!({ "name": tool, "arguments": arguments });
-                    match probe::rpc_call_host(
+                    let stateless = protocol.as_deref() == Some(crate::LITEMCP_PROTOCOL);
+                    let params = if stateless {
+                        json!({
+                            "name": tool,
+                            "arguments": arguments,
+                            "_meta": {
+                                "io.modelcontextprotocol/protocolVersion": crate::LITEMCP_PROTOCOL
+                            }
+                        })
+                    } else {
+                        json!({ "name": tool, "arguments": arguments })
+                    };
+                    let mut extra: Vec<(&str, &str)> =
+                        vec![("Mcp-Method", "tools/call"), ("Mcp-Name", tool)];
+                    if stateless {
+                        extra.push(("MCP-Protocol-Version", crate::LITEMCP_PROTOCOL));
+                    }
+                    match probe::rpc_call_host_headers(
                         &host,
                         port,
                         &path,
@@ -1118,6 +1153,7 @@ fn proxy_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                         params,
                         rpc_id,
                         PROXY_TIMEOUT_MS,
+                        &extra,
                     ) {
                         Ok((result, _head)) => {
                             // transparence : le résultat du serveur distant
@@ -2273,6 +2309,12 @@ mod tests {
             (
                 "grant_revoke",
                 json!({ "request_id": "00000000000000000000000000000000" }),
+            ),
+            // Lot M4 : appairage sortant de MCP Control avec un serveur LiteMCP
+            // verrouillé (droit `admin`, action locale uniquement).
+            (
+                "server_pair",
+                json!({ "id": "cible", "host": "127.0.0.1", "port": 30_901 }),
             ),
         ]
     }
