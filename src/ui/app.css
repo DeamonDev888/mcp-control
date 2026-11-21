@@ -513,8 +513,10 @@ button.tile:hover{border-color:var(--border-strong);background:var(--elevated)}
 .dash-item{display:flex;align-items:center;justify-content:space-between;gap:0.5rem;padding:0.35rem 0;
   border-bottom:1px solid var(--border-soft);font-size:0.75rem}
 .dash-item:last-child{border-bottom:none}
+.dash-item>div{min-width:0;flex:1}
+.dash-item button{flex-shrink:0}
 .dash-item .nm{font-weight:500;color:var(--t1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dash-item .meta{font:0.6875rem/1.3 var(--mono);color:var(--t3)}
+.dash-item .meta{font:0.6875rem/1.3 var(--mono);color:var(--t3);overflow:hidden;text-overflow:ellipsis}
 
 /* --- Journal (bas, style console IDE) --- */
 #logpanel{flex-shrink:0;height:170px;background:var(--sidebar);border-top:1px solid var(--border);

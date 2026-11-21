@@ -2710,7 +2710,11 @@ function renderAccIdentity() {
 }
 async function closeOtherSessions() {
   try {
-    const r = await fetch('/api/session/close-others', {method: 'POST'});
+    const r = await fetch('/api/session/close-others', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: '{}'
+    });
     const j = await r.json().catch(() => null);
     if (r.ok && j && j.ok) {
       const n = j.closed || 0;
