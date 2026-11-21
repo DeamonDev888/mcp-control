@@ -3940,3 +3940,247 @@ fn ui_api_stage_a_contrats_securite_et_surface_complete() {
 
     e.action(&json!({ "action": "kill", "id": srv_id }));
 }
+
+/// Construit une requête HTTP/1.1 brute `POST /mcp` signée pour `authority`
+/// (`host:port`) avec un `(created, nonce)` donné — réutilisable octet pour
+/// octet pour tester les rejeux inter-ports (R-1) et post-redémarrage (R-2).
+fn raw_mcp_signed(
+    signer: &Signer,
+    authority: &str,
+    corps: &Value,
+    created: u64,
+    nonce: [u8; 16],
+) -> Vec<u8> {
+    let body = corps.to_string();
+    let methode = corps["method"].as_str().unwrap_or("");
+    let base: Vec<(String, String)> = vec![
+        ("Content-Type".to_string(), "application/json".to_string()),
+        ("Mcp-Method".to_string(), methode.to_string()),
+    ];
+    let refs0: Vec<(&str, &str)> = base.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+    let a_signer = RequestToSign::new("POST", "/mcp", authority, &refs0, body.as_bytes());
+    let signes = signer.headers_at(&a_signer, created, &nonce);
+    let mut raw = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nMcp-Method: {methode}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (n, v) in signes.iter() {
+        raw.push_str(&format!("{n}: {v}\r\n"));
+    }
+    raw.push_str("\r\n");
+    raw.push_str(&body);
+    raw.into_bytes()
+}
+
+/// R-1 (audit R) : une requête `/mcp` signée pour le port A (`Host: 127.0.0.1:A`)
+/// doit être refusée (`403`) si rejouée sur une 2e instance écoutant sur le port B,
+/// même quand le même client Ed25519 est enregistré sur les deux instances.
+#[test]
+fn r1_rejeu_inter_ports_inter_instances_refuse() {
+    let _garde = serial_guard();
+    let e_a = engine();
+    let e_b = engine();
+    assert_ne!(e_a.port, e_b.port, "deux ports distincts requis");
+
+    let cle = SigningKey::generate();
+    let keyid = nouveau_keyid();
+    let pub_hex = hex_bytes(&cle.verifying_key().to_bytes());
+    let demande = json!({
+        "keyid": keyid,
+        "label": "client-r1",
+        "public_key": pub_hex,
+        "created": now(),
+    });
+    for inst in [&e_a, &e_b] {
+        let r = inst.post_json("/auth/pair", &demande);
+        assert_eq!(r.status, 200, "appairage refusé : {}", r.text());
+        let pair_id = r.json()["pair_id"].as_str().expect("pair_id").to_string();
+        let ok = inst.action(&json!({
+            "action": "pair_approve",
+            "pair_id": pair_id,
+            "rights": ["lecture"],
+        }));
+        assert_eq!(ok["ok"], json!(true), "approbation refusée : {ok}");
+    }
+    let signer = Signer::new(cle).with_keyid(keyid);
+    let raw = raw_mcp_signed(
+        &signer,
+        &format!("127.0.0.1:{}", e_a.port),
+        &corps_tools_list(1),
+        now(),
+        nonce_neuf(),
+    );
+
+    let rep_a = e_a.raw(&raw, 0);
+    assert_eq!(
+        rep_a.status,
+        200,
+        "instance A (port cible) → 200 : {}",
+        rep_a.text()
+    );
+
+    let rep_b = e_b.raw(&raw, 0);
+    assert!(
+        rep_b.status == 403 || rep_b.status == 401,
+        "rejeu inter-ports sur instance B doit être refusé (403/401), vu {} : {}",
+        rep_b.status,
+        rep_b.text()
+    );
+}
+
+/// R-2 (audit R) : une requête `/mcp` signée avant un redémarrage du moteur
+/// (donc `created < boot_ts`) doit être refusée en `401` après redémarrage,
+/// même dans la fenêtre ±60 s.
+#[test]
+fn r2_rejeu_nonce_apres_redemarrage_refuse_401() {
+    let _garde = serial_guard();
+    let mut e = engine();
+    let signer = client_appaire(&e, &["lecture"]);
+    let ts = now();
+    let raw = raw_mcp_signed(
+        &signer,
+        &format!("127.0.0.1:{}", e.port),
+        &corps_tools_list(1),
+        ts,
+        nonce_neuf(),
+    );
+
+    let avant = e.raw(&raw, 0);
+    assert_eq!(
+        avant.status,
+        200,
+        "avant redémarrage → 200 : {}",
+        avant.text()
+    );
+
+    // Garantir boot_ts > ts (horloge en secondes).
+    std::thread::sleep(Duration::from_millis(1200));
+    e.restart().expect("redémarrage sur la même config");
+
+    let rejeu = e.raw(&raw, 0);
+    assert_eq!(
+        rejeu.status,
+        401,
+        "rejeu après redémarrage doit rendre 401, vu {} : {}",
+        rejeu.status,
+        rejeu.text()
+    );
+    assert_eq!(rejeu.json()["error"]["message"], json!("unauthorized"));
+
+    // Contrôle positif : une requête neuve signée après redémarrage passe toujours.
+    let frais = post_mcp_signe(&e, &signer, "127.0.0.1", &corps_tools_list(2), None, None);
+    assert_eq!(
+        frais.status,
+        200,
+        "requête fraîche post-boot → 200 : {}",
+        frais.text()
+    );
+}
+
+/// R-5 (audit R) : `mcp-control auth list` et `mcp-control auth revoke <keyid>`
+/// obtiennent une session locale S1 via le canal fichier et réussissent en CLI
+/// (sans jamais afficher de secret ni de cookie), et la révocation prend effet
+/// dès la requête signée suivante (`401`).
+#[test]
+fn r5_cli_auth_list_et_auth_revoke_via_session_locale() {
+    let _garde = serial_guard();
+    let e = engine();
+
+    let cle = SigningKey::generate();
+    let keyid = nouveau_keyid();
+    let pub_hex = hex_bytes(&cle.verifying_key().to_bytes());
+    let r = e.post_json(
+        "/auth/pair",
+        &json!({
+            "keyid": keyid,
+            "label": "client-cli-r5",
+            "public_key": pub_hex,
+            "created": now(),
+        }),
+    );
+    assert_eq!(r.status, 200, "appairage refusé : {}", r.text());
+    let pair_id = r.json()["pair_id"].as_str().expect("pair_id").to_string();
+    let ok = e.action(&json!({
+        "action": "pair_approve",
+        "pair_id": pair_id,
+        "rights": ["lecture"],
+    }));
+    assert_eq!(ok["ok"], json!(true), "approbation refusée : {ok}");
+
+    let signer = Signer::new(cle).with_keyid(keyid.clone());
+    let avant = post_mcp_signe(&e, &signer, "127.0.0.1", &corps_tools_list(1), None, None);
+    assert_eq!(
+        avant.status,
+        200,
+        "avant révocation → 200 : {}",
+        avant.text()
+    );
+
+    let cfg_path = e.tmp_dir().join("config.json");
+
+    // 1. `mcp-control auth list` → exit 0, affiche le client, aucune fuite de session
+    let out_list = Command::new(env!("CARGO_BIN_EXE_mcp-control"))
+        .args(["auth", "list"])
+        .env("MCC_CONFIG", &cfg_path)
+        .env("MCC_KEYRING_SERVICE", "")
+        .output()
+        .expect("exécution auth list");
+    let list_stdout = String::from_utf8_lossy(&out_list.stdout);
+    let list_stderr = String::from_utf8_lossy(&out_list.stderr);
+    assert!(
+        out_list.status.success(),
+        "auth list doit réussir (exit 0), stderr={list_stderr}, stdout={list_stdout}"
+    );
+    assert!(
+        list_stdout.contains(&keyid),
+        "auth list doit afficher {keyid} : {list_stdout}"
+    );
+    for interdit in ["mcc_session", "X-MCC-Session", "PRIVATE KEY"] {
+        assert!(
+            !list_stdout.contains(interdit),
+            "fuite {interdit} sur stdout"
+        );
+        assert!(
+            !list_stderr.contains(interdit),
+            "fuite {interdit} sur stderr"
+        );
+    }
+
+    // 2. `mcp-control auth revoke <keyid>` → exit 0, aucune fuite de session
+    let out_rev = Command::new(env!("CARGO_BIN_EXE_mcp-control"))
+        .args(["auth", "revoke", &keyid])
+        .env("MCC_CONFIG", &cfg_path)
+        .env("MCC_KEYRING_SERVICE", "")
+        .output()
+        .expect("exécution auth revoke");
+    let rev_stdout = String::from_utf8_lossy(&out_rev.stdout);
+    let rev_stderr = String::from_utf8_lossy(&out_rev.stderr);
+    assert!(
+        out_rev.status.success(),
+        "auth revoke doit réussir (exit 0), stderr={rev_stderr}, stdout={rev_stdout}"
+    );
+    assert!(
+        rev_stdout.contains(&keyid),
+        "auth revoke doit confirmer {keyid} : {rev_stdout}"
+    );
+    for interdit in ["mcc_session", "X-MCC-Session", "PRIVATE KEY"] {
+        assert!(
+            !rev_stdout.contains(interdit),
+            "fuite {interdit} sur stdout"
+        );
+        assert!(
+            !rev_stderr.contains(interdit),
+            "fuite {interdit} sur stderr"
+        );
+    }
+
+    // 3. La requête signée suivante de ce client est immédiatement refusée en 401
+    let apres = post_mcp_signe(&e, &signer, "127.0.0.1", &corps_tools_list(2), None, None);
+    assert_eq!(
+        apres.status,
+        401,
+        "client révoqué via CLI doit recevoir 401, vu {} : {}",
+        apres.status,
+        apres.text()
+    );
+}

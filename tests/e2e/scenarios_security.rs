@@ -1048,3 +1048,60 @@ fn set_notify_reponse_masquee_et_motif_precis() {
         "l'ancien message générique ne doit plus sortir"
     );
 }
+
+/// R-3 (audit R) : en-têtes critiques dupliqués (`Host`, `Origin`, `Cookie`,
+/// `X-MCC-Session`) et `Content-Length` non numérique → `400 Bad Request`.
+#[test]
+fn r3_entetes_dupliques_et_content_length_invalide_rejetes_400() {
+    let _garde = crate::harness::serial_guard();
+    let e = spawn_loopback();
+    let port = e.port;
+
+    let cases: [(&str, String); 6] = [
+        (
+            "Host dupliqué",
+            format!(
+                "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nHost: evil.example:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        (
+            "Origin dupliqué",
+            format!(
+                "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nOrigin: https://evil.example\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        (
+            "X-MCC-Session dupliqué",
+            format!(
+                "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-MCC-Session: a\r\nX-MCC-Session: b\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        (
+            "Cookie mcc_session dupliqué (2 en-têtes)",
+            format!(
+                "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nCookie: mcc_session=a\r\nCookie: mcc_session=b\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        (
+            "Cookie mcc_session dupliqué (1 en-tête)",
+            format!(
+                "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nCookie: mcc_session=a; mcc_session=b\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        (
+            "Content-Length non numérique",
+            format!(
+                "POST /api/action HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: abc\r\nConnection: close\r\n\r\n{{}}"
+            ),
+        ),
+    ];
+
+    for (label, raw_req) in &cases {
+        let resp = e.raw(raw_req.as_bytes(), 0);
+        assert_eq!(
+            resp.status, 400,
+            "{label} doit rendre 400, vu {}",
+            resp.status
+        );
+    }
+}

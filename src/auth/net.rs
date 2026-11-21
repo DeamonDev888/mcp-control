@@ -1094,7 +1094,15 @@ pub fn handle_server_pair(state: &Arc<AppState>, body: &str) -> Value {
             }
             k.to_string()
         }
-        None => format!("mcc-srv-{}", crate::random_hex(1)),
+        None => match crate::random_hex(1) {
+            Some(hex) => format!("mcc-srv-{hex}"),
+            None => {
+                return json!({
+                    "ok": false,
+                    "error": "entropie OS indisponible"
+                });
+            }
+        },
     };
 
     let cle = SigningKey::generate();

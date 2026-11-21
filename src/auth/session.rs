@@ -127,15 +127,16 @@ fn journal(level: &str, message: &str) {
         message
     );
     eprint!("{line}");
-    if let Some(cell) = LOG_PATH.get() {
-        if let Some(path) = cell.lock().unwrap_or_else(|p| p.into_inner()).as_deref() {
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                let _ = f.write_all(line.as_bytes());
-            }
+    let path = LOG_PATH
+        .get()
+        .and_then(|cell| cell.lock().unwrap_or_else(|p| p.into_inner()).clone());
+    if let Some(path) = path {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = f.write_all(line.as_bytes());
         }
     }
 }
@@ -258,26 +259,40 @@ pub struct Issued {
 /// périmé, plafond de sessions atteint ou entropie OS indisponible (échec
 /// fermé : aucun cookie n'est émis).
 pub fn exchange(token: &str) -> Option<Issued> {
+    {
+        let mut s = slot();
+        prune(&mut s);
+        let idx = s
+            .bootstraps
+            .iter()
+            .position(|b| crate::crypto::ct_eq(b.token.as_bytes(), token.as_bytes()))?;
+        let boot = s.bootstraps.remove(idx);
+        if boot.issued.elapsed() >= boot.ttl {
+            return None;
+        }
+        if s.sessions.len() >= MAX_SESSIONS {
+            drop(s);
+            journal(
+                "warn",
+                "session refusée : le plafond de 8 sessions simultanées est atteint (fermer une fenêtre ou « fermer les autres sessions »)",
+            );
+            return None;
+        }
+    }
+    // Usage unique : le jeton est consommé AVANT de tirer les secrets, hors du
+    // verrou `SLOT` afin qu'aucune E/S de `journal()` ne soit exécutée verrou tenu.
+    let id = fresh_token(32)?;
+    let secret = fresh_token(32)?;
     let mut s = slot();
     prune(&mut s);
-    let idx = s
-        .bootstraps
-        .iter()
-        .position(|b| crate::crypto::ct_eq(b.token.as_bytes(), token.as_bytes()))?;
-    let boot = s.bootstraps.remove(idx);
-    if boot.issued.elapsed() >= boot.ttl {
-        return None;
-    }
     if s.sessions.len() >= MAX_SESSIONS {
+        drop(s);
         journal(
             "warn",
             "session refusée : le plafond de 8 sessions simultanées est atteint (fermer une fenêtre ou « fermer les autres sessions »)",
         );
         return None;
     }
-    // Usage unique : le jeton est consommé AVANT de rendre la session.
-    let id = fresh_token(32)?;
-    let secret = fresh_token(32)?;
     let now = Instant::now();
     s.sessions.push(Session {
         id: id.clone(),
@@ -288,23 +303,45 @@ pub fn exchange(token: &str) -> Option<Issued> {
     Some(Issued { cookie: id, secret })
 }
 
-/// Valeur du cookie `mcc_session` présentée par la requête, s'il y en a une.
-pub fn cookie_value(headers: &[(String, String)]) -> Option<String> {
+/// Nombre d'occurrences du cookie `mcc_session=` dans tous les en-têtes `Cookie`.
+/// Permet au sas HTTP de rejeter en `400 Bad Request` tout envoi ambigu (R-3).
+pub fn cookie_count(headers: &[(String, String)]) -> usize {
     headers
         .iter()
         .filter(|(n, _)| n == "cookie")
         .flat_map(|(_, v)| v.split(';'))
         .filter_map(|pair| pair.trim().split_once('='))
-        .find(|(name, _)| *name == COOKIE_NAME)
+        .filter(|(name, _)| name.trim() == COOKIE_NAME)
+        .count()
+}
+
+/// Valeur du cookie `mcc_session` présentée par la requête, s'il y en a une
+/// seule (aucune ambiguïté).
+pub fn cookie_value(headers: &[(String, String)]) -> Option<String> {
+    if cookie_count(headers) != 1 {
+        return None;
+    }
+    headers
+        .iter()
+        .filter(|(n, _)| n == "cookie")
+        .flat_map(|(_, v)| v.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .find(|(name, _)| name.trim() == COOKIE_NAME)
         .map(|(_, value)| value.trim().to_string())
 }
 
-/// Valeur d'un en-tête (nom déjà en minuscules côté `handle_conn`).
+/// Valeur d'un en-tête unique (nom déjà en minuscules côté `handle_conn`).
+/// Retourne `None` si l'en-tête est absent ou dupliqué.
 fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
-    headers
+    let mut vals = headers
         .iter()
-        .find(|(n, _)| n == name)
-        .map(|(_, v)| v.trim().to_string())
+        .filter(|(n, _)| n == name)
+        .map(|(_, v)| v.trim().to_string());
+    let first = vals.next()?;
+    if vals.next().is_some() {
+        return None;
+    }
+    Some(first)
 }
 
 /// Session vivante désignée par la requête : cookie ET secret doivent
@@ -397,19 +434,35 @@ fn sidecar(config_path: &str, name: &str) -> std::path::PathBuf {
 /// le fichier est supprimé : aucun jeton ne reste lisible par un autre compte
 /// (échec fermé).
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    // Fichier créé VIDE, restreint, PUIS rempli : aucun octet secret n'existe
-    // avec les ACL héritées du dossier (fenêtre fermée).
-    std::fs::File::create(path)?;
-    if let Err(e) = crate::manage::restrict_permissions(&path.to_string_lossy()) {
-        let _ = std::fs::remove_file(path);
+    // Fichier temporaire créé VIDE, restreint, rempli + sync_all, PUIS renommé
+    // atomiquement : aucun octet secret n'existe avec les ACL héritées ET le
+    // lecteur (`serve_session_requests` / `request_bootstrap`) ne voit jamais
+    // un fichier vide ou tronqué en cours d'écriture.
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(format!(".{}.tmp", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp_os);
+    std::fs::File::create(&tmp)?;
+    if let Err(e) = crate::manage::restrict_permissions(&tmp.to_string_lossy()) {
+        let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)?;
-    f.write_all(bytes)?;
-    let _ = f.sync_all();
+    let write_res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        let _ = f.sync_all();
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -767,5 +820,35 @@ mod tests {
         assert!(exchange(&token).is_some());
         assert!(exchange(&token).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doublons_cookie_et_en_tete_session_refuses() {
+        let _g = guard();
+        let s = open();
+        assert_eq!(
+            cookie_count(&hs(&[
+                ("cookie", &format!("mcc_session={}", s.cookie)),
+                ("cookie", "mcc_session=autre"),
+            ])),
+            2
+        );
+        assert!(!authorized(&hs(&[
+            ("cookie", &format!("mcc_session={}", s.cookie)),
+            ("cookie", "mcc_session=autre"),
+            (SESSION_HEADER, &s.secret),
+        ])));
+        assert!(!authorized(&hs(&[
+            (
+                "cookie",
+                &format!("mcc_session={}; mcc_session=autre", s.cookie)
+            ),
+            (SESSION_HEADER, &s.secret),
+        ])));
+        assert!(!authorized(&hs(&[
+            ("cookie", &format!("mcc_session={}", s.cookie)),
+            (SESSION_HEADER, &s.secret),
+            (SESSION_HEADER, "autre"),
+        ])));
     }
 }
