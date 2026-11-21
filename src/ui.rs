@@ -77,6 +77,13 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
         data-act="srv-filter">
       <button id="srvFilterClear" hidden data-act="clear-filter" aria-label="Effacer le filtre" title="Effacer le filtre">&times;</button>
     </div>
+    <div class="exp-pills" id="expStatePills" role="group" aria-label="Filtres rapides par &eacute;tat">
+      <button class="exp-pill sel" data-act="exp-state" data-mode="all">Tous</button>
+      <button class="exp-pill" data-act="exp-state" data-mode="up">UP</button>
+      <button class="exp-pill" data-act="exp-state" data-mode="down">Panne</button>
+      <button class="exp-pill" data-act="exp-state" data-mode="locked">Verrouill&eacute;s</button>
+      <button class="exp-pill" data-act="exp-state" data-mode="paused">Pause</button>
+    </div>
     <div id="hiddenBar" hidden data-act="show-hidden"
       title="Les serveurs masqu&eacute;s ne le restent que pour cette session : ils reviennent &agrave; la r&eacute;ouverture de l'application (ou d'un rechargement de la page)"></div>
     <div id="localSec">

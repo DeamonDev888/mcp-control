@@ -279,10 +279,27 @@ const ic = n => `<svg class='ic' viewBox='0 0 24 24' aria-hidden='true'>${ICONS[
 let pollFails = 0;
 const DEAD_BOOT_MSG = 'moteur injoignable, nouvel essai…';
 const DEAD_MSG = 'moteur injoignable';
+let _lastSelectedSrvSig = '';
+let _lastAccessRevision = null;
+let _sigServers = '';
+let _sigPeers = '';
+let _sigAnn = '';
+let _sigLog = '';
+let _sigOverview = '';
+let _sigDetail = '';
+let _sigAccess = '';
+const setHidden = (el, h) => { if (el && el.hidden !== !!h) el.hidden = !!h; };
+const setText = (el, txt) => { const s = String(txt ?? ''); if (el && el.textContent !== s) el.textContent = s; };
+
 function setDead(on, msg) {
   const b = document.getElementById('deadBanner');
-  if (b) { b.hidden = !on; if (on) b.textContent = msg; }
-  document.body.classList.toggle('dead', on);
+  if (b) {
+    setHidden(b, !on);
+    if (on) setText(b, msg);
+  }
+  if (document.body.classList.contains('dead') !== !!on) {
+    document.body.classList.toggle('dead', on);
+  }
   // boot jamais réussi : la zone principale est vide — y porter le message,
   // render() l'écrasera à la reprise.
   const c = document.getElementById('content');
@@ -299,23 +316,31 @@ async function load() {
     state = await r.json();
     pollFails = 0;
     setDead(false);
-    if (selectedId && !state.servers.find(s => s.id === selectedId)) { selectedId = null; detailCache = null; }
+    if (selectedId && !state.servers.find(s => s.id === selectedId)) {
+      selectedId = null; detailCache = null; _lastSelectedSrvSig = ''; _sigOverview = '';
+    }
     render();
+    const rev = state && state.access ? state.access.revision : null;
+    if (rev !== _lastAccessRevision) {
+      _lastAccessRevision = rev;
+      const ad = document.getElementById('accessDlg');
+      if (ad && ad.open) refreshAccess();
+    }
     if (selectedId) {
-      const r2 = await fetch('/api/detail?id=' + encodeURIComponent(selectedId));
-      if (r2.ok) { detailCache = await r2.json(); renderDetail(); }
+      const srvSummary = state.servers.find(s => s.id === selectedId);
+      const srvSig = JSON.stringify(srvSummary || null);
+      if (!detailCache || detailCache.id !== selectedId || srvSig !== _lastSelectedSrvSig) {
+        _lastSelectedSrvSig = srvSig;
+        const r2 = await fetch('/api/detail?id=' + encodeURIComponent(selectedId));
+        if (r2.ok) { detailCache = await r2.json(); renderDetail(); }
+      }
     }
   } catch(e) {
-    // moteur injoignable ou redémarrage : signaler au lieu de laisser des
-    // chiffres périmés sans message. Un 401 de session (U-9) a déjà posé le
-    // bandeau et coupé les appels : on ne compte pas de panne réseau.
     if (sessionLost) { setDead(true, SESSION_LOST_MSG); return; }
     if (document.getElementById('loginDlg')?.open) return;
     pollFails++;
     if (state === null) setDead(true, DEAD_BOOT_MSG);
     else if (pollFails >= 2) setDead(true, DEAD_MSG);
-    // panne : réessai RAPIDE (2 s) au lieu du prochain cycle complet —
-    // bandeau dès le 2ᵉ échec, ~refresh_secs+2 s au lieu de ~2×refresh_secs.
     scheduleNext(POLL_RETRY_MS);
   }
 }
@@ -323,36 +348,37 @@ async function load() {
 function render() {
   if (!state) return;
   const s = state.stats;
-  // Alerte réseau : la passerelle LAN ne répond pas → les serveurs distants
-  // sont injoignables (VPN le plus souvent). Une pastille rouge dans la barre
-  // du Journal — visible même le journal replié — remplace l'ancien bandeau
-  // pleine largeur qui poussait toute l'interface ; tooltip + clic portent
-  // l'explication complète au lieu de l'imposer en permanence.
   const nw = document.getElementById('netWarn');
   if (nw) {
     const off = state.lan_ok === false;
-    nw.hidden = !off;
+    setHidden(nw, !off);
     if (off && !nw.innerHTML) nw.innerHTML = ic('warn') + '<span>R&eacute;seau local injoignable</span>';
   }
-  document.getElementById('stUp').textContent = s.up;
-  document.getElementById('stTotal').textContent = s.total;
-  document.getElementById('stTools').textContent = s.tools;
+  setText(document.getElementById('stUp'), s.up);
+  setText(document.getElementById('stTotal'), s.total);
+  setText(document.getElementById('stTools'), s.tools);
   armPolling();
   const au = document.getElementById('stAuto');
   if (au) {
-    au.innerHTML = ic('power') + '<span>Auto-boot ' + (state.autostart ? 'ON' : 'OFF') + '</span>';
-    au.setAttribute('aria-checked', state.autostart ? 'true' : 'false');
-    au.classList.toggle('auto-on', !!state.autostart);
-    au.classList.toggle('auto-off', !state.autostart);
+    const autoKey = state.autostart ? '1' : '0';
+    if (au.dataset.stateKey !== autoKey) {
+      au.dataset.stateKey = autoKey;
+      au.innerHTML = ic('power') + '<span>Auto-boot ' + (state.autostart ? 'ON' : 'OFF') + '</span>';
+      au.setAttribute('aria-checked', state.autostart ? 'true' : 'false');
+      au.classList.toggle('auto-on', !!state.autostart);
+      au.classList.toggle('auto-off', !state.autostart);
+    }
   }
   const upd = document.getElementById('stUpdate');
   if (state.update_available && state.latest_version) {
-    upd.hidden = false;
-    // libellé épuré : « Mettre à jour » — les versions vivent en survol
-    upd.innerHTML = ic('download') + ' Mettre &agrave; jour';
-    upd.title = 'Mettre à jour vers v' + state.latest_version + ' (installée : v' + MCC_VERSION
-      + ') — clic : téléchargement direct pour cette machine';
-  } else upd.hidden = true;
+    setHidden(upd, false);
+    if (upd.dataset.ver !== String(state.latest_version)) {
+      upd.dataset.ver = String(state.latest_version);
+      upd.innerHTML = ic('download') + ' Mettre &agrave; jour';
+      upd.title = 'Mettre à jour vers v' + state.latest_version + ' (installée : v' + MCC_VERSION
+        + ') — clic : téléchargement direct pour cette machine';
+    }
+  } else setHidden(upd, true);
   renderServers();
   renderPeers();
   syncAnnouncements();
@@ -397,12 +423,15 @@ function renderAnnouncements() {
   const sec = document.getElementById('annSec');
   const box = document.getElementById('annList');
   if (!sec || !box) return;
+  const sig = JSON.stringify(unfollowedAnnouncements);
+  if (sig === _sigAnn) return;
+  _sigAnn = sig;
   if (!unfollowedAnnouncements.length) {
-    sec.hidden = true;
+    setHidden(sec, true);
     box.innerHTML = '';
     return;
   }
-  sec.hidden = false;
+  setHidden(sec, false);
   box.innerHTML = unfollowedAnnouncements.map(a => {
     const portTxt = a.port ? `:${esc(a.port)}` : 'port inconnu';
     const verTxt = a.version ? ` &middot; v${esc(a.version)}` : '';
@@ -491,10 +520,23 @@ function groupHeadHtml(key, label, up, total, machine) {
    ni config.json ni localStorage. Fermer l'app (ou recharger la page) les fait
    réapparaître, comme demandé. La supervision moteur continue de les sonder. */
 const hiddenServers = new Set();
+let expStateFilter = 'all';
+
+function setExpStateFilter(mode) {
+  expStateFilter = mode || 'all';
+  document.querySelectorAll('#expStatePills .exp-pill').forEach(b => {
+    b.classList.toggle('sel', b.dataset.mode === expStateFilter);
+  });
+  renderServers();
+}
 
 function srvVisible(s, q) {
   if (hiddenServers.has(s.id)) return false;
   if (overviewFilter === 'up' && s.state !== 'UP') return false;
+  if (expStateFilter === 'up' && s.state !== 'UP') return false;
+  if (expStateFilter === 'down' && !(s.enabled && (s.state === 'DOWN' || s.state === 'PORT-ONLY'))) return false;
+  if (expStateFilter === 'locked' && !s.locked) return false;
+  if (expStateFilter === 'paused' && (s.enabled && s.state !== 'DISABLED')) return false;
   if (q) {
     const hay = (s.label + ' ' + s.id + ' ' + (s.framework || '') + ' '
       + (s.transport === 'http' ? (s.transport_info.port ?? '') : '') + ' ' + (s.state || '')).toLowerCase();
@@ -511,43 +553,53 @@ function renderServers() {
   const clr = document.getElementById('srvFilterClear');
   const qRaw = (document.getElementById('srvFilter')?.value || '').trim();
   const q = qRaw.toLowerCase();
-  if (clr) clr.hidden = !qRaw;
+  if (clr) setHidden(clr, !qRaw);
+  const keys = groupKeys();
+  const sig = JSON.stringify([
+    state.servers,
+    state.settings && state.settings.ssh_hosts,
+    selectedId,
+    overviewFilter,
+    expStateFilter,
+    q,
+    [...hiddenServers],
+    keys.map(k => [k, groupClosed(k)]),
+    groupClosed('local'),
+    Object.keys(FRAMEWORKS).length
+  ]);
+  if (sig === _sigServers) return;
+  _sigServers = sig;
   if (!state.servers.length) {
-    localHead.hidden = true; count.textContent = '';
+    setHidden(localHead, true); setText(count, '');
     localBox.innerHTML = '<div class="empty-sec">aucun serveur — lance un scan</div>';
-    label.hidden = true; groupsBox.innerHTML = '';
+    setHidden(label, true); groupsBox.innerHTML = '';
     const hb = document.getElementById('hiddenBar');
-    if (hb) hb.hidden = true;
+    if (hb) setHidden(hb, true);
     return;
   }
-  // Les compteurs de groupe comptent TOUS les serveurs affichables du groupe
-  // (les masqués ne comptent ni dans les lignes ni dans les comptes) ; seules
-  // les lignes visibles passent ensuite par le filtre texte.
   const shown = state.servers.filter(s => !hiddenServers.has(s.id));
   const localAll = shown.filter(s => hostOf(s) === 'local');
   const local = localAll.filter(s => srvVisible(s, q));
   const remotes = shown.filter(s => hostOf(s) !== 'local');
   const byKey = {};
   remotes.forEach(s => { const k = hostOf(s); (byKey[k] = byKey[k] || []).push(s); });
-  // barre « masqués — afficher » : le seul chemin pour les réafficher
   const hb = document.getElementById('hiddenBar');
   if (hb) {
     const n = hiddenServers.size;
-    hb.hidden = !n;
+    setHidden(hb, !n);
     if (n) hb.innerHTML = ic('eyeOff') + ' ' + n + ' serveur' + (n > 1 ? 's' : '')
       + ' masqu\u00e9' + (n > 1 ? 's' : '') + ' (reviennent \u00e0 la r\u00e9ouverture) <b>afficher</b>';
   }
   const upOf = rows => rows.filter(s => s.state === 'UP').length;
-  /* Favoris (⭐) épinglés en tête de chaque section, quel que soit le tri :
-     tri stable — les épinglées gardent leur ordre relatif entre elles. */
   const favFirst = rows => rows.slice().sort((a, b) => ((b.favorite === true) - (a.favorite === true)));
   const noneMatch = '<div class="empty-sec">aucun serveur ne correspond au filtre</div>';
-  localHead.hidden = false;
-  count.textContent = upOf(localAll) + '/' + localAll.length;
+  setHidden(localHead, false);
+  localHead.classList.toggle('closed', groupClosed('local'));
+  localBox.classList.toggle('closed', groupClosed('local'));
+  setText(count, upOf(localAll) + '/' + localAll.length);
   localBox.innerHTML = local.length ? favFirst(local).map(srvRow).join('')
     : (localAll.length ? noneMatch : '<div class="empty-sec">aucun serveur — lance un scan</div>');
-  const keys = groupKeys();
-  label.hidden = !keys.length;
+  setHidden(label, !keys.length);
   groupsBox.innerHTML = keys.map(k => {
     const all = byKey[k] || [];
     const rows = all.filter(s => srvVisible(s, q));
@@ -841,6 +893,9 @@ function rowDragEnd(ev, el) {
 
 function renderPeers() {
   const box = document.getElementById('peerList');
+  const sig = JSON.stringify(state.peers || []);
+  if (sig === _sigPeers) return;
+  _sigPeers = sig;
   if (!state.peers || !state.peers.length) { box.innerHTML = '<div class="empty-sec">aucun pair d&eacute;tect&eacute;</div>'; return; }
   box.innerHTML = state.peers.map(p => {
     const st = p.stats || {};
@@ -854,6 +909,9 @@ function renderPeers() {
 
 function renderLog() {
   const lb = document.getElementById('logbody');
+  const sig = JSON.stringify(state.log || []);
+  if (sig === _sigLog) return;
+  _sigLog = sig;
   lb.innerHTML = state.log.map(l => {
     const ts = Number.isFinite(l.ts) ? l.ts : 0;
     const d = new Date(ts * 1000).toLocaleTimeString('fr-FR');
@@ -883,32 +941,119 @@ function clearFilter() {
 }
 function renderOverview() {
   const s = state.stats;
-  const nbMachines = (state.settings.ssh_hosts || []).length;
-  document.getElementById('content').innerHTML = `
-    <div class="tiles">
-      <button class="tile${overviewFilter === 'up' ? ' sel' : ''}" data-act="tile" data-mode="up"
-        title="Cliquer : ne montrer que les serveurs UP dans l'explorateur (re-cliquer pour tout afficher)">
-        <div class="n ok">${s.up}</div><div class="lbl">serveurs UP</div></button>
-      <button class="tile${overviewFilter ? '' : ' sel'}" data-act="tile" data-mode="all"
-        title="Cliquer : réafficher tous les serveurs dans l'explorateur">
-        <div class="n">${s.total}</div><div class="lbl">serveurs suivis</div></button>
-      <button class="tile" data-act="tile-tools"
-        title="Cliquer : trier l'explorateur par nombre d'outils">
-        <div class="n">${s.tools}</div><div class="lbl">tools actifs</div></button>
-      <button class="tile" data-act="machines"
-        title="Cliquer : gérer les machines distantes (SSH)">
-        <div class="n">${nbMachines}</div><div class="lbl">machines distantes</div></button>
-    </div>
-    <div class="welcome">
-      <div class="big">Centre de contr&ocirc;le de tes serveurs MCP</div>
-      <div class="hint">S&eacute;lectionne un serveur dans l'explorateur pour voir ses tools, ses infos et les basculer ON/OFF un par un.</div>
+  const a = state.access || {};
+  const pendCount = (a.pending || 0) + (a.pairs || 0);
+  const tls = (state.settings && state.settings.tls) || {};
+  const sessActive = state.sessions_active || 1;
+  const srvs = state.servers || [];
+  const downSrvs = srvs.filter(x => x.enabled && (x.state === 'DOWN' || x.state === 'PORT-ONLY'));
+  const lockedSrvs = srvs.filter(x => x.locked && x.state !== 'UP');
+  const recentLogs = (state.log || []).slice(0, 5);
+  const sig = JSON.stringify([
+    s, a, tls, sessActive, overviewFilter,
+    downSrvs.map(x => [x.id, x.label, x.state, x.can_start, x.last_error]),
+    lockedSrvs.map(x => [x.id, x.label, x.state]),
+    unfollowedAnnouncements,
+    recentLogs,
+    srvs.length
+  ]);
+  const contentEl = document.getElementById('content');
+  if (!selectedId && sig === _sigOverview && contentEl && contentEl.querySelector('.dash-head')) return;
+  _sigOverview = sig;
+  const tlsLabel = tls.active ? 'TLS 1.3 actif' : (tls.compiled ? 'Loopback HTTP (TLS 1.3 pr\u00eat)' : 'Loopback seul');
+  const downHtml = downSrvs.length
+    ? downSrvs.slice(0, 6).map(x => `<div class="dash-item">
+        <div><div class="nm">${esc(x.label)}</div><div class="meta">${esc(x.state)}${x.last_error ? ' &mdash; ' + esc(String(x.last_error).slice(0, 48)) : ''}</div></div>
+        <button class="primary" data-act="row-act" data-op="${x.can_start ? 'start' : 'refresh'}" data-id="${esc(x.id)}">${ic(x.can_start ? 'play' : 'refresh')} Relancer</button>
+      </div>`).join('')
+    : '<div class="empty-note">Tous les serveurs actifs r&eacute;pondent normalement.</div>';
+  const lockedHtml = lockedSrvs.length
+    ? lockedSrvs.slice(0, 6).map(x => `<div class="dash-item">
+        <div><div class="nm">${esc(x.label)}</div><div class="meta">Signature RFC 9421 requise</div></div>
+        <button class="primary" data-act="server-pair" data-id="${esc(x.id)}">${ic('lock')} Appairer</button>
+      </div>`).join('')
+    : '<div class="empty-note">Aucun serveur verrouill&eacute; en attente d&rsquo;appairage.</div>';
+  const annHtml = unfollowedAnnouncements.length
+    ? unfollowedAnnouncements.slice(0, 6).map(x => `<div class="dash-item">
+        <div><div class="nm">${esc(x.name)}</div><div class="meta">127.0.0.1:${esc(x.port || '?')}${x.version ? ' &middot; v' + esc(x.version) : ''}</div></div>
+        ${x.port ? `<button class="primary" data-act="follow-ann" data-name="${esc(x.name)}" data-port="${esc(x.port)}">${ic('check')} Suivre</button>` : ''}
+      </div>`).join('')
+    : '<div class="empty-note">Aucune annonce LiteMCP locale non suivie.</div>';
+  const logHtml = recentLogs.length
+    ? recentLogs.map(l => {
+        const ts = Number.isFinite(l.ts) ? l.ts : 0;
+        const d = new Date(ts * 1000).toLocaleTimeString('fr-FR');
+        return `<div class="logline ${esc(l.level)}"><span class="t">${esc(d)}</span> ${esc(l.msg)}</div>`;
+      }).join('')
+    : '<div class="empty-note">Aucun &eacute;v&eacute;nement r&eacute;cent.</div>';
+  const firstStartGuide = !srvs.length ? `
+    <div class="welcome" id="welcome">
+      <div class="big">Bienvenue dans MCP Control</div>
+      <div class="hint">Aucun serveur MCP n'est encore configur&eacute;. Lancez un scan local, explorez la boutique ou ajoutez une machine distante :</div>
       <div class="qa">
-        <button data-act="scan">${ic('search')} Scanner les ports locaux</button>
+        <button class="primary" data-act="scan">${ic('search')} Scanner les ports locaux</button>
+        <button data-act="store">${ic('cart')} Ouvrir la Boutique</button>
         <button data-act="scan-net">${ic('globe')} Scanner le r&eacute;seau</button>
         <button data-act="machines">${ic('monitor')} Choisir une machine</button>
       </div>
       <div class="hint hint-gap">Le scan utilise la plage configur&eacute;e. Pour une machine du LAN : connexion SSH par cl&eacute;,
       l'app liste ses ports en &eacute;coute, y sonde les serveurs MCP et les importe ici.</div>
+    </div>` : '';
+  contentEl.innerHTML = `
+    <div class="dash-head">
+      <div>
+        <h1>Tableau de bord MCP Control</h1>
+        <div class="sub">Supervision des serveurs MCP, passerelle sign&eacute;e Ed25519 et centre de s&eacute;curit&eacute; local</div>
+      </div>
+      <div class="d-actions">
+        <button data-act="tile" data-mode="all" class="${overviewFilter ? '' : 'primary'}">Tous les serveurs (${s.total})</button>
+        <button data-act="machines">${ic('monitor')} Machines SSH (${(state.settings.ssh_hosts || []).length})</button>
+      </div>
+    </div>
+    <div class="tiles">
+      <button class="tile${overviewFilter === 'up' ? ' sel' : ''}" data-act="tile" data-mode="up"
+        title="Cliquer : ne montrer que les serveurs UP dans l'explorateur (re-cliquer pour tout afficher)">
+        <div class="n ok">${s.up} / ${s.total}</div>
+        <div class="lbl">Serveurs UP / Total</div>
+        <div class="meta">${downSrvs.length ? downSrvs.length + ' en panne' : '100 % op\u00e9rationnels'}</div>
+      </button>
+      <button class="tile" data-act="tile-tools"
+        title="Cliquer : trier l'explorateur par nombre d'outils expos&eacute;s">
+        <div class="n">${s.tools}</div>
+        <div class="lbl">Outils expos&eacute;s</div>
+        <div class="meta">Passerelle POST /mcp</div>
+      </button>
+      <button class="tile" data-act="access-open" data-pending="1"
+        title="Cliquer : ouvrir le centre Acc&egrave;s &amp; S&eacute;curit&eacute;">
+        <div class="n ${pendCount > 0 ? 'warn' : 'ok'}">${pendCount}</div>
+        <div class="lbl">Confirmations &amp; Appairages</div>
+        <div class="meta">${a.pending || 0} ex&eacute;cution(s) &middot; ${a.pairs || 0} appairage(s)</div>
+      </button>
+      <button class="tile" data-act="access-open"
+        title="Cliquer : inspecter l'identit&eacute; serveur, les sessions locales et TLS 1.3">
+        <div class="n">${sessActive}</div>
+        <div class="lbl">Sessions locales &amp; TLS</div>
+        <div class="meta">${esc(tlsLabel)}</div>
+      </button>
+    </div>
+    ${firstStartGuide}
+    <div class="dash-grid">
+      <div class="dash-card">
+        <h3><span>${ic('warn')} Serveurs en panne (${downSrvs.length})</span></h3>
+        ${downHtml}
+      </div>
+      <div class="dash-card">
+        <h3><span>${ic('lock')} Serveurs verrouill&eacute;s (${lockedSrvs.length})</span></h3>
+        ${lockedHtml}
+      </div>
+      <div class="dash-card">
+        <h3><span>${ic('activity')} D&eacute;tect&eacute;s, non suivis (${unfollowedAnnouncements.length})</span></h3>
+        ${annHtml}
+      </div>
+      <div class="dash-card">
+        <h3><span>${ic('terminal')} Derniers &eacute;v&eacute;nements du journal</span></h3>
+        ${logHtml}
+      </div>
     </div>`;
 }
 
@@ -956,15 +1101,70 @@ function confAgent(s) {
     blk('JSON mcpServers (Claude, Cursor, VS Code&hellip;)', mcpJson(s)) +
     blk('claude mcp add', claudeCmd(s));
 }
+let toolSearchQuery = '';
+const expandedTools = new Set();
+
+function mdInline(t) {
+  return esc(t)
+    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+    .replace(/(^|[^*])\*([^*\s][^*]*)\*/g, '$1<i>$2</i>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>');
+}
+function renderToolsRowsHtml(s) {
+  const all = s.tools_list || [];
+  const q = toolSearchQuery.trim().toLowerCase();
+  const filtered = q ? all.filter(t => (t.name + ' ' + (t.desc || '')).toLowerCase().includes(q)) : all;
+  if (!filtered.length) {
+    return `<div class="empty-note">${all.length ? 'aucun outil ne correspond au filtre' : 'aucun tool list&eacute;'}</div>`;
+  }
+  return filtered.map(t => {
+    const expKey = s.id + '::' + t.name;
+    const isExp = expandedTools.has(expKey);
+    return `<div class="tool ${t.disabled?'off':''} ${isExp?'expanded':''}" data-act="tool-expand" data-tool="${esc(t.name)}" title="Cliquer pour d&eacute;plier / replier la description compl&egrave;te">
+       <code>${esc(t.name)}</code>
+       <span class="desc">${t.desc ? mdInline(t.desc) : '&mdash;'}</span>
+       <button class="tgl ${t.disabled?'off':'on'}" role="switch" aria-checked="${t.disabled?'false':'true'}" aria-label="${t.disabled?'R&eacute;activer':'D&eacute;sactiver'} l'outil ${esc(t.name)}" title="${t.disabled?'R&eacute;activer ce tool':'D&eacute;sactiver ce tool'}"
+               data-act="tool-toggle" data-id="${esc(s.id)}" data-tool="${esc(t.name)}">
+         ${t.disabled ? 'OFF' : 'ON'}
+       </button>
+     </div>`;
+  }).join('');
+}
+function setToolSearch(el) {
+  toolSearchQuery = el ? el.value : '';
+  const box = document.getElementById('toolsRowsBox');
+  if (box && detailCache) box.innerHTML = renderToolsRowsHtml(detailCache);
+}
+function toggleToolExpand(el) {
+  if (!detailCache || !el || !el.dataset.tool) return;
+  const expKey = detailCache.id + '::' + el.dataset.tool;
+  if (expandedTools.has(expKey)) {
+    expandedTools.delete(expKey);
+    el.classList.remove('expanded');
+  } else {
+    expandedTools.add(expKey);
+    el.classList.add('expanded');
+  }
+}
+async function setAllTools(id, enableAll) {
+  if (!detailCache || detailCache.id !== id) return;
+  const list = (detailCache.tools_list || []).filter(t => enableAll ? t.disabled : !t.disabled);
+  if (!list.length) return;
+  await Promise.all(list.map(t => postAction({action: 'toggle_tool', id, tool: t.name}, {quiet: true})));
+  const r = await fetch('/api/detail?id=' + encodeURIComponent(id));
+  if (r.ok) { detailCache = await r.json(); renderDetail(); }
+  await load();
+}
+
 function renderDetail() {
   const s = detailCache;
   if (!s || s.id !== selectedId) return;
-  // Le rendu tourne toutes les 5 s : si l'utilisateur tape dans le formulaire
-  // Démarrage (set_start_cmd), on ne détruit pas le DOM sous ses doigts —
-  // le prochain cycle réaffichera l'état à jour.
   const aEl = document.activeElement;
-  if (aEl && (aEl.id === 'scProgram' || aEl.id === 'scArgs' || aEl.id === 'scWorkdir')) return;
-  // Hors saisie active : conserver ce qui a déjà été tapé dans ces champs.
+  if (aEl && (aEl.id === 'scProgram' || aEl.id === 'scArgs' || aEl.id === 'scWorkdir' || aEl.id === 'toolSearch')) return;
+  const sig = JSON.stringify([s, detailTab, toolSearchQuery, Object.keys(FRAMEWORKS).length]);
+  const contentEl = document.getElementById('content');
+  if (selectedId && sig === _sigDetail && contentEl && contentEl.querySelector('.d-head')) return;
+  _sigDetail = sig;
   const typed = {};
   ['scProgram', 'scArgs', 'scWorkdir'].forEach(idOld => {
     const el = document.getElementById(idOld);
@@ -973,8 +1173,6 @@ function renderDetail() {
   const ti = s.transport === 'http'
     ? `HTTP ${s.transport_info.host ? s.transport_info.host + ':' : ''}${s.transport_info.port}${s.transport_info.path}`
     : `stdio \u00b7 ${s.transport_info.program} ${(s.transport_info.args || []).join(' ')}`;
-  /* Ligne clé/valeur : toute valeur informative se copie d'un clic (pid,
-     commande, url…). Tiret cadratin pour « pas de valeur » — cohérent partout. */
   const kvRow = (k, v) => {
     const cpy = v && v !== '—';
     return `<div class="k">${k}</div><div class="v${cpy ? ' cpy' : ''}"${cpy
@@ -995,8 +1193,6 @@ function renderDetail() {
     ['dernier vu', s.last_seen ? new Date(s.last_seen * 1000).toLocaleString('fr-FR') : '—'],
     ['erreur', s.last_error ?? '—'],
   ].map(([k, v]) => kvRow(k, v)).join('');
-  /* Panneau Démarrage : contrôle du process par MCP Control.
-     « au démarrage » = process lancé ici et vivant, mais MCP pas encore répondu. */
   const starting = s.enabled && s.managed && s.state !== 'UP';
   const dispState = starting ? 'STARTING' : s.state;
   const etatProcess = s.state === 'UP' ? 'en marche'
@@ -1014,41 +1210,26 @@ function renderDetail() {
     ['auto-restart', s.auto_restart ? 'ON \u2014 relance automatique au boot/crash' : 'OFF'],
     ['commande', cmd ?? '—'],
   ].map(([k, v]) => kvRow(k, v)).join('');
-  /* Replis à état mémorisé : le rendu tourne à chaque cycle de rafraîchissement,
-     l'état ouvert/fermé choisi par l'utilisateur est donc persisté (localStorage)
-     et relu ici — sinon le triangle revenait à son état d'origine toutes les 5 s
-     et à chaque réouverture d'onglet. */
   const foldOpen = name => {
     try {
       const v = localStorage.getItem('mcc.fold.' + name);
       if (v !== null) return v === 'true';
     } catch (e) {}
-    return name === 'demarrage'; // défauts : Démarrage ouvert, Informations fermé
+    return name === 'demarrage';
   };
   const fold = (name, title, inner) =>
     `<details class="fold" data-fold="${name}"${foldOpen(name) ? ' open' : ''}><summary>${title}</summary>${inner}</details>`;
-  /* Rendu « markdown inline » minimal pour les descriptions d'outils : les
-     serveurs MCP renvoient souvent **gras** et `code` — affichés bruts, les
-     astérisques cassent la lecture. Le texte est ÉCHAPPÉ d'abord (aucun < >
-     ne peut donc passer dans le HTML généré) : injection impossible. */
-  const mdInline = t => esc(t)
-    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
-    .replace(/(^|[^*])\*([^*\s][^*]*)\*/g, '$1<i>$2</i>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>');
-  const tools = (s.tools_list || []).map(t =>
-    `<div class="tool ${t.disabled?'off':''}" data-tool="${esc(t.name)}">
-       <code>${esc(t.name)}</code>
-       <span class="desc" title="${esc(t.desc)}">${t.desc ? mdInline(t.desc) : '&mdash;'}</span>
-       <button class="tgl ${t.disabled?'off':'on'}" role="switch" aria-checked="${t.disabled?'false':'true'}" aria-label="${t.disabled?'R&eacute;activer':'D&eacute;sactiver'} l'outil ${esc(t.name)}" title="${t.disabled?'R&eacute;activer ce tool':'D&eacute;sactiver ce tool'}"
-               data-act="tool-toggle" data-id="${esc(s.id)}" data-tool="${esc(t.name)}">
-         ${t.disabled ? 'OFF' : 'ON'}
-       </button>
-     </div>`).join('');
   const nOn = (s.tools_list || []).filter(t => !t.disabled).length;
   const nTot = (s.tools_list || []).length;
   const toolsHtml = `<h4 class="sec">Outils &mdash; ${nOn} actif${nOn > 1 ? 's' : ''} sur ${nTot}${nTot - nOn ? ` (${nTot - nOn} d&eacute;sactiv&eacute;${nTot - nOn > 1 ? 's' : ''})` : ''}</h4>
-    ${tools || '<div class="empty-note">aucun tool list&eacute;</div>'}`;
-  document.getElementById('content').innerHTML = `
+    ${nTot > 0 ? `<div class="tools-bar">
+      <label for="toolSearch" class="sr-only">Rechercher un outil</label>
+      <input id="toolSearch" placeholder="Filtrer les outils de ce serveur&hellip;" data-act="tool-search" value="${esc(toolSearchQuery)}">
+      <button data-act="tools-all-on" data-id="${esc(s.id)}" ${nOn === nTot ? 'disabled' : ''}>${ic('check')} Tout activer</button>
+      <button data-act="tools-all-off" data-id="${esc(s.id)}" ${nOn === 0 ? 'disabled' : ''}>${ic('x')} Tout couper</button>
+    </div>` : ''}
+    <div id="toolsRowsBox">${renderToolsRowsHtml(s)}</div>`;
+  contentEl.innerHTML = `
     <div class="crumb">serveurs / <b>${esc(s.label)}</b></div>
     <div class="d-head">
       <span class="dot dot-lg ${esc(dispState)}"></span>
@@ -1090,15 +1271,23 @@ function renderDetail() {
     <div id="dpanel-main" role="tabpanel" aria-labelledby="dtab-${esc(detailTab)}">
       ${detailTab === 'conf' ? confAgent(s) : toolsHtml}
     </div>`;
-  // Restaure la saisie en cours du formulaire Démarrage (set_start_cmd) :
-  // le re-rendu périodique régénère ces champs, on ne perd pas ce qui est tapé.
   for (const idOld in typed) {
     const el = document.getElementById(idOld);
     if (el && !el.value) el.value = typed[idOld];
   }
 }
 
-function select(id) { selectedId = id; detailCache = null; detailTab = 'outils'; render(); load(); }
+function select(id) {
+  selectedId = id;
+  detailCache = null;
+  _lastSelectedSrvSig = '';
+  _sigDetail = '';
+  _sigOverview = '';
+  toolSearchQuery = '';
+  detailTab = 'outils';
+  render();
+  load();
+}
 
 /* Formulaire « commande de lancement » : pour un serveur local découvert par
    scan (port connu, commande inconnue) — poser la commande fait apparaître les
@@ -2254,6 +2443,23 @@ function toggleHideInst() {
   }
   renderStoreItems();
 }
+function storeEnvKeys(i) {
+  const desc = String((i && i.desc) || '');
+  const matches = desc.match(/\b[A-Z][A-Z0-9_]{3,}\b/g) || [];
+  const keys = [...new Set(matches.filter(k => k.includes('_')))];
+  if (!keys.length && /tokens?\s+requis\s+en\s+env/i.test(desc)) {
+    return ['API_TOKEN'];
+  }
+  return keys;
+}
+function toggleEnvEye(btn) {
+  const row = btn && btn.closest ? btn.closest('.scard-env-row') : null;
+  const inp = row ? row.querySelector('input.store-env-inp') : null;
+  if (!inp) return;
+  const show = inp.type === 'password';
+  inp.type = show ? 'text' : 'password';
+  btn.innerHTML = ic(show ? 'eyeOff' : 'eye');
+}
 function renderStoreItems() {
   if (!storeItems) return;
   const q = (document.getElementById('storeSearch').value || '').toLowerCase();
@@ -2269,11 +2475,16 @@ function renderStoreItems() {
     : list.length + ' affiché' + (list.length > 1 ? 's' : '') + ' sur ' + storeItems.length;
   document.getElementById('storeGrid').innerHTML = list.map(i => {
     const isInst = installed.has(storeSrvId(i));
-    /* Pas de ligne de commande sur la carte : la description suffit, la
-       commande est visible dans le détail une fois installé. */
+    const envKeys = !isInst ? storeEnvKeys(i) : [];
+    const envHtml = envKeys.length ? `<div class="scard-env">${envKeys.map(k =>
+      `<div class="scard-env-row">
+        <input type="password" class="store-env-inp" data-env="${esc(k)}" placeholder="${esc(k)}" aria-label="Variable ${esc(k)}" autocomplete="off">
+        <button type="button" class="eye-btn" data-act="toggle-env-eye" aria-label="Afficher ou masquer ${esc(k)}" title="Afficher / masquer">${ic('eye')}</button>
+      </div>`).join('')}</div>` : '';
     return `<div class="scard">
       <div class="scard-top">${storeLogo(i)}<b>${esc(i.name)}</b><span class="tag ${i.kind==='npm'?'npm':'py'}">${esc(i.kind)}</span></div>
       <div class="scard-desc">${esc(i.desc)}</div>
+      ${envHtml}
       ${isInst
         ? `<button class="btn-inst" disabled title="Ce serveur est d&eacute;j&agrave; dans ta liste">${ic('check')} D&eacute;j&agrave; install&eacute;</button>`
         : `<button class="primary" data-act="install-store" data-id="${esc(i.id)}">${ic('download')} Installer</button>`}
@@ -2281,8 +2492,20 @@ function renderStoreItems() {
   }).join('') || '<div class="empty-sec">aucun r&eacute;sultat</div>';
 }
 async function installStore(id, btn) {
+  const card = btn && btn.closest ? btn.closest('.scard') : null;
+  const envInps = card ? [...card.querySelectorAll('input.store-env-inp')] : [];
+  const envMap = {};
+  let hasEnv = false;
+  envInps.forEach(inp => {
+    const k = inp.dataset.env;
+    const v = (inp.value || '').trim();
+    if (k && v) { envMap[k] = v; hasEnv = true; }
+    inp.value = '';
+    inp.type = 'password';
+  });
   btn.disabled = true; btn.textContent = '\u23f3 Installation\u2026';
   const body = {action: 'install_store', id};
+  if (hasEnv) body.env = envMap;
   if (id === 'filesystem') {
     const res = await askConfirm({
       title: 'Dossier Filesystem',
@@ -2514,6 +2737,21 @@ function verdictIcon(v) {
   if (s.includes('revo')) return 'lock';
   return 'x';
 }
+/* Ticker local 1000 ms pour les comptes à rebours de #accessDlg : met uniquement
+   à jour .textContent des éléments [data-ttl-until] sans requête réseau ni innerHTML. */
+function tickAccessTtl() {
+  const dlg = document.getElementById('accessDlg');
+  if (!dlg || !dlg.open) return;
+  const now = Date.now();
+  dlg.querySelectorAll('[data-ttl-until]').forEach(el => {
+    const until = +el.dataset.ttlUntil || 0;
+    const rem = Math.max(0, Math.ceil((until - now) / 1000));
+    const txt = el.dataset.ttlMode === 'grant'
+      ? (rem + ' s restantes')
+      : ('expire dans ' + rem + ' s');
+    setText(el, txt);
+  });
+}
 
 /* ===== Écran « Accès » (lot M3, docs/auth.md §5) ========================
    Cinq volets : confirmations en attente (ce qui va être lancé), appairage
@@ -2538,20 +2776,21 @@ function accessBadge() {
   const n = (a.pending || 0) + (a.pairs || 0);
   const b = document.getElementById('accessBanner');
   if (b) {
-    b.hidden = !n;
+    setHidden(b, !n);
     if (n) {
       const parts = [];
       if (a.pending) parts.push(a.pending + ' confirmation' + (a.pending > 1 ? 's' : '') + ' avant ex\u00e9cution');
       if (a.pairs) parts.push(a.pairs + ' demande' + (a.pairs > 1 ? 's' : '') + ' d\u2019appairage');
-      b.innerHTML = ic('shield') + '<span>' + parts.join(' et ') + ' en attente &mdash; cliquer pour d\u00e9cider</span>';
+      const html = ic('shield') + '<span>' + parts.join(' et ') + ' en attente &mdash; cliquer pour d\u00e9cider</span>';
+      if (b.innerHTML !== html) b.innerHTML = html;
     }
   }
   const badge = document.getElementById('tbAccessN');
-  if (badge) { badge.hidden = !n; badge.textContent = String(n); }
+  if (badge) { setHidden(badge, !n); setText(badge, n); }
   const cp = document.getElementById('accCountPending');
-  if (cp) { cp.hidden = !(a.pending || 0); cp.textContent = String(a.pending || 0); }
+  if (cp) { setHidden(cp, !(a.pending || 0)); setText(cp, a.pending || 0); }
   const cpa = document.getElementById('accCountPairs');
-  if (cpa) { cpa.hidden = !(a.pairs || 0); cpa.textContent = String(a.pairs || 0); }
+  if (cpa) { setHidden(cpa, !(a.pairs || 0)); setText(cpa, a.pairs || 0); }
 }
 function openAccessDlg(pending) {
   const d = document.getElementById('accessDlg');
@@ -2564,7 +2803,7 @@ function openAccessDlg(pending) {
   d.showModal();
   refreshAccess();
   if (accessTimer) clearInterval(accessTimer);
-  accessTimer = setInterval(() => { if (d.open) refreshAccess(); }, 3000);
+  accessTimer = setInterval(tickAccessTtl, 1000);
 }
 function closeAccessDlg() {
   if (accessTimer) { clearInterval(accessTimer); accessTimer = null; }
@@ -2592,6 +2831,9 @@ async function refreshAccess() {
 }
 function renderAccess() {
   if (!accessState) return;
+  const sig = JSON.stringify([accessState, clientFilterMode, decisionFilterQuery, pairDroits]);
+  if (sig === _sigAccess) return;
+  _sigAccess = sig;
   renderAccPending();
   renderAccClients();
   renderAccPairs();
@@ -2929,6 +3171,7 @@ const ACT = {
   'sort': el => applySort(el.value),
   'srv-filter': () => renderServers(),
   'clear-filter': () => clearFilter(),
+  'exp-state': el => setExpStateFilter(el.dataset.mode),
   'show-hidden': () => showHiddenServers(),
   'group-toggle': el => toggleGroup(el.dataset.key),
   'add-server': () => toggleAdd(),
@@ -2946,6 +3189,10 @@ const ACT = {
   'tile': el => tileFilter(el.dataset.mode),
   'tile-tools': () => tileSortTools(),
   'detail-tab': el => { detailTab = el.dataset.tab; renderDetail(); },
+  'tool-search': el => setToolSearch(el),
+  'tools-all-on': el => setAllTools(el.dataset.id, true),
+  'tools-all-off': el => setAllTools(el.dataset.id, false),
+  'tool-expand': el => toggleToolExpand(el),
   'tool-toggle': el => toggleTool(el.dataset.id, el.dataset.tool),
   'server-pair': el => serverPair(el.dataset.id),
   'copy-self': el => copyText(el.textContent),
@@ -2958,6 +3205,7 @@ const ACT = {
   'store-search': () => renderStoreItems(),
   'store-sort': () => renderStoreItems(),
   'store-hide-inst': () => toggleHideInst(),
+  'toggle-env-eye': el => toggleEnvEye(el),
   'install-store': el => installStore(el.dataset.id, el),
   // -- machines distantes (SSH)
   'ssh-discover': el => sshDiscover(el.dataset.id, el.dataset.user),
