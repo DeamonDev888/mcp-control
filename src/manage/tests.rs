@@ -4079,3 +4079,414 @@ fn ui_api_aucun_secret_ni_fuite_gateway() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn p1_save_cache_ne_reecrit_pas_si_contenu_utile_inchange() {
+    use std::collections::{HashMap, HashSet};
+    let dir = std::env::temp_dir().join(format!(
+        "mcc-p1-cache-{}-{}",
+        std::process::id(),
+        crate::types::now_ts()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let cfg = dir.join("config.json");
+    let cache = dir.join("state-cache.json");
+
+    let state = Arc::new(AppState {
+        servers: Mutex::new(vec![Server {
+            id: "s1".into(),
+            label: "S1".into(),
+            transport: Transport::Http {
+                host: Some("127.0.0.1".into()),
+                port: 19991,
+                path: "/mcp".into(),
+            },
+            origin: Origin::Manual,
+            enabled: true,
+            state: SState::Up,
+            pid: None,
+            bound_host: Some("127.0.0.1".into()),
+            server_name: Some("demo".into()),
+            version: Some("1.0.0".into()),
+            protocol: Some("2024-11-05".into()),
+            sse: false,
+            sse_endpoint: false,
+            ws: false,
+            lang: Some("node".into()),
+            framework: None,
+            via_ssh: false,
+            tools: vec![crate::types::ToolInfo {
+                name: "ping".into(),
+                desc: "ok".into(),
+            }],
+            latency_ms: Some(4),
+            last_seen_ts: Some(1000),
+            last_error: None,
+            start_cmd: None,
+            auto_restart: false,
+            favorite: false,
+            tools_disabled: vec![],
+        }]),
+        log: Mutex::new(VecDeque::new()),
+        settings: Mutex::new(Settings::default()),
+        children: Mutex::new(HashMap::new()),
+        config_path: cfg.to_string_lossy().to_string(),
+        peers: Mutex::new(HashMap::new()),
+        allowed_origins: Mutex::new(vec![]),
+        allowed_hosts: Mutex::new(vec![]),
+        spawn_fails: Mutex::new(HashMap::new()),
+        runtime: Mutex::new(crate::runtime::RuntimeLog::new()),
+        spawning: Mutex::new(HashSet::new()),
+        update_latest: Mutex::new(None),
+        lan_ok: Mutex::new(None),
+    });
+
+    // 1re écriture : le fichier est créé.
+    save_cache(&state);
+    assert!(
+        cache.exists(),
+        "state-cache.json doit être écrit la 1re fois"
+    );
+    let first_bytes = std::fs::read(&cache).expect("lecture cache 1");
+
+    // Seuls les champs volatils changent (latency_ms, last_seen_ts) :
+    // on remplace le fichier par un marqueur pour prouver qu'aucune écriture
+    // disque n'a lieu lors du second save_cache.
+    std::fs::write(&cache, b"SENTINEL_UNTOUCHED").expect("écriture sentinelle");
+    {
+        let mut srvs = lockv(&state.servers);
+        srvs[0].latency_ms = Some(99);
+        srvs[0].last_seen_ts = Some(2000);
+    }
+    save_cache(&state);
+    let after_unchanged = std::fs::read(&cache).expect("lecture sentinelle");
+    assert_eq!(
+        after_unchanged, b"SENTINEL_UNTOUCHED",
+        "save_cache ne doit PAS réécrire sur disque quand seul latency_ms/last_seen_ts/saved_at change"
+    );
+
+    // Changement réel (version) : le cache DOIT être réécrit.
+    {
+        let mut srvs = lockv(&state.servers);
+        srvs[0].version = Some("2.0.0".into());
+    }
+    save_cache(&state);
+    let after_changed = std::fs::read(&cache).expect("lecture cache 2");
+    assert_ne!(after_changed, b"SENTINEL_UNTOUCHED");
+    assert_ne!(after_changed, first_bytes);
+    assert!(String::from_utf8_lossy(&after_changed).contains("2.0.0"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn p1_tools_list_mis_en_cache_sur_serveur_up_et_invalide_sur_changement_version() {
+    use std::collections::{HashMap, HashSet};
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+    let port = listener.local_addr().unwrap().port();
+    let init_count = Arc::new(AtomicUsize::new(0));
+    let tools_count = Arc::new(AtomicUsize::new(0));
+    let version = Arc::new(Mutex::new("1.0.0".to_string()));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let ic = Arc::clone(&init_count);
+    let tc = Arc::clone(&tools_count);
+    let ver = Arc::clone(&version);
+    let stp = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        let _ = listener.set_nonblocking(false);
+        for stream in listener.incoming() {
+            if stp.load(Ordering::Relaxed) {
+                break;
+            }
+            let Ok(mut s) = stream else { break };
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            for _ in 0..8 {
+                match s.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                }
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let req = String::from_utf8_lossy(&buf);
+            if !req.contains("\r\n\r\n") {
+                continue;
+            }
+            let body = if req.contains("\"tools/list\"") {
+                tc.fetch_add(1, Ordering::SeqCst);
+                r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"ok"}]}}"#
+                    .to_string()
+            } else if req.contains("\"initialize\"") {
+                ic.fetch_add(1, Ordering::SeqCst);
+                let v = ver.lock().unwrap().clone();
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2024-11-05","serverInfo":{{"name":"p1-demo","version":"{v}"}}}}}}"#
+                )
+            } else {
+                r#"{"ok":false}"#.to_string()
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = s.write_all(resp.as_bytes());
+        }
+    });
+
+    let state = Arc::new(AppState {
+        servers: Mutex::new(vec![Server {
+            id: "p1-s".into(),
+            label: "P1-S".into(),
+            transport: Transport::Http {
+                host: Some("127.0.0.1".into()),
+                port,
+                path: "/mcp".into(),
+            },
+            origin: Origin::Manual,
+            enabled: true,
+            state: SState::Down,
+            pid: None,
+            bound_host: None,
+            server_name: None,
+            version: None,
+            protocol: None,
+            sse: false,
+            sse_endpoint: false,
+            ws: false,
+            lang: None,
+            framework: None,
+            via_ssh: false,
+            tools: vec![],
+            latency_ms: None,
+            last_seen_ts: None,
+            last_error: None,
+            start_cmd: None,
+            auto_restart: false,
+            favorite: false,
+            tools_disabled: vec![],
+        }]),
+        log: Mutex::new(VecDeque::new()),
+        settings: Mutex::new(Settings::default()),
+        children: Mutex::new(HashMap::new()),
+        config_path: String::new(),
+        peers: Mutex::new(HashMap::new()),
+        allowed_origins: Mutex::new(vec![]),
+        allowed_hosts: Mutex::new(vec![]),
+        spawn_fails: Mutex::new(HashMap::new()),
+        runtime: Mutex::new(crate::runtime::RuntimeLog::new()),
+        spawning: Mutex::new(HashSet::new()),
+        update_latest: Mutex::new(None),
+        lan_ok: Mutex::new(None),
+    });
+
+    // Cycle 1 (DOWN → UP) : initialize + tools/list exécutés.
+    poll_one_bg(&state, "p1-s");
+    assert_eq!(init_count.load(Ordering::SeqCst), 1);
+    assert_eq!(tools_count.load(Ordering::SeqCst), 1);
+    assert_eq!(lockv(&state.servers)[0].tools.len(), 1);
+
+    // Cycle 2 (UP → UP, même version) : initialize seul, tools/list SAUTÉ !
+    poll_one_bg(&state, "p1-s");
+    assert_eq!(init_count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        tools_count.load(Ordering::SeqCst),
+        1,
+        "tools/list ne doit pas être redemandé sur un serveur UP inchangé"
+    );
+    assert_eq!(lockv(&state.servers)[0].tools.len(), 1);
+
+    // Cycle 3 : changement de version → tools/list rechargé !
+    *version.lock().unwrap() = "2.0.0".to_string();
+    poll_one_bg(&state, "p1-s");
+    assert_eq!(init_count.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        tools_count.load(Ordering::SeqCst),
+        2,
+        "tools/list doit être rechargé quand la version change"
+    );
+    assert_eq!(lockv(&state.servers)[0].version.as_deref(), Some("2.0.0"));
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+}
+
+#[test]
+fn p1_scan_network_guard_anti_reentrance() {
+    let g1 = scans::NetworkScanGuard::try_acquire();
+    assert!(g1.is_some(), "premier verrou scan réseau doit passer");
+    assert!(
+        scans::NetworkScanGuard::try_acquire().is_none(),
+        "second verrou concurrent doit être refusé"
+    );
+    drop(g1);
+    assert!(
+        scans::NetworkScanGuard::try_acquire().is_some(),
+        "après libération, un nouveau scan réseau est autorisé"
+    );
+}
+
+#[test]
+fn p1_refresh_lan_state_saute_sans_distant_ni_network_enabled() {
+    use std::collections::{HashMap, HashSet};
+    let settings = Settings {
+        network_enabled: false,
+        ..Settings::default()
+    };
+    let state = Arc::new(AppState {
+        servers: Mutex::new(vec![Server {
+            id: "local-1".into(),
+            label: "Local".into(),
+            transport: Transport::Http {
+                host: Some("127.0.0.1".into()),
+                port: 19992,
+                path: "/mcp".into(),
+            },
+            origin: Origin::Manual,
+            enabled: true,
+            state: SState::Up,
+            pid: None,
+            bound_host: Some("127.0.0.1".into()),
+            server_name: None,
+            version: None,
+            protocol: None,
+            sse: false,
+            sse_endpoint: false,
+            ws: false,
+            lang: None,
+            framework: None,
+            via_ssh: false,
+            tools: vec![],
+            latency_ms: None,
+            last_seen_ts: None,
+            last_error: None,
+            start_cmd: None,
+            auto_restart: false,
+            favorite: false,
+            tools_disabled: vec![],
+        }]),
+        log: Mutex::new(VecDeque::new()),
+        settings: Mutex::new(settings),
+        children: Mutex::new(HashMap::new()),
+        config_path: String::new(),
+        peers: Mutex::new(HashMap::new()),
+        allowed_origins: Mutex::new(vec![]),
+        allowed_hosts: Mutex::new(vec![]),
+        spawn_fails: Mutex::new(HashMap::new()),
+        runtime: Mutex::new(crate::runtime::RuntimeLog::new()),
+        spawning: Mutex::new(HashSet::new()),
+        update_latest: Mutex::new(None),
+        lan_ok: Mutex::new(Some(true)),
+    });
+    let t0 = std::time::Instant::now();
+    refresh_lan_state(&state);
+    assert!(
+        t0.elapsed() < std::time::Duration::from_millis(200),
+        "sans serveur distant ni network_enabled, aucun ipconfig/ping ne doit être lancé"
+    );
+    assert_eq!(*lockv(&state.lan_ok), None);
+}
+
+#[test]
+fn p1_servers_summary_json_filtre_et_stats_coherents() {
+    use std::collections::{HashMap, HashSet};
+    let state = Arc::new(AppState {
+        servers: Mutex::new(vec![
+            Server {
+                id: "up-1".into(),
+                label: "Up1".into(),
+                transport: Transport::Http {
+                    host: None,
+                    port: 19993,
+                    path: "/mcp".into(),
+                },
+                origin: Origin::Manual,
+                enabled: true,
+                state: SState::Up,
+                pid: None,
+                bound_host: None,
+                server_name: Some("u".into()),
+                version: Some("1".into()),
+                protocol: None,
+                sse: false,
+                sse_endpoint: false,
+                ws: false,
+                lang: None,
+                framework: None,
+                via_ssh: false,
+                tools: vec![crate::types::ToolInfo {
+                    name: "t1".into(),
+                    desc: "d".into(),
+                }],
+                latency_ms: Some(2),
+                last_seen_ts: None,
+                last_error: None,
+                start_cmd: None,
+                auto_restart: false,
+                favorite: false,
+                tools_disabled: vec![],
+            },
+            Server {
+                id: "down-1".into(),
+                label: "Down1".into(),
+                transport: Transport::Http {
+                    host: None,
+                    port: 19994,
+                    path: "/mcp".into(),
+                },
+                origin: Origin::Manual,
+                enabled: true,
+                state: SState::Down,
+                pid: None,
+                bound_host: None,
+                server_name: None,
+                version: None,
+                protocol: None,
+                sse: false,
+                sse_endpoint: false,
+                ws: false,
+                lang: None,
+                framework: None,
+                via_ssh: false,
+                tools: vec![],
+                latency_ms: None,
+                last_seen_ts: None,
+                last_error: None,
+                start_cmd: None,
+                auto_restart: false,
+                favorite: false,
+                tools_disabled: vec![],
+            },
+        ]),
+        log: Mutex::new(VecDeque::new()),
+        settings: Mutex::new(Settings::default()),
+        children: Mutex::new(HashMap::new()),
+        config_path: String::new(),
+        peers: Mutex::new(HashMap::new()),
+        allowed_origins: Mutex::new(vec![]),
+        allowed_hosts: Mutex::new(vec![]),
+        spawn_fails: Mutex::new(HashMap::new()),
+        runtime: Mutex::new(crate::runtime::RuntimeLog::new()),
+        spawning: Mutex::new(HashSet::new()),
+        update_latest: Mutex::new(None),
+        lan_ok: Mutex::new(None),
+    });
+
+    let all = servers_summary_json(&state, None);
+    assert_eq!(all["stats"]["total"], 2);
+    assert_eq!(all["stats"]["up"], 1);
+    assert_eq!(all["stats"]["tools"], 1);
+    assert_eq!(all["servers"].as_array().unwrap().len(), 2);
+
+    let only_up = servers_summary_json(&state, Some("UP"));
+    assert_eq!(only_up["stats"]["total"], 2);
+    assert_eq!(only_up["servers"].as_array().unwrap().len(), 1);
+    assert_eq!(only_up["servers"][0]["id"], "up-1");
+}

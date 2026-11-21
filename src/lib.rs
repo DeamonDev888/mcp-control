@@ -790,6 +790,7 @@ impl From<(u16, &'static str, Vec<u8>)> for Reply {
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         202 => "Accepted",
+        304 => "Not Modified",
         400 => "Bad Request",
         200 => "OK",
         401 => "Unauthorized",
@@ -804,6 +805,91 @@ fn reason_phrase(status: u16) -> &'static str {
         500 => "Internal Server Error",
         _ => "Bad Request",
     }
+}
+
+/// Contrôle interruptible des threads de fond (P-4 / P1 rang 4) : un changement
+/// de `refresh_secs` ou une demande d'arrêt réveille immédiatement les boucles
+/// sans attendre 5 à 30 s.
+struct BgControl {
+    wake_seq: u64,
+    shutdown: bool,
+}
+
+fn bg_control() -> &'static (Mutex<BgControl>, std::sync::Condvar) {
+    static CTRL: std::sync::OnceLock<(Mutex<BgControl>, std::sync::Condvar)> =
+        std::sync::OnceLock::new();
+    CTRL.get_or_init(|| {
+        (
+            Mutex::new(BgControl {
+                wake_seq: 0,
+                shutdown: false,
+            }),
+            std::sync::Condvar::new(),
+        )
+    })
+}
+
+/// Réveille immédiatement les threads de fond (ex. après changement de `refresh_secs`).
+pub fn wake_bg_poller() {
+    let (m, cv) = bg_control();
+    let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
+    g.wake_seq = g.wake_seq.wrapping_add(1);
+    cv.notify_all();
+}
+
+/// Signale l'arrêt propre aux threads de fond.
+pub fn shutdown_bg() {
+    let (m, cv) = bg_control();
+    let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
+    g.shutdown = true;
+    cv.notify_all();
+}
+
+/// Dort au plus `dur`, réveillé immédiatement par `wake_bg_poller()` ou `shutdown_bg()`.
+/// Renvoie `true` si la boucle doit continuer, `false` si l'arrêt est demandé.
+fn wait_bg(dur: Duration) -> bool {
+    let (m, cv) = bg_control();
+    let guard = m.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.shutdown {
+        return false;
+    }
+    let start_seq = guard.wake_seq;
+    let deadline = Instant::now() + dur;
+    let mut g = guard;
+    while !g.shutdown && g.wake_seq == start_seq {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            break;
+        }
+        let (next, res) = cv
+            .wait_timeout(g, remain)
+            .unwrap_or_else(|p| p.into_inner());
+        g = next;
+        if res.timed_out() {
+            break;
+        }
+    }
+    !g.shutdown
+}
+
+/// Compare un en-tête `If-None-Match` à un `ETag` serveur (RFC 9110 §13.1.2 :
+/// gère `*`, les listes séparées par virgules et le préfixe faible `W/`).
+pub(crate) fn etag_matches(if_none_match: &str, etag: &str) -> bool {
+    fn norm(s: &str) -> &str {
+        let t = s.trim();
+        t.strip_prefix("W/").unwrap_or(t).trim()
+    }
+    let target = norm(etag);
+    if target.is_empty() {
+        return false;
+    }
+    for part in if_none_match.split(',') {
+        let p = part.trim();
+        if p == "*" || norm(p) == target {
+            return true;
+        }
+    }
+    false
 }
 
 /// Résultat de `run_headless` : l'URL de l'UI, et si un moteur TOURNAIT DÉJÀ
@@ -890,9 +976,18 @@ pub fn run_headless() -> RunOutcome {
     crate::auth::secret::ensure_server_identity(&state);
     crate::auth::net::set_config_path(&state.config_path);
 
-    let local_ips_list = manage::local_ips();
+    // P1 rang 5 : en bind loopback (cas par défaut), on ne bloque PAS avant
+    // `TcpListener::bind` sur `manage::local_ips()` (qui lance `ipconfig.exe`
+    // et provoquait des pics TCP à 1,5 s). Les IP LAN ne sont requises avant
+    // le bind que pour un bind réseau (certificat TLS SANs).
     let mut ui_port = settings.ui_port;
     let requested_bind = settings.ui_bind.clone();
+    let loopback_requested = is_loopback_bind(&requested_bind);
+    let local_ips_list = if loopback_requested {
+        Vec::new()
+    } else {
+        manage::local_ips()
+    };
     #[cfg(feature = "tls")]
     let mut tls_server_config: Option<Arc<rustls::ServerConfig>> = None;
 
@@ -1111,6 +1206,23 @@ pub fn run_headless() -> RunOutcome {
     // (port UI réel après repli +1..+9, IP locales, bind) — une URL de webhook
     // qui les vise est refusée à l'enregistrement comme à l'envoi.
     crate::notify::note_self_listen(ui_port, &local_ips_list, &ui_bind);
+    // Complète les IP locales + aligne autostart en arrière-plan (sans retarder
+    // l'écoute TCP ni la disponibilité du gateway).
+    {
+        let st = state.clone();
+        let bind_bg = ui_bind.clone();
+        thread::spawn(move || {
+            if loopback_requested {
+                let ips = manage::local_ips();
+                let extra = lockv(&st.settings).allowed_origins.clone();
+                let (origins, hosts) = listes_hosts_origins(ui_port, &ips, &extra);
+                *lockv(&st.allowed_origins) = origins;
+                *lockv(&st.allowed_hosts) = hosts;
+                crate::notify::note_self_listen(ui_port, &ips, &bind_bg);
+            }
+            manage::sync_autostart_at_boot(&st);
+        });
+    }
     let ui_host = if ui_bind == "0.0.0.0" {
         "<ip-lan>".to_string()
     } else {
@@ -1164,7 +1276,7 @@ pub fn run_headless() -> RunOutcome {
         ),
     );
 
-    // poller : première passe immédiate, ensuite refresh_secs.
+    // poller : première passe immédiate, ensuite refresh_secs (interruptible via Condvar, P-4).
     // catch_unwind : un panic dans un cycle de sondage ne doit JAMAIS tuer la
     // supervision (c'était le cas avant l'audit 2026-10-25 — le thread mourait
     // en silence et l'app affichait un état figé).
@@ -1181,17 +1293,21 @@ pub fn run_headless() -> RunOutcome {
                 );
             }
             let secs = lockv(&st.settings).refresh_secs;
-            thread::sleep(Duration::from_secs(secs));
+            if !wait_bg(Duration::from_secs(secs)) {
+                break;
+            }
         });
     }
     // veille réseau : la passerelle LAN répond-elle ? (VPN, câble, Wi-Fi)
-    // Mesuré tout de suite puis toutes les 30 s — l'UI explique les serveurs
-    // distants injoignables au lieu de les afficher comme en panne.
+    // Mesuré tout de suite puis toutes les 30 s (uniquement si serveurs distants
+    // ou network_enabled ; sommeil interruptible).
     {
         let st = state.clone();
         thread::spawn(move || loop {
             manage::refresh_lan_state(&st);
-            thread::sleep(Duration::from_secs(30));
+            if !wait_bg(Duration::from_secs(30)) {
+                break;
+            }
         });
     }
     // AUTO-SCAN au boot : tous les ports en écoute de la machine (netstat/ss),
@@ -1200,27 +1316,34 @@ pub fn run_headless() -> RunOutcome {
     {
         let st = state.clone();
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(1200));
+            if !wait_bg(Duration::from_millis(1200)) {
+                return;
+            }
             manage::scan_listening(&st);
         });
     }
-    // démarrage automatique : aligne le registre/fichier sur la préférence
-    // persistée (créé au premier lancement — settings.autostart vaut true)
-    manage::sync_autostart_at_boot(&state);
     // vérification de mise à jour (release GitHub) : au boot puis chaque heure
     {
         let st = state.clone();
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(8));
-            manage::check_update(&st);
-            thread::sleep(Duration::from_secs(3600));
+        thread::spawn(move || {
+            if !wait_bg(Duration::from_secs(8)) {
+                return;
+            }
+            loop {
+                manage::check_update(&st);
+                if !wait_bg(Duration::from_secs(3600)) {
+                    break;
+                }
+            }
         });
     }
     // découverte des pairs MCP Control + réseau (après le scan local)
     {
         let st = state.clone();
         thread::spawn(move || {
-            thread::sleep(Duration::from_secs(30));
+            if !wait_bg(Duration::from_secs(30)) {
+                return;
+            }
             manage::discover_peers(&st);
             let enabled = crate::types::lockv(&st.settings).network_enabled;
             if enabled {
@@ -1236,8 +1359,7 @@ pub fn run_headless() -> RunOutcome {
     // GATEWAY MCP : la console est elle-même un serveur MCP — POST /mcp sur
     // le port UI, toute la surface de l'app en tools + proxy vers les
     // serveurs détectés (cf. gateway::serve). Le snapshot des ressources est
-    // reconstruit quand l'empreinte de détection change (thread ci-dessous ;
-    // les actions passées par le gateway lui-même rafraîchissent immédiatement).
+    // reconstruit sur événement de changement (Condvar, P-4 ; filet 60 s).
     let gw = gateway::install(&state);
     {
         let msg = format!(
@@ -1256,12 +1378,13 @@ pub fn run_headless() -> RunOutcome {
     {
         let st = state.clone();
         thread::spawn(move || {
-            let mut last = gateway::fingerprint(&st);
+            let mut last_fp = gateway::fingerprint(&st);
+            let mut last_seq = 0u64;
             loop {
-                thread::sleep(Duration::from_secs(5));
+                last_seq = gateway::wait_change(last_seq, Duration::from_secs(60));
                 let now = gateway::fingerprint(&st);
-                if now != last {
-                    last = now;
+                if now != last_fp {
+                    last_fp = now;
                     gateway::refresh(&st);
                 }
             }
@@ -1729,14 +1852,21 @@ fn handle_conn_stream(
                 }
             }
         }
-        Ok(()) => route_peer_session(
-            &state,
-            &method,
-            &path,
-            &body,
-            peer_ip,
-            session_id.as_deref(),
-        ),
+        Ok(()) => {
+            let if_none_match = headers
+                .iter()
+                .find(|(n, _)| n == "if-none-match")
+                .map(|(_, v)| v.as_str());
+            route_peer_session_cond(
+                &state,
+                &method,
+                &path,
+                &body,
+                peer_ip,
+                session_id.as_deref(),
+                if_none_match,
+            )
+        }
     };
     let Reply {
         status,
@@ -1746,17 +1876,22 @@ fn handle_conn_stream(
     } = reply;
     // ACAO dynamique : on reflète UNIQUEMENT une origine autorisée (jamais *),
     // sinon aucun site tiers ne peut lire nos réponses (/api/state inclu).
-    let mut resp = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}",
-        status,
-        reason_phrase(status),
-        ctype,
-        payload.len(),
-        SECURITY_HEADERS
-    );
-    // En-têtes portés par la route (lot M2) : `Set-Cookie` de la session et
-    // `WWW-Authenticate` du 401 de litemcp. Leurs noms et valeurs sont cons-
-    // truits par le serveur, jamais recopiés d'une entrée client.
+    // RFC 9110 §15.4.5 : une réponse 304 Not Modified n'emporte aucun corps.
+    let mut resp = if status == 304 {
+        format!("HTTP/1.1 304 Not Modified\r\n{}", SECURITY_HEADERS)
+    } else {
+        format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}",
+            status,
+            reason_phrase(status),
+            ctype,
+            payload.len(),
+            SECURITY_HEADERS
+        )
+    };
+    // En-têtes portés par la route (lot M2) : `Set-Cookie` de la session,
+    // `WWW-Authenticate` du 401 de litemcp et `ETag` (P1 rang 3). Leurs noms
+    // et valeurs sont construits par le serveur, jamais recopiés du client.
     for (name, value) in &extra {
         resp.push_str(&format!("{}: {}\r\n", name, value));
     }
@@ -1769,9 +1904,8 @@ fn handle_conn_stream(
         resp.push_str(&format!("Content-Security-Policy: {}\r\n", UI_CSP));
         resp.push_str("Cache-Control: no-cache\r\n");
     }
-    // Assets UI : no-cache aussi — les fichiers sont locaux (refetch négligeable
-    // sur loopback) et un cache même versionné créerait des pages périmées en
-    // dev (même version, binaire différent). Le 304/ETag reste le chantier perf.
+    // Assets UI : no-cache + ETag/304 (revalidation légère, pas de pages
+    // périmées en dev).
     if ctype.starts_with("text/css") || ctype.starts_with("text/javascript") {
         resp.push_str("Cache-Control: no-cache\r\n");
     }
@@ -1782,15 +1916,54 @@ fn handle_conn_stream(
     }
     resp.push_str("Connection: close\r\n\r\n");
     let _ = stream.write_all(resp.as_bytes());
-    let _ = stream.write_all(&payload);
+    if status != 304 && !payload.is_empty() {
+        let _ = stream.write_all(&payload);
+    }
     let _ = stream.flush();
 }
 
-/// Versionne un asset UI : le placeholder de version devient la version réelle
-/// (utilisé par app.js pour afficher sa version et par les query ?v=).
-fn ui_asset(s: &str) -> Vec<u8> {
-    s.replace("__MCC_VERSION__", env!("CARGO_PKG_VERSION"))
-        .into_bytes()
+/// Asset UI pré-versionné + ETag stable dérivé de la version et du contenu du binaire.
+struct StaticAsset {
+    bytes: Vec<u8>,
+    etag: String,
+}
+
+fn build_static_asset(src: &str) -> StaticAsset {
+    use std::hash::{Hash, Hasher};
+    let bytes = src
+        .replace("__MCC_VERSION__", env!("CARGO_PKG_VERSION"))
+        .into_bytes();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    env!("CARGO_PKG_VERSION").hash(&mut h);
+    bytes.hash(&mut h);
+    let etag = format!("\"a-{}-{:016x}\"", env!("CARGO_PKG_VERSION"), h.finish());
+    StaticAsset { bytes, etag }
+}
+
+fn serve_static_asset(
+    asset: &StaticAsset,
+    ctype: &'static str,
+    if_none_match: Option<&str>,
+) -> Reply {
+    if if_none_match.is_some_and(|inm| etag_matches(inm, &asset.etag)) {
+        return Reply::new(304, ctype, Vec::new()).with_header("ETag", asset.etag.clone());
+    }
+    Reply::new(200, ctype, asset.bytes.clone()).with_header("ETag", asset.etag.clone())
+}
+
+fn asset_app_css() -> &'static StaticAsset {
+    static ASSET: std::sync::OnceLock<StaticAsset> = std::sync::OnceLock::new();
+    ASSET.get_or_init(|| build_static_asset(ui::APP_CSS))
+}
+
+fn asset_app_boot_js() -> &'static StaticAsset {
+    static ASSET: std::sync::OnceLock<StaticAsset> = std::sync::OnceLock::new();
+    ASSET.get_or_init(|| build_static_asset(ui::APP_BOOT_JS))
+}
+
+fn asset_app_js() -> &'static StaticAsset {
+    static ASSET: std::sync::OnceLock<StaticAsset> = std::sync::OnceLock::new();
+    ASSET.get_or_init(|| build_static_asset(ui::APP_JS))
 }
 
 pub fn route(
@@ -1828,6 +2001,20 @@ pub fn route_peer_session(
     body: &[u8],
     peer: Option<IpAddr>,
     session: Option<&str>,
+) -> Reply {
+    route_peer_session_cond(state, method, path, body, peer, session, None)
+}
+
+/// Routage avec `If-None-Match` (ETag / 304 Not Modified, P1 rang 3) — appelé
+/// uniquement APRÈS tous les contrôles de sécurité (`check_access`, `check_host_port`).
+pub fn route_peer_session_cond(
+    state: &Arc<AppState>,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    peer: Option<IpAddr>,
+    session: Option<&str>,
+    if_none_match: Option<&str>,
 ) -> Reply {
     let bare_path = path.split('?').next().unwrap_or(path);
     // ---- Appairage (docs/auth.md §3.4) : les deux seules routes non
@@ -1916,18 +2103,23 @@ pub fn route_peer_session(
     // Assets de l'UI (split v0.7.19) : servis PRÉ-authentification comme la
     // coquille — ils ne contiennent aucun secret (le code d'accès ne quitte
     // jamais le serveur) et la page de login en a besoin pour s'afficher.
+    // P1 rang 3 : ETag stable + 304 Not Modified sur If-None-Match.
     if method == "GET" && bare_path == "/app.css" {
-        return Reply::new(200, "text/css; charset=utf-8", ui_asset(ui::APP_CSS));
+        return serve_static_asset(asset_app_css(), "text/css; charset=utf-8", if_none_match);
     }
     if method == "GET" && bare_path == "/app-boot.js" {
-        return Reply::new(
-            200,
+        return serve_static_asset(
+            asset_app_boot_js(),
             "text/javascript; charset=utf-8",
-            ui_asset(ui::APP_BOOT_JS),
+            if_none_match,
         );
     }
     if method == "GET" && bare_path == "/app.js" {
-        return Reply::new(200, "text/javascript; charset=utf-8", ui_asset(ui::APP_JS));
+        return serve_static_asset(
+            asset_app_js(),
+            "text/javascript; charset=utf-8",
+            if_none_match,
+        );
     }
     if method == "GET" && bare_path == "/api/hello" {
         // amorce de la preuve de pair : identité + nonce à usage unique, aucun secret
@@ -1950,11 +2142,19 @@ pub fn route_peer_session(
         );
     }
     if (method == "GET" || method == "POST") && bare_path == "/api/state" {
-        return Reply::json(200, manage::state_json(state));
+        let etag = manage::state_etag(state);
+        if method == "GET" && if_none_match.is_some_and(|inm| etag_matches(inm, &etag)) {
+            return Reply::new(304, "application/json", Vec::new()).with_header("ETag", etag);
+        }
+        return Reply::json(200, manage::state_json(state)).with_header("ETag", etag);
     }
     if method == "GET" && bare_path == "/api/detail" {
         if let Some(id) = query_param(path, "id") {
-            return Reply::json(200, manage::detail_json(state, &id));
+            let etag = manage::detail_etag(state, &id);
+            if if_none_match.is_some_and(|inm| etag_matches(inm, &etag)) {
+                return Reply::new(304, "application/json", Vec::new()).with_header("ETag", etag);
+            }
+            return Reply::json(200, manage::detail_json(state, &id)).with_header("ETag", etag);
         }
     }
     // Historique runtime : crashs, redémarrages, échecs de démarrage et
@@ -2000,9 +2200,19 @@ pub fn route_peer_session(
         }
         let text = String::from_utf8_lossy(body).to_string();
         if nom == "server_pair" {
-            return Reply::json(200, crate::auth::net::handle_server_pair(state, &text));
+            let res = crate::auth::net::handle_server_pair(state, &text);
+            gateway::notify_change();
+            return Reply::json(200, res);
         }
-        return Reply::json(200, manage::handle_action(state, &text));
+        if nom == "refresh" {
+            manage::invalidate_tools_cache(state);
+        }
+        let res = manage::handle_action(state, &text);
+        if nom == "settings" || nom == "save_settings" {
+            wake_bg_poller();
+        }
+        gateway::notify_change();
+        return Reply::json(200, res);
     }
     Reply::new(
         404,
@@ -2917,5 +3127,144 @@ mod tests {
             }),
             Some("efcdab8967452301".to_string())
         );
+    }
+
+    #[test]
+    fn p1_etag_matches_et_304_api_et_statiques() {
+        assert!(etag_matches("\"s-abc\"", "\"s-abc\""));
+        assert!(etag_matches("W/\"s-abc\"", "\"s-abc\""));
+        assert!(etag_matches("\"other\", \"s-abc\"", "\"s-abc\""));
+        assert!(etag_matches("*", "\"s-abc\""));
+        assert!(!etag_matches("\"s-def\"", "\"s-abc\""));
+
+        let state = test_state_with_access(None);
+        state.servers.lock().unwrap().push(crate::types::Server {
+            id: "s1".into(),
+            label: "S1".into(),
+            transport: crate::types::Transport::Http {
+                host: Some("127.0.0.1".into()),
+                port: 19995,
+                path: "/mcp".into(),
+            },
+            origin: crate::types::Origin::Manual,
+            enabled: true,
+            state: crate::types::SState::Up,
+            pid: None,
+            bound_host: Some("127.0.0.1".into()),
+            server_name: Some("demo".into()),
+            version: Some("1.0".into()),
+            protocol: None,
+            sse: false,
+            sse_endpoint: false,
+            ws: false,
+            lang: None,
+            framework: None,
+            via_ssh: false,
+            tools: vec![],
+            latency_ms: Some(5),
+            last_seen_ts: Some(100),
+            last_error: None,
+            start_cmd: None,
+            auto_restart: false,
+            favorite: false,
+            tools_disabled: vec![],
+        });
+
+        let loopback = Some("127.0.0.1".parse().unwrap());
+
+        // 1. /api/state → 200 + ETag
+        let r1 = route_peer_session_cond(&state, "GET", "/api/state", b"", loopback, None, None);
+        assert_eq!(r1.status, 200);
+        let etag1 = r1
+            .headers
+            .iter()
+            .find(|(k, _)| k == "ETag")
+            .map(|(_, v)| v.clone())
+            .expect("ETag manquant sur /api/state");
+
+        // 2. Même état + changements volatils seuls (latency_ms, last_seen_ts) → 304 sans corps
+        {
+            let mut srvs = lockv(&state.servers);
+            srvs[0].latency_ms = Some(42);
+            srvs[0].last_seen_ts = Some(999);
+        }
+        let r2 = route_peer_session_cond(
+            &state,
+            "GET",
+            "/api/state",
+            b"",
+            loopback,
+            None,
+            Some(&etag1),
+        );
+        assert_eq!(r2.status, 304);
+        assert!(r2.body.is_empty(), "304 ne doit porter aucun corps");
+
+        // 3. Changement réel (state → Down) → 200 + nouvel ETag
+        {
+            lockv(&state.servers)[0].state = crate::types::SState::Down;
+        }
+        let r3 = route_peer_session_cond(
+            &state,
+            "GET",
+            "/api/state",
+            b"",
+            loopback,
+            None,
+            Some(&etag1),
+        );
+        assert_eq!(r3.status, 200);
+        let etag3 = r3
+            .headers
+            .iter()
+            .find(|(k, _)| k == "ETag")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_ne!(etag1, etag3);
+
+        // 4. /api/detail?id=s1 → 200 + ETag → 304 sur If-None-Match
+        let d1 = route_peer_session_cond(
+            &state,
+            "GET",
+            "/api/detail?id=s1",
+            b"",
+            loopback,
+            None,
+            None,
+        );
+        assert_eq!(d1.status, 200);
+        let detag = d1
+            .headers
+            .iter()
+            .find(|(k, _)| k == "ETag")
+            .map(|(_, v)| v.clone())
+            .expect("ETag manquant sur /api/detail");
+        let d2 = route_peer_session_cond(
+            &state,
+            "GET",
+            "/api/detail?id=s1",
+            b"",
+            loopback,
+            None,
+            Some(&detag),
+        );
+        assert_eq!(d2.status, 304);
+        assert!(d2.body.is_empty());
+
+        // 5. Assets statiques → 200 + ETag → 304 sur If-None-Match
+        for path in ["/app.css", "/app-boot.js", "/app.js"] {
+            let a1 = route_peer_session_cond(&state, "GET", path, b"", loopback, None, None);
+            assert_eq!(a1.status, 200, "{path} doit rendre 200");
+            let aetag = a1
+                .headers
+                .iter()
+                .find(|(k, _)| k == "ETag")
+                .map(|(_, v)| v.clone())
+                .expect("ETag manquant sur asset statique");
+            let a2 =
+                route_peer_session_cond(&state, "GET", path, b"", loopback, None, Some(&aetag));
+            assert_eq!(a2.status, 304, "{path} doit rendre 304");
+            assert!(a2.body.is_empty());
+        }
     }
 }

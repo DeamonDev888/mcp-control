@@ -281,6 +281,9 @@ const DEAD_BOOT_MSG = 'moteur injoignable, nouvel essai…';
 const DEAD_MSG = 'moteur injoignable';
 let _lastSelectedSrvSig = '';
 let _lastAccessRevision = null;
+let _stateEtag = null;
+let _detailEtag = null;
+let _detailEtagId = null;
 let _sigServers = '';
 let _sigPeers = '';
 let _sigAnn = '';
@@ -310,14 +313,21 @@ function setDead(on, msg) {
 async function load() {
   if (document.hidden) return; // fenêtre masquée (tray) : polling suspendu — CPU/mémoire au repos
   try {
-    const r = await fetch('/api/state');
+    const stOpts = _stateEtag ? {headers: {'If-None-Match': _stateEtag}} : {};
+    const r = await fetch('/api/state', stOpts);
+    if (r.status === 304) {
+      pollFails = 0;
+      setDead(false);
+      return;
+    }
     // Un 401 (session expirée) n'est pas un état : ne jamais le rendre.
     if (!r.ok) throw new Error('HTTP ' + r.status);
+    _stateEtag = r.headers.get('ETag') || null;
     state = await r.json();
     pollFails = 0;
     setDead(false);
     if (selectedId && !state.servers.find(s => s.id === selectedId)) {
-      selectedId = null; detailCache = null; _lastSelectedSrvSig = ''; _sigOverview = '';
+      selectedId = null; detailCache = null; _lastSelectedSrvSig = ''; _detailEtag = null; _detailEtagId = null; _sigOverview = '';
     }
     render();
     const rev = state && state.access ? state.access.revision : null;
@@ -327,12 +337,22 @@ async function load() {
       if (ad && ad.open) refreshAccess();
     }
     if (selectedId) {
+      if (_detailEtagId !== selectedId) {
+        _detailEtag = null;
+        _detailEtagId = selectedId;
+      }
       const srvSummary = state.servers.find(s => s.id === selectedId);
       const srvSig = JSON.stringify(srvSummary || null);
       if (!detailCache || detailCache.id !== selectedId || srvSig !== _lastSelectedSrvSig) {
         _lastSelectedSrvSig = srvSig;
-        const r2 = await fetch('/api/detail?id=' + encodeURIComponent(selectedId));
-        if (r2.ok) { detailCache = await r2.json(); renderDetail(); }
+        const dOpts = _detailEtag ? {headers: {'If-None-Match': _detailEtag}} : {};
+        const r2 = await fetch('/api/detail?id=' + encodeURIComponent(selectedId), dOpts);
+        if (r2.status === 304) return;
+        if (r2.ok) {
+          _detailEtag = r2.headers.get('ETag') || null;
+          detailCache = await r2.json();
+          renderDetail();
+        }
       }
     }
   } catch(e) {
