@@ -255,7 +255,7 @@ fn worker_sondes() {
         };
         let Travail { state, id } = travail;
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            poll_one(&state, &id);
+            poll_one_bg(&state, &id);
         }));
         // le marqueur est libéré même en cas de panic : le serveur sera
         // re-sondé au cycle suivant (jamais sauté pour toujours)
@@ -298,6 +298,9 @@ fn cycle_via_pool(state: &Arc<AppState>, ids: &[String]) {
 }
 
 pub fn poll_all(state: &Arc<AppState>) {
+    // P-3 : invalide la table port → process du cycle précédent afin qu'au plus
+    // un seul `netstat` + `tasklist` soit construit pour ce cycle.
+    probe::begin_port_owner_cycle();
     // Les annonces litemcp NE SONT PLUS importées ici (audit S4, point 2) :
     // `litemcp_announcements` les liste à la demande, sans adoption ni écriture
     // de config. Le cycle ne lit donc plus %TEMP% et ne peut plus créer de

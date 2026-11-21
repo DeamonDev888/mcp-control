@@ -53,8 +53,22 @@ pub struct McpProbe {
     /// GET /health répond 200 « ok » (deux signatures documentées de litemcp).
     pub framework: Option<String>,
     pub tools: Vec<ToolInfo>,
+    /// Vrai quand une sonde légère sur serveur déjà UP (nom + version inchangés)
+    /// a sauté `tools/list` et les sondes annexes (`/sse`, WS, `/health`).
+    /// L'appelant conserve alors les métadonnées/outils en cache.
+    pub metadata_reused: bool,
     pub latency_ms: u64,
     pub error: Option<String>,
+}
+
+/// Indice de sonde légère pour un serveur déjà UP (P1 rang 2) : si `initialize`
+/// renvoie les mêmes `name` et `version`, la sonde saute `tools/list` et les
+/// vérifications annexes (`/sse`, WS, `/health`, `port_owner_lang`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProbeHint<'a> {
+    pub reuse_metadata_if_unchanged: bool,
+    pub prev_name: Option<&'a str>,
+    pub prev_version: Option<&'a str>,
 }
 
 impl McpProbe {
@@ -74,6 +88,7 @@ impl McpProbe {
             lang: None,
             framework: None,
             tools: vec![],
+            metadata_reused: false,
             latency_ms: 0,
             error: Some(err),
         }
@@ -106,6 +121,7 @@ impl McpProbe {
             lang: Some("rust".to_string()),
             framework: fw.map(|f| f.id.to_string()),
             tools: vec![],
+            metadata_reused: false,
             latency_ms,
             error: Some(crate::auth::net::LOCKED_SERVER_MSG.to_string()),
         }
@@ -762,28 +778,49 @@ pub fn detect_lang_http(head: &RespHead, name: Option<&str>) -> Option<String> {
     Some(lang.to_string())
 }
 
+/// Génération du cycle de sondage pour mutualiser la table port → process
+/// (P-3 : une seule construction `netstat` + `tasklist` par cycle, partagée
+/// par tous les workers sans tempête de spawns concurrents).
+static PORT_OWNER_CYCLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Démarre un nouveau cycle de sondage : invalide la table port → process
+/// construite au cycle précédent (appelé au début de `poll_all`).
+pub fn begin_port_owner_cycle() {
+    PORT_OWNER_CYCLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Langage inféré du process qui écoute réellement un port local
-/// (Windows : netstat -ano → PID → tasklist → image). Cache 10 s.
+/// (Windows : netstat -ano → PID → tasklist → image).
+/// Mutualisé par cycle de sondage (verrou unique : 12 workers parallèles ne
+/// déclenchent qu'UN SEUL `netstat` + `tasklist`, plus repli TTL 10 s hors cycle).
 #[cfg(windows)]
 pub fn port_owner_lang(port: u16) -> Option<String> {
     use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
-    static CACHE: OnceLock<Mutex<(Instant, HashMap<u16, String>)>> = OnceLock::new();
-    let cache = CACHE
-        .get_or_init(|| Mutex::new((Instant::now() - Duration::from_secs(60), HashMap::new())));
-    if let Ok(g) = cache.lock() {
-        let (t, map) = &*g;
-        if t.elapsed() < Duration::from_secs(10) {
-            return map.get(&port).and_then(|img| detect_lang_from_image(img));
-        }
+    struct PortOwnerCache {
+        cycle: u64,
+        built_at: Instant,
+        map: HashMap<u16, String>,
     }
-    let map = build_port_owner_map();
-    let lang = map.get(&port).and_then(|img| detect_lang_from_image(img));
-    if let Ok(mut g) = cache.lock() {
-        *g = (Instant::now(), map);
+    static CACHE: OnceLock<Mutex<PortOwnerCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| {
+        Mutex::new(PortOwnerCache {
+            cycle: 0,
+            built_at: Instant::now() - Duration::from_secs(60),
+            map: HashMap::new(),
+        })
+    });
+    let cur_cycle = PORT_OWNER_CYCLE.load(Ordering::Relaxed);
+    let mut g = cache.lock().unwrap_or_else(|p| p.into_inner());
+    let fresh = g.cycle == cur_cycle && g.built_at.elapsed() < Duration::from_secs(10);
+    if !fresh {
+        g.map = build_port_owner_map();
+        g.cycle = cur_cycle;
+        g.built_at = Instant::now();
     }
-    lang
+    g.map.get(&port).and_then(|img| detect_lang_from_image(img))
 }
 
 #[cfg(not(windows))]
@@ -1607,6 +1644,7 @@ pub fn ssh_probe_server(
         lang,
         framework,
         tools,
+        metadata_reused: false,
         latency_ms: latency,
         error: None,
     }
@@ -2308,6 +2346,11 @@ pub fn rpc_call(
 
 /// Probe MCP streamable-HTTP complète : initialize + tools/list.
 pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
+    probe_http_with(port, path, timeout_ms, &ProbeHint::default())
+}
+
+/// Probe MCP streamable-HTTP avec indice de sonde légère (P1 rang 2).
+pub fn probe_http_with(port: u16, path: &str, timeout_ms: u64, hint: &ProbeHint<'_>) -> McpProbe {
     let quick = Duration::from_millis(timeout_ms.min(1500));
     let open_host = if port_open("::1", port, quick) {
         "::1"
@@ -2516,6 +2559,39 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
                 .map(String::from)
         });
 
+    // Sonde légère (P1 rang 2) : si le serveur était déjà UP et que
+    // serverInfo.name + version n'ont pas changé, on saute /sse, WS,
+    // port_owner_lang, /health et tools/list (réutilisés en cache).
+    let sse = head.sse();
+    if hint.reuse_metadata_if_unchanged
+        && name.as_deref() == hint.prev_name
+        && version.as_deref() == hint.prev_version
+    {
+        let locked = crate::auth::net::outbound_identity_for(&host, port)
+            .ok()
+            .flatten()
+            .is_some();
+        return McpProbe {
+            mcp_up: true,
+            port_open: true,
+            locked,
+            pid: None,
+            host: Some(host),
+            name,
+            version,
+            protocol,
+            sse,
+            sse_endpoint: false,
+            ws: false,
+            lang: None,
+            framework: None,
+            tools: Vec::new(),
+            metadata_reused: true,
+            latency_ms: latency,
+            error: None,
+        };
+    }
+
     // Classification transport — le Content-Type de l'initialize NE SUFFIT PAS :
     // FastMCP httpStream répond en text/event-stream (mcp-proxy encode les
     // réponses JSON-RPC en événements SSE, enableJsonResponse=false par défaut)
@@ -2523,7 +2599,6 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
     // sse = encodage SSE des réponses ; sse_endpoint = /sse legacy co-servi.
     // Le transport réel est streamable HTTP dans tous les cas ici (le POST
     // initialize a été répondu) — un vrai serveur SSE-only échouerait avant.
-    let sse = head.sse();
     let sse_path = if path == "/sse" { path } else { "/sse" };
     let sse_endpoint = sse_get_host(&host, port, sse_path, timeout_ms.clamp(500, 1200));
     // Transport WS : upgrade WebSocket acceptée (101) → badge « WS » dans l'UI.
@@ -2612,6 +2687,7 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
         lang,
         framework,
         tools,
+        metadata_reused: false,
         latency_ms: latency,
         error: None,
     }
@@ -2827,6 +2903,7 @@ pub fn probe_stdio(
                 lang,
                 framework,
                 tools,
+                metadata_reused: false,
                 latency_ms: latency,
                 error: None,
             },
@@ -2851,6 +2928,7 @@ pub fn probe_stdio(
                 lang,
                 framework,
                 tools,
+                metadata_reused: false,
                 latency_ms: latency,
                 error: None,
             },
@@ -2912,6 +2990,17 @@ pub fn rpc_call_host_headers(
 
 /// Probe MCP streamable-HTTP sur un hôte précis : initialize + tools/list.
 pub fn probe_http_host(host: &str, port: u16, path: &str, timeout_ms: u64) -> McpProbe {
+    probe_http_host_with(host, port, path, timeout_ms, &ProbeHint::default())
+}
+
+/// Probe MCP streamable-HTTP sur un hôte précis avec indice de sonde légère (P1 rang 2).
+pub fn probe_http_host_with(
+    host: &str,
+    port: u16,
+    path: &str,
+    timeout_ms: u64,
+    hint: &ProbeHint<'_>,
+) -> McpProbe {
     if !port_open(host, port, Duration::from_millis(timeout_ms.min(1500))) {
         return McpProbe::fail(format!("{}:{} injoignable", host, port), false);
     }
@@ -3056,10 +3145,42 @@ pub fn probe_http_host(host: &str, port: u16, path: &str, timeout_ms: u64) -> Mc
                 .map(String::from)
         });
 
+    // Sonde légère (P1 rang 2) : si le serveur était déjà UP et que
+    // serverInfo.name + version n'ont pas changé, on saute /sse, WS, /health
+    // et tools/list (réutilisés en cache).
+    let sse = head.sse();
+    if hint.reuse_metadata_if_unchanged
+        && name.as_deref() == hint.prev_name
+        && version.as_deref() == hint.prev_version
+    {
+        let locked = crate::auth::net::outbound_identity_for(host, port)
+            .ok()
+            .flatten()
+            .is_some();
+        return McpProbe {
+            mcp_up: true,
+            port_open: true,
+            locked,
+            pid: None,
+            host: Some(host.to_string()),
+            name,
+            version,
+            protocol,
+            sse,
+            sse_endpoint: false,
+            ws: false,
+            lang: None,
+            framework: None,
+            tools: Vec::new(),
+            metadata_reused: true,
+            latency_ms: latency,
+            error: None,
+        };
+    }
+
     // Même classification que probe_http (voir le commentaire là-bas) :
     // POST initialize répondu = streamable HTTP ; sse = encodage SSE des
     // réponses ; sse_endpoint = /sse legacy co-servi (FastMCP).
-    let sse = head.sse();
     let sse_path = if path == "/sse" { path } else { "/sse" };
     let sse_endpoint = sse_get_host(host, port, sse_path, timeout_ms.clamp(500, 1200));
     // Transport WS : upgrade WebSocket acceptée (101) → badge « WS » dans l'UI.
@@ -3139,6 +3260,7 @@ pub fn probe_http_host(host: &str, port: u16, path: &str, timeout_ms: u64) -> Mc
         lang,
         framework,
         tools,
+        metadata_reused: false,
         latency_ms: latency,
         error: None,
     }

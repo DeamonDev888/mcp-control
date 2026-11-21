@@ -99,29 +99,42 @@ pub fn lan_decision(gw: Option<bool>, distants_ko: bool) -> Option<bool> {
 /// 2. état des serveurs DISTANTS : s'ils échouent tous avec une erreur réseau
 ///    (ssh/connect/timeout/injoignable), c'est le LAN qui est coupé, pas eux.
 pub fn refresh_lan_state(state: &Arc<AppState>) {
-    let gw = probe::lan_reachable();
-    let distants_ko = {
+    // P1 rang 4 : aucun serveur distant (hors loopback) ET découverte réseau
+    // coupée → inutile de lancer `ipconfig.exe` + `ping.exe` toutes les 30 s.
+    let net_enabled = lockv(&state.settings).network_enabled;
+    let distants: Vec<(bool, Option<String>)> = {
         let servers = lockv(&state.servers);
-        let distants: Vec<(bool, Option<String>)> = servers
+        servers
             .iter()
-            .filter(|s| s.enabled && matches!(&s.transport, Transport::Http { host: Some(_), .. }))
-            .map(|s| (s.state == SState::Up, s.last_error.clone()))
-            .collect();
-        !distants.is_empty()
-            && distants.iter().all(|(up, err)| {
-                !up && err
-                    .as_deref()
-                    .map(|e| {
-                        let e = e.to_lowercase();
-                        e.contains("ssh")
-                            || e.contains("connect")
-                            || e.contains("timed out")
-                            || e.contains("injoignable")
-                            || e.contains("unreachable")
-                    })
-                    .unwrap_or(false)
+            .filter(|s| {
+                s.enabled
+                    && matches!(
+                        &s.transport,
+                        Transport::Http { host: Some(h), .. } if !crate::is_loopback_bind(h)
+                    )
             })
+            .map(|s| (s.state == SState::Up, s.last_error.clone()))
+            .collect()
     };
+    if distants.is_empty() && !net_enabled {
+        *lockv(&state.lan_ok) = None;
+        return;
+    }
+    let gw = probe::lan_reachable();
+    let distants_ko = !distants.is_empty()
+        && distants.iter().all(|(up, err)| {
+            !up && err
+                .as_deref()
+                .map(|e| {
+                    let e = e.to_lowercase();
+                    e.contains("ssh")
+                        || e.contains("connect")
+                        || e.contains("timed out")
+                        || e.contains("injoignable")
+                        || e.contains("unreachable")
+                })
+                .unwrap_or(false)
+        });
     let reachable = lan_decision(gw, distants_ko);
     let mut slot = lockv(&state.lan_ok);
     let changed = *slot != reachable;
@@ -287,4 +300,244 @@ pub fn detail_json(state: &Arc<AppState>, id: &str) -> Value {
         }
         None => json!({"ok": false, "error": "serveur inconnu"}),
     }
+}
+
+/// Variante légère de `state_json` pour `gateway::list_servers` (P1 rang 5) :
+/// évite de sérialiser `log`, `peers`, `settings`, `access` et de parcourir le
+/// disque (`litemcp_announcements`), filtre avant sérialisation et ne clone pas
+/// le tableau `servers`.
+pub fn servers_summary_json(state: &Arc<AppState>, state_filter: Option<&str>) -> Value {
+    let managed = managed_ids(state);
+    let order = lockv(&state.settings).server_order.clone();
+    let (list, up, total, tools) = {
+        let servers = lockv(&state.servers);
+        let up = servers.iter().filter(|s| s.state == SState::Up).count();
+        let total = servers.len();
+        let tools: usize = servers
+            .iter()
+            .filter(|s| s.state == SState::Up)
+            .map(tools_actifs)
+            .sum();
+        let mut ordered: Vec<(usize, &Server)> = servers
+            .iter()
+            .filter(|s| match state_filter {
+                Some(want) => s.state.as_str() == want,
+                None => true,
+            })
+            .map(|s| {
+                let pos = order.iter().position(|x| x == &s.id).unwrap_or(usize::MAX);
+                (pos, s)
+            })
+            .collect();
+        ordered.sort_by_key(|(pos, _)| *pos);
+        let list: Vec<Value> = ordered
+            .into_iter()
+            .map(|(_, s)| server_json(s, managed.contains(&s.id)))
+            .collect();
+        (list, up, total, tools)
+    };
+    let lan = *lockv(&state.lan_ok);
+    json!({
+        "stats": {"up": up, "total": total, "tools": tools},
+        "lan_ok": lan,
+        "servers": list,
+    })
+}
+
+/// Hash d'un serveur pour ETag `/api/state` et `/api/detail` (hors champs
+/// volatils `latency_ms` et `last_seen_ts` qui changent à chaque sonde).
+fn hash_server_visible<H: std::hash::Hasher>(
+    s: &Server,
+    managed: bool,
+    include_tools_list: bool,
+    h: &mut H,
+) {
+    use std::hash::Hash;
+    s.id.hash(h);
+    s.label.hash(h);
+    match &s.transport {
+        Transport::Http { host, port, path } => {
+            0u8.hash(h);
+            host.hash(h);
+            port.hash(h);
+            path.hash(h);
+        }
+        Transport::Stdio {
+            program,
+            args,
+            workdir,
+            env,
+        } => {
+            1u8.hash(h);
+            program.hash(h);
+            args.hash(h);
+            workdir.hash(h);
+            env.len().hash(h);
+            for (k, _) in env {
+                k.hash(h);
+            }
+        }
+    }
+    s.origin.as_str().hash(h);
+    s.enabled.hash(h);
+    s.state.as_str().hash(h);
+    s.pid.hash(h);
+    s.bound_host.hash(h);
+    s.server_name.hash(h);
+    s.version.hash(h);
+    s.protocol.hash(h);
+    tools_actifs(s).hash(h);
+    s.tools.len().hash(h);
+    s.tools_disabled.hash(h);
+    s.last_error.hash(h);
+    s.auto_restart.hash(h);
+    s.favorite.hash(h);
+    s.sse.hash(h);
+    s.sse_endpoint.hash(h);
+    s.ws.hash(h);
+    s.lang.hash(h);
+    s.framework.hash(h);
+    crate::auth::net::is_server_locked(s).hash(h);
+    s.via_ssh.hash(h);
+    managed.hash(h);
+    match &s.start_cmd {
+        Some(c) => {
+            true.hash(h);
+            c.program.hash(h);
+            c.args.hash(h);
+            c.workdir.hash(h);
+            c.env.len().hash(h);
+            for (k, _) in &c.env {
+                k.hash(h);
+            }
+        }
+        None => false.hash(h),
+    }
+    if include_tools_list {
+        for t in &s.tools {
+            t.name.hash(h);
+            t.desc.hash(h);
+        }
+    }
+}
+
+/// Empreinte stable (ETag) de `/api/state` hors horodatages volatils
+/// (`latency_ms`, `last_seen_ts`, `peers[].last_seen`). Permet de répondre
+/// `304 Not Modified` sans sérialiser le JSON quand rien de visible n'a changé
+/// (P1 rang 3).
+pub fn state_etag(state: &Arc<AppState>) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let managed = managed_ids(state);
+    let order = {
+        let settings = lockv(&state.settings);
+        settings.refresh_secs.hash(&mut h);
+        settings.ui_port.hash(&mut h);
+        settings.ui_bind.hash(&mut h);
+        settings.scan_from.hash(&mut h);
+        settings.scan_to.hash(&mut h);
+        settings.network_enabled.hash(&mut h);
+        settings.network_ports.hash(&mut h);
+        settings.discovery_ports_only.hash(&mut h);
+        settings.discovery_ports_excluded.hash(&mut h);
+        settings.ssh_hosts.len().hash(&mut h);
+        for sh in &settings.ssh_hosts {
+            sh.ip.hash(&mut h);
+            sh.user.hash(&mut h);
+        }
+        settings.server_order.hash(&mut h);
+        settings.autostart.hash(&mut h);
+        settings.notify.desktop.hash(&mut h);
+        settings.notify.webhook_url.hash(&mut h);
+        settings.notify.method.hash(&mut h);
+        settings.notify.min_interval_secs.hash(&mut h);
+        settings.notify.states.hash(&mut h);
+        settings.notify.headers.trim().is_empty().hash(&mut h);
+        settings.auth.tls_fp.hash(&mut h);
+        settings.auth.tls_bind_refused.hash(&mut h);
+        settings.auth.tls_notice.hash(&mut h);
+        settings.server_order.clone()
+    };
+    {
+        let servers = lockv(&state.servers);
+        servers.len().hash(&mut h);
+        let mut idxs: Vec<(usize, usize)> = servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let pos = order.iter().position(|x| x == &s.id).unwrap_or(usize::MAX);
+                (pos, i)
+            })
+            .collect();
+        idxs.sort_by_key(|(pos, _)| *pos);
+        for (_, i) in idxs {
+            let s = &servers[i];
+            hash_server_visible(s, managed.contains(&s.id), false, &mut h);
+        }
+    }
+    {
+        let log = lockv(&state.log);
+        log.len().hash(&mut h);
+        if let Some(last) = log.back() {
+            last.ts.hash(&mut h);
+            last.level.hash(&mut h);
+            last.msg.hash(&mut h);
+        }
+        if let Some(first) = log.front() {
+            first.ts.hash(&mut h);
+            first.msg.hash(&mut h);
+        }
+    }
+    {
+        let peers = lockv(&state.peers);
+        let mut keys: Vec<&String> = peers.keys().collect();
+        keys.sort();
+        keys.len().hash(&mut h);
+        for k in keys {
+            if let Some(p) = peers.get(k) {
+                p.ip.hash(&mut h);
+                p.ui_port.hash(&mut h);
+                if let Some(st) = p.servers.get("stats") {
+                    st.to_string().hash(&mut h);
+                }
+                if let Some(arr) = p.servers.get("servers").and_then(Value::as_array) {
+                    arr.len().hash(&mut h);
+                }
+            }
+        }
+    }
+    lockv(&state.update_latest).hash(&mut h);
+    (*lockv(&state.lan_ok)).hash(&mut h);
+    let access = crate::auth::confirm::summary(state);
+    access.to_string().hash(&mut h);
+    let announcements_count = litemcp_announcements(state)["announcements"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|a| a.get("followed").and_then(Value::as_bool) == Some(false))
+                .count()
+        })
+        .unwrap_or(0);
+    announcements_count.hash(&mut h);
+    crate::auth::session::active_count().hash(&mut h);
+    format!("\"s-{:016x}\"", h.finish())
+}
+
+/// Empreinte stable (ETag) de `/api/detail?id=...` hors horodatages volatils.
+pub fn detail_etag(state: &Arc<AppState>, id: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let managed = managed_ids(state);
+    let servers = lockv(&state.servers);
+    match servers.iter().find(|s| s.id == id) {
+        Some(s) => {
+            true.hash(&mut h);
+            hash_server_visible(s, managed.contains(&s.id), true, &mut h);
+        }
+        None => {
+            false.hash(&mut h);
+            id.hash(&mut h);
+        }
+    }
+    format!("\"d-{:016x}\"", h.finish())
 }

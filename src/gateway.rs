@@ -209,6 +209,35 @@ fn verifier_for(state: &Arc<AppState>) -> Arc<dyn litemcp::auth::Verifier> {
     }))
 }
 
+/// Signal événementiel de changement d'état pour le thread de rafraîchissement
+/// du gateway (P-4 / P1 rang 4) : évite le recalcul aveugle toutes les 5 s.
+fn gw_change_signal() -> &'static (std::sync::Mutex<u64>, std::sync::Condvar) {
+    static SIG: OnceLock<(std::sync::Mutex<u64>, std::sync::Condvar)> = OnceLock::new();
+    SIG.get_or_init(|| (std::sync::Mutex::new(0), std::sync::Condvar::new()))
+}
+
+/// Réveille immédiatement le thread de rafraîchissement du gateway.
+pub fn notify_change() {
+    let (m, cv) = gw_change_signal();
+    let mut seq = m.lock().unwrap_or_else(|p| p.into_inner());
+    *seq = seq.wrapping_add(1);
+    cv.notify_all();
+}
+
+/// Attend un changement d'état du gateway (ou l'échéance `timeout` en filet).
+/// Renvoie la nouvelle séquence observée.
+pub fn wait_change(last_seq: u64, timeout: std::time::Duration) -> u64 {
+    let (m, cv) = gw_change_signal();
+    let guard = m.lock().unwrap_or_else(|p| p.into_inner());
+    if *guard != last_seq {
+        return *guard;
+    }
+    let (guard, _) = cv
+        .wait_timeout(guard, timeout)
+        .unwrap_or_else(|p| p.into_inner());
+    *guard
+}
+
 /// Empreinte de l'état qui nourrit le snapshot : ids, états, interrupteurs,
 /// outils (nombre + désactivés) de chaque serveur. Change dès que la
 /// détection ou un toggle change → le thread de fond reconstruit le
@@ -216,25 +245,16 @@ fn verifier_for(state: &Arc<AppState>) -> Arc<dyn litemcp::auth::Verifier> {
 pub fn fingerprint(state: &Arc<AppState>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    let mut lines: Vec<String> = {
-        let servers = lockv(&state.servers);
-        servers
-            .iter()
-            .map(|s| {
-                format!(
-                    "{}|{}|{}|{}|{}",
-                    s.id,
-                    s.state.as_str(),
-                    s.enabled,
-                    s.tools.len(),
-                    s.tools_disabled.len()
-                )
-            })
-            .collect()
-    };
-    lines.sort();
-    for line in &lines {
-        line.hash(&mut h);
+    let servers = lockv(&state.servers);
+    let mut idxs: Vec<usize> = (0..servers.len()).collect();
+    idxs.sort_by(|&a, &b| servers[a].id.cmp(&servers[b].id));
+    for i in idxs {
+        let s = &servers[i];
+        s.id.hash(&mut h);
+        s.state.as_str().hash(&mut h);
+        s.enabled.hash(&mut h);
+        s.tools.len().hash(&mut h);
+        s.tools_disabled.len().hash(&mut h);
     }
     h.finish()
 }
@@ -400,31 +420,15 @@ fn read_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
             {
                 let st = Arc::clone(state);
                 move |args| {
-                    let full = manage::state_json(&st);
-                    let mut servers = full["servers"].clone();
-                    if let Some(want) = args.get("state").and_then(Value::as_str) {
-                        let want = want.to_ascii_uppercase();
-                        let want = match want.as_str() {
-                            "PORT_ONLY" => "PORT-ONLY",
-                            w => w,
-                        };
-                        servers = servers
-                            .as_array()
-                            .map(|arr| {
-                                Value::Array(
-                                    arr.iter()
-                                        .filter(|s| s["state"].as_str() == Some(want))
-                                        .cloned()
-                                        .collect(),
-                                )
-                            })
-                            .unwrap_or(Value::Array(vec![]));
-                    }
-                    Ok(json!({
-                        "stats": full["stats"],
-                        "lan_ok": full["lan_ok"],
-                        "servers": servers,
-                    }))
+                    let want_owned = args.get("state").and_then(Value::as_str).map(|w| {
+                        let u = w.to_ascii_uppercase();
+                        if u == "PORT_ONLY" {
+                            "PORT-ONLY".to_string()
+                        } else {
+                            u
+                        }
+                    });
+                    Ok(manage::servers_summary_json(&st, want_owned.as_deref()))
                 }
             },
         );
@@ -681,6 +685,9 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                     // discover = scan_listening). Régression lot A : l'ancien
                     // handler envoyait {"action":"refresh"} sans id — le
                     // dispatcher exige un id → « id manquant » à chaque appel.
+                    // Rafraîchissement manuel explicite : invalide le cache
+                    // tools/list avant de relancer le pool.
+                    manage::invalidate_tools_cache(&st);
                     manage::poll_all(&st);
                     do_action(&st, json!({ "action": "discover" }))
                 }
