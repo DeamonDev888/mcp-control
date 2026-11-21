@@ -90,6 +90,10 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     <div id="remoteGroups"></div>
     <div class="sec-label">Machines &amp; pairs</div>
     <div id="peerList"></div>
+    <div id="annSec" hidden>
+      <div class="sec-label">D&eacute;tect&eacute;s, non suivis</div>
+      <div id="annList"></div>
+    </div>
     <div id="addWrap"><button data-act="add-server">+ Ajouter un serveur</button></div>
   </aside>
   <div id="grip" role="separator" aria-orientation="vertical" aria-label="Ajuster la largeur de l'explorateur" title="Glisser pour ajuster la largeur"></div>
@@ -280,6 +284,18 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
               <div class="set-err" id="err_ports" hidden></div></div>
             <div class="set-ctrl"><input id="sNetPorts" placeholder="5090, 5091" class="set-txt" aria-describedby="desc_ports err_ports"></div>
           </div>
+          <div class="set-row">
+            <div class="set-label"><label for="sDiscOnly">Ne sonder que ces ports (liste blanche)</label>
+              <em id="desc_disc_only">Restreint la d&eacute;couverte locale aux seuls ports list&eacute;s. Vide = tous les ports en &eacute;coute.</em>
+              <div class="set-err" id="err_disc_only" hidden></div></div>
+            <div class="set-ctrl"><input id="sDiscOnly" placeholder="ex. 3000, 8787" class="set-txt" aria-describedby="desc_disc_only err_disc_only"></div>
+          </div>
+          <div class="set-row">
+            <div class="set-label"><label for="sDiscExcl">Ports exclus de la d&eacute;couverte</label>
+              <em id="desc_disc_excl">Ports locaux ignor&eacute;s lors de la d&eacute;couverte automatique des ports en &eacute;coute.</em>
+              <div class="set-err" id="err_disc_excl" hidden></div></div>
+            <div class="set-ctrl"><input id="sDiscExcl" placeholder="ex. 5432, 9222" class="set-txt" aria-describedby="desc_disc_excl err_disc_excl"></div>
+          </div>
         </div>
       </section>
 
@@ -287,8 +303,7 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
         <div class="set-list">
           <div class="set-row">
             <div class="set-label"><label for="sUiBind">&Eacute;coute</label>
-              <em id="desc_bind">127.0.0.1 = cette machine seule. 0.0.0.0 = accessible du LAN (code d'acc&egrave;s exig&eacute;).
-              Appliqu&eacute; au prochain d&eacute;marrage.</em></div>
+              <em id="desc_bind">127.0.0.1 = cette machine seule (session locale requise sur /api/*). 0.0.0.0 = accessible du LAN en TLS 1.3 obligatoire avec signatures Ed25519 RFC 9421 sur /mcp. Appliqu&eacute; au prochain d&eacute;marrage.</em></div>
             <div class="set-ctrl">
               <select id="sUiBind" aria-describedby="desc_bind">
                 <option value="127.0.0.1">127.0.0.1</option>
@@ -380,6 +395,14 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
               <button data-act="check-update" title="Interroge l'API GitHub releases/latest maintenant"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M21 12a9 9 0 1 1-2.6-6.4L21 8'/><path d='M21 3v5h-5'/></svg> V&eacute;rifier</button>
               <button class="primary" data-act="update-download" title="T&eacute;l&eacute;charge directement l'installateur pour cette machine"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 15.5V4m0 0L7.5 8.5M12 4l4.5 4.5'/><path d='M4 16.5V19a1.5 1.5 0 0 0 1.5 1.5h13A1.5 1.5 0 0 0 20 19v-2.5'/></svg> Mettre &agrave; jour</button>
               <button data-act="release-page" title="Toutes les versions et archives"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M14 4h6v6M20 4l-9 9'/><path d='M19 14v5a1.5 1.5 0 0 1-1.5 1.5h-12A1.5 1.5 0 0 1 4 19V7.5A1.5 1.5 0 0 1 5.5 6H10'/></svg> Releases</button>
+            </div>
+          </div>
+          <div class="set-row col" id="sSha256Row" hidden>
+            <div class="set-label"><span>Empreinte SHA-256 attendue (<span id="sSha256Asset">&ndash;</span>)</span>
+              <em id="sSha256Note">Publi&eacute;e dans SHA256SUMS.txt de la release GitHub pour v&eacute;rifier l'int&eacute;grit&eacute; de l'installateur.</em></div>
+            <div class="set-ctrl set-ctrl-wide">
+              <code id="sSha256Val" class="mono-inline">&ndash;</code>
+              <button id="sSha256Copy" data-act="copy-sha256" hidden title="Copier l'empreinte SHA-256">Copier SHA-256</button>
             </div>
           </div>
         </div>

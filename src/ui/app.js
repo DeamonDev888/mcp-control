@@ -355,9 +355,76 @@ function render() {
   } else upd.hidden = true;
   renderServers();
   renderPeers();
+  syncAnnouncements();
   renderLog();
   accessBadge();
   if (!selectedId) renderOverview();
+}
+
+/* ===== Annonces LiteMCP détectées, non suivies (lot S4 pt 2) =====
+   Lecture seule : jamais d'adoption silencieuse. L'opérateur clique « Suivre »
+   pour ajouter explicitement le serveur HTTP à sa configuration. */
+let unfollowedAnnouncements = [];
+let lastAnnCount = -1;
+async function syncAnnouncements() {
+  const count = (state && Number.isFinite(state.announcements_count)) ? state.announcements_count : 0;
+  if (count === 0) {
+    lastAnnCount = 0;
+    if (unfollowedAnnouncements.length) {
+      unfollowedAnnouncements = [];
+      renderAnnouncements();
+      if (!selectedId) renderOverview();
+    } else {
+      renderAnnouncements();
+    }
+    return;
+  }
+  if (count === lastAnnCount) {
+    renderAnnouncements();
+    return;
+  }
+  lastAnnCount = count;
+  const j = await postAction({action: 'litemcp_announcements'}, {quiet: true});
+  if (j && j.ok && Array.isArray(j.announcements)) {
+    unfollowedAnnouncements = j.announcements.filter(a => a && a.followed === false);
+  } else {
+    unfollowedAnnouncements = [];
+  }
+  renderAnnouncements();
+  if (!selectedId) renderOverview();
+}
+function renderAnnouncements() {
+  const sec = document.getElementById('annSec');
+  const box = document.getElementById('annList');
+  if (!sec || !box) return;
+  if (!unfollowedAnnouncements.length) {
+    sec.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+  sec.hidden = false;
+  box.innerHTML = unfollowedAnnouncements.map(a => {
+    const portTxt = a.port ? `:${esc(a.port)}` : 'port inconnu';
+    const verTxt = a.version ? ` &middot; v${esc(a.version)}` : '';
+    const btn = a.port
+      ? `<button class="primary" data-act="follow-ann" data-name="${esc(a.name)}" data-port="${esc(a.port)}" title="Ajouter explicitement ce serveur LiteMCP &agrave; la liste suivie">${ic('check')} Suivre</button>`
+      : '';
+    return `<div class="ann-row">
+      <div class="l1"><span class="dot PORT-ONLY"></span><span class="nm">${esc(a.name)}</span><span class="tag litemcp">LiteMCP</span></div>
+      <div class="l2">127.0.0.1${portTxt}${verTxt} &mdash; d&eacute;tect&eacute;, non suivi</div>
+      ${btn}
+    </div>`;
+  }).join('');
+}
+async function followAnnouncement(name, port) {
+  const p = +port;
+  if (!p) { toast('Port d\u2019annonce manquant', 'err'); return; }
+  const j = await postAction({action: 'add', transport: 'http', label: name || ('litemcp-' + p), port: p, path: '/mcp'});
+  if (j && j.ok) {
+    toast('Serveur \u00ab ' + (name || p) + ' \u00bb ajout\u00e9 \u00e0 la supervision', 'ok');
+    lastAnnCount = -1;
+    await act('refresh', j.id);
+  }
 }
 
 /* ===== Explorateur ===== */
@@ -994,6 +1061,7 @@ function renderDetail() {
       ${s.transport === 'stdio' ? '<span class="legacy" title="Legacy : serveur stdio uniquement (pas de transport HTTP)">legacy</span>' : ''}
       <span class="sub">${s.server_name ? esc(s.server_name) + ' v' + esc(s.version || '?') : ''}${s.latency_ms != null ? ' &middot; ' + s.latency_ms + ' ms' : ''}</span>
       <div class="d-actions">
+        ${s.locked && s.state !== 'UP' ? `<button class="primary" data-act="server-pair" data-id="${esc(s.id)}" title="Appairer MCP Control avec ce serveur LiteMCP verrouill&eacute; par signature RFC 9421">${ic('lock')} Appairer ce serveur</button>` : ''}
         ${s.can_start && s.state !== 'UP' ? `<button class="primary" data-act="row-act" data-op="start" data-id="${esc(s.id)}">${ic('play')} Start</button>` : ''}
         ${s.can_start && s.state === 'UP' ? `<button class="danger" data-act="row-act" data-op="kill" data-id="${esc(s.id)}">${ic('stop')} Stop</button>` : ''}
         <button data-act="row-act" data-op="refresh" data-id="${esc(s.id)}">${ic('activity')} Sonder</button>
@@ -1010,6 +1078,7 @@ function renderDetail() {
           : `<button class="danger" data-act="remove-seed" data-id="${esc(s.id)}" title="Supprime ce seed de la config : il ne sera pas r&eacute;inject&eacute; au red&eacute;marrage">${ic('trash')} Supprimer d&eacute;finitivement</button>`}
       </div>
     </div>
+    ${s.locked && s.state !== 'UP' ? `<div class="d-lock-banner"><div>${ic('lock')} <b>Serveur LiteMCP verrouill&eacute; par signature Ed25519 (RFC 9421)</b> &mdash; associez l'identit&eacute; locale <code>mcc-server</code> pour autoriser la sonde et le proxy.</div><button class="primary" data-act="server-pair" data-id="${esc(s.id)}">${ic('lock')} Appairer ce serveur</button></div>` : ''}
     ${s.origin === 'seed' ? '<div class="seed-note">Serveur seed : <b>Retirer durablement</b> l&rsquo;efface m&ecirc;me apr&egrave;s red&eacute;marrage (consign&eacute; dans config.json) ; <b>D&eacute;sactiver</b> l&rsquo;&eacute;teint sans le supprimer.</div>' : ''}
     ${s.last_error ? `<div class="d-err">${ic('warn')} ${esc(s.last_error)}</div>` : ''}
     ${fold('demarrage', 'D&eacute;marrage', `<div class="kv">${kvd}</div>${startCmdForm(s)}`)}
@@ -1467,8 +1536,33 @@ async function postAction(body, opts) {
   return j;
 }
 async function act(action, id) {
-  await postAction({action, id});
+  const j = await postAction({action, id});
+  if (!j.ok && j.needs_force && Array.isArray(j.occupants)) {
+    const desc = j.occupants.map(o => (o.process || 'processus') + ' (PID ' + o.pid + ')').join(', ');
+    const force = await askConfirm({
+      title: 'Processus tiers sur le port',
+      msg: 'Ce port est tenu par un processus qui n\u2019a pas \u00e9t\u00e9 lanc\u00e9 par MCP Control. Voulez-vous l\u2019arr\u00eater quand m\u00eame ?',
+      detail: 'Occupant(s) : ' + desc,
+      okLabel: 'Arr\u00eater quand m\u00eame',
+      danger: true,
+    });
+    if (force) {
+      const jf = await postAction({action: 'stop_server_force', id});
+      if (jf && jf.ok) toast('Processus tiers arr\u00eat\u00e9', 'ok');
+    }
+  }
   await load();
+}
+async function serverPair(id) {
+  const j = await postAction({action: 'server_pair', id});
+  if (j && j.ok) {
+    toast('Serveur LiteMCP appair\u00e9 (' + (j.keyid || 'mcc-server') + ')', 'ok');
+  }
+  await load();
+  if (selectedId === id) {
+    const r2 = await fetch('/api/detail?id=' + encodeURIComponent(id));
+    if (r2.ok) { detailCache = await r2.json(); renderDetail(); }
+  }
 }
 
 // Autoboot par serveur (⚡) : relance auto au démarrage de MCP Control
@@ -1606,6 +1700,8 @@ const SETTINGS_LABELS = {
   ui_bind: '\u00e9coute',
   network: 'r\u00e9seau',
   network_ports: 'ports UI des pairs',
+  discovery_ports_only: 'liste blanche de d\u00e9couverte',
+  discovery_ports_excluded: 'ports exclus de la d\u00e9couverte',
 };
 function setFieldErr(id, msg) {
   const el = document.getElementById('err_' + id);
@@ -1614,7 +1710,7 @@ function setFieldErr(id, msg) {
   else { el.textContent = ''; el.hidden = true; }
 }
 function clearFieldErrs() {
-  ['refresh', 'scan', 'ports', 'webhook', 'states', 'min'].forEach(id => setFieldErr(id, ''));
+  ['refresh', 'scan', 'ports', 'disc_only', 'disc_excl', 'webhook', 'states', 'min'].forEach(id => setFieldErr(id, ''));
 }
 function showMsg(rowId, msgId, text) {
   const row = document.getElementById(rowId);
@@ -1631,6 +1727,10 @@ function openSettingsDlg() {
   document.getElementById('sScanTo').value = s.scan_to || 3200;
   document.getElementById('sNetEnabled').checked = !!s.network_enabled;
   document.getElementById('sNetPorts').value = (s.network_ports || []).join(', ');
+  const discOnlyEl = document.getElementById('sDiscOnly');
+  if (discOnlyEl) discOnlyEl.value = (s.discovery_ports_only || []).join(', ');
+  const discExclEl = document.getElementById('sDiscExcl');
+  if (discExclEl) discExclEl.value = (s.discovery_ports_excluded || []).join(', ');
   document.getElementById('sUiBind').value = s.ui_bind || '127.0.0.1';
   document.getElementById('sUiPort').value = s.ui_port || 5090;
   // Notifications (moteur : action set_notify, section notify de config.json).
@@ -1689,6 +1789,28 @@ async function checkUpdateNow() {
   msg.classList.remove('tone-warn', 'tone-ok');
   msg.textContent = '⏳ vérification de la release GitHub…';
   const j = await postAction({action: 'check_update'}, {quiet: true});
+  const shaRow = document.getElementById('sSha256Row');
+  const shaAsset = document.getElementById('sSha256Asset');
+  const shaVal = document.getElementById('sSha256Val');
+  const shaCopy = document.getElementById('sSha256Copy');
+  const shaNote = document.getElementById('sSha256Note');
+  if (shaRow) {
+    if (j.sha256 && typeof j.sha256 === 'object') {
+      shaRow.hidden = false;
+      if (shaAsset) shaAsset.textContent = j.sha256.asset || 'binaire';
+      if (j.sha256.sha256) {
+        if (shaVal) shaVal.textContent = j.sha256.sha256;
+        if (shaCopy) shaCopy.hidden = false;
+        if (shaNote) shaNote.textContent = 'Empreinte SHA-256 publi\u00e9e dans SHA256SUMS.txt de la release GitHub.';
+      } else {
+        if (shaVal) shaVal.textContent = j.sha256.note || 'non publi\u00e9e';
+        if (shaCopy) shaCopy.hidden = true;
+        if (shaNote) shaNote.textContent = j.sha256.note || 'Empreinte non disponible pour cet actif.';
+      }
+    } else {
+      shaRow.hidden = true;
+    }
+  }
   if (j.ok && j.checked && j.update_available) {
     document.getElementById('sLatest').textContent = 'v' + j.latest;
     msg.textContent = '\u2b06 v' + j.latest + ' disponible (installée : v' + j.current + ') — bouton « Mettre à jour » en bas à droite';
@@ -1702,6 +1824,10 @@ async function checkUpdateNow() {
       ? '✗ vérification impossible (réseau ?) — dernière info connue : v' + j.latest + ' disponible'
       : '✗ vérification impossible (réseau ?) — nouvel essai auto au boot puis chaque heure';
   }
+}
+function copySha256() {
+  const el = document.getElementById('sSha256Val');
+  if (el && el.textContent && el.textContent !== '\u2013') copyText(el.textContent);
 }
 async function openReleasePage() {
   // window.open est neutralisé dans la webview Tauri (desktop) : le clic mort
@@ -1819,6 +1945,18 @@ function collectSettingsForm() {
   if (bad.length) { setFieldErr('ports', 'ports invalides : ' + bad.slice(0, 3).join(', ')); ok = false; }
   else setFieldErr('ports', '');
   const netPorts = tokens.filter(t => /^\d+$/.test(t)).map(Number).filter(p => p >= 1 && p <= 65535);
+  // Découverte locale : liste blanche (discovery_ports_only) et exclusions (discovery_ports_excluded)
+  const parseDiscField = (inputId, errId) => {
+    const el = document.getElementById(inputId);
+    const raw = el ? el.value.trim() : '';
+    const toks = raw ? raw.split(/[\s,]+/).filter(Boolean) : [];
+    const badToks = toks.filter(t => !/^\d+$/.test(t) || +t < 1 || +t > 65535);
+    if (badToks.length) { setFieldErr(errId, 'ports invalides : ' + badToks.slice(0, 3).join(', ')); ok = false; return []; }
+    setFieldErr(errId, '');
+    return [...new Set(toks.map(Number).filter(p => p >= 1 && p <= 65535))];
+  };
+  const discOnly = parseDiscField('sDiscOnly', 'disc_only');
+  const discExcl = parseDiscField('sDiscExcl', 'disc_excl');
   // Webhook : vide autorisé (canal off), sinon URL http:// uniquement —
   // https:// est refusé par le moteur à l'enregistrement (aucune pile TLS :
   // l'envoi partait en HTTP brut sur le port 443, audit 05 #4).
@@ -1843,6 +1981,8 @@ function collectSettingsForm() {
       ui_bind: document.getElementById('sUiBind').value,
       network_enabled: document.getElementById('sNetEnabled').checked,
       network_ports: netPorts,
+      discovery_ports_only: discOnly,
+      discovery_ports_excluded: discExcl,
     },
     notifyChanged: JSON.stringify(notify) !== notifyOriginal,
     notify,
@@ -2252,16 +2392,141 @@ function toggleLog() {
   try { v = localStorage.getItem('mcc.logmin'); } catch (e) {}
   document.getElementById('logpanel').classList.toggle('min', v === null ? true : v === 'true');
 })();
+/* Helpers pour les onglets Identité & Sessions, Guide d'appairage et Verdicts
+   (toutes les interpolations passent par esc() / ic()). */
+function copyDataText(el) {
+  const txt = el && el.dataset ? el.dataset.text : '';
+  if (txt) copyText(txt);
+}
+function pairGuideHtml(uiUrl, sampleKeyId) {
+  const url = uiUrl || (window.location && window.location.origin) || 'http://127.0.0.1:5090';
+  const kid = sampleKeyId || '<keyid>';
+  const cmdPair = 'mcp-control auth pair ' + url;
+  const jsonBridge = JSON.stringify({
+    mcpServers: {
+      'mcp-control': {
+        command: 'mcp-control',
+        args: ['bridge', url, '--key', kid]
+      }
+    }
+  }, null, 2);
+  const blk = (title, code) =>
+    `<div class="conf-block"><div class="conf-head">${esc(title)}<button data-act="copy-conf">copier</button></div><pre>${esc(code)}</pre></div>`;
+  return `<div class="acc-sub">Connecter un client / assistant IA</div>
+    <div class="acc-card">
+      <div class="acc-who"><b>1. Appairer la machine cliente</b> &mdash; ex&eacute;cutez cette commande puis validez le code &agrave; 6 chiffres ci-dessus :</div>
+      ${blk('Terminal — Demande d’appairage Ed25519', cmdPair)}
+      <div class="acc-who"><b>2. Configurer Claude Desktop / Claude Code / Cursor</b> &mdash; le pont local signe chaque requ&ecirc;te RFC 9421 :</div>
+      ${blk('JSON mcpServers — Pont signé mcp-control bridge', jsonBridge)}
+    </div>`;
+}
+function renderAccIdentity() {
+  const box = document.getElementById('accIdentity');
+  if (!box || !accessState) return;
+  const id = accessState.server_identity || {};
+  const tls = accessState.tls || {};
+  const sess = accessState.sessions || {active: (state && state.sessions_active) || 1, max: 8};
+  const storageBadge = id.storage === 'keyring'
+    ? `<span class="acc-tag ok">${ic('check')} Trousseau syst&egrave;me (keyring)</span>`
+    : (id.storage === 'file_fallback'
+      ? `<span class="acc-tag warn">${ic('warn')} Repli fichier local (file_fallback)</span>`
+      : `<span class="acc-tag bad">${ic('x')} Indisponible (${esc(id.storage || 'unavailable')})</span>`);
+  const storageWarn = id.storage === 'file_fallback'
+    ? `<div class="acc-who tone-warn">${ic('warn')} La cl&eacute; priv&eacute;e du serveur est stock&eacute;e en fichier local (trousseau syst&egrave;me indisponible ou d&eacute;sactiv&eacute;).</div>`
+    : (id.storage && id.storage !== 'keyring'
+      ? `<div class="acc-who tone-bad">${ic('warn')} Identit&eacute; cryptographique du serveur non disponible.</div>`
+      : '');
+  const tlsBadge = tls.bind_refused
+    ? `<span class="acc-tag bad">${ic('x')} Bind LAN refus&eacute; (sans TLS)</span>`
+    : (tls.active
+      ? `<span class="acc-tag ok">${ic('lock')} TLS 1.3 actif</span>`
+      : (tls.compiled
+        ? `<span class="acc-tag">${ic('shield')} Loopback HTTP (TLS 1.3 compil&eacute;)</span>`
+        : `<span class="acc-tag warn">Non compil&eacute; (loopback seul)</span>`));
+  const verifyCmd = 'mcp-control auth verify-log';
+  box.innerHTML = `
+    <div class="acc-card">
+      <div class="acc-h">
+        <span class="acc-tool">Identit&eacute; du serveur (${esc(id.keyid || 'mcc-server')})</span>
+        ${storageBadge}
+      </div>
+      ${storageWarn}
+      <div class="acc-kv"><span class="acc-k">keyid</span><span class="acc-v">${esc(id.keyid || 'mcc-server')}</span></div>
+      <div class="acc-kv"><span class="acc-k">empreinte courte</span><span class="acc-v">${esc(id.fingerprint_court || '—')}</span></div>
+      <div class="acc-kv"><span class="acc-k">empreinte compl&egrave;te</span><span class="acc-v">${esc(id.fingerprint || '—')}</span></div>
+      ${id.fingerprint ? `<div class="acc-acts"><button data-act="copy-text" data-text="${esc(id.fingerprint)}">${ic('copy')} Copier l'empreinte serveur</button></div>` : ''}
+    </div>
+    <div class="acc-card">
+      <div class="acc-h">
+        <span class="acc-tool">R&eacute;seau &amp; TLS 1.3</span>
+        ${tlsBadge}
+      </div>
+      <div class="acc-kv"><span class="acc-k">URL d'acc&egrave;s</span><span class="acc-v">${esc(accessState.ui_url || '—')}</span></div>
+      <div class="acc-kv"><span class="acc-k">certificat TLS</span><span class="acc-v">${esc(tls.fingerprint || 'aucun (loopback)')}</span></div>
+      ${tls.notice ? `<div class="acc-who">${esc(tls.notice)}</div>` : ''}
+      ${tls.fingerprint ? `<div class="acc-acts"><button data-act="copy-text" data-text="${esc(tls.fingerprint)}">${ic('copy')} Copier l'empreinte TLS</button></div>` : ''}
+    </div>
+    <div class="acc-card">
+      <div class="acc-h">
+        <span class="acc-tool">Sessions locales</span>
+        <span class="acc-tag ok">${esc(sess.active ?? 1)} / ${esc(sess.max ?? 8)} sessions actives</span>
+      </div>
+      <div class="acc-who">Chaque onglet local authentifi&eacute; d&eacute;tient un cookie HttpOnly <code>mcc_session</code> coupl&eacute; &agrave; un secret en m&eacute;moire (<code>X-MCC-Session</code>).</div>
+      <div class="acc-acts">
+        <button class="danger" data-act="close-other-sessions">${ic('lock')} Fermer les autres sessions</button>
+      </div>
+    </div>
+    <div class="acc-card">
+      <div class="acc-h">
+        <span class="acc-tool">Journal d'audit cha&icirc;n&eacute; (SHA-256)</span>
+        <span class="acc-tag">${ic('shield')} audit.jsonl</span>
+      </div>
+      <div class="acc-who">Chaque d&eacute;cision d'authentification et d'autorisation sur <code>/mcp</code> est scell&eacute;e par le hachage SHA-256 de l'entr&eacute;e pr&eacute;c&eacute;dente. V&eacute;rifiez l'int&eacute;grit&eacute; de la cha&icirc;ne avec :</div>
+      <div class="conf-block"><div class="conf-head">V&eacute;rification d'int&eacute;grit&eacute; du journal<button data-act="copy-conf">copier</button></div><pre>${esc(verifyCmd)}</pre></div>
+    </div>`;
+}
+async function closeOtherSessions() {
+  try {
+    const r = await fetch('/api/session/close-others', {method: 'POST'});
+    const j = await r.json().catch(() => null);
+    if (r.ok && j && j.ok) {
+      const n = j.closed || 0;
+      toast(n + ' autre' + (n > 1 ? 's' : '') + ' session' + (n > 1 ? 's' : '') + ' ferm\u00e9e' + (n > 1 ? 's' : ''), 'ok');
+      await refreshAccess();
+      await load();
+    } else {
+      accessMsg('\u2717 ' + ((j && j.error) || 'impossible de fermer les autres sessions'));
+    }
+  } catch (e) {
+    accessMsg('\u2717 erreur r\u00e9seau lors de la fermeture des sessions');
+  }
+}
+function verdictTone(v) {
+  const s = String(v || '').toLowerCase();
+  if (s.includes('allow') || s.includes('autoris') || s === 'ok' || s.includes('approv')) return 'ok';
+  if (s.includes('expir')) return 'warn';
+  return 'bad';
+}
+function verdictIcon(v) {
+  const s = String(v || '').toLowerCase();
+  if (s.includes('allow') || s.includes('autoris') || s === 'ok' || s.includes('approv')) return 'check';
+  if (s.includes('expir')) return 'warn';
+  if (s.includes('revo')) return 'lock';
+  return 'x';
+}
+
 /* ===== Écran « Accès » (lot M3, docs/auth.md §5) ========================
-   Quatre volets : confirmations en attente (ce qui va être lancé), clients
-   appairés (droits, révocation), demandes d'appairage (code de comparaison),
-   100 dernières décisions. TOUT texte venu d'un client passe par esc() : un
-   libellé hostile ne doit jamais devenir du HTML (test « libellé hostile » côté
-   Rust). Les ordres partent par postAction (session locale) — jamais un fetch
-   direct vers /api/action. */
+   Cinq volets : confirmations en attente (ce qui va être lancé), appairage
+   (demandes + guide), clients appairés (droits, inactivité > 180 j, rotation,
+   révocation), identité & sessions, 100 dernières décisions. TOUT texte venu
+   d'un client passe par esc() : un libellé hostile ne doit jamais devenir du
+   HTML (test « libellé hostile » côté Rust). Les ordres partent par postAction
+   (session locale) — jamais un fetch direct vers /api/action. */
 let accessState = null;
 let accessTab = 'confirmations';
 let accessTimer = null;
+let clientFilterMode = 'all';
+let decisionFilterQuery = '';
 const pairDroits = {}; // pair_id -> droits choisis localement (défaut : lecture)
 
 function accessMsg(txt) {
@@ -2291,6 +2556,7 @@ function accessBadge() {
 function openAccessDlg(pending) {
   const d = document.getElementById('accessDlg');
   if (!d) return;
+  rememberFocus();
   let tab = 'confirmations';
   if (!pending) { try { tab = localStorage.getItem('mcc.acctab') || tab; } catch (e) {} }
   setAccessTab(tab);
@@ -2298,8 +2564,6 @@ function openAccessDlg(pending) {
   d.showModal();
   refreshAccess();
   if (accessTimer) clearInterval(accessTimer);
-  // rafraîchissement tant que l'écran est ouvert : une demande arrive pendant
-  // qu'on le regarde, et l'expiration (2 min) doit se voir sans clic.
   accessTimer = setInterval(() => { if (d.open) refreshAccess(); }, 3000);
 }
 function closeAccessDlg() {
@@ -2331,6 +2595,7 @@ function renderAccess() {
   renderAccPending();
   renderAccClients();
   renderAccPairs();
+  renderAccIdentity();
   renderAccDecisions();
   accessBadge();
 }
@@ -2367,6 +2632,7 @@ function renderAccPending() {
   const box = document.getElementById('accPending');
   const grantsBox = document.getElementById('accGrants');
   if (!box || !grantsBox) return;
+  const nowMs = Date.now();
   const pend = accessState.pending || [];
   const ttl = accessState.request_ttl_secs || 120;
   let html = pend.length ? '' :
@@ -2375,14 +2641,14 @@ function renderAccPending() {
   html += pend.map(p => `<div class="acc-card warn">
     <div class="acc-h">
       <span class="acc-tool">${esc(p.tool)}</span>
-      <span class="acc-ttl" title="une demande non d\u00e9cid\u00e9e expire au bout de ${esc(ttl)} s">expire dans ${esc(p.expires_in)} s</span>
+      <span class="acc-ttl" data-ttl-until="${esc(nowMs + Number(p.expires_in || 0) * 1000)}" data-ttl-mode="pending" title="une demande non d\u00e9cid\u00e9e expire au bout de ${esc(ttl)} s">expire dans ${esc(p.expires_in)} s</span>
     </div>
     <div class="acc-who">${esc(p.label || p.keyid)} <span class="acc-fp" title="${esc(p.fingerprint)}">${esc(String(p.fingerprint || '').slice(0, 24))}</span> depuis <b>${esc(p.address)}</b></div>
     <div class="acc-what">${esc((p.effect || {}).resume || '')}</div>
     ${effectHtml(p.effect)}
     <div class="acc-acts">
       <button class="primary" data-act="confirm-approve" data-id="${esc(p.id)}" data-mode="once">Accepter une fois</button>
-      <button data-act="confirm-approve" data-id="${esc(p.id)}" data-mode="window">Accepter ${esc(Math.round((accessState.window_secs || 600) / 60))} minutes</button>
+      <button class="primary" data-act="confirm-approve" data-id="${esc(p.id)}" data-mode="window">Accepter ${esc(Math.round((accessState.window_secs || 600) / 60))} minutes</button>
       <button class="danger" data-act="confirm-deny" data-id="${esc(p.id)}">Refuser</button>
     </div>
   </div>`).join('');
@@ -2395,30 +2661,46 @@ function renderAccPending() {
     <div class="acc-h">
       <span class="acc-tool">${esc(g.tool)}</span>
       <span class="acc-tag">${esc(g.mode === 'once' ? 'une fois' : 'fen\u00eatre')}</span>
-      <span class="acc-ttl">${esc(g.expires_in)} s restantes</span>
+      <span class="acc-ttl" data-ttl-until="${esc(nowMs + Number(g.expires_in || 0) * 1000)}" data-ttl-mode="grant">${esc(g.expires_in)} s restantes</span>
     </div>
     <div class="acc-who">${esc(g.label || g.keyid)}</div>
     <div class="acc-acts"><button class="danger" data-act="grant-revoke" data-id="${esc(g.id)}">R\u00e9voquer</button></div>
   </div>`).join('');
   grantsBox.innerHTML = gh;
 }
+function setClientFilter(mode) {
+  clientFilterMode = mode || 'all';
+  renderAccClients();
+}
 function renderAccClients() {
   const box = document.getElementById('accClients');
   if (!box) return;
-  const clients = accessState.clients || [];
-  let html = clients.length ? '' : '<div class="empty-sec">aucun client appair\u00e9</div>';
+  const allClients = accessState.clients || [];
+  const clients = allClients.filter(c => {
+    if (clientFilterMode === 'active') return c.status !== 'revoked';
+    if (clientFilterMode === 'revoked') return c.status === 'revoked';
+    return true;
+  });
+  let html = '<div class="acc-toolbar" role="group" aria-label="Filtrer les clients">' +
+    '<button class="exp-pill' + (clientFilterMode === 'all' ? ' sel' : '') + '" data-act="client-filter" data-mode="all">Tous (' + esc(allClients.length) + ')</button>' +
+    '<button class="exp-pill' + (clientFilterMode === 'active' ? ' sel' : '') + '" data-act="client-filter" data-mode="active">Actifs (' + esc(allClients.filter(c => c.status !== 'revoked').length) + ')</button>' +
+    '<button class="exp-pill' + (clientFilterMode === 'revoked' ? ' sel' : '') + '" data-act="client-filter" data-mode="revoked">R\u00e9voqu\u00e9s (' + esc(allClients.filter(c => c.status === 'revoked').length) + ')</button>' +
+    '</div>';
+  html += clients.length ? '' : '<div class="empty-sec">aucun client appair\u00e9 dans cette vue</div>';
   html += clients.map(c => {
     const droits = c.rights || [];
     const boutons = ['lecture', 'pilotage', 'execution'].map(r => {
       const classeOn = droits.includes(r) ? ' on' : '';
-      return `<button class="acc-right${classeOn}" data-act="client-right" data-id="${esc(c.keyid)}" data-right="${esc(r)}"
+      return `<button class="acc-right${classeOn}" role="switch" aria-checked="${esc(droits.includes(r) ? 'true' : 'false')}" data-act="client-right" data-id="${esc(c.keyid)}" data-right="${esc(r)}"
         title="${esc(droits.includes(r) ? 'Retirer' : 'Accorder')} le droit ${esc(r)}">${esc(r)}</button>`;
     }).join('');
     const revoque = c.status === 'revoked';
     const classeOff = revoque ? ' off' : '';
-    const badgeRevoque = revoque ? '<span class="acc-tag bad">r\u00e9voqu\u00e9</span>' : '';
+    const badgeRevoque = (revoque ? '<span class="acc-tag bad">' + esc('révoqué') + '</span>' : '<span class="acc-tag ok">' + esc('actif') + '</span>')
+      + (c.stale_180d ? ' <span class="acc-tag warn" title="Aucune utilisation depuis plus de 180 jours">Inactif &gt; 180 j</span>' : '');
     const btnRevoque = revoque ? ''
-      : '<button class="danger" data-act="client-revoke" data-id="' + esc(c.keyid) + '">R\u00e9voquer</button>';
+      : '<button data-act="client-rotate" data-id="' + esc(c.keyid) + '">Rotation de cl\u00e9</button>'
+        + '<button class="danger" data-act="client-revoke" data-id="' + esc(c.keyid) + '">R\u00e9voquer</button>';
     return `<div class="acc-card${classeOff}">
       <div class="acc-h">
         <span class="acc-tool">${esc(c.label || c.keyid)}</span>
@@ -2439,9 +2721,10 @@ function renderAccClients() {
 function renderAccPairs() {
   const box = document.getElementById('accPairs');
   if (!box) return;
+  const nowMs = Date.now();
   const pairs = accessState.pairs || [];
   let html = pairs.length ? '' :
-    '<div class="empty-sec">aucune demande d\u2019appairage \u2014 un client qui lance <code>mcp-control auth pair</code> appara\u00eetra ici</div>';
+    '<div class="empty-sec">aucune demande d\u2019appairage en attente \u2014 un client qui lance <code>mcp-control auth pair</code> appara\u00eetra ici</div>';
   html += pairs.map(p => {
     if (!pairDroits[p.pair_id]) pairDroits[p.pair_id] = ['lecture'];
     const choisis = pairDroits[p.pair_id];
@@ -2451,7 +2734,7 @@ function renderAccPairs() {
     return `<div class="acc-card">
       <div class="acc-h">
         <span class="acc-code" title="le client affiche le m\u00eame code : s\u2019ils diff\u00e8rent, refusez">${esc(p.code)}</span>
-        <span class="acc-ttl">expire dans ${esc(p.expires_in)} s</span>
+        <span class="acc-ttl" data-ttl-until="${esc(nowMs + Number(p.expires_in || 0) * 1000)}" data-ttl-mode="pending">expire dans ${esc(p.expires_in)} s</span>
       </div>
       <div class="acc-who">${esc(p.label || p.keyid)} <span class="acc-fp" title="${esc(p.fingerprint)}">${esc(p.fingerprint_court || '')}</span>
         \u00b7 ${esc(p.keyid)} \u00b7 depuis ${esc(p.paired_from || '?')}</div>
@@ -2461,24 +2744,47 @@ function renderAccPairs() {
       </div>
     </div>`;
   }).join('');
+  const firstClient = ((accessState.clients || []).find(c => c.status !== 'revoked') || {}).keyid || '<keyid>';
+  html += pairGuideHtml(accessState.ui_url, firstClient);
   box.innerHTML = html;
+}
+function setDecisionFilter(el) {
+  decisionFilterQuery = (el && el.value ? el.value : '').trim().toLowerCase();
+  renderAccDecisionsList();
 }
 function renderAccDecisions() {
   const box = document.getElementById('accDecisions');
   if (!box) return;
-  const d = accessState.decisions || [];
+  let listBox = document.getElementById('accDecisionsRows');
+  if (!listBox) {
+    box.innerHTML = '<div class="acc-toolbar">' +
+      '<label for="accDecisionFilter" class="sr-only">Filtrer le journal d\u2019audit</label>' +
+      '<input id="accDecisionFilter" placeholder="Filtrer par outil, client, verdict ou motif\u2026" data-act="decision-filter" value="' + esc(decisionFilterQuery) + '">' +
+      '</div><div id="accDecisionsRows"></div>';
+  }
+  renderAccDecisionsList();
+}
+function renderAccDecisionsList() {
+  const rowsBox = document.getElementById('accDecisionsRows');
+  if (!rowsBox || !accessState) return;
+  const all = accessState.decisions || [];
+  const q = decisionFilterQuery;
+  const d = q ? all.filter(x => {
+    const hay = ((x.verdict || '') + ' ' + (x.tool || '') + ' ' + (x.keyid || '') + ' ' + (x.reason || '')).toLowerCase();
+    return hay.includes(q);
+  }) : all;
   const heure = ts => {
     try { return new Date(Number(ts) * 1000).toLocaleTimeString(); } catch (e) { return '?'; }
   };
-  let html = d.length ? '' : '<div class="empty-sec">aucune d\u00e9cision enregistr\u00e9e pour l\u2019instant</div>';
+  let html = d.length ? '' : '<div class="empty-sec">aucune d\u00e9cision enregistr\u00e9e pour ce filtre</div>';
   html += d.map(x => `<div class="acc-line">
     <span class="acc-when">${esc(heure(x.ts))}</span>
-    <span class="acc-verdict">${esc(x.verdict)}</span>
+    <span class="acc-verdict"><span class="acc-tag ${esc(verdictTone(x.verdict))}">${ic(verdictIcon(x.verdict))} ${esc(x.verdict)}</span></span>
     <span class="acc-tool">${esc(x.tool)}</span>
     <span class="acc-who-sm">${esc(x.keyid)}</span>
     <span class="acc-reason">${esc(x.reason === '-' ? '' : (x.reason || ''))}</span>
   </div>`).join('');
-  box.innerHTML = html;
+  rowsBox.innerHTML = html;
 }
 async function confirmApprove(id, mode) {
   const j = await postAction({action: 'confirm_approve', request_id: id, mode}, {quiet: true});
@@ -2506,6 +2812,26 @@ async function clientToggleRight(keyid, right) {
   const droits = actuels.includes(right) ? actuels.filter(r => r !== right) : actuels.concat([right]);
   const j = await postAction({action: 'client_set_scopes', keyid, rights: droits}, {quiet: true});
   if (!j.ok) { accessMsg('\u2717 ' + (j.error || 'refus')); return; }
+  await refreshAccess();
+}
+async function clientRotateModal(keyid) {
+  const res = await askConfirm({
+    title: 'Rotation de cl\u00e9 Ed25519',
+    msg: 'Remplacer la cl\u00e9 publique du client ' + keyid + ' en conservant ses droits :',
+    inputs: [
+      {id: 'new_keyid', label: 'Nouveau keyid (mcc-<nom>-<16hex>)', placeholder: 'mcc-cli-0123456789abcdef'},
+      {id: 'public_key', label: 'Nouvelle cl\u00e9 publique Ed25519 (64 hex)', placeholder: '64 caract\u00e8res hexad\u00e9cimaux minuscules'}
+    ],
+    okLabel: 'Effectuer la rotation',
+  });
+  if (!res || typeof res !== 'object') return;
+  if (!res.new_keyid || !res.public_key) {
+    accessMsg('\u2717 nouveau keyid et cl\u00e9 publique requis');
+    return;
+  }
+  const j = await postAction({action: 'client_rotate', keyid, new_keyid: res.new_keyid, public_key: res.public_key}, {quiet: true});
+  if (!j.ok) { accessMsg('\u2717 ' + (j.error || 'rotation refus\u00e9e')); return; }
+  toast('rotation effectu\u00e9e : ' + (j.keyid || res.new_keyid), 'ok');
   await refreshAccess();
 }
 async function clientRevokeConfirm(keyid) {
@@ -2549,7 +2875,7 @@ async function pairReject(pairId) {
 (function () {
   const d = document.getElementById('accessDlg');
   if (!d) return;
-  d.addEventListener('cancel', () => { if (accessTimer) { clearInterval(accessTimer); accessTimer = null; } });
+  d.addEventListener('cancel', () => { if (accessTimer) { clearInterval(accessTimer); accessTimer = null; } restoreFocus(); });
 })();
 
 /* ===== Polling armé sur les réglages =====
@@ -2615,12 +2941,15 @@ const ACT = {
   'remove-seed': el => removeSeedForever(el.dataset.id),
   'ssh-forget': el => sshForget(el.dataset.id),
   'import-peer': el => importPeer(el.dataset.id),
+  'follow-ann': el => followAnnouncement(el.dataset.name, el.dataset.port),
   // -- accueil et détail serveur
   'tile': el => tileFilter(el.dataset.mode),
   'tile-tools': () => tileSortTools(),
   'detail-tab': el => { detailTab = el.dataset.tab; renderDetail(); },
   'tool-toggle': el => toggleTool(el.dataset.id, el.dataset.tool),
+  'server-pair': el => serverPair(el.dataset.id),
   'copy-self': el => copyText(el.textContent),
+  'copy-text': el => copyDataText(el),
   'copy-conf': el => copyConf(el),
   'set-start-cmd': el => setStartCmd(el.dataset.id),
   'ctx-item': el => ctxItem(el),
@@ -2639,6 +2968,7 @@ const ACT = {
   'theme': el => applyThemeAndSave(el.dataset.theme),
   'test-notify': () => testNotify(),
   'check-update': () => checkUpdateNow(),
+  'copy-sha256': () => copySha256(),
   'release-page': () => openReleasePage(),
   'settings-close': () => closeSettings(),
   'save-settings': () => saveSettings(),
@@ -2651,11 +2981,15 @@ const ACT = {
   'confirm-approve': el => confirmApprove(el.dataset.id, el.dataset.mode),
   'confirm-deny': el => confirmDeny(el.dataset.id),
   'grant-revoke': el => grantRevoke(el.dataset.id),
+  'client-filter': el => setClientFilter(el.dataset.mode),
   'client-right': el => clientToggleRight(el.dataset.id, el.dataset.right),
+  'client-rotate': el => clientRotateModal(el.dataset.id),
   'client-revoke': el => clientRevokeConfirm(el.dataset.id),
   'pair-approve': el => pairApprove(el.dataset.id),
   'pair-reject': el => pairReject(el.dataset.id),
   'pair-right': el => pairRightChange(el),
+  'close-other-sessions': () => closeOtherSessions(),
+  'decision-filter': el => setDecisionFilter(el),
   // -- formulaires et dialogs
   'add-submit': (_el, ev) => addServer(ev),
   'login-submit': (_el, ev) => loginSubmit(ev),
