@@ -464,8 +464,9 @@ pub struct Decision {
 struct Core {
     entrees: Vec<Entree>,
     decisions: VecDeque<Value>,
-    /// Compteur de la dernière décision écrite dans l'anneau (anti-doublon des
-    /// lignes « en attente » quand le client réessaie).
+    /// Compteur monotone de révision (incrémenté sur création, décision,
+    /// consommation, révocation ou expiration).
+    rev_seq: u64,
     ttl: u64,
     fenetre: u64,
 }
@@ -475,6 +476,7 @@ impl Core {
         Core {
             entrees: Vec::new(),
             decisions: VecDeque::new(),
+            rev_seq: 0,
             ttl,
             fenetre,
         }
@@ -488,6 +490,7 @@ impl Core {
         while self.decisions.len() > DECISIONS_KEPT {
             self.decisions.pop_front();
         }
+        self.rev_seq = self.rev_seq.wrapping_add(1);
     }
 
     fn en_attente(&self) -> usize {
@@ -507,6 +510,7 @@ impl Core {
                 gardees.push(e);
                 continue;
             }
+            self.rev_seq = self.rev_seq.wrapping_add(1);
             match e.etat {
                 Etat::Attente => {
                     lignes.push(format!(
@@ -580,6 +584,7 @@ impl Core {
             echeance: now.saturating_add(self.ttl),
             etat: Etat::Attente,
         });
+        self.rev_seq = self.rev_seq.wrapping_add(1);
         id
     }
 
@@ -898,12 +903,87 @@ pub fn list(state: &Arc<AppState>, actor: Actor<'_>) -> Value {
     vue
 }
 
+fn push_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+impl Core {
+    fn hash_into(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.rev_seq.to_be_bytes());
+        buf.extend_from_slice(&(self.entrees.len() as u64).to_be_bytes());
+        for e in &self.entrees {
+            push_bytes(buf, e.id.as_bytes());
+            buf.push(match e.etat {
+                Etat::Attente => 0,
+                Etat::UneFois => 1,
+                Etat::Fenetre => 2,
+                Etat::Refusee => 3,
+            });
+            buf.extend_from_slice(&e.cree.to_be_bytes());
+            buf.extend_from_slice(&e.echeance.to_be_bytes());
+        }
+        buf.extend_from_slice(&(self.decisions.len() as u64).to_be_bytes());
+        for d in &self.decisions {
+            push_bytes(buf, d.to_string().as_bytes());
+        }
+    }
+}
+
+fn hash_auth_registry(auth: &crate::auth::AuthState, now: u64, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&(auth.pairs.len() as u64).to_be_bytes());
+    for p in &auth.pairs {
+        push_bytes(buf, p.pair_id.as_bytes());
+        push_bytes(buf, p.keyid.as_bytes());
+        push_bytes(buf, p.status(now).as_bytes());
+        buf.extend_from_slice(&p.created.to_be_bytes());
+        buf.extend_from_slice(&p.decided_at.unwrap_or(0).to_be_bytes());
+    }
+    buf.extend_from_slice(&(auth.clients.len() as u64).to_be_bytes());
+    for c in &auth.clients {
+        push_bytes(buf, c.keyid.as_bytes());
+        push_bytes(buf, c.label.as_bytes());
+        push_bytes(buf, c.public_key.as_bytes());
+        push_bytes(buf, c.status.as_bytes());
+        push_bytes(buf, c.created_at.as_bytes());
+        push_bytes(buf, c.last_used_at.as_deref().unwrap_or("").as_bytes());
+        push_bytes(buf, c.revoked_at.as_deref().unwrap_or("").as_bytes());
+        push_bytes(buf, c.rotated_to.as_deref().unwrap_or("").as_bytes());
+        push_bytes(buf, c.expires_at.as_deref().unwrap_or("").as_bytes());
+        buf.push(u8::from(c.stale_180d(now)));
+        buf.extend_from_slice(&(c.rights.len() as u64).to_be_bytes());
+        for r in &c.rights {
+            push_bytes(buf, r.as_bytes());
+        }
+    }
+}
+
+/// Empreinte entière (53 bits, exacte en JS) de tout l'état Accès : change dès
+/// qu'une confirmation en attente, un permis actif, une demande d'appairage, un
+/// client enregistré ou une décision récente change.
+#[cfg(test)]
+fn compute_revision(core: &Core, auth: &crate::auth::AuthState, now: u64) -> u64 {
+    let mut buf = Vec::with_capacity(512);
+    core.hash_into(&mut buf);
+    hash_auth_registry(auth, now, &mut buf);
+    digest_to_revision(&buf)
+}
+
+fn digest_to_revision(buf: &[u8]) -> u64 {
+    let digest = crate::crypto::sha256(buf);
+    u64::from_be_bytes([
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+    ]) & ((1u64 << 53) - 1)
+}
+
 /// Résumé pour le bandeau de l'interface (aucun texte venu d'un client).
 pub fn summary(state: &Arc<AppState>) -> Value {
     let now = now_ts();
+    let mut buf = Vec::with_capacity(512);
     let (pending, grants) = {
         let mut c = lock_store();
         let _ = c.balayer(now);
+        c.hash_into(&mut buf);
         (
             c.entrees.iter().filter(|e| e.etat == Etat::Attente).count(),
             c.entrees
@@ -912,11 +992,20 @@ pub fn summary(state: &Arc<AppState>) -> Value {
                 .count(),
         )
     };
-    let pairs = crate::auth::pair::list(state, now)["pending"]
-        .as_array()
-        .map(Vec::len)
-        .unwrap_or(0);
-    json!({"pending": pending, "grants": grants, "pairs": pairs})
+    let pairs = {
+        let mut settings = lockv(&state.settings);
+        crate::auth::pair::prune(&mut settings.auth.pairs, now);
+        let pending_pairs = settings
+            .auth
+            .pairs
+            .iter()
+            .filter(|p| p.is_pending(now))
+            .count();
+        hash_auth_registry(&settings.auth, now, &mut buf);
+        pending_pairs
+    };
+    let revision = digest_to_revision(&buf);
+    json!({"pending": pending, "grants": grants, "pairs": pairs, "revision": revision})
 }
 
 // ---------------------------------------------------------------------------
@@ -1417,5 +1506,76 @@ mod tests {
         std::env::set_var("MCC_CONFIRM_SECS", "beaucoup");
         assert_eq!(window_secs(), DEFAULT_WINDOW_SECS);
         std::env::remove_var("MCC_CONFIRM_SECS");
+    }
+
+    #[test]
+    fn revision_change_sur_toutes_les_mutations_et_reste_stable_au_repos() {
+        let mut c = Core::new(120, 600);
+        let mut auth = crate::auth::AuthState::default();
+        let r0 = compute_revision(&c, &auth, 1000);
+        assert_eq!(
+            r0,
+            compute_revision(&c, &auth, 1005),
+            "stable au repos même quand le temps avance"
+        );
+
+        // 1. Confirmation en attente créée
+        let d = arguments_digest(&args_simple());
+        c.decider(1005, &qui(A), "start_server", &d, &effet(), "1");
+        let r1 = compute_revision(&c, &auth, 1005);
+        assert_ne!(r1, r0);
+        assert_eq!(
+            r1,
+            compute_revision(&c, &auth, 1010),
+            "stable tant que la demande vit sans changement"
+        );
+
+        // 2. Passage en permis actif (UneFois -> consommé -> Fenetre)
+        c.entrees[0].etat = Etat::Fenetre;
+        c.entrees[0].echeance = 1605;
+        let r2 = compute_revision(&c, &auth, 1010);
+        assert_ne!(r2, r1);
+
+        // 3. Décision récente enregistrée (même sans changer les permis)
+        c.note(1011, A, "list_servers", "accordé", "-");
+        let r3 = compute_revision(&c, &auth, 1011);
+        assert_ne!(r3, r2);
+
+        // 4. Expiration balayée
+        let _ = c.balayer(1606);
+        let r4 = compute_revision(&c, &auth, 1606);
+        assert_ne!(r4, r3);
+
+        // 5. Demande d'appairage ajoutée puis expirée
+        auth.pairs.push(crate::auth::pair::PairRequest {
+            pair_id: "00000000000000000000000000000001".into(),
+            keyid: A.into(),
+            label: "poste".into(),
+            public_key: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a".into(),
+            code: "123 456".into(),
+            created: 1606,
+            paired_from: "127.0.0.1".into(),
+            decision: None,
+            decided_at: None,
+        });
+        let r5 = compute_revision(&c, &auth, 1606);
+        assert_ne!(r5, r4);
+        let r5_exp = compute_revision(&c, &auth, 1606 + 120);
+        assert_ne!(r5_exp, r5, "expiration d'appairage détectée");
+
+        // 6. Client enregistré puis modifié
+        auth.insert(crate::auth::ClientRecord::new(
+            A.into(),
+            "poste".into(),
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a".into(),
+            vec!["lecture".into()],
+            "127.0.0.1".into(),
+        ))
+        .unwrap();
+        let r6 = compute_revision(&c, &auth, 1730);
+        assert_ne!(r6, r5_exp);
+        auth.revoke(A).unwrap();
+        let r7 = compute_revision(&c, &auth, 1730);
+        assert_ne!(r7, r6);
     }
 }

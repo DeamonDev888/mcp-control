@@ -337,6 +337,22 @@ pub fn authorized(headers: &[(String, String)]) -> bool {
     authorized_session(headers).is_some()
 }
 
+/// Nombre de sessions locales actives (dans leurs bornes d'inactivité et de
+/// durée absolue). Lecture seule : aucun jeton, cookie ni secret n'est exposé.
+pub fn active_count() -> usize {
+    let s = slot();
+    let now = Instant::now();
+    s.sessions
+        .iter()
+        .filter(|x| {
+            !expired(
+                now.duration_since(x.issued),
+                now.duration_since(x.last_seen),
+            )
+        })
+        .count()
+}
+
 /// Révoque toutes les sessions SAUF celle désignée par `current`. Rend le
 /// nombre de sessions fermées (`None` = session courante invalide).
 pub fn close_others(current: &str) -> Option<usize> {
@@ -617,8 +633,11 @@ mod tests {
     #[test]
     fn plusieurs_sessions_simultanees_sans_invalider_les_precedentes() {
         let _g = guard();
+        assert_eq!(active_count(), 0);
         let a = open();
+        assert_eq!(active_count(), 1);
         let b = open();
+        assert_eq!(active_count(), 2);
         assert_ne!(a.cookie, b.cookie);
         // la 2e fenêtre n'a pas invalidé la 1re
         assert!(authorized(&with_session(&a.cookie, &a.secret)));
@@ -649,7 +668,9 @@ mod tests {
         let courante = open();
         let autre1 = open();
         let autre2 = open();
+        assert_eq!(active_count(), 3);
         assert_eq!(close_others(&courante.cookie), Some(2));
+        assert_eq!(active_count(), 1);
         assert!(authorized(&with_session(
             &courante.cookie,
             &courante.secret

@@ -24,6 +24,49 @@ pub const ALL_RIGHTS: [&str; 3] = [RIGHT_LECTURE, RIGHT_PILOTAGE, RIGHT_EXECUTIO
 /// lancement).
 pub const SERVER_KEYID: &str = "mcc-server";
 
+/// Seuil d'inactivité signalé dans l'écran « Accès » (docs/auth.md §3.3).
+pub const STALE_180D_SECS: u64 = 180 * 86_400;
+
+/// Analyse un horodatage UTC `"YYYY-MM-DD HH:MM:SS"` ou `"YYYY-MM-DDTHH:MM:SSZ"`
+/// en secondes Unix. Inverse exact de [`crate::types::iso_utc`].
+fn parse_iso_utc(s: &str) -> Option<u64> {
+    let s = s.trim().strip_suffix('Z').unwrap_or(s.trim());
+    let (date, time) = s.split_once(' ').or_else(|| s.split_once('T'))?;
+    let mut dp = date.split('-');
+    let y: i64 = dp.next()?.parse().ok()?;
+    let m: i64 = dp.next()?.parse().ok()?;
+    let d: i64 = dp.next()?.parse().ok()?;
+    if dp.next().is_some()
+        || !(1970..=9999).contains(&y)
+        || !(1..=12).contains(&m)
+        || !(1..=31).contains(&d)
+    {
+        return None;
+    }
+    let mut tp = time.split(':');
+    let hh: u64 = tp.next()?.parse().ok()?;
+    let mm: u64 = tp.next()?.parse().ok()?;
+    let ss: u64 = tp.next()?.split('.').next()?.parse().ok()?;
+    if tp.next().is_some() || hh > 23 || mm > 59 || ss > 59 {
+        return None;
+    }
+    let y_adj = y - if m <= 2 { 1 } else { 0 };
+    let era = y_adj.div_euclid(400);
+    let yoe = y_adj.rem_euclid(400);
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    if days < 0 {
+        return None;
+    }
+    let ts = (days as u64) * 86_400 + hh * 3600 + mm * 60 + ss;
+    let canonical = format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}");
+    if crate::types::iso_utc(ts) != canonical {
+        return None;
+    }
+    Some(ts)
+}
+
 /// Un droit est accordable à un client s'il fait partie des trois ci-dessus.
 pub fn is_grantable(right: &str) -> bool {
     ALL_RIGHTS.contains(&right)
@@ -151,6 +194,23 @@ impl ClientRecord {
 
     pub fn is_active(&self) -> bool {
         self.status == "active"
+    }
+
+    /// Vrai si la clé est active et inutilisée depuis plus de 180 jours
+    /// (`docs/auth.md` §3.3 : signalement seul, jamais de révocation d'office).
+    pub fn stale_180d(&self, now: u64) -> bool {
+        if !self.is_active() {
+            return false;
+        }
+        let ref_str = self
+            .last_used_at
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&self.created_at);
+        let Some(ref_ts) = parse_iso_utc(ref_str) else {
+            return false;
+        };
+        now.saturating_sub(ref_ts) > STALE_180D_SECS
     }
 
     /// Vue publique : ce que `client_list` et l'écran « Accès » affichent. La
@@ -671,5 +731,37 @@ mod tests {
         )
         .unwrap();
         assert!(AuthState::from_json(&corrompu).clients.is_empty());
+    }
+
+    #[test]
+    fn stale_180d_seuils_et_roundtrip_utc() {
+        for ts in [0, 1, 86_399, 951_782_400, 1_700_000_000, 4_102_444_800] {
+            let formatted = crate::types::iso_utc(ts);
+            assert_eq!(parse_iso_utc(&formatted), Some(ts), "{formatted}");
+        }
+        assert_eq!(parse_iso_utc("2023-11-14T22:13:20Z"), Some(1_700_000_000));
+        assert_eq!(parse_iso_utc("2026-02-29 12:00:00"), None);
+        assert_eq!(parse_iso_utc(""), None);
+
+        let now = 1_800_000_000u64;
+        let mut c = rec("mcc-a-0000000000000001", &["lecture"]);
+        c.created_at = crate::types::iso_utc(now - STALE_180D_SECS);
+        c.last_used_at = None;
+        assert!(!c.stale_180d(now), "exactement 180j = pas encore obsolète");
+
+        c.created_at = crate::types::iso_utc(now - STALE_180D_SECS - 1);
+        assert!(c.stale_180d(now), "> 180j sans usage = obsolète");
+
+        // Un usage récent annule l'ancienneté de created_at
+        c.last_used_at = Some(crate::types::iso_utc(now - 3600));
+        assert!(!c.stale_180d(now));
+
+        // Usage > 180j = obsolète
+        c.last_used_at = Some(crate::types::iso_utc(now - STALE_180D_SECS - 10));
+        assert!(c.stale_180d(now));
+
+        // Client déjà révoqué : jamais signalé comme simple clé inactive
+        c.status = "revoked".to_string();
+        assert!(!c.stale_180d(now));
     }
 }
