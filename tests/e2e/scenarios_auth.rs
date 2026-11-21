@@ -2590,8 +2590,11 @@ fn anti_force_brute_lan_et_tempete_60s_fenetre_locale_fluide() {
     let lat_429 = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u128>::new()));
 
     let mut handles = Vec::new();
+    let lan_host_str = lan.clone();
+    let lan_port_u16 = e2.port;
     for _ in 0..2 {
         let req = raw_bytes.clone();
+        let lan_h = lan_host_str.clone();
         let c401 = std::sync::Arc::clone(&atk_401);
         let c429 = std::sync::Arc::clone(&atk_429);
         let coth = std::sync::Arc::clone(&atk_other);
@@ -2601,7 +2604,24 @@ fn anti_force_brute_lan_et_tempete_60s_fenetre_locale_fluide() {
             while Instant::now() < fin {
                 let t0 = Instant::now();
                 let mut status = 0u16;
-                if let Ok(mut s) =
+                if cfg!(feature = "tls") {
+                    if let Ok((data, _)) = mcp_control::auth::net::https_exchange_raw(
+                        &lan_h,
+                        lan_port_u16,
+                        &req,
+                        Duration::from_secs(5),
+                        None,
+                        4096,
+                    ) {
+                        let head = String::from_utf8_lossy(&data);
+                        status = head
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .and_then(|p| p.parse::<u16>().ok())
+                            .unwrap_or(0);
+                    }
+                } else if let Ok(mut s) =
                     std::net::TcpStream::connect_timeout(&lan_addr, Duration::from_secs(2))
                 {
                     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
@@ -2914,4 +2934,718 @@ fn uniformite_refus_corps_statut_et_temps_1000_requetes() {
             "motif {motif} attendu >= {N} fois dans auth-audit.log, vu {count}"
         );
     }
+}
+
+// =====================================================================
+// Lot M4 — TLS 1.3 réseau, pairs migrés, sondes et proxy signés
+// =====================================================================
+
+/// (Lot M4 points 1 & 2, avec feature `tls`) :
+/// - Écoute hors loopback en TLS 1.3 (`rustls` + `rcgen`, `ALPN http/1.1`),
+///   certificat auto-signé persisté et identique après redémarrage ;
+/// - Capture TCP brute via relais : **0 octet HTTP en clair** (ni en-tête, ni
+///   signature, ni corps JSON-RPC) sur le lien réseau ;
+/// - HTTP en clair hors loopback refusé (0 octet HTTP servi) ;
+/// - ClientHello TLS 1.2 refusé (alerte TLS `0x15`, 0 octet HTTP) ;
+/// - Certificat substitué refusé par `PinnedServer` avant tout échange HTTP ;
+/// - `tls_fp` (`sha256:<64 hex>`) annoncée dans `/auth/pair` et `/api/state`.
+#[cfg(feature = "tls")]
+#[test]
+fn m4_tls13_lan_capture_zero_clair_refus_tls12_et_cert_substitue() {
+    use std::io::Write as _;
+    let _garde = serial_guard();
+    let mut e = spawn(EngineCfg {
+        ui_port: free_port(),
+        ui_bind: "0.0.0.0",
+        api_access: None,
+    })
+    .expect("spawn moteur TLS LAN");
+    e.wait_ready(Duration::from_secs(30)).expect("moteur prêt");
+
+    let st = e.get("/api/state").json();
+    assert_eq!(st["settings"]["tls"]["compiled"], json!(true));
+    assert_eq!(st["settings"]["tls"]["active"], json!(true));
+    assert_eq!(st["settings"]["tls"]["bind_refused"], json!(false));
+    let tls_fp = e.tls_fp();
+    assert!(
+        mcp_control::auth::net::valid_tls_fp(&tls_fp),
+        "tls_fp sha256:<64 hex> attendue, reçu : {tls_fp}"
+    );
+    assert!(
+        e.tmp_dir().join("tls").join("server.crt").exists(),
+        "tls/server.crt doit être persisté"
+    );
+    assert!(
+        e.tmp_dir().join("tls").join("server.key").exists(),
+        "tls/server.key doit être persisté (MCC_KEYRING_SERVICE vide)"
+    );
+
+    // Point 2 : `/auth/pair` intègre `tls_fp` dans sa réponse et dans le code de comparaison.
+    let (_, v_pair) = demander(&e, "mcc-m4-0000000000000001");
+    assert_eq!(
+        v_pair["tls_fp"].as_str(),
+        Some(tls_fp.as_str()),
+        "/auth/pair doit annoncer tls_fp"
+    );
+
+    let Some(lan) = e.lan_ip() else {
+        eprintln!("SKIP partie LAN de m4_tls13_lan : aucune IP LAN non-loopback");
+        return;
+    };
+
+    // 1) Relais TCP passif enregistrant TOUS les octets sur le câble entre le
+    //    client TLS et `<lan>:<e.port>`.
+    let relay_listener = std::net::TcpListener::bind((lan.as_str(), 0)).expect("bind relais TCP");
+    let relay_port = relay_listener.local_addr().unwrap().port();
+    let target_addr: std::net::SocketAddr = format!("{}:{}", lan, e.port).parse().unwrap();
+    let cap_c2s = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let cap_s2c = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let c2s_cl = std::sync::Arc::clone(&cap_c2s);
+    let s2c_cl = std::sync::Arc::clone(&cap_s2c);
+    let relay_th = std::thread::spawn(move || {
+        if let Ok((mut client_sock, _)) = relay_listener.accept() {
+            let mut srv_sock =
+                std::net::TcpStream::connect_timeout(&target_addr, Duration::from_secs(5))
+                    .expect("connect relais -> moteur");
+            let _ = client_sock.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = srv_sock.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut client_r = client_sock.try_clone().unwrap();
+            let mut srv_w = srv_sock.try_clone().unwrap();
+            let t_up = std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = client_r.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    c2s_cl.lock().unwrap().extend_from_slice(&buf[..n]);
+                    if srv_w.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = srv_sock.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                s2c_cl.lock().unwrap().extend_from_slice(&buf[..n]);
+                if client_sock.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+            let _ = t_up.join();
+        }
+    });
+
+    // Appel signé `POST /mcp` (`tools/list`) à travers le relais TCP avec
+    // vérification `PinnedServer` de `tls_fp`.
+    let c_lan = client_appaire(&e, &["lecture"]);
+    let authority = format!("{}:{}", lan, e.port);
+    let body = corps_tools_list(77).to_string();
+    let base_hdrs = [
+        ("Content-Type", "application/json"),
+        ("Mcp-Method", "tools/list"),
+    ];
+    let a_signer = RequestToSign::new("POST", "/mcp", &authority, &base_hdrs, body.as_bytes());
+    let sig_hdrs = c_lan.headers(&a_signer);
+    let mut raw_req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nMcp-Method: tools/list\r\n"
+    );
+    for (k, v) in sig_hdrs.iter() {
+        raw_req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    raw_req.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    ));
+
+    let (dec_resp, obs_fp) = mcp_control::auth::net::https_exchange_raw(
+        &lan,
+        relay_port,
+        raw_req.as_bytes(),
+        Duration::from_secs(10),
+        Some(&tls_fp),
+        2 * 1024 * 1024,
+    )
+    .expect("échange TLS 1.3 via relais");
+    let _ = relay_th.join();
+
+    assert_eq!(obs_fp, tls_fp, "empreinte observée == empreinte épinglée");
+    let parsed = Resp::parse(&dec_resp);
+    assert_eq!(parsed.status, 200, "réponse déchiffrée : {}", parsed.text());
+    assert_eq!(nombre_outils(&parsed), 10);
+
+    // Preuve capture : 0 en-tête et 0 corps en clair sur le câble TCP !
+    let c2s = cap_c2s.lock().unwrap().clone();
+    let s2c = cap_s2c.lock().unwrap().clone();
+    assert!(
+        c2s.len() > 200 && s2c.len() > 200,
+        "octets TLS capturés : c2s={}, s2c={}",
+        c2s.len(),
+        s2c.len()
+    );
+    assert_eq!(c2s[0], 0x16, "premier octet c2s = 0x16 (TLS Handshake)");
+    assert_eq!(s2c[0], 0x16, "premier octet s2c = 0x16 (TLS Handshake)");
+    for interdit in [
+        &b"HTTP/1.1"[..],
+        &b"POST /mcp"[..],
+        &b"Host:"[..],
+        &b"Signature"[..],
+        &b"Signature-Input"[..],
+        &b"Content-Digest"[..],
+        &b"jsonrpc"[..],
+        &b"tools/list"[..],
+        &b"list_servers"[..],
+    ] {
+        assert!(
+            mcp_control::find_sub(&c2s, interdit).is_none(),
+            "motif en clair {:?} trouvé dans c2s !",
+            String::from_utf8_lossy(interdit)
+        );
+        assert!(
+            mcp_control::find_sub(&s2c, interdit).is_none(),
+            "motif en clair {:?} trouvé dans s2c !",
+            String::from_utf8_lossy(interdit)
+        );
+    }
+    eprintln!(
+        "[M4 capture LAN] c2s={} octets, s2c={} octets, 0 motif HTTP/JSON-RPC/Signature en clair",
+        c2s.len(),
+        s2c.len()
+    );
+
+    // 2) HTTP en clair sur `<lan>:<e.port>` → refusé (0 réponse HTTP).
+    {
+        let mut plain = std::net::TcpStream::connect_timeout(&target_addr, Duration::from_secs(3))
+            .expect("connect TCP clair");
+        let _ = plain.set_read_timeout(Some(Duration::from_secs(3)));
+        let _ = plain.write_all(b"GET /api/hello HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        let mut rep = Vec::new();
+        let _ = plain.read_to_end(&mut rep);
+        assert!(
+            !String::from_utf8_lossy(&rep).contains("HTTP/1.1"),
+            "HTTP en clair hors loopback ne doit jamais recevoir de réponse HTTP : {rep:?}"
+        );
+    }
+
+    // 3) ClientHello TLS 1.2 sur `<lan>:<e.port>` → refusé (alerte TLS 0x15, 0 HTTP).
+    {
+        let mut tcp12 = std::net::TcpStream::connect_timeout(&target_addr, Duration::from_secs(3))
+            .expect("connect TCP TLS 1.2");
+        let _ = tcp12.set_read_timeout(Some(Duration::from_secs(3)));
+        let hello_tls12: [u8; 52] = [
+            0x16, 0x03, 0x01, 0x00, 0x2f, // Record Handshake (47 octets)
+            0x01, 0x00, 0x00, 0x2b, // ClientHello (43 octets)
+            0x03, 0x03, // Version TLS 1.2 (0x0303)
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20, 0x00, // Session ID len = 0
+            0x00, 0x02, 0xc0, 0x2f, // Cipher Suite TLS 1.2
+            0x01, 0x00, // Compression null
+            0x00, 0x00, // Extensions len = 0
+        ];
+        tcp12.write_all(&hello_tls12).unwrap();
+        let mut rep12 = Vec::new();
+        let _ = tcp12.read_to_end(&mut rep12);
+        assert!(
+            !String::from_utf8_lossy(&rep12).contains("HTTP/1.1"),
+            "TLS 1.2 ne doit jamais négocier HTTP : {rep12:?}"
+        );
+        if !rep12.is_empty() {
+            assert_eq!(rep12[0], 0x15, "alerte TLS 0x15 attendue sur TLS 1.2");
+        }
+    }
+
+    // 4) Certificat substitué (mauvaise empreinte attendue par PinnedServer) → refusé.
+    let faux_fp = format!("sha256:{}", "f".repeat(64));
+    let err_sub = mcp_control::auth::net::https_exchange_raw(
+        &lan,
+        e.port,
+        raw_req.as_bytes(),
+        Duration::from_secs(5),
+        Some(&faux_fp),
+        4096,
+    )
+    .expect_err("un certificat différent de PinnedServer doit être refusé");
+    assert!(
+        err_sub.contains("PinnedServer") || err_sub.contains("refus TLS"),
+        "attendu refus PinnedServer, reçu : {err_sub}"
+    );
+
+    // 5) Redémarrage : le certificat TLS persiste (même `tls_fp`).
+    e.restart().expect("redémarrage moteur TLS");
+    assert_eq!(
+        e.tls_fp(),
+        tls_fp,
+        "l'empreinte du certificat TLS doit survivre au redémarrage"
+    );
+}
+
+/// (Lot M4 point 1, sans feature `tls` — DA5 = a) :
+/// Sans la feature `tls`, un moteur configuré avec `ui_bind: "0.0.0.0"` refuse
+/// d'écouter hors loopback, reste en `127.0.0.1`, et publie un message clair
+/// dans le journal (`mcc.log`) et dans `/api/state` (`settings.tls`).
+#[cfg(not(feature = "tls"))]
+#[test]
+fn m4_sans_feature_tls_refuse_ecoute_hors_loopback_et_reste_en_local() {
+    let _garde = serial_guard();
+    let mut e = spawn(EngineCfg {
+        ui_port: free_port(),
+        ui_bind: "0.0.0.0",
+        api_access: None,
+    })
+    .expect("spawn moteur sans feature tls");
+    e.wait_ready(Duration::from_secs(30)).expect("moteur prêt");
+
+    let st = e.get("/api/state").json();
+    assert_eq!(st["settings"]["tls"]["compiled"], json!(false));
+    assert_eq!(st["settings"]["tls"]["active"], json!(false));
+    assert_eq!(st["settings"]["tls"]["bind_refused"], json!(true));
+    let notice = st["settings"]["tls"]["notice"].as_str().unwrap_or("");
+    assert!(
+        notice.contains("feature") && notice.contains("127.0.0.1"),
+        "notice TLS claire attendue dans /api/state, reçu : {notice}"
+    );
+
+    let journal = std::fs::read_to_string(e.tmp_dir().join("mcc.log")).unwrap_or_default();
+    assert!(
+        journal.contains("[tls]")
+            && journal.contains("hors loopback refusée")
+            && journal.contains("127.0.0.1"),
+        "message clair attendu dans mcc.log : {journal}"
+    );
+
+    if let Some(host_lan) = e.host_lan_ip() {
+        let addr: std::net::SocketAddr = format!("{}:{}", host_lan, e.port).parse().unwrap();
+        assert!(
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(800)).is_err(),
+            "le moteur sans feature `tls` ne doit PAS écouter sur l'IP LAN {addr}"
+        );
+    }
+}
+
+/// (Lot M4 point 3) Pairs migrés : un pair MCP Control appairé avec le droit
+/// `lecture` interroge `POST /mcp` (`tools/call` `list_servers`) signé par sa
+/// clé Ed25519 (et vérifiant `PinnedServer` en TLS 1.3 hors loopback), sans
+/// aucun secret partagé `api_access` ni `X-MCC-Proof`.
+#[test]
+fn m4_pairs_migres_identite_signee_lecture_sans_x_mcc_proof() {
+    let _garde = serial_guard();
+    let mut e_b = spawn(EngineCfg {
+        ui_port: free_port(),
+        ui_bind: "127.0.0.1",
+        api_access: None,
+    })
+    .expect("spawn pair B");
+    e_b.wait_ready(Duration::from_secs(30))
+        .expect("pair B prêt");
+
+    // Ajoute un serveur sur B pour qu'il soit visible dans la découverte de pairs.
+    let add_b = e_b.action(&json!({
+        "action": "add",
+        "transport": "http",
+        "port": 31_991,
+        "path": "/mcp",
+        "label": "Serveur-Du-Pair-B"
+    }));
+    assert_eq!(add_b["ok"], json!(true), "{add_b}");
+
+    let mut e_a = spawn(EngineCfg {
+        ui_port: free_port(),
+        ui_bind: "127.0.0.1",
+        api_access: None,
+    })
+    .expect("spawn moteur A");
+    e_a.wait_ready(Duration::from_secs(30))
+        .expect("moteur A prêt");
+
+    // Appairage de A auprès de B comme client `lecture` (stocké dans `A/auth/clients/`).
+    let cle_pair = SigningKey::generate();
+    let keyid_pair = "mcc-peer-0000000000000001";
+    let pub_hex = hex_bytes(&cle_pair.verifying_key().to_bytes());
+    let r_pair = e_b.post_json(
+        "/auth/pair",
+        &json!({
+            "keyid": keyid_pair,
+            "label": "pair-moteur-A",
+            "public_key": pub_hex,
+            "created": now(),
+        }),
+    );
+    assert_eq!(r_pair.status, 200, "{}", r_pair.text());
+    let pair_id = r_pair.json()["pair_id"].as_str().unwrap().to_string();
+    let server_pub_b = r_pair.json()["server_pub"].as_str().unwrap().to_string();
+    let tls_fp_b = r_pair.json()["tls_fp"].as_str().unwrap_or("").to_string();
+    let app = e_b.action(&json!({
+        "action": "pair_approve",
+        "pair_id": pair_id,
+        "rights": ["lecture"],
+    }));
+    assert_eq!(app["ok"], json!(true), "{app}");
+
+    let clients_dir_a = e_a.tmp_dir().join("auth").join("clients");
+    std::fs::create_dir_all(&clients_dir_a).unwrap();
+    mcp_control::auth::secret::write_secret_file(
+        &clients_dir_a.join(format!("{keyid_pair}.key")),
+        &cle_pair.export(),
+    )
+    .unwrap();
+    let pin_doc = json!({
+        "keyid": keyid_pair,
+        "label": "pair-moteur-A",
+        "url": format!("http://127.0.0.1:{}", e_b.port),
+        "host": "127.0.0.1",
+        "port": e_b.port,
+        "pair_id": pair_id,
+        "server_pub": server_pub_b,
+        "tls_fp": tls_fp_b,
+        "rights": ["lecture"],
+        "store": "file",
+        "paired_at": mcp_control::types::iso_utc(now()),
+    });
+    mcp_control::auth::secret::write_secret_file(
+        &clients_dir_a.join(format!("{keyid_pair}.pin.json")),
+        &serde_json::to_string_pretty(&pin_doc).unwrap(),
+    )
+    .unwrap();
+
+    // Active la découverte réseau sur A visant le port de B (sans aucun `api_access`).
+    let set_a = e_a.action(&json!({
+        "action": "set_settings",
+        "network_enabled": true,
+        "network_ports": [e_b.port],
+    }));
+    assert_eq!(set_a["ok"], json!(true), "{set_a}");
+
+    let disc = e_a.action(&json!({ "action": "discover_peers" }));
+    assert_eq!(disc["ok"], json!(true), "{disc}");
+
+    let st_a = e_a.get("/api/state").json();
+    let peers = st_a["peers"].as_array().expect("peers array");
+    let found_b = peers
+        .iter()
+        .find(|p| p["ui_port"] == json!(e_b.port))
+        .expect("le pair B doit être découvert par identité signée");
+    assert_eq!(found_b["ip"], json!("127.0.0.1"));
+    assert!(
+        found_b["stats"]["total"].as_u64().unwrap_or(0) >= 1,
+        "le catalogue de B doit être remonté : {found_b}"
+    );
+
+    // Preuve côté B : le journal d'audit a tracé l'appel signé `list_servers` par `keyid_pair`.
+    let audit_b = std::fs::read_to_string(e_b.tmp_dir().join("auth-audit.log")).unwrap_or_default();
+    assert!(
+        audit_b.contains(&format!("keyid={keyid_pair}"))
+            && audit_b.contains("tool=list_servers")
+            && audit_b.contains("verdict=allowed"),
+        "l'appel de pair signé doit figurer dans auth-audit.log de B : {audit_b}"
+    );
+}
+
+/// (Lot M4 points 4 & 5) Serveur LiteMCP verrouillé :
+/// 1. Avant appairage : la sonde reçoit `401` + `WWW-Authenticate` de `litemcp`
+///    → le serveur est vu « joignable mais verrouillé » (`locked: true`,
+///    `state: "PORT-ONLY"`, `framework: "litemcp"`, `tools_count: 0`), et
+///    `call_server_tool` refuse avec un motif explicite ;
+/// 2. Action locale `server_pair` (droit `admin`, refusée hors session locale) :
+///    génère et stocke la clé cliente Ed25519 + épinglage `<keyid>.pin.json` ;
+/// 3. Après inscription de la clé publique sur le serveur LiteMCP : la sonde
+///    signe ses requêtes (`initialize` + `tools/list`), le serveur passe `UP`
+///    avec son nombre exact d'outils (2) et `locked: true`, et le proxy
+///    `call_server_tool` signe l'appel d'outil de bout en bout.
+#[test]
+fn m4_serveur_litemcp_verrouille_sonde_server_pair_et_proxy_call_server_tool() {
+    use litemcp::auth::sign::{ClientKey, KeyStore, NonceCache, SignatureVerifier};
+    use litemcp::auth::VerifiedRequest;
+    use litemcp::server::{McpHeaders, ProtocolProfile};
+    use litemcp::{zod, Gateway as LiteGateway, ServerBuilder};
+    use std::io::Write as _;
+
+    struct DynamicKeyStore {
+        keys: std::sync::Mutex<Vec<(String, [u8; 32])>>,
+    }
+    impl KeyStore for DynamicKeyStore {
+        fn lookup(&self, keyid: &str) -> Option<ClientKey> {
+            let g = self.keys.lock().unwrap();
+            g.iter().find(|(k, _)| k == keyid).map(|(k, pub_bytes)| {
+                ClientKey::new(k.clone(), *pub_bytes)
+                    .with_label("mcp-control")
+                    .with_rights(["lecture", "pilotage", "execution"])
+            })
+        }
+    }
+
+    let _garde = serial_guard();
+    let store = std::sync::Arc::new(DynamicKeyStore {
+        keys: std::sync::Mutex::new(Vec::new()),
+    });
+    let verifier = std::sync::Arc::new(SignatureVerifier::new(
+        std::sync::Arc::clone(&store) as std::sync::Arc<dyn KeyStore>,
+        NonceCache::default(),
+    ));
+    let core = LiteGateway::new(
+        ServerBuilder::new("litemcp-locked-demo", "1.0.0")
+            .protocol_profile(ProtocolProfile::Legacy)
+            .tool_typed(
+                "echo_locked",
+                "Renvoie le message reçu (serveur LiteMCP verrouillé).",
+                zod::object().field("msg", zod::string()).strict(),
+                |args| {
+                    let m = args["msg"].as_str().unwrap_or("");
+                    Ok(json!({ "echoed": m }))
+                },
+            )
+            .require_right("echo_locked", "execution")
+            .tool_typed(
+                "ping_locked",
+                "Sonde de test signée.",
+                zod::object().strict(),
+                |_args| Ok(json!({ "pong": true })),
+            )
+            .require_right("ping_locked", "lecture")
+            .verifier(verifier),
+    )
+    .snapshot();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind serveur LiteMCP");
+    let srv_port = listener.local_addr().unwrap().port();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_cl = std::sync::Arc::clone(&stop);
+    let core_cl = std::sync::Arc::clone(&core);
+
+    let srv_th = std::thread::spawn(move || {
+        while !stop_cl.load(std::sync::atomic::Ordering::Relaxed) {
+            let Ok((mut s, _)) = listener.accept() else {
+                break;
+            };
+            if stop_cl.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let _ = s.set_read_timeout(Some(Duration::from_millis(400)));
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let mut sep_pos = None;
+            loop {
+                if let Some(p) = mcp_control::find_sub(&buf, b"\r\n\r\n") {
+                    sep_pos = Some(p);
+                    let head = String::from_utf8_lossy(&buf[..p]).to_ascii_lowercase();
+                    let cl = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buf.len() >= p + 4 + cl {
+                        break;
+                    }
+                }
+                match s.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                }
+            }
+            let Some(p) = sep_pos else { continue };
+            let head_str = String::from_utf8_lossy(&buf[..p]).to_string();
+            let body = &buf[p + 4..];
+            let mut lines = head_str.split("\r\n");
+            let req_line = lines.next().unwrap_or("");
+            let mut parts = req_line.split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let path = parts.next().unwrap_or("/");
+            if method == "GET" && path == "/health" {
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+                continue;
+            }
+            let mut hdrs: Vec<(String, String)> = Vec::new();
+            let mut authority = String::new();
+            let mut mcp_method = None;
+            let mut mcp_name = None;
+            for l in lines {
+                if let Some((k, v)) = l.split_once(':') {
+                    let kl = k.trim().to_ascii_lowercase();
+                    let vt = v.trim().to_string();
+                    if kl == "host" {
+                        authority = vt.clone();
+                    } else if kl == "mcp-method" {
+                        mcp_method = Some(vt.clone());
+                    } else if kl == "mcp-name" {
+                        mcp_name = Some(vt.clone());
+                    }
+                    hdrs.push((kl, vt));
+                }
+            }
+            if mcp_method.is_none() {
+                let _ = s.write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 27\r\nConnection: close\r\n\r\n{\"error\":\"missing headers\"}",
+                );
+                continue;
+            }
+            let _ = McpHeaders {
+                protocol_version: None,
+                method: mcp_method,
+                name: mcp_name,
+                params: Vec::new(),
+            };
+            let refs: Vec<(&str, &str)> =
+                hdrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let vreq = VerifiedRequest::new(method, path, &authority, &refs, body);
+            let vresp = core_cl.dispatch_verified(&vreq);
+            let status_txt = match vresp.status {
+                200 => "200 OK",
+                202 => "202 Accepted",
+                401 => "401 Unauthorized",
+                403 => "403 Forbidden",
+                _ => "400 Bad Request",
+            };
+            let mut http_resp = format!(
+                "HTTP/1.1 {status_txt}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+                vresp.body.len()
+            );
+            for (hk, hv) in &vresp.headers {
+                http_resp.push_str(&format!("{hk}: {hv}\r\n"));
+            }
+            http_resp.push_str("Connection: close\r\n\r\n");
+            let _ = s.write_all(http_resp.as_bytes());
+            let _ = s.write_all(&vresp.body);
+        }
+    });
+
+    let e = engine_ready();
+    let add = e.action(&json!({
+        "action": "add",
+        "transport": "http",
+        "port": srv_port,
+        "path": "/mcp",
+        "label": "LiteMCP Verrouillé"
+    }));
+    assert_eq!(add["ok"], json!(true), "{add}");
+    let srv_id = add["id"].as_str().unwrap().to_string();
+
+    // 1) Avant appairage : le serveur répond 401 + WWW-Authenticate LiteMCP →
+    //    vu « joignable mais verrouillé » (`locked: true`, `framework: "litemcp"`,
+    //    `state: "PORT-ONLY"`, `tools_count: 0`).
+    let _ = e.action(&json!({ "action": "refresh", "id": srv_id }));
+    let st1 = e.get("/api/state").json();
+    let s1 = st1["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == json!(srv_id))
+        .expect("serveur présent");
+    assert_eq!(s1["locked"], json!(true), "locked:true attendu : {s1}");
+    assert_eq!(s1["state"], json!("PORT-ONLY"), "PORT-ONLY attendu : {s1}");
+    assert_eq!(
+        s1["framework"],
+        json!("litemcp"),
+        "framework litemcp attendu : {s1}"
+    );
+    assert_eq!(s1["tools_count"], json!(0));
+    assert!(
+        s1["last_error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("verrouillé (401 Signature)"),
+        "motif verrouillé attendu : {s1}"
+    );
+
+    // `call_server_tool` avant appairage → motif clair indiquant qu'il est verrouillé.
+    let call_avant = e.post_json(
+        "/mcp",
+        &corps_tool(
+            "call_server_tool",
+            json!({
+                "server": srv_id,
+                "tool": "echo_locked",
+                "arguments": { "msg": "test" }
+            }),
+            50,
+        ),
+    );
+    assert_eq!(call_avant.status, 200);
+    assert!(
+        call_avant.text().contains("verrouillé") && call_avant.text().contains("server_pair"),
+        "motif explicite attendu sur call_server_tool non appairé : {}",
+        call_avant.text()
+    );
+
+    // 2) `server_pair` sans session locale → refusé en 401 (action `admin` locale).
+    let sans_sess = e.send(
+        "127.0.0.1",
+        e.port,
+        "POST",
+        "/api/action",
+        &[("Content-Type", "application/json"), ("Cookie", "-")],
+        Some(
+            json!({ "action": "server_pair", "id": srv_id })
+                .to_string()
+                .as_bytes(),
+        ),
+        SignMode::None,
+    );
+    assert_eq!(
+        sans_sess.status,
+        401,
+        "server_pair sans session : {}",
+        sans_sess.text()
+    );
+
+    // Appel local légitime de `server_pair`.
+    let paired = e.action(&json!({
+        "action": "server_pair",
+        "id": srv_id,
+        "label": "mcc-console-m4"
+    }));
+    assert_eq!(paired["ok"], json!(true), "server_pair : {paired}");
+    let keyid = paired["keyid"].as_str().unwrap().to_string();
+    let pub_hex = paired["public_key"].as_str().unwrap().to_string();
+    let pub_bytes = mcp_control::auth::registry::decode_public_key(&pub_hex)
+        .expect("clé publique Ed25519 valide");
+    store.keys.lock().unwrap().push((keyid.clone(), pub_bytes));
+
+    // 3) Après appairage : `refresh` signe `initialize` + `tools/list` → le
+    //    serveur passe `UP` avec ses 2 outils et conserve `locked: true` (badge cadenas).
+    let _ = e.action(&json!({ "action": "refresh", "id": srv_id }));
+    let st2 = e.get("/api/state").json();
+    let s2 = st2["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == json!(srv_id))
+        .expect("serveur présent après server_pair");
+    assert_eq!(s2["state"], json!("UP"), "serveur doit passer UP : {s2}");
+    assert_eq!(s2["locked"], json!(true), "badge cadenas conservé : {s2}");
+    assert_eq!(s2["framework"], json!("litemcp"));
+    assert_eq!(s2["tools_count"], json!(2), "2 outils attendus : {s2}");
+
+    // 4) Proxy `call_server_tool` signé de bout en bout vers `echo_locked`.
+    let call_apres = e.post_json(
+        "/mcp",
+        &corps_tool(
+            "call_server_tool",
+            json!({
+                "server": srv_id,
+                "tool": "echo_locked",
+                "arguments": { "msg": "bonjour-litemcp-signe" }
+            }),
+            51,
+        ),
+    );
+    assert_eq!(call_apres.status, 200, "{}", call_apres.text());
+    assert!(
+        call_apres.text().contains("bonjour-litemcp-signe"),
+        "réponse de l'outil signé attendue : {}",
+        call_apres.text()
+    );
+    let journal = std::fs::read_to_string(e.tmp_dir().join("mcc.log")).unwrap_or_default();
+    assert!(
+        journal.contains("call_server_tool") && journal.contains("(client "),
+        "le proxy doit journaliser le client appelant (C1) : {journal}"
+    );
+
+    drop(e);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = std::net::TcpStream::connect(("127.0.0.1", srv_port));
+    let _ = srv_th.join();
 }

@@ -774,3 +774,8 @@ input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 
 :root[data-theme="light"] #accessBanner{color:#8f5c10;background:rgba(192,133,50,.16);
   border-bottom:1px solid rgba(143,92,16,.40)}
 :root[data-theme="light"] #accessBanner:hover{background:rgba(192,133,50,.26);color:#7a4d0c}
+/* Badge cadenas (lot M4 pt 4) : serveur LiteMCP verrouillé par signature */
+.tag.lock{display:inline-flex;align-items:center;justify-content:center;padding:1px 4px;border:1px solid var(--border-soft)}
+.tag.lock .ic{width:10px;height:10px}
+.tag.lock.unpaired{color:var(--warn);border-color:rgba(192,133,50,.45);background:rgba(192,133,50,.10)}
+.tag.lock.paired{color:var(--ok);border-color:rgba(85,165,131,.40);background:rgba(85,165,131,.08)}

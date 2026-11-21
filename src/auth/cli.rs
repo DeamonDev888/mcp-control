@@ -21,41 +21,76 @@ use crate::auth::pair::{comparison_code, PAIR_TTL_SECS};
 use crate::auth::secret;
 
 pub const USAGE: &str = "mcp-control auth <commande>\n\
-  pair <url>         appairer ce poste avec un moteur MCP Control (http://hôte:port)\n\
+  pair <url>         appairer ce poste avec un moteur MCP Control (http://127.0.0.1:port ou https://hôte:port)\n\
   list               clients appairés du moteur local\n\
   revoke <keyid>     révoquer un client (effet à la requête suivante)\n\
   fingerprint        empreintes de l'identité du serveur local\n\
   verify-log [--path <fichier>]  vérifier la chaîne du journal d'audit (auth-audit.log)";
 
-/// Squelette d'URL accepté : `http://hôte[:port][/]`. Aucun `https` (TLS = lot
-/// M4), aucun chemin (l'API d'appairage est à la racine du port UI).
-pub fn parse_url(url: &str) -> Result<(String, u16), String> {
+/// Analyse une URL `http://hôte[:port][/]` ou `https://hôte[:port][/]`.
+/// Renvoie `(is_https, host, port)`. Sans la feature `tls`, `https://` est refusé
+/// avec un motif explicite.
+pub fn parse_url_scheme(url: &str) -> Result<(bool, String, u16), String> {
     let url = url.trim();
-    let reste = match url.strip_prefix("http://") {
-        Some(r) => r,
-        None if url.starts_with("https://") => {
+    let (is_https, reste, def_port) = if let Some(r) = url.strip_prefix("http://") {
+        (false, r, 80u16)
+    } else if let Some(r) = url.strip_prefix("https://") {
+        if !crate::auth::net::tls_compiled() {
             return Err(
-                "https:// non pris en charge : MCP Control n'écoute pas encore en TLS (lot M4)"
-                    .to_string(),
+                "https:// non pris en charge : binaire compilé sans la feature `tls`".to_string(),
             );
         }
-        None => return Err(format!("URL attendue en http://hôte:port — reçu « {url} »")),
+        (true, r, 443u16)
+    } else {
+        return Err(format!(
+            "URL attendue en http://hôte:port ou https://hôte:port — reçu « {url} »"
+        ));
     };
     let reste = reste.trim_end_matches('/');
     if reste.contains('/') || reste.is_empty() {
-        return Err(format!("URL attendue en http://hôte:port — reçu « {url} »"));
+        return Err(format!(
+            "URL attendue en http(s)://hôte:port sans chemin — reçu « {url} »"
+        ));
     }
-    let (host, port) = match reste.rsplit_once(':') {
-        Some((h, p)) => (
-            h,
-            p.parse::<u16>().map_err(|_| "port invalide".to_string())?,
-        ),
-        None => (reste, 80),
+    let (host, port) = if let Some(bracketed) = reste.strip_prefix('[') {
+        match bracketed.split_once(']') {
+            Some((h, "")) => (h, def_port),
+            Some((h, after)) => match after.strip_prefix(':') {
+                Some(p) => (
+                    h,
+                    p.parse::<u16>().map_err(|_| "port invalide".to_string())?,
+                ),
+                None => return Err("hôte IPv6 invalide".to_string()),
+            },
+            None => return Err("crochet IPv6 non fermé".to_string()),
+        }
+    } else {
+        match reste.rsplit_once(':') {
+            Some((h, p)) => (
+                h,
+                p.parse::<u16>().map_err(|_| "port invalide".to_string())?,
+            ),
+            None => (reste, def_port),
+        }
     };
     if host.is_empty() {
         return Err("hôte vide".to_string());
     }
-    Ok((host.to_string(), port))
+    Ok((is_https, host.to_string(), port))
+}
+
+/// Squelette d'URL HTTP locale (`http://hôte[:port][/]`), utilisé par le pont
+/// stdio (`bridge.rs`).
+pub fn parse_url(url: &str) -> Result<(String, u16), String> {
+    let url = url.trim();
+    if url.starts_with("https://") {
+        return Err(
+            "https:// non pris en charge sur cette commande HTTP locale (lot M4 : utiliser auth pair pour TLS)"
+                .to_string(),
+        );
+    }
+    let (_, host, port) = parse_url_scheme(url)?;
+    Ok((host, port))
 }
 
 /// Préfixe lisible du `keyid` : 1 à 8 caractères `[a-z0-9]` tirés du nom de la
@@ -152,6 +187,55 @@ fn http_json(
     Ok((status, v))
 }
 
+/// Requête HTTP ou HTTPS (TLS 1.3) pour le protocole d'appairage (`auth pair`).
+/// Renvoie `(statut_http, corps_json, empreinte_tls_observee)`.
+fn pair_http_json(
+    is_https: bool,
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    expected_tls_fp: Option<&str>,
+) -> Result<(u16, Value, String), String> {
+    if !is_https {
+        let (status, v) = http_json(host, port, method, path, body)?;
+        return Ok((status, v, String::new()));
+    }
+    let texte = body.map(|b| b.to_string());
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: application/json\r\n"
+    );
+    if let Some(ref b) = texte {
+        req.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            b.len()
+        ));
+    }
+    req.push_str("\r\n");
+    if let Some(ref b) = texte {
+        req.push_str(b);
+    }
+    let (data, observed_fp) = crate::auth::net::https_exchange_raw(
+        host,
+        port,
+        req.as_bytes(),
+        Duration::from_secs(15),
+        expected_tls_fp,
+        4 * 1024 * 1024,
+    )?;
+    let texte_rep = String::from_utf8_lossy(&data).to_string();
+    let (head, corps) = texte_rep.split_once("\r\n\r\n").unwrap_or((&texte_rep, ""));
+    let status = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| "réponse HTTPS illisible".to_string())?;
+    let v: Value = serde_json::from_str(corps).unwrap_or(Value::Null);
+    Ok((status, v, observed_fp))
+}
+
 /// Chemin de `config.json` de CE poste (même résolution que le moteur).
 fn config_path() -> String {
     crate::manage::resolve_config_path(env!("CARGO_MANIFEST_DIR"), std::env::var("MCC_CONFIG").ok())
@@ -195,13 +279,36 @@ fn action(v: Value) -> Result<Value, String> {
 
 /// `auth pair <url>` — les cinq messages du §3.4, côté client.
 fn cmd_pair(url: &str) -> i32 {
-    let (host, port) = match parse_url(url) {
+    let (is_https, host, port) = match parse_url_scheme(url) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("auth pair : {e}");
             return 2;
         }
     };
+    if !is_https && !crate::is_loopback_bind(&host) {
+        eprintln!(
+            "auth pair : connexion HTTP en clair hors loopback refusée (DA5 : utiliser https://{host}:{port})"
+        );
+        return 1;
+    }
+    let cfg_dir = config_dir();
+    // Si un épinglage existe déjà pour ce serveur avec TLS, tout repli HTTP ou
+    // changement de certificat dès la connexion est refusé (§3.4 et §7).
+    let pre_pinned_tls = crate::auth::net::find_existing_pin(&cfg_dir, &host, port)
+        .and_then(|v| {
+            v.get("tls_fp")
+                .and_then(|t| t.as_str())
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|s| !s.is_empty());
+    if !is_https && pre_pinned_tls.is_some() {
+        eprintln!(
+            "auth pair : le serveur {host}:{port} avait une empreinte TLS épinglée — repli HTTP en clair refusé"
+        );
+        return 1;
+    }
+
     let cle = litemcp::auth::sign::SigningKey::generate();
     let cle_pub = crate::crypto::hex(&cle.verifying_key().to_bytes());
     let keyid = format!("mcc-{}-{}", keyid_prefix(&hostname()), crate::random_hex(1));
@@ -211,7 +318,15 @@ fn cmd_pair(url: &str) -> i32 {
         "public_key": cle_pub,
         "created": crate::types::now_ts(),
     });
-    let (status, reponse) = match http_json(&host, port, "POST", "/auth/pair", Some(&corps)) {
+    let (status, reponse, observed_tls_fp) = match pair_http_json(
+        is_https,
+        &host,
+        port,
+        "POST",
+        "/auth/pair",
+        Some(&corps),
+        pre_pinned_tls.as_deref(),
+    ) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("auth pair : {e}");
@@ -249,6 +364,37 @@ fn cmd_pair(url: &str) -> i32 {
         eprintln!("auth pair : réponse d'appairage incomplète — abandon");
         return 1;
     }
+    // §3.4 message 2 : comparer `tls_fp` à l'empreinte observée pendant la
+    // poignée de main TLS ; différentes → abandon explicite.
+    if is_https {
+        if tls_fp.is_empty() || !crate::auth::net::valid_tls_fp(&tls_fp) {
+            eprintln!(
+                "auth pair : le serveur TLS n'a pas annoncé d'empreinte tls_fp valide — abandon"
+            );
+            return 1;
+        }
+        if !litemcp::auth::PinnedServer::new(&observed_tls_fp)
+            .is_ok_and(|p| p.verify(&tls_fp).is_ok())
+        {
+            eprintln!(
+                "auth pair : l'empreinte TLS annoncée ({tls_fp}) diffère du certificat observé ({observed_tls_fp}) — certificat substitué ou MITM, abandon"
+            );
+            return 1;
+        }
+    } else if !tls_fp.is_empty() {
+        eprintln!(
+            "auth pair : le serveur annonce une empreinte TLS ({tls_fp}) sur une connexion HTTP en clair — utiliser https://{host}:{port}"
+        );
+        return 1;
+    }
+    // §7 : refuser un serveur dont l'identité Ed25519 ou le certificat TLS a
+    // changé par rapport à un épinglage existant.
+    if let Err(e) =
+        crate::auth::net::verify_no_identity_change(&cfg_dir, &host, port, &server_pub, &tls_fp)
+    {
+        eprintln!("auth pair : {e}");
+        return 1;
+    }
     let code = comparison_code(&pair_id, &cle_pub, &server_pub, &tls_fp);
     println!("Demande d'appairage envoyée à {host}:{port}");
     println!("  keyid client : {keyid}");
@@ -256,6 +402,9 @@ fn cmd_pair(url: &str) -> i32 {
         "  empreinte    : {}",
         crate::auth::registry::fingerprint_of(&cle_pub).unwrap_or_default()
     );
+    if !tls_fp.is_empty() {
+        println!("  certificat   : {tls_fp}");
+    }
     println!();
     println!("  CODE DE COMPARAISON : {code}");
     println!();
@@ -263,6 +412,11 @@ fn cmd_pair(url: &str) -> i32 {
     println!("« Accès »), puis approuve la demande avec les droits voulus.");
     println!("Attente de l'approbation ({} s au plus)...", PAIR_TTL_SECS);
 
+    let expected_poll_tls = if is_https {
+        Some(tls_fp.as_str())
+    } else {
+        None
+    };
     let limite = Instant::now() + Duration::from_secs(PAIR_TTL_SECS + 10);
     let droits: Vec<String> = loop {
         if Instant::now() >= limite {
@@ -270,14 +424,21 @@ fn cmd_pair(url: &str) -> i32 {
             return 1;
         }
         std::thread::sleep(Duration::from_secs(2));
-        let (status, v) =
-            match http_json(&host, port, "GET", &format!("/auth/pair/{pair_id}"), None) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("auth pair : {e}");
-                    return 1;
-                }
-            };
+        let (status, v, _) = match pair_http_json(
+            is_https,
+            &host,
+            port,
+            "GET",
+            &format!("/auth/pair/{pair_id}"),
+            None,
+            expected_poll_tls,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("auth pair : {e}");
+                return 1;
+            }
+        };
         if status == 404 {
             eprintln!("auth pair : demande inconnue du serveur (expirée ou redémarrage) — abandon");
             return 1;
@@ -286,9 +447,15 @@ fn cmd_pair(url: &str) -> i32 {
             eprintln!("auth pair : le serveur a répondu {status} — abandon");
             return 1;
         }
-        // L'identité du serveur ne doit pas changer en cours d'appairage.
+        // L'identité et l'empreinte TLS du serveur ne doivent pas changer en cours d'appairage.
         if v.get("server_pub").and_then(|p| p.as_str()) != Some(server_pub.as_str()) {
             eprintln!("auth pair : l'identité du serveur a CHANGÉ pendant l'appairage — abandon");
+            return 1;
+        }
+        if v.get("tls_fp").and_then(|p| p.as_str()).unwrap_or("") != tls_fp {
+            eprintln!(
+                "auth pair : l'empreinte TLS du serveur a CHANGÉ pendant l'appairage — abandon"
+            );
             return 1;
         }
         match v.get("status").and_then(|s| s.as_str()).unwrap_or("") {
@@ -333,7 +500,7 @@ fn cmd_pair(url: &str) -> i32 {
         }
     }
     if range == secret::SecretStore::File {
-        let chemin = config_dir()
+        let chemin = cfg_dir
             .join("auth")
             .join("clients")
             .join(format!("{keyid}.key"));
@@ -342,24 +509,27 @@ fn cmd_pair(url: &str) -> i32 {
             return 1;
         }
     }
+    let scheme = if is_https { "https" } else { "http" };
     let pin = json!({
-        "url": format!("http://{host}:{port}"),
+        "url": format!("{scheme}://{host}:{port}"),
+        "host": host,
+        "port": port,
         "server_keyid": reponse.get("server_keyid").cloned().unwrap_or(Value::Null),
         "server_pub": server_pub,
         "tls_fp": tls_fp,
         "keyid": keyid,
         "paired_at": crate::types::iso_utc(crate::types::now_ts()),
     });
-    let pin_path = config_dir()
+    let pin_path = cfg_dir
         .join("auth")
         .join("clients")
         .join(format!("{keyid}.pin.json"));
     if let Some(parent) = pin_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = std::fs::write(
+    if let Err(e) = secret::write_secret_file(
         &pin_path,
-        serde_json::to_string_pretty(&pin).unwrap_or_default(),
+        &serde_json::to_string_pretty(&pin).unwrap_or_default(),
     ) {
         eprintln!("auth pair : identité du serveur non épinglée ({e})");
         return 1;
@@ -625,6 +795,27 @@ mod tests {
         assert!(parse_url("https://exemple.test:5090")
             .unwrap_err()
             .contains("M4"));
+        assert_eq!(
+            parse_url_scheme("http://127.0.0.1:5504"),
+            Ok((false, "127.0.0.1".to_string(), 5504))
+        );
+        #[cfg(feature = "tls")]
+        {
+            assert_eq!(
+                parse_url_scheme("https://192.0.2.10:5504/"),
+                Ok((true, "192.0.2.10".to_string(), 5504))
+            );
+            assert_eq!(
+                parse_url_scheme("https://exemple.test"),
+                Ok((true, "exemple.test".to_string(), 443))
+            );
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            assert!(parse_url_scheme("https://192.0.2.10:5504")
+                .unwrap_err()
+                .contains("tls"));
+        }
         assert!(parse_url("exemple.test:5090").is_err());
         assert!(parse_url("http://exemple.test:5090/api").is_err());
         assert!(parse_url("http://:5090").is_err());

@@ -224,6 +224,7 @@ pub fn handle_post(
     if settings.auth.find(keyid).is_some() {
         return json_error(409, "keyid déjà enregistré");
     }
+    let tls_fp = settings.auth.tls_fp.clone();
     let pairs = &mut settings.auth.pairs;
     prune(pairs, now);
     // Même keyid déjà en attente : on rend LA MÊME demande (un client qui
@@ -238,12 +239,12 @@ pub fn handle_post(
             "api": PAIR_API,
             "server_keyid": server.keyid,
             "server_pub": server.public_key,
-            "tls_fp": "",
+            "tls_fp": tls_fp,
         });
         return (200, "application/json", resp.to_string().into_bytes());
     }
     let pair_id = crate::random_hex(2);
-    let code = comparison_code(&pair_id, public_key, &server.public_key, "");
+    let code = comparison_code(&pair_id, public_key, &server.public_key, &tls_fp);
     pairs.push(PairRequest {
         pair_id: pair_id.clone(),
         keyid: keyid.to_string(),
@@ -262,7 +263,7 @@ pub fn handle_post(
         "api": PAIR_API,
         "server_keyid": server.keyid,
         "server_pub": server.public_key,
-        "tls_fp": "",
+        "tls_fp": tls_fp,
     });
     (200, "application/json", resp.to_string().into_bytes())
 }
@@ -279,6 +280,7 @@ pub fn handle_get(state: &Arc<AppState>, pair_id: &str, now: u64) -> (u16, &'sta
     }
     let reponse = {
         let mut settings = lockv(&state.settings);
+        let tls_fp = settings.auth.tls_fp.clone();
         prune(&mut settings.auth.pairs, now);
         let Some(pair) = settings.auth.pairs.iter().find(|p| p.pair_id == pair_id) else {
             return json_error(404, "demande inconnue");
@@ -286,13 +288,18 @@ pub fn handle_get(state: &Arc<AppState>, pair_id: &str, now: u64) -> (u16, &'sta
         let Some(server) = settings.auth.server.as_ref() else {
             return json_error(503, "identité du serveur indisponible");
         };
-        (pair.status(now), pair.rights(), server.public_key.clone())
+        (
+            pair.status(now),
+            pair.rights(),
+            server.public_key.clone(),
+            tls_fp,
+        )
     };
     let resp = json!({
         "status": reponse.0,
         "rights": reponse.1,
         "server_pub": reponse.2,
-        "tls_fp": "",
+        "tls_fp": reponse.3,
     });
     (200, "application/json", resp.to_string().into_bytes())
 }
@@ -300,6 +307,7 @@ pub fn handle_get(state: &Arc<AppState>, pair_id: &str, now: u64) -> (u16, &'sta
 /// Action locale `pair_list` : ce que la fenêtre affiche pour comparer le code.
 pub fn list(state: &Arc<AppState>, now: u64) -> Value {
     let mut settings = lockv(&state.settings);
+    let tls_fp = settings.auth.tls_fp.clone();
     prune(&mut settings.auth.pairs, now);
     let server_pub = settings
         .auth
@@ -331,6 +339,7 @@ pub fn list(state: &Arc<AppState>, now: u64) -> Value {
         "ok": true,
         "server_keyid": SERVER_KEYID,
         "server_pub": server_pub,
+        "tls_fp": tls_fp,
         "pending": pending,
         "pending_max": PAIR_MAX_PENDING,
         "ttl_secs": PAIR_TTL_SECS,
@@ -778,5 +787,44 @@ mod tests {
         let pair_id = v["pending"][0]["pair_id"].as_str().unwrap().to_string();
         approve(&st, &pair_id, vec![RIGHT_LECTURE.into()], now).unwrap();
         assert_eq!(list(&st, now)["pending"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tls_fp_integree_dans_post_get_list_et_code_de_comparaison() {
+        let st = state();
+        let fp = format!("sha256:{}", "3c".repeat(32));
+        let srv_pub = lockv(&st.settings)
+            .auth
+            .server
+            .as_ref()
+            .unwrap()
+            .public_key
+            .clone();
+        lockv(&st.settings).auth.tls_fp = fp.clone();
+
+        let now = 1_800_000_000;
+        let ip = Some("192.0.2.18".parse().unwrap());
+        let (s, _, b) = handle_post(
+            &st,
+            &corps(now, "mcc-a-0000000000000001", CLIENT_PUB),
+            ip,
+            now,
+        );
+        assert_eq!(s, 200);
+        let v: Value = serde_json::from_slice(&b).unwrap();
+        let pair_id = v["pair_id"].as_str().unwrap();
+        assert_eq!(v["tls_fp"].as_str(), Some(fp.as_str()));
+
+        let (_, _, bg) = handle_get(&st, pair_id, now);
+        let vg: Value = serde_json::from_slice(&bg).unwrap();
+        assert_eq!(vg["tls_fp"].as_str(), Some(fp.as_str()));
+
+        let vl = list(&st, now);
+        assert_eq!(vl["tls_fp"].as_str(), Some(fp.as_str()));
+        let code_serveur = vl["pending"][0]["code"].as_str().unwrap();
+        let code_attendu = comparison_code(pair_id, CLIENT_PUB, &srv_pub, &fp);
+        let code_sans_tls = comparison_code(pair_id, CLIENT_PUB, &srv_pub, "");
+        assert_eq!(code_serveur, code_attendu);
+        assert_ne!(code_serveur, code_sans_tls);
     }
 }

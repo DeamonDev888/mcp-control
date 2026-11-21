@@ -25,6 +25,9 @@ pub struct McpProbe {
     pub mcp_up: bool,
     #[allow(dead_code)] // réservé : distinguer port fermé vs MCP muet côté UI
     pub port_open: bool,
+    /// Serveur LiteMCP verrouillé (a répondu 401 + `WWW-Authenticate` de la lib,
+    /// ou est sondé avec une identité cliente signée — badge cadenas sur UP/DOWN).
+    pub locked: bool,
     pub pid: Option<u32>,
     pub host: Option<String>,
     pub name: Option<String>,
@@ -59,6 +62,7 @@ impl McpProbe {
         McpProbe {
             mcp_up: false,
             port_open,
+            locked: false,
             pid: None,
             host: None,
             name: None,
@@ -72,6 +76,38 @@ impl McpProbe {
             tools: vec![],
             latency_ms: 0,
             error: Some(err),
+        }
+    }
+
+    /// Serveur LiteMCP joignable mais verrouillé (`401` + `WWW-Authenticate`
+    /// `Signature realm="litemcp", tag="litemcp-auth-v1"`, lot M4 point 4).
+    pub fn locked_litemcp(host: String, health: bool, latency_ms: u64) -> McpProbe {
+        let fw = crate::frameworks::detect(
+            None,
+            Some(crate::LITEMCP_PROTOCOL),
+            health,
+            false,
+            false,
+            Some("rust"),
+        )
+        .or_else(|| crate::frameworks::by_id("litemcp"));
+        McpProbe {
+            mcp_up: false,
+            port_open: true,
+            locked: true,
+            pid: None,
+            host: Some(host),
+            name: None,
+            version: None,
+            protocol: Some(crate::LITEMCP_PROTOCOL.to_string()),
+            sse: false,
+            sse_endpoint: false,
+            ws: false,
+            lang: Some("rust".to_string()),
+            framework: fw.map(|f| f.id.to_string()),
+            tools: vec![],
+            latency_ms,
+            error: Some(crate::auth::net::LOCKED_SERVER_MSG.to_string()),
         }
     }
 }
@@ -1061,22 +1097,44 @@ pub fn lan_reachable() -> Option<bool> {
 /// GET /health sur un hôte précis — vrai si 2xx avec un corps contenant « ok ».
 /// Sonde de vie documentée de litemcp ; second signal du fingerprint du framework.
 pub fn health_ok_host(host: &str, port: u16, timeout_ms: u64) -> bool {
+    let timeout = Duration::from_millis(timeout_ms);
+    let host_hdr = http_host_header(host, port);
+    let req = format!(
+        "GET /health HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        host_hdr
+    );
+    if let Ok(Some(ident)) = crate::auth::net::outbound_identity_for(host, port) {
+        if !ident.tls_fp.is_empty() {
+            let Ok((data, _)) = crate::auth::net::https_exchange_raw(
+                host,
+                port,
+                req.as_bytes(),
+                timeout,
+                Some(&ident.tls_fp),
+                MAX_PROBE_READ_SMALL,
+            ) else {
+                return false;
+            };
+            let Some(sep) = find_sub(&data, b"\r\n\r\n") else {
+                return false;
+            };
+            let head = String::from_utf8_lossy(&data[..sep]).to_lowercase();
+            return (head.starts_with("http/1.1 2") || head.starts_with("http/1.0 2"))
+                && String::from_utf8_lossy(&data[sep + 4..])
+                    .to_lowercase()
+                    .contains("ok");
+        }
+    }
     let addr = match socket_addr(host, port) {
         Ok(a) => a,
         Err(_) => return false,
     };
-    let timeout = Duration::from_millis(timeout_ms);
     let mut stream = match TcpStream::connect_timeout(&addr, timeout) {
         Ok(s) => s,
         Err(_) => return false,
     };
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
-    let host_hdr = http_host_header(host, port);
-    let req = format!(
-        "GET /health HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        host_hdr
-    );
     if stream.write_all(req.as_bytes()).is_err() {
         return false;
     }
@@ -1133,7 +1191,7 @@ fn detect_framework(
 pub fn probe_mcp_any_path(port: u16, timeout_ms: u64) -> Option<(&'static str, McpProbe)> {
     for path in ["/mcp", "/", "/api/mcp"] {
         let p = probe_http(port, path, timeout_ms);
-        if p.mcp_up {
+        if p.mcp_up || p.locked {
             return Some((path, p));
         }
     }
@@ -1537,6 +1595,7 @@ pub fn ssh_probe_server(
     McpProbe {
         mcp_up: true,
         port_open: true,
+        locked: false,
         pid: None,
         host: Some(host.to_string()),
         name,
@@ -1838,6 +1897,39 @@ fn http_request_trusted(
     }
     Err(last_err)
 }
+/// Extrait la méthode JSON-RPC et éventuellement `params.name` / `params.uri`
+/// d'un corps de requête JSON-RPC sortant pour aligner les en-têtes
+/// `Mcp-Method` / `Mcp-Name` avant signature RFC 9421.
+fn extract_rpc_meta(body: &str) -> (Option<String>, Option<String>) {
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        return (None, None);
+    };
+    let m = v
+        .get("method")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let name = match m.as_deref() {
+        Some("tools/call" | "prompts/get") => v
+            .get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        Some("resources/read") => v
+            .get("params")
+            .and_then(|p| p.get("uri"))
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        _ => None,
+    };
+    (m, name)
+}
+
 fn http_request(
     method: &str,
     host: &str,
@@ -1849,7 +1941,115 @@ fn http_request(
 ) -> Result<(Vec<u8>, RespHead), String> {
     let timeout = Duration::from_millis(timeout_ms);
     let mut last_err = String::new();
-    {
+    let outbound = if path != "/api/state" && path != "/api/hello" {
+        crate::auth::net::outbound_identity_for(host, port)
+            .map_err(|e| format!("{}: {}", host, e))?
+    } else {
+        crate::auth::net::outbound_identity_for(host, port)
+            .ok()
+            .flatten()
+    };
+
+    // Host exact (le "localhost" historique casse les vhosts sur hôte distant)
+    let host_hdr = http_host_header(host, port);
+    // path sans CR/LF ni espace : il est placé tel quel dans la ligne de
+    // requête — un path configuré ne doit pas pouvoir injecter d'en-têtes
+    let path = sanitize_http_path(path, "/mcp");
+    let mut req = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\nAccept: application/json, text/event-stream\r\n",
+        method, path, host_hdr
+    );
+    let mut req_headers: Vec<(String, String)> = Vec::new();
+    if body.is_some() {
+        req.push_str("Content-Type: application/json\r\n");
+        req_headers.push(("Content-Type".to_string(), "application/json".to_string()));
+        // Le protocole par défaut est 2024-11-05. Un appelant qui
+        // sonde le protocole stateless fournit SON en-tête
+        // (2026-07-28) : envoyer les deux valeurs dans la même
+        // requête fait répondre 400 aux serveurs stricts.
+        let has_proto = extra_headers
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("MCP-Protocol-Version"));
+        if !has_proto {
+            req.push_str("MCP-Protocol-Version: 2024-11-05\r\n");
+            req_headers.push(("MCP-Protocol-Version".to_string(), "2024-11-05".to_string()));
+        }
+    }
+    for (n, v) in extra_headers {
+        // SÉCURITÉ (audit 2026-10-25 + lot M4) : la valeur ne doit contenir
+        // ni CR/LF ni caractère de contrôle (request splitting impossible) ;
+        // les caractères ASCII imprimables (0x20..=0x7E) sont autorisés pour
+        // supporter les en-têtes RFC 9421 (`Signature-Input`, `Signature`).
+        let name_ok = !n.is_empty()
+            && n.len() <= 128
+            && n.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        let val_ok =
+            !v.is_empty() && v.len() <= 1024 && v.bytes().all(|b| (0x20..=0x7E).contains(&b));
+        if name_ok && val_ok {
+            req.push_str(&format!("{}: {}\r\n", n, v));
+            req_headers.push(((*n).to_string(), (*v).to_string()));
+        }
+    }
+    if let (Some(ident), Some(b)) = (outbound.as_ref(), body) {
+        if method.eq_ignore_ascii_case("POST") && path != "/api/state" {
+            let (rpc_method, rpc_name) = extract_rpc_meta(b);
+            if let Some(m) = rpc_method {
+                let has_method = req_headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("Mcp-Method"));
+                if !has_method && m.bytes().all(|c| (0x21..=0x7E).contains(&c)) {
+                    req.push_str(&format!("Mcp-Method: {}\r\n", m));
+                    req_headers.push(("Mcp-Method".to_string(), m));
+                }
+            }
+            if let Some(nm) = rpc_name {
+                let has_name = req_headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("Mcp-Name"));
+                if !has_name && nm.bytes().all(|c| (0x20..=0x7E).contains(&c)) {
+                    req.push_str(&format!("Mcp-Name: {}\r\n", nm));
+                    req_headers.push(("Mcp-Name".to_string(), nm));
+                }
+            }
+            let hdr_refs: Vec<(&str, &str)> = req_headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            for (k, v) in ident.sign_headers("POST", path, &host_hdr, &hdr_refs, b.as_bytes()) {
+                req.push_str(&format!("{}: {}\r\n", k, v));
+            }
+        }
+    }
+    match body {
+        Some(b) => req.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            b.len(),
+            b
+        )),
+        None => req.push_str("Connection: close\r\n\r\n"),
+    }
+
+    let mut data: Vec<u8> = Vec::new();
+    let mut header_len: Option<usize> = None;
+    let mut status_ok = false;
+
+    if let Some(ident) = outbound.as_ref().filter(|id| !id.tls_fp.is_empty()) {
+        let (tls_data, _) = crate::auth::net::https_exchange_raw(
+            host,
+            port,
+            req.as_bytes(),
+            timeout,
+            Some(&ident.tls_fp),
+            MAX_PROBE_READ,
+        )?;
+        data = tls_data;
+        if let Some(p) = find_sub(&data, b"\r\n\r\n") {
+            header_len = Some(p + 4);
+            let head = String::from_utf8_lossy(&data[..p]).to_lowercase();
+            status_ok = head.starts_with("http/1.1 2") || head.starts_with("http/1.0 2");
+        }
+    } else {
         let addr: SocketAddr = match socket_addr(host, port) {
             Ok(a) => a,
             Err(e) => return Err(format!("addr {}: {}", host, e)),
@@ -1858,63 +2058,12 @@ fn http_request(
             Ok(mut stream) => {
                 stream.set_read_timeout(Some(timeout)).ok();
                 stream.set_write_timeout(Some(timeout)).ok();
-                // Host exact (le "localhost" historique casse les vhosts sur hôte distant)
-                let host_hdr = http_host_header(host, port);
-                // path sans CR/LF ni espace : il est placé tel quel dans la ligne de
-                // requête — un path configuré ne doit pas pouvoir injecter d'en-têtes
-                let path = sanitize_http_path(path, "/mcp");
-                let mut req = format!(
-                    "{} {} HTTP/1.1\r\nHost: {}\r\nAccept: application/json, text/event-stream\r\n",
-                    method, path, host_hdr
-                );
-                if body.is_some() {
-                    req.push_str("Content-Type: application/json\r\n");
-                    // Le protocole par défaut est 2024-11-05. Un appelant qui
-                    // sonde le protocole stateless fournit SON en-tête
-                    // (2026-07-28) : envoyer les deux valeurs dans la même
-                    // requête fait répondre 400 aux serveurs stricts.
-                    let has_proto = extra_headers
-                        .iter()
-                        .any(|(n, _)| n.eq_ignore_ascii_case("MCP-Protocol-Version"));
-                    if !has_proto {
-                        req.push_str("MCP-Protocol-Version: 2024-11-05\r\n");
-                    }
-                }
-                for (n, v) in extra_headers {
-                    // SÉCURITÉ (audit 2026-10-25) : la VALEUR d'un en-tête
-                    // additionnel arrive de sources distantes (le nonce renvoyé
-                    // par /api/hello d'un pair). Écrite telle quelle, une valeur
-                    // contenant \r\n permet le request splitting (injecter des
-                    // en-têtes, voire une seconde requête). On n'écrit que les
-                    // valeurs du jeu sûr (hex/base64/jeton) — le nonce est hex,
-                    // la preuve est hex.
-                    let ok = !v.is_empty()
-                        && v.len() <= 256
-                        && v.chars().all(|c| {
-                            c.is_ascii_alphanumeric()
-                                || matches!(c, '/' | '+' | '=' | '.' | '_' | '-' | '~' | ':')
-                        });
-                    if ok {
-                        req.push_str(&format!("{}: {}\r\n", n, v));
-                    }
-                }
-                match body {
-                    Some(b) => req.push_str(&format!(
-                        "Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        b.len(),
-                        b
-                    )),
-                    None => req.push_str("Connection: close\r\n\r\n"),
-                }
                 if let Err(e) = stream.write_all(req.as_bytes()) {
                     return Err(format!("{} write: {}", host, e));
                 }
-                let mut data = Vec::new();
                 let mut tmp = [0u8; 16384];
                 let deadline = Instant::now() + timeout;
                 // lit l'en-tête puis s'arrête dès que le corps est complet (Content-Length / 0-chunk)
-                let mut header_len: Option<usize> = None;
-                let mut status_ok = false;
                 loop {
                     let remain = deadline.saturating_duration_since(Instant::now());
                     if remain.is_zero() {
@@ -1962,76 +2111,98 @@ fn http_request(
                         }
                     }
                 }
-                if data.is_empty() {
-                    if last_err.is_empty() {
-                        last_err = format!("{}: réponse vide", host);
-                    }
-                    return Err(last_err);
-                }
-                if data.len() > MAX_PROBE_READ {
-                    // Dépassement explicite (audit 02, constat 6) : au lieu de
-                    // laisser le parse conclure « réponse non JSON (N octets) »
-                    // sur un corps tronqué, on nomme la vraie cause : la lecture
-                    // a été coupée au plafond mémoire.
-                    return Err(format!(
-                        "{}: réponse trop grande (plafond de lecture de {} Mio dépassé)",
-                        host,
-                        MAX_PROBE_READ / (1024 * 1024)
-                    ));
-                }
-                if header_len.is_some() && !status_ok {
-                    return Err(format!(
-                        "{}: réponse HTTP non-2xx (port occupé par un non-MCP ?)",
-                        host
-                    ));
-                }
-                // ROBUSTESSE (audit 2026-10-25) : une réponse sans séparateur
-                // CRLFCRLF (serveur qui répond 1-3 octets puis ferme) faisait
-                // panicer sur `data[sep + 4..]` (sep=0, len<4) → le thread du
-                // POLLER mourait en silence (fenêtre desktop : aucune console)
-                // et la supervision des serveurs s'arrêtait définitivement.
-                // On borne l'extraction du corps au contenu réellement reçu.
-                let sep = find_sub(&data, b"\r\n\r\n").unwrap_or(0);
-                let raw_head = String::from_utf8_lossy(&data[..sep]);
-                let head = raw_head.to_lowercase();
-                let header = |name: &str| -> String {
-                    head.lines()
-                        .find_map(|l| l.strip_prefix(name))
-                        .map(|v| v.trim().to_string())
-                        .unwrap_or_default()
-                };
-                // Mcp-Session-Id : nom d'en-tête insensible à la casse, mais la
-                // VALEUR du jeton de session doit conserver sa casse exacte.
-                let session_id = raw_head
-                    .lines()
-                    .find_map(|l| {
-                        let (k, v) = l.split_once(':')?;
-                        if k.trim().eq_ignore_ascii_case("mcp-session-id") {
-                            Some(v.trim().to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-                let resp_head = RespHead {
-                    content_type: header("content-type:"),
-                    server: header("server:"),
-                    powered_by: header("x-powered-by:"),
-                    session_id,
-                };
-                let body_start = sep.saturating_add(4).min(data.len());
-                let mut body_bytes = data[body_start..].to_vec();
-                if head.contains("transfer-encoding: chunked") {
-                    body_bytes = dechunk(&body_bytes);
-                }
-                return Ok((body_bytes, resp_head));
             }
             Err(e) => {
-                last_err = format!("{}: {}", host, e);
+                return Err(format!("{}: {}", host, e));
             }
         }
     }
-    Err(last_err)
+
+    if data.is_empty() {
+        if last_err.is_empty() {
+            last_err = format!("{}: réponse vide", host);
+        }
+        return Err(last_err);
+    }
+    if data.len() > MAX_PROBE_READ {
+        // Dépassement explicite (audit 02, constat 6) : au lieu de
+        // laisser le parse conclure « réponse non JSON (N octets) »
+        // sur un corps tronqué, on nomme la vraie cause : la lecture
+        // a été coupée au plafond mémoire.
+        return Err(format!(
+            "{}: réponse trop grande (plafond de lecture de {} Mio dépassé)",
+            host,
+            MAX_PROBE_READ / (1024 * 1024)
+        ));
+    }
+    if header_len.is_some() && !status_ok {
+        let sep = find_sub(&data, b"\r\n\r\n").unwrap_or(0);
+        let raw_head = String::from_utf8_lossy(&data[..sep]);
+        let first_line = raw_head.lines().next().unwrap_or("");
+        let status_code = first_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse::<u16>().ok())
+            .unwrap_or(0);
+        let www_auth = raw_head
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                if k.trim().eq_ignore_ascii_case("www-authenticate") {
+                    Some(v.trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+        if status_code == 401 && crate::auth::net::is_litemcp_auth_challenge(&www_auth) {
+            return Err(format!("{}: {}", host, crate::auth::net::LOCKED_SERVER_MSG));
+        }
+        return Err(format!(
+            "{}: réponse HTTP non-2xx (port occupé par un non-MCP ?)",
+            host
+        ));
+    }
+    // ROBUSTESSE (audit 2026-10-25) : une réponse sans séparateur
+    // CRLFCRLF (serveur qui répond 1-3 octets puis ferme) faisait
+    // panicer sur `data[sep + 4..]` (sep=0, len<4) → le thread du
+    // POLLER mourait en silence (fenêtre desktop : aucune console)
+    // et la supervision des serveurs s'arrêtait définitivement.
+    // On borne l'extraction du corps au contenu réellement reçu.
+    let sep = find_sub(&data, b"\r\n\r\n").unwrap_or(0);
+    let raw_head = String::from_utf8_lossy(&data[..sep]);
+    let head = raw_head.to_lowercase();
+    let header = |name: &str| -> String {
+        head.lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default()
+    };
+    // Mcp-Session-Id : nom d'en-tête insensible à la casse, mais la
+    // VALEUR du jeton de session doit conserver sa casse exacte.
+    let session_id = raw_head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case("mcp-session-id") {
+                Some(v.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+    let resp_head = RespHead {
+        content_type: header("content-type:"),
+        server: header("server:"),
+        powered_by: header("x-powered-by:"),
+        session_id,
+    };
+    let body_start = sep.saturating_add(4).min(data.len());
+    let mut body_bytes = data[body_start..].to_vec();
+    if head.contains("transfer-encoding: chunked") {
+        body_bytes = dechunk(&body_bytes);
+    }
+    Ok((body_bytes, resp_head))
 }
 
 fn dechunk(data: &[u8]) -> Vec<u8> {
@@ -2217,6 +2388,11 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
                     break 'probe;
                 }
                 Err(e) => {
+                    if e.contains(crate::auth::net::LOCKED_SERVER_MSG) {
+                        err_hote = Some(e);
+                        muet = true;
+                        break 'probe;
+                    }
                     if host == open_host {
                         // PORT MUET (lot A) : la forme a expiré sans AUCUN octet
                         // de l'hôte vérifié ouvert — rejouer les formes suivantes
@@ -2299,6 +2475,14 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
             let motif = err_hote
                 .or(err_repli)
                 .unwrap_or_else(|| "pas de réponse initialize".to_string());
+            if motif.contains(crate::auth::net::LOCKED_SERVER_MSG) {
+                let health = health_ok_host(open_host, port, timeout_ms.clamp(400, 1200));
+                return McpProbe::locked_litemcp(
+                    open_host.to_string(),
+                    health,
+                    t0.elapsed().as_millis() as u64,
+                );
+            }
             return McpProbe::fail(motif, true);
         }
     };
@@ -2409,9 +2593,14 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
             }
         }
     }
+    let locked = crate::auth::net::outbound_identity_for(&host, port)
+        .ok()
+        .flatten()
+        .is_some();
     McpProbe {
         mcp_up: true,
         port_open: true,
+        locked,
         pid: None,
         host: Some(host),
         name,
@@ -2626,6 +2815,7 @@ pub fn probe_stdio(
             McpProbe {
                 mcp_up: true,
                 port_open: true,
+                locked: false,
                 pid: Some(pid),
                 host: None,
                 name,
@@ -2649,6 +2839,7 @@ pub fn probe_stdio(
             McpProbe {
                 mcp_up: true,
                 port_open: true,
+                locked: false,
                 pid: Some(pid),
                 host: None,
                 name,
@@ -2725,18 +2916,124 @@ pub fn probe_http_host(host: &str, port: u16, path: &str, timeout_ms: u64) -> Mc
         return McpProbe::fail(format!("{}:{} injoignable", host, port), false);
     }
     let t0 = Instant::now();
+    let client_info = json!({
+        "name": "mcp-control",
+        "version": env!("CARGO_PKG_VERSION")
+    });
     let init_params = json!({
         "protocolVersion": "2024-11-05",
         "capabilities": {},
-        "clientInfo": {"name": "mcp-control", "version": env!("CARGO_PKG_VERSION")}
+        "clientInfo": client_info.clone()
     });
-    let (res, head) =
-        match rpc_call_host(host, port, path, "initialize", init_params, 1, timeout_ms) {
-            Ok(x) => x,
-            Err(e) => return McpProbe::fail(e, true),
-        };
-    let latency = t0.elapsed().as_millis() as u64;
-    let si = res.get("serverInfo");
+    let strict_meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": client_info.clone(),
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    let init_strict = json!({
+        "protocolVersion": "2026-07-28",
+        "capabilities": {},
+        "clientInfo": client_info,
+        "_meta": strict_meta.clone()
+    });
+    let strict_init_hdrs: [(&str, &str); 2] = [
+        ("MCP-Protocol-Version", "2026-07-28"),
+        ("Mcp-Method", "initialize"),
+    ];
+
+    let mut attempt: Option<(serde_json::Value, RespHead, u64, bool)> = None;
+    let mut err_hote: Option<String> = None;
+    let mut muet = false;
+    for (params, hdrs, stateless) in [
+        (&init_params, &[][..], false),
+        (&init_strict, &strict_init_hdrs[..], true),
+    ] {
+        match rpc_call_host_headers(
+            host,
+            port,
+            path,
+            "initialize",
+            params.clone(),
+            1,
+            timeout_ms,
+            hdrs,
+        ) {
+            Ok((r, h)) => {
+                attempt = Some((r, h, t0.elapsed().as_millis() as u64, stateless));
+                break;
+            }
+            Err(e) => {
+                let is_locked = e.contains(crate::auth::net::LOCKED_SERVER_MSG);
+                let muet_forme = zero_octets(&e, host);
+                err_hote = Some(e);
+                if is_locked || muet_forme {
+                    muet = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut discovered: Option<serde_json::Value> = None;
+    if attempt.is_none() && !muet {
+        let discover_hdrs: [(&str, &str); 2] = [
+            ("MCP-Protocol-Version", "2026-07-28"),
+            ("Mcp-Method", "server/discover"),
+        ];
+        if let Ok((r, h)) = rpc_call_host_headers(
+            host,
+            port,
+            path,
+            "server/discover",
+            json!({ "_meta": strict_meta.clone() }),
+            1,
+            timeout_ms,
+            &discover_hdrs,
+        ) {
+            let proof = r
+                .get("_meta")
+                .and_then(|m| m.get("io.modelcontextprotocol/serverInfo"))
+                .and_then(|si| si.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|n| !n.trim().is_empty())
+                .unwrap_or(false);
+            if proof {
+                discovered = Some(r);
+                attempt = Some((
+                    serde_json::Value::Null,
+                    h,
+                    t0.elapsed().as_millis() as u64,
+                    true,
+                ));
+            } else {
+                err_hote =
+                    Some("server/discover sans serverInfo : ce port ne parle pas MCP".to_string());
+            }
+        }
+    }
+
+    let (res, head, latency, stateless_mode) = match attempt {
+        Some(x) => x,
+        None => {
+            let motif = err_hote.unwrap_or_else(|| "pas de réponse initialize".to_string());
+            if motif.contains(crate::auth::net::LOCKED_SERVER_MSG) {
+                let health = health_ok_host(host, port, timeout_ms.clamp(400, 1200));
+                return McpProbe::locked_litemcp(
+                    host.to_string(),
+                    health,
+                    t0.elapsed().as_millis() as u64,
+                );
+            }
+            return McpProbe::fail(motif, true);
+        }
+    };
+    let si = discovered
+        .as_ref()
+        .and_then(|d| {
+            d.get("_meta")
+                .and_then(|m| m.get("io.modelcontextprotocol/serverInfo"))
+        })
+        .or_else(|| res.get("serverInfo"));
     let name = si
         .and_then(|s| s.get("name"))
         .and_then(|x| x.as_str())
@@ -2748,7 +3045,16 @@ pub fn probe_http_host(host: &str, port: u16, path: &str, timeout_ms: u64) -> Mc
     let protocol = res
         .get("protocolVersion")
         .and_then(|x| x.as_str())
-        .map(String::from);
+        .map(String::from)
+        .or_else(|| {
+            discovered
+                .as_ref()
+                .and_then(|d| d.get("supportedVersions"))
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|x| x.as_str())
+                .map(String::from)
+        });
 
     // Même classification que probe_http (voir le commentaire là-bas) :
     // POST initialize répondu = streamable HTTP ; sse = encodage SSE des
@@ -2775,13 +3081,22 @@ pub fn probe_http_host(host: &str, port: u16, path: &str, timeout_ms: u64) -> Mc
     if !head.session_id.is_empty() {
         session_hdr.push(("Mcp-Session-Id", head.session_id.as_str()));
     }
+    if stateless_mode {
+        session_hdr.push(("MCP-Protocol-Version", "2026-07-28"));
+        session_hdr.push(("Mcp-Method", "tools/list"));
+    }
+    let tools_params = if stateless_mode {
+        json!({ "_meta": strict_meta })
+    } else {
+        json!({})
+    };
     let mut tools = Vec::new();
     if let Ok((tr, _)) = rpc_call_host_headers(
         host,
         port,
         path,
         "tools/list",
-        json!({}),
+        tools_params,
         2,
         timeout_ms,
         &session_hdr,
@@ -2805,9 +3120,14 @@ pub fn probe_http_host(host: &str, port: u16, path: &str, timeout_ms: u64) -> Mc
             }
         }
     }
+    let locked = crate::auth::net::outbound_identity_for(host, port)
+        .ok()
+        .flatten()
+        .is_some();
     McpProbe {
         mcp_up: true,
         port_open: true,
+        locked,
         pid: None,
         host: Some(host.to_string()),
         name,
@@ -2831,17 +3151,67 @@ pub struct PeerProbe {
     pub servers: Option<Value>,
 }
 
-/// Sonde /api/state d'un moteur MCP Control distant (cache de pairs).
-/// `access` : code d'accès API partagé (même valeur des deux côtés).
+/// Sonde un moteur MCP Control distant (cache de pairs).
 ///
-/// SÉCURITÉ (audit 2026-10-24) : le code n'est plus envoyé en clair à la cible —
-/// il était diffusé à toutes les cibles sondées du LAN. Déroulé en deux phases :
-/// 1. GET /api/hello (préauth) → un moteur MCP Control répond avec un nonce à usage unique ;
-/// 2. POST /api/state avec X-MCC-Nonce + X-MCC-Proof = HMAC-SHA256(code, nonce)
-///    (cf. crypto.rs) — un observateur réseau ne récupère qu'une preuve morte.
-///
-/// Un pair en bind loopback accepte aussi la sonde sans preuve (pas de garde).
+/// Lot M4 (point 3, `docs/auth.md` §10) :
+/// 1. Si ce pair est appairé (identité cliente épinglée dans `auth/clients/`),
+///    la sonde utilise `POST /mcp` (`tools/call` `list_servers`, droit
+///    `lecture`), signé avec l'identité cliente et vérifiant `PinnedServer`
+///    en TLS 1.3 hors loopback — plus aucun secret partagé `X-MCC-Proof`.
+/// 2. Repli transitoire DA3 (0.8.x) : si aucun appairage n'existe encore pour
+///    cette cible, conserve le chemin lecture seule `/api/hello` + `/api/state`
+///    avec `X-MCC-Proof` (ou sans preuve sur loopback).
 pub fn probe_peer(ip: &str, port: u16, access: Option<&str>) -> PeerProbe {
+    match crate::auth::net::outbound_identity_for(ip, port) {
+        Err(_) => {
+            return PeerProbe {
+                alive: false,
+                servers: None,
+            };
+        }
+        Ok(Some(_)) => {
+            let hdrs = [("Mcp-Method", "tools/call"), ("Mcp-Name", "list_servers")];
+            let Ok((res, _)) = rpc_call_host_headers(
+                ip,
+                port,
+                "/mcp",
+                "tools/call",
+                json!({ "name": "list_servers", "arguments": {} }),
+                1,
+                2000,
+                &hdrs,
+            ) else {
+                return PeerProbe {
+                    alive: false,
+                    servers: None,
+                };
+            };
+            let doc = res
+                .get("structuredContent")
+                .cloned()
+                .or_else(|| {
+                    res.get("content")
+                        .and_then(|c| c.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|item| item.get("text"))
+                        .and_then(|t| t.as_str())
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                })
+                .unwrap_or(res);
+            if doc.get("servers").is_some() && doc.get("stats").is_some() {
+                return PeerProbe {
+                    alive: true,
+                    servers: Some(doc),
+                };
+            }
+            return PeerProbe {
+                alive: false,
+                servers: None,
+            };
+        }
+        Ok(None) => {}
+    }
+
     let nonce: Option<String> = match http_get_host(ip, port, "/api/hello", 1200) {
         Ok((bytes, _)) => match serde_json::from_slice::<Value>(&bytes) {
             Ok(v) if v.get("app").and_then(|x| x.as_str()) == Some("mcp-control") => {
@@ -2967,6 +3337,33 @@ pub fn control_ui_at_hosts(port: u16, hosts: &[&str]) -> Option<String> {
                         format!("{}:{}", host, port)
                     };
                     return Some(format!("http://{}", h));
+                }
+            }
+        } else if !crate::is_loopback_bind(host) {
+            let host_hdr = http_host_header(host, port);
+            let req = format!(
+                "GET /api/hello HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                host_hdr
+            );
+            if let Ok((raw, _)) = crate::auth::net::https_exchange_raw(
+                host,
+                port,
+                req.as_bytes(),
+                Duration::from_millis(2000),
+                None,
+                MAX_PROBE_READ_SMALL,
+            ) {
+                if let Some(sep) = find_sub(&raw, b"\r\n\r\n") {
+                    if let Ok(v) = serde_json::from_slice::<Value>(&raw[sep + 4..]) {
+                        if v.get("app").and_then(|x| x.as_str()) == Some("mcp-control") {
+                            let h = if host.contains(':') {
+                                format!("[{}]:{}", host, port)
+                            } else {
+                                format!("{}:{}", host, port)
+                            };
+                            return Some(format!("http://{}", h));
+                        }
+                    }
                 }
             }
         }

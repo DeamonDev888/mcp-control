@@ -290,6 +290,14 @@ pub struct AuthState {
     pub server: Option<ServerIdentity>,
     pub clients: Vec<ClientRecord>,
     pub pairs: Vec<crate::auth::pair::PairRequest>,
+    /// Empreinte `sha256:<64 hex>` du certificat TLS 1.3 actif (vide quand
+    /// l'écoute est en loopback, `docs/auth.md` §3.4 et §7).
+    pub tls_fp: String,
+    /// Vrai si `ui_bind` hors loopback a été refusé au démarrage (binaire sans
+    /// feature `tls` ou certificat invalide, DA5 = a).
+    pub tls_bind_refused: bool,
+    /// Message d'information/refus TLS exposé à l'interface (`/api/state`).
+    pub tls_notice: Option<String>,
 }
 
 impl AuthState {

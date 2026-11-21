@@ -335,10 +335,8 @@ impl Engine {
         &self.base_url
     }
 
-    /// IP LAN non-loopback de la machine (astuce UDP : connect("8.8.8.8:80")
-    /// n'émet AUCUN paquet, il sélectionne juste l'interface de routage).
-    /// None si indisponible (pas d'interface LAN, sandbox…).
-    pub fn lan_ip(&self) -> Option<String> {
+    /// IP LAN non-loopback de la machine hôte (indépendamment de la feature `tls`).
+    pub fn host_lan_ip(&self) -> Option<String> {
         let s = UdpSocket::bind("0.0.0.0:0").ok()?;
         s.connect("8.8.8.8:80").ok()?;
         let ip = s.local_addr().ok()?.ip();
@@ -346,6 +344,29 @@ impl Engine {
             return None;
         }
         Some(ip.to_string())
+    }
+
+    /// IP LAN joignable du moteur : disponible lorsque la feature `tls` est
+    /// compilée (DA5 = a : sans `tls`, l'écoute hors loopback est refusée et
+    /// le moteur reste en `127.0.0.1`).
+    pub fn lan_ip(&self) -> Option<String> {
+        if !cfg!(feature = "tls") {
+            return None;
+        }
+        self.host_lan_ip()
+    }
+
+    /// Empreinte `tls_fp` (`sha256:<64 hex>`) publiée par le moteur dans `/api/state`
+    /// (vide en écoute loopback sans TLS).
+    pub fn tls_fp(&self) -> String {
+        self.get("/api/state")
+            .json()
+            .get("settings")
+            .and_then(|s| s.get("tls"))
+            .and_then(|t| t.get("fingerprint"))
+            .and_then(|f| f.as_str())
+            .unwrap_or("")
+            .to_string()
     }
 
     /// URL LAN du moteur (même port que loopback ; bind 0.0.0.0 requis côté moteur).
@@ -524,6 +545,32 @@ impl Engine {
                 req.extend_from_slice(b);
             }
             None => req.extend_from_slice(b"Connection: close\r\n\r\n"),
+        }
+        if !local && cfg!(feature = "tls") {
+            match mcp_control::auth::net::https_exchange_raw(
+                host,
+                port,
+                &req,
+                Duration::from_secs(60),
+                None,
+                64 * 1024 * 1024,
+            ) {
+                Ok((data, _)) => {
+                    if data.is_empty() {
+                        return Resp::dead(format!(
+                            "réponse TLS vide : {}:{} a fermé sans répondre",
+                            host, port
+                        ));
+                    }
+                    return Resp::parse(&data);
+                }
+                Err(e) => {
+                    if let Some(raw_http) = e.split("refus pré-TLS : ").nth(1) {
+                        return Resp::parse(raw_http.as_bytes());
+                    }
+                    return Resp::dead(e);
+                }
+            }
         }
         let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
             Ok(s) => s,
@@ -1013,7 +1060,7 @@ impl Resp {
     }
 
     /// Parse une réponse HTTP brute (status + headers + corps).
-    fn parse(raw: &[u8]) -> Resp {
+    pub fn parse(raw: &[u8]) -> Resp {
         let sep = find_sub(raw, b"\r\n\r\n").unwrap_or(raw.len());
         let head = String::from_utf8_lossy(&raw[..sep]).to_string();
         let mut lines = head.split("\r\n");
