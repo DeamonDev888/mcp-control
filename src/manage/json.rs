@@ -158,6 +158,8 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
                 "scan_to": settings.scan_to,
                 "network_enabled": settings.network_enabled,
                 "network_ports": settings.network_ports,
+                "discovery_ports_only": settings.discovery_ports_only,
+                "discovery_ports_excluded": settings.discovery_ports_excluded,
                 "ssh_hosts": settings.ssh_hosts.iter().map(|h| json!({
                     "ip": h.ip, "user": h.user
                 })).collect::<Vec<_>>(),
@@ -234,6 +236,17 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
     // d'un client par ce canal (le détail vit dans `access_list`, action
     // locale). Aucun verrou de réglages n'est tenu ici (pair::list le prend).
     let access = crate::auth::confirm::summary(state);
+    // Annonces LiteMCP non suivies : lecture seule (aucune adoption ni écriture).
+    let announcements_count = litemcp_announcements(state)["announcements"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|a| a.get("followed").and_then(Value::as_bool) == Some(false))
+                .count()
+        })
+        .unwrap_or(0);
+    // Compteur seul : jamais de jeton, cookie ni secret de session ici.
+    let sessions_active = crate::auth::session::active_count();
     json!({
         "servers": list, "log": logarr,
         "latest_version": latest,
@@ -245,6 +258,8 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
         "settings": settings_val,
         "peers": peers_arr,
         "access": access,
+        "announcements_count": announcements_count,
+        "sessions_active": sessions_active,
     })
 }
 

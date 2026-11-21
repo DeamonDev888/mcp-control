@@ -1487,6 +1487,15 @@ fn set_start_cmd_refuse_seed_et_distant_persiste_le_local() {
     );
 }
 
+/// Verrou sérialisant les tests qui modifient `MCC_LITEMP_REGISTRY` en
+/// parallèle dans le même process de test.
+fn litemp_env_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 /// Helper : dossier d'annonces isolé pour un test (jamais %TEMP% réel).
 fn dossier_annonces(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("mcc-annonces-{}-{tag}", std::process::id()));
@@ -1497,6 +1506,7 @@ fn dossier_annonces(tag: &str) -> std::path::PathBuf {
 
 #[test]
 fn annonces_litemcp_listees_sans_adoption_ni_ecriture() {
+    let _env_garde = litemp_env_guard();
     // Audit S4, point 2 : une annonce trouvée est LISTÉE (« détecté, non
     // suivi »), jamais adoptée : aucun serveur créé, aucun config.json écrit,
     // aucun champ exécuté (exe/args ne sortent même pas de la lecture).
@@ -3589,4 +3599,483 @@ fn m4_json_expose_locked_et_etat_tls() {
         j["settings"]["tls"]["notice"],
         serde_json::json!("écoute hors loopback refusée sans tls")
     );
+}
+
+#[test]
+fn ui_api_state_json_expose_decouverte_annonces_sessions_et_revision() {
+    let _env_garde = litemp_env_guard();
+    let dir = dossier_annonces("ui-api-state");
+    // 2 annonces non suivies + 1 annonce déjà suivie par label/port + 1 JSON cassé
+    std::fs::write(
+        dir.join("libre-1.json"),
+        r#"{"name":"libre-1","port":18781,"version":"0.1.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("libre-2.json"),
+        r#"{"name":"libre-2","port":18782}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("deja-suivi.json"),
+        r#"{"name":"Suivi","port":18783}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("invalide.json"), "{pas json").unwrap();
+
+    let cfg_dir = std::env::temp_dir().join(format!("mcc-uiapi-state-cfg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cfg_dir);
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    let cfg_path = cfg_dir.join("config.json");
+
+    let mut base = match Arc::try_unwrap(test_state()) {
+        Ok(s) => s,
+        Err(_) => panic!("test_state doit être unique"),
+    };
+    base.config_path = cfg_path.to_string_lossy().to_string();
+    let state = Arc::new(base);
+    {
+        let mut st = lockv(&state.settings);
+        st.discovery_ports_only = vec![8787, 3000];
+        st.discovery_ports_excluded = vec![3131, 5090];
+        st.auth.server = Some(crate::auth::ServerIdentity {
+            keyid: crate::auth::SERVER_KEYID.into(),
+            public_key: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a".into(),
+            created_at: crate::types::iso_utc(crate::types::now_ts()),
+        });
+    }
+    lockv(&state.servers).push(srv_http(
+        "srv-suivi",
+        None,
+        "Suivi",
+        None,
+        18783,
+        Origin::Manual,
+        Some(100),
+    ));
+
+    std::env::set_var("MCC_LITEMP_REGISTRY", &dir);
+    let j1 = state_json(&state);
+    let j2 = state_json(&state);
+    std::env::remove_var("MCC_LITEMP_REGISTRY");
+
+    assert_eq!(
+        j1["settings"]["discovery_ports_only"],
+        serde_json::json!([8787, 3000])
+    );
+    assert_eq!(
+        j1["settings"]["discovery_ports_excluded"],
+        serde_json::json!([3131, 5090])
+    );
+    assert_eq!(
+        j1["announcements_count"],
+        serde_json::json!(2),
+        "seules les 2 annonces non suivies doivent compter : {j1}"
+    );
+    // Lecture seule : aucune adoption, aucun config.json créé
+    assert_eq!(lockv(&state.servers).len(), 1);
+    assert!(!cfg_path.exists());
+    assert!(j1["sessions_active"].is_u64());
+
+    let rev0 = j1["access"]["revision"]
+        .as_u64()
+        .expect("access.revision u64 attendu");
+    assert_eq!(
+        j2["access"]["revision"].as_u64(),
+        Some(rev0),
+        "revision doit rester identique sans changement"
+    );
+
+    // Changement 1 : demande d'appairage ajoutée → revision change
+    let now = crate::types::now_ts();
+    let req_pair = serde_json::json!({
+        "keyid": "mcc-ui-0000000000000001",
+        "label": "client-ui",
+        "public_key": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        "created": now,
+    })
+    .to_string();
+    let (status, _, body) = crate::auth::pair::handle_post(&state, req_pair.as_bytes(), None, now);
+    assert_eq!(status, 200);
+    let pair_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["pair_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    std::env::set_var("MCC_LITEMP_REGISTRY", &dir);
+    let rev_pair = state_json(&state)["access"]["revision"].as_u64().unwrap();
+    std::env::remove_var("MCC_LITEMP_REGISTRY");
+    assert_ne!(rev_pair, rev0);
+
+    // Changement 2 : approbation (client inscrit + paire décidée) → revision change
+    let ok = handle_action(
+        &state,
+        &serde_json::json!({
+            "action": "pair_approve",
+            "pair_id": pair_id,
+            "rights": ["lecture"],
+        })
+        .to_string(),
+    );
+    assert_eq!(ok["ok"], serde_json::json!(true));
+    std::env::set_var("MCC_LITEMP_REGISTRY", &dir);
+    let rev_approved = state_json(&state)["access"]["revision"].as_u64().unwrap();
+    std::env::remove_var("MCC_LITEMP_REGISTRY");
+    assert_ne!(rev_approved, rev_pair);
+
+    // Changement 3 : modification des droits puis révocation → revision change
+    let ok = handle_action(
+        &state,
+        r#"{"action":"client_set_scopes","keyid":"mcc-ui-0000000000000001","rights":["lecture","pilotage"]}"#,
+    );
+    assert_eq!(ok["ok"], serde_json::json!(true));
+    std::env::set_var("MCC_LITEMP_REGISTRY", &dir);
+    let rev_scopes = state_json(&state)["access"]["revision"].as_u64().unwrap();
+    std::env::remove_var("MCC_LITEMP_REGISTRY");
+    assert_ne!(rev_scopes, rev_approved);
+
+    let ok = handle_action(
+        &state,
+        r#"{"action":"client_revoke","keyid":"mcc-ui-0000000000000001"}"#,
+    );
+    assert_eq!(ok["ok"], serde_json::json!(true));
+    std::env::set_var("MCC_LITEMP_REGISTRY", &dir);
+    let rev_revoked = state_json(&state)["access"]["revision"].as_u64().unwrap();
+    std::env::remove_var("MCC_LITEMP_REGISTRY");
+    assert_ne!(rev_revoked, rev_scopes);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&cfg_dir);
+}
+
+#[test]
+fn ui_api_access_list_expose_identite_sessions_tls_url_et_stale_180d() {
+    let dir = std::env::temp_dir().join(format!("mcc-uiapi-access-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Crée une vraie clé serveur en repli fichier (service = None → zéro trousseau OS)
+    let loaded = crate::auth::secret::load_or_create_server(&dir, None).expect("clé serveur");
+    let srv_pub_hex = crate::crypto::hex(&loaded.key.verifying_key().to_bytes());
+    let srv_block = loaded.key.export();
+
+    let mut base = match Arc::try_unwrap(test_state()) {
+        Ok(s) => s,
+        Err(_) => panic!("test_state doit être unique"),
+    };
+    base.config_path = dir.join("config.json").to_string_lossy().to_string();
+    let state = Arc::new(base);
+
+    let now = crate::types::now_ts();
+    let cle_pub = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+    let mut frais = crate::auth::ClientRecord::new(
+        "mcc-a-0000000000000001".into(),
+        "frais".into(),
+        cle_pub.into(),
+        vec!["lecture".into()],
+        "127.0.0.1".into(),
+    );
+    frais.created_at = crate::types::iso_utc(now - 3600);
+
+    let mut ancien = crate::auth::ClientRecord::new(
+        "mcc-a-0000000000000002".into(),
+        "ancien".into(),
+        cle_pub.into(),
+        vec!["lecture".into()],
+        "127.0.0.1".into(),
+    );
+    ancien.created_at = crate::types::iso_utc(now - crate::auth::registry::STALE_180D_SECS - 120);
+
+    let mut revoque_ancien = crate::auth::ClientRecord::new(
+        "mcc-a-0000000000000003".into(),
+        "revoque".into(),
+        cle_pub.into(),
+        vec!["lecture".into()],
+        "127.0.0.1".into(),
+    );
+    revoque_ancien.created_at =
+        crate::types::iso_utc(now - crate::auth::registry::STALE_180D_SECS - 120);
+    revoque_ancien.status = "revoked".into();
+
+    let ident = crate::auth::ServerIdentity {
+        keyid: crate::auth::SERVER_KEYID.into(),
+        public_key: srv_pub_hex.clone(),
+        created_at: crate::types::iso_utc(now),
+    };
+    let tls_fp = format!("sha256:{}", "ab".repeat(32));
+    {
+        let mut st = lockv(&state.settings);
+        st.ui_bind = "0.0.0.0".into();
+        st.ui_port = 5544;
+        st.auth.server = Some(ident.clone());
+        st.auth.tls_fp = tls_fp.clone();
+        st.auth.tls_bind_refused = false;
+        st.auth.tls_notice = None;
+        st.auth.insert(frais).unwrap();
+        st.auth.insert(ancien).unwrap();
+        st.auth.insert(revoque_ancien).unwrap();
+    }
+
+    let j = handle_action(&state, r#"{"action":"access_list"}"#);
+    assert_eq!(j["ok"], serde_json::json!(true), "{j}");
+
+    // server_identity sans aucune clé privée
+    assert_eq!(
+        j["server_identity"]["keyid"],
+        serde_json::json!("mcc-server")
+    );
+    assert_eq!(
+        j["server_identity"]["fingerprint"],
+        serde_json::json!(crate::auth::registry::fingerprint_of(&srv_pub_hex).unwrap())
+    );
+    assert_eq!(
+        j["server_identity"]["fingerprint_court"],
+        serde_json::json!(crate::auth::registry::short_fingerprint_of(&srv_pub_hex).unwrap())
+    );
+    assert_eq!(
+        j["server_identity"]["storage"],
+        serde_json::json!("file_fallback")
+    );
+    assert_eq!(
+        server_storage_kind(&ident, &base_path_or(&dir), Some(&srv_block)),
+        "keyring"
+    );
+    // Une autre clé au trousseau ne trompe pas la détection file_fallback
+    let autre_cle = ::litemcp::auth::sign::SigningKey::generate().export();
+    assert_eq!(
+        server_storage_kind(&ident, &base_path_or(&dir), Some(&autre_cle)),
+        "file_fallback"
+    );
+
+    // sessions { active, max: 8 }
+    assert!(j["sessions"]["active"].is_u64());
+    assert_eq!(j["sessions"]["max"], serde_json::json!(8));
+
+    // tls + ui_url (0.0.0.0 + TLS actif -> https://127.0.0.1:5544)
+    assert_eq!(
+        j["tls"]["compiled"],
+        serde_json::json!(crate::auth::net::tls_compiled())
+    );
+    assert_eq!(j["tls"]["active"], serde_json::json!(true));
+    assert_eq!(j["tls"]["fingerprint"], serde_json::json!(tls_fp));
+    assert_eq!(j["tls"]["bind_refused"], serde_json::json!(false));
+    assert!(j["tls"]["notice"].is_null());
+    assert_eq!(j["ui_url"], serde_json::json!("https://127.0.0.1:5544"));
+
+    // Variantes ui_url (loopback, IP LAN, IPv6, bind refusé)
+    assert_eq!(
+        current_ui_url("127.0.0.1", 5090, false, false),
+        "http://127.0.0.1:5090"
+    );
+    assert_eq!(
+        current_ui_url("0.0.0.0", 5090, false, true),
+        "http://127.0.0.1:5090"
+    );
+    assert_eq!(
+        current_ui_url("192.168.1.25", 5090, true, false),
+        "https://192.168.1.25:5090"
+    );
+    assert_eq!(
+        current_ui_url("192.168.1.25", 5090, false, true),
+        "http://127.0.0.1:5090"
+    );
+    assert_eq!(
+        current_ui_url("::1", 5090, false, false),
+        "http://[::1]:5090"
+    );
+
+    // clients[] : stale_180d
+    let clients = j["clients"].as_array().unwrap();
+    let find_c = |id: &str| clients.iter().find(|c| c["keyid"] == id).unwrap();
+    assert_eq!(
+        find_c("mcc-a-0000000000000001")["stale_180d"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        find_c("mcc-a-0000000000000002")["stale_180d"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        find_c("mcc-a-0000000000000003")["stale_180d"],
+        serde_json::json!(false)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn base_path_or(dir: &std::path::Path) -> String {
+    dir.join("config.json").to_string_lossy().to_string()
+}
+
+#[test]
+fn ui_api_check_update_sha256_etats() {
+    let asset = Some("mcp-control-cli-windows-x86_64.exe");
+    let sum = "a".repeat(64);
+    let found = check_update_sha256_json(true, Some("0.8.0"), asset, |tag, a| {
+        assert_eq!(tag, "v0.8.0");
+        assert_eq!(a, "mcp-control-cli-windows-x86_64.exe");
+        Ok(Sha256Lookup::Found(sum.clone()))
+    })
+    .unwrap();
+    assert_eq!(
+        found["asset"],
+        serde_json::json!("mcp-control-cli-windows-x86_64.exe")
+    );
+    assert_eq!(found["sha256"], serde_json::json!(sum));
+    assert!(found["note"].is_null());
+
+    let absent = check_update_sha256_json(true, Some("v0.8.0"), asset, |tag, _| {
+        assert_eq!(tag, "v0.8.0");
+        Ok(Sha256Lookup::Absent)
+    })
+    .unwrap();
+    assert!(absent["sha256"].is_null());
+    assert!(absent["note"].as_str().unwrap().contains("SHA256SUMS.txt"));
+
+    let malformed = check_update_sha256_json(true, Some("0.8.0"), asset, |_, _| {
+        Ok(Sha256Lookup::Malformed)
+    })
+    .unwrap();
+    assert!(malformed["sha256"].is_null());
+    assert!(malformed["note"].as_str().is_some());
+
+    let err =
+        check_update_sha256_json(true, Some("0.8.0"), asset, |_, _| Err("réseau coupé")).unwrap();
+    assert!(err["sha256"].is_null());
+    assert_eq!(err["note"], serde_json::json!("réseau coupé"));
+
+    assert!(check_update_sha256_json(true, None, asset, |_, _| panic!("pas appelé")).is_none());
+    assert!(
+        check_update_sha256_json(false, Some("0.8.0"), asset, |_, _| panic!("pas appelé"))
+            .is_none()
+    );
+}
+
+#[test]
+fn ui_api_aucun_secret_ni_fuite_gateway() {
+    let dir = std::env::temp_dir().join(format!("mcc-uiapi-sec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("auth").join("clients")).unwrap();
+
+    let loaded = crate::auth::secret::load_or_create_server(&dir, None).expect("clé serveur");
+    let srv_pub = crate::crypto::hex(&loaded.key.verifying_key().to_bytes());
+    let srv_priv_block = loaded.key.export();
+    let client_priv_key = ::litemcp::auth::sign::SigningKey::generate().export();
+    let client_key_path = dir
+        .join("auth")
+        .join("clients")
+        .join("mcc-out-0000000000000001.key");
+    std::fs::write(&client_key_path, &client_priv_key).unwrap();
+
+    let mut base = match Arc::try_unwrap(test_state()) {
+        Ok(s) => s,
+        Err(_) => panic!("test_state doit être unique"),
+    };
+    base.config_path = dir.join("config.json").to_string_lossy().to_string();
+    let state = Arc::new(base);
+    {
+        let mut st = lockv(&state.settings);
+        st.api_access = Some("secret-legacy-api-access-999".into());
+        st.notify.headers =
+            "Authorization: Bearer secret-webhook-bearer-888\nX-Hook-Secret: hook-777".into();
+        st.auth.server = Some(crate::auth::ServerIdentity {
+            keyid: crate::auth::SERVER_KEYID.into(),
+            public_key: srv_pub,
+            created_at: crate::types::iso_utc(crate::types::now_ts()),
+        });
+        st.auth
+            .insert(crate::auth::ClientRecord::new(
+                "mcc-c-0000000000000001".into(),
+                "client".into(),
+                "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a".into(),
+                vec!["lecture".into()],
+                "127.0.0.1".into(),
+            ))
+            .unwrap();
+    }
+    lockv(&state.servers).push(Server {
+        id: "stdio-sec".into(),
+        label: "Stdio Secret".into(),
+        transport: Transport::Stdio {
+            program: "node".into(),
+            args: vec!["srv.js".into()],
+            workdir: None,
+            env: vec![("SECRET_TOKEN".into(), "secret-env-value-555".into())],
+        },
+        origin: Origin::Manual,
+        enabled: true,
+        state: SState::Down,
+        pid: None,
+        bound_host: None,
+        server_name: None,
+        version: None,
+        protocol: None,
+        sse: false,
+        sse_endpoint: false,
+        ws: false,
+        lang: None,
+        framework: None,
+        via_ssh: false,
+        tools: vec![],
+        latency_ms: None,
+        last_seen_ts: None,
+        last_error: None,
+        start_cmd: Some(StartCmd {
+            program: "node".into(),
+            args: vec!["srv.js".into()],
+            workdir: None,
+            env: vec![("SECRET_TOKEN".into(), "secret-env-value-555".into())],
+        }),
+        auto_restart: false,
+        favorite: false,
+        tools_disabled: vec![],
+    });
+
+    let st_str = state_json(&state).to_string();
+    let acc_str = handle_action(&state, r#"{"action":"access_list"}"#).to_string();
+
+    for (nom, txt) in [("state_json", &st_str), ("access_list", &acc_str)] {
+        for interdit in [
+            "PRIVATE KEY",
+            "secret-legacy-api-access-999",
+            "secret-webhook-bearer-888",
+            "hook-777",
+            "secret-env-value-555",
+            "mcc_session",
+            "X-MCC-Session",
+            "x-mcc-session",
+        ] {
+            assert!(
+                !txt.contains(interdit),
+                "{nom} ne doit JAMAIS contenir « {interdit} » : {txt}"
+            );
+        }
+        for line in srv_priv_block
+            .lines()
+            .chain(client_priv_key.lines())
+            .filter(|l| l.len() > 24 && !l.starts_with("---"))
+        {
+            assert!(
+                !txt.contains(line),
+                "{nom} a divulgué une ligne de clé privée"
+            );
+        }
+    }
+
+    // Aucune de ces actions admin/sensibles ne doit figurer au catalogue /mcp
+    for interdite in [
+        "access_list",
+        "server_pair",
+        "client_rotate",
+        "litemcp_announcements",
+        "stop_server_force",
+    ] {
+        assert!(
+            !crate::gateway::TOOL_RIGHTS
+                .iter()
+                .any(|(name, _)| *name == interdite),
+            "{interdite} ne doit jamais être exposée sur /mcp"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

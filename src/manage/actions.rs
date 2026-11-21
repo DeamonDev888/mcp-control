@@ -1163,12 +1163,19 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             let verdict = check_update(state);
             let latest = lockv(&state.update_latest).clone();
             let checked = !matches!(verdict, UpdateCheck::Unreachable);
+            let sha256 = check_update_sha256_json(
+                checked,
+                latest.as_deref(),
+                running_asset(),
+                expected_sha256,
+            );
             json!({
                 "ok": true,
                 "checked": checked,
                 "current": env!("CARGO_PKG_VERSION"),
                 "latest": latest,
                 "update_available": latest.is_some(),
+                "sha256": sha256,
             })
         }
         "open_release_page" => {
@@ -1826,6 +1833,49 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
         "access_list" => {
             let mut v = crate::auth::confirm::list(state, crate::auth::confirm::Actor::LocalAdmin);
             let pairs = crate::auth::pair::list(state, crate::types::now_ts());
+            let (server, ui_bind, ui_port, tls_fp, tls_bind_refused, tls_notice) = {
+                let st = lockv(&state.settings);
+                (
+                    st.auth.server.clone(),
+                    st.ui_bind.clone(),
+                    st.ui_port,
+                    st.auth.tls_fp.clone(),
+                    st.auth.tls_bind_refused,
+                    st.auth.tls_notice.clone(),
+                )
+            };
+            let keyring_block = server.as_ref().and_then(|_| {
+                let svc = crate::auth::secret::service()?;
+                crate::auth::secret::load_client_key(
+                    Some(&svc),
+                    crate::auth::secret::ACCOUNT_SERVER,
+                )
+                .ok()
+                .flatten()
+            });
+            let server_identity = match server.as_ref() {
+                Some(ident) => json!({
+                    "keyid": ident.keyid,
+                    "fingerprint": crate::auth::registry::fingerprint_of(&ident.public_key)
+                        .unwrap_or_default(),
+                    "fingerprint_court": crate::auth::registry::short_fingerprint_of(&ident.public_key)
+                        .unwrap_or_default(),
+                    "storage": server_storage_kind(
+                        ident,
+                        &state.config_path,
+                        keyring_block.as_deref(),
+                    ),
+                }),
+                None => json!({
+                    "keyid": "",
+                    "fingerprint": "",
+                    "fingerprint_court": "",
+                    "storage": "unavailable",
+                }),
+            };
+            drop(keyring_block);
+            let tls_active = !tls_fp.is_empty();
+            let ui_url = current_ui_url(&ui_bind, ui_port, tls_active, tls_bind_refused);
             if let Value::Object(o) = &mut v {
                 // Contrat des actions locales : `ok` explicite. Sans lui, l'écran
                 // « Accès » s'arrête sur « lecture impossible » et n'affiche rien.
@@ -1844,6 +1894,25 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 o.insert("pairs_max".into(), pairs["pending_max"].clone());
                 o.insert("pairs_ttl_secs".into(), pairs["ttl_secs"].clone());
                 o.insert("server_pub".into(), pairs["server_pub"].clone());
+                o.insert("server_identity".into(), server_identity);
+                o.insert(
+                    "sessions".into(),
+                    json!({
+                        "active": crate::auth::session::active_count(),
+                        "max": crate::auth::session::MAX_SESSIONS,
+                    }),
+                );
+                o.insert(
+                    "tls".into(),
+                    json!({
+                        "compiled": crate::auth::net::tls_compiled(),
+                        "active": tls_active,
+                        "fingerprint": tls_fp,
+                        "bind_refused": tls_bind_refused,
+                        "notice": tls_notice,
+                    }),
+                );
+                o.insert("ui_url".into(), json!(ui_url));
             }
             v
         }
@@ -1882,6 +1951,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
 /// (clés PUBLIQUES et empreintes seulement — aucun secret, par construction).
 fn clients_json(state: &Arc<AppState>) -> Value {
     let settings = lockv(&state.settings);
+    let now = crate::types::now_ts();
     let clients: Vec<Value> = settings
         .auth
         .clients
@@ -1898,9 +1968,90 @@ fn clients_json(state: &Arc<AppState>) -> Value {
                     json!(crate::auth::registry::short_fingerprint_of(&c.public_key)
                         .unwrap_or_default()),
                 );
+                o.insert("stale_180d".into(), json!(c.stale_180d(now)));
             }
             v
         })
         .collect();
     json!({ "ok": true, "clients": clients })
+}
+
+/// Empreinte SHA-256 de l'actif courant pour `check_update` (S3 pt 5).
+pub(super) fn check_update_sha256_json<F>(
+    checked: bool,
+    latest: Option<&str>,
+    asset: Option<&'static str>,
+    lookup: F,
+) -> Option<Value>
+where
+    F: FnOnce(&str, &str) -> Result<Sha256Lookup, &'static str>,
+{
+    if !checked {
+        return None;
+    }
+    let (v, a) = latest.zip(asset)?;
+    let tag = format!("v{}", v.strip_prefix('v').unwrap_or(v));
+    Some(match lookup(&tag, a) {
+        Ok(Sha256Lookup::Found(s)) => json!({"asset": a, "sha256": s, "note": Value::Null}),
+        Ok(_) => json!({
+            "asset": a,
+            "sha256": Value::Null,
+            "note": "absent ou illisible dans SHA256SUMS.txt"
+        }),
+        Err(e) => json!({"asset": a, "sha256": Value::Null, "note": e}),
+    })
+}
+
+/// Stockage effectif de la clé privée Ed25519 du serveur sans jamais exposer de
+/// secret (`"keyring"` si la clé du trousseau correspond à l'identité publiée,
+/// sinon `"file_fallback"` si `auth/server.key` existe, sinon `"unavailable"`).
+pub(super) fn server_storage_kind(
+    ident: &crate::auth::ServerIdentity,
+    config_path: &str,
+    keyring_secret_block: Option<&str>,
+) -> &'static str {
+    if let Some(block) = keyring_secret_block {
+        if let Ok(key) = ::litemcp::auth::sign::SigningKey::import(block) {
+            if crate::crypto::hex(&key.verifying_key().to_bytes()) == ident.public_key {
+                return "keyring";
+            }
+        }
+    }
+    if !config_path.trim().is_empty() {
+        let dir = std::path::Path::new(config_path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        if crate::auth::secret::server_key_path(dir).exists() {
+            return "file_fallback";
+        }
+    }
+    "unavailable"
+}
+
+/// URL courante de l'interface / appairage (`http(s)://hôte:port`), d'après
+/// `ui_bind`, `ui_port` et TLS actif (repli `127.0.0.1` si `0.0.0.0` ou bind
+/// refusé faute de feature `tls`).
+pub(super) fn current_ui_url(
+    ui_bind: &str,
+    ui_port: u16,
+    tls_active: bool,
+    tls_bind_refused: bool,
+) -> String {
+    let scheme = if tls_active { "https" } else { "http" };
+    let host = if tls_bind_refused {
+        "127.0.0.1".to_string()
+    } else {
+        let b = ui_bind.trim();
+        if b.is_empty() || matches!(b, "0.0.0.0" | "*" | "::" | "[::]") {
+            "127.0.0.1".to_string()
+        } else if b == "::1" || b == "[::1]" {
+            "[::1]".to_string()
+        } else if b.contains(':') && !b.starts_with('[') {
+            format!("[{b}]")
+        } else {
+            b.to_string()
+        }
+    };
+    format!("{scheme}://{host}:{ui_port}")
 }

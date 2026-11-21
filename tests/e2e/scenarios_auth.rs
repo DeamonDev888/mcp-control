@@ -1941,7 +1941,15 @@ fn bandeau_sans_texte_de_client_et_ecran_local_seulement() {
     );
     let v = e.get("/api/state").json();
     let access = v["access"].as_object().expect("access dans /api/state");
-    assert_eq!(access.len(), 3, "compteurs seulement : {access:?}");
+    assert_eq!(
+        access.len(),
+        4,
+        "compteurs + revision seulement : {access:?}"
+    );
+    assert!(
+        access.contains_key("revision"),
+        "revision attendue dans access : {access:?}"
+    );
     for (nom, valeur) in access {
         assert!(valeur.is_u64(), "{nom} doit être un compteur, pas un texte");
     }
@@ -2971,6 +2979,14 @@ fn m4_tls13_lan_capture_zero_clair_refus_tls12_et_cert_substitue() {
         mcp_control::auth::net::valid_tls_fp(&tls_fp),
         "tls_fp sha256:<64 hex> attendue, reçu : {tls_fp}"
     );
+    let acc = e.action(&json!({ "action": "access_list" }));
+    assert_eq!(acc["tls"]["compiled"], json!(true));
+    assert_eq!(acc["tls"]["active"], json!(true));
+    assert_eq!(acc["tls"]["fingerprint"], json!(tls_fp));
+    assert_eq!(
+        acc["ui_url"],
+        json!(format!("https://127.0.0.1:{}", e.port))
+    );
     assert!(
         e.tmp_dir().join("tls").join("server.crt").exists(),
         "tls/server.crt doit être persisté"
@@ -3207,6 +3223,11 @@ fn m4_sans_feature_tls_refuse_ecoute_hors_loopback_et_reste_en_local() {
         notice.contains("feature") && notice.contains("127.0.0.1"),
         "notice TLS claire attendue dans /api/state, reçu : {notice}"
     );
+    let acc = e.action(&json!({ "action": "access_list" }));
+    assert_eq!(acc["tls"]["compiled"], json!(false));
+    assert_eq!(acc["tls"]["active"], json!(false));
+    assert_eq!(acc["tls"]["bind_refused"], json!(true));
+    assert_eq!(acc["ui_url"], json!(format!("http://127.0.0.1:{}", e.port)));
 
     let journal = std::fs::read_to_string(e.tmp_dir().join("mcc.log")).unwrap_or_default();
     assert!(
@@ -3648,4 +3669,274 @@ fn m4_serveur_litemcp_verrouille_sonde_server_pair_et_proxy_call_server_tool() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = std::net::TcpStream::connect(("127.0.0.1", srv_port));
     let _ = srv_th.join();
+}
+
+// =====================================================================
+// Lot UI-api (Stage A) — surface API UI/Auth/Sécurité sans fuite
+// =====================================================================
+
+#[test]
+fn ui_api_stage_a_contrats_securite_et_surface_complete() {
+    let _garde = serial_guard();
+    let _secs = GardeConfirmSecs::defaut();
+    let mut e = engine_ready();
+    e.set_auto_approve(false);
+    poller_endormi(&e);
+
+    // 1) Réglages discovery_ports_*, annonces LiteMCP non suivies, webhook & env secrets
+    let rep = e.action(&json!({
+        "action": "set_settings",
+        "discovery_ports_only": [8787, 3000],
+        "discovery_ports_excluded": [3131],
+    }));
+    assert_eq!(rep["ok"], json!(true), "{rep}");
+
+    let rep_wh = e.action(&json!({
+        "action": "set_notify",
+        "webhook_url": "http://192.0.2.99/hook",
+        "headers": "Authorization: Bearer e2e-webhook-secret-999\nX-Hook-Token: e2e-hook-888",
+    }));
+    assert_eq!(rep_wh["ok"], json!(true), "{rep_wh}");
+
+    let rep_srv = e.action(&json!({
+        "action": "add",
+        "transport": "stdio",
+        "label": "srv-e2e-sec",
+        "program": "node",
+        "args": ["nope.js"],
+        "env": { "API_SECRET": "e2e-env-secret-777" },
+    }));
+    assert_eq!(rep_srv["ok"], json!(true), "{rep_srv}");
+
+    let reg_dir = e.tmp_dir().join("litemcp-registry");
+    std::fs::write(
+        reg_dir.join("libre.json"),
+        r#"{"name":"e2e-libre","port":28787,"version":"0.1.0"}"#,
+    )
+    .unwrap();
+
+    let st0_resp = e.get("/api/state");
+    assert_eq!(st0_resp.status, 200);
+    let st0 = st0_resp.json();
+    assert_eq!(st0["settings"]["discovery_ports_only"], json!([8787, 3000]));
+    assert_eq!(st0["settings"]["discovery_ports_excluded"], json!([3131]));
+    assert_eq!(st0["announcements_count"], json!(1));
+    assert_eq!(st0["sessions_active"], json!(1));
+    assert!(
+        !st0["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["label"] == "e2e-libre"),
+        "l'annonce ne doit jamais être adoptée : {st0}"
+    );
+    let rev0 = st0["access"]["revision"].as_u64().expect("access.revision");
+    assert_eq!(
+        e.get("/api/state").json()["access"]["revision"].as_u64(),
+        Some(rev0),
+        "revision stable au repos"
+    );
+
+    // 2) Sessions : 1 -> 2 via canal fichier -> 1 après close-others
+    let (c2, s2) = e.open_extra_session().expect("seconde session");
+    let st_s2 = e.get("/api/state").json();
+    assert_eq!(st_s2["sessions_active"], json!(2));
+    let acc_s2 = e.action(&json!({ "action": "access_list" }));
+    assert_eq!(acc_s2["sessions"], json!({ "active": 2, "max": 8 }));
+
+    let close = e.post_json("/api/session/close-others", &json!({}));
+    assert_eq!(close.status, 200, "{}", close.text());
+    assert_eq!(e.get("/api/state").json()["sessions_active"], json!(1));
+
+    // 3) access_list : server_identity, sessions, tls, ui_url, clients[].stale_180d
+    let acc = e.action(&json!({ "action": "access_list" }));
+    assert_eq!(acc["ok"], json!(true), "{acc}");
+    assert_eq!(acc["server_identity"]["keyid"], json!("mcc-server"));
+    assert!(acc["server_identity"]["fingerprint"]
+        .as_str()
+        .unwrap_or("")
+        .starts_with("ed25519:"));
+    assert!(acc["server_identity"]["fingerprint_court"]
+        .as_str()
+        .unwrap_or("")
+        .starts_with("ed25519:"));
+    assert_eq!(acc["server_identity"]["storage"], json!("file_fallback"));
+    assert_eq!(acc["sessions"], json!({ "active": 1, "max": 8 }));
+    assert_eq!(acc["tls"]["compiled"], json!(cfg!(feature = "tls")));
+    assert_eq!(acc["tls"]["active"], json!(false));
+    assert_eq!(acc["tls"]["bind_refused"], json!(false));
+    assert_eq!(acc["ui_url"], json!(format!("http://127.0.0.1:{}", e.port)));
+    let clients_arr = acc["clients"].as_array().unwrap();
+    assert!(!clients_arr.is_empty());
+    for c in clients_arr {
+        assert_eq!(c["stale_180d"], json!(false));
+    }
+
+    // 4) access.revision bouge sur chacun des 5 événements Accès
+    let (srv_id, _marqueur) = ajoute_marqueur(&e, "uiapi-rev");
+    let client_exec = client_appaire(&e, &["execution"]);
+    let rev_client = e.get("/api/state").json()["access"]["revision"]
+        .as_u64()
+        .unwrap();
+    assert_ne!(rev_client, rev0, "nouveau client → revision change");
+
+    // 4a. Confirmation en attente
+    let r_pend = post_mcp_signe(
+        &e,
+        &client_exec,
+        "127.0.0.1",
+        &corps_tool("start_server", json!({ "id": srv_id }), 1),
+        None,
+        None,
+    );
+    assert!(demande_confirmation(&r_pend));
+    let rev_pend = e.get("/api/state").json()["access"]["revision"]
+        .as_u64()
+        .unwrap();
+    assert_ne!(rev_pend, rev_client, "demande en attente → revision change");
+
+    // 4b. Permis actif + révocation de permis
+    let req_id = demande_en_attente(&e, "start_server")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let app = e.action(&json!({
+        "action": "confirm_approve",
+        "request_id": req_id,
+        "mode": "window",
+    }));
+    assert_eq!(app["ok"], json!(true));
+    let rev_grant = e.get("/api/state").json()["access"]["revision"]
+        .as_u64()
+        .unwrap();
+    assert_ne!(rev_grant, rev_pend, "permis actif → revision change");
+
+    let revk = e.action(&json!({ "action": "grant_revoke", "request_id": req_id }));
+    assert_eq!(revk["ok"], json!(true));
+    let rev_ungrant = e.get("/api/state").json()["access"]["revision"]
+        .as_u64()
+        .unwrap();
+    assert_ne!(rev_ungrant, rev_grant, "permis révoqué → revision change");
+
+    // 4c. Décision récente (droit manquant)
+    let client_lec = client_appaire(&e, &["lecture"]);
+    let r_deny = post_mcp_signe(
+        &e,
+        &client_lec,
+        "127.0.0.1",
+        &corps_tool("refresh", json!({}), 2),
+        None,
+        None,
+    );
+    assert!(est_refus_droit(&r_deny));
+    let rev_dec = e.get("/api/state").json()["access"]["revision"]
+        .as_u64()
+        .unwrap();
+    assert_ne!(rev_dec, rev_ungrant, "décision récente → revision change");
+
+    // 4d. Demande d'appairage
+    let (ps, pv) = demander(&e, "mcc-uiapi-0000000000000009");
+    assert_eq!(ps, 200, "{pv}");
+    let rev_pair = e.get("/api/state").json()["access"]["revision"]
+        .as_u64()
+        .unwrap();
+    assert_ne!(rev_pair, rev_dec, "demande d'appairage → revision change");
+
+    // 5) Sécurité négative : zéro secret dans state_json et access_list
+    let st_raw = e.get("/api/state").text();
+    let acc_raw = e.action(&json!({ "action": "access_list" })).to_string();
+    let server_key =
+        std::fs::read_to_string(e.tmp_dir().join("auth").join("server.key")).unwrap_or_default();
+    let client_key =
+        std::fs::read_to_string(e.tmp_dir().join("e2e-client.key")).unwrap_or_default();
+    let sess_cookie = e.session_cookie().unwrap_or("");
+    let sess_secret = e.session_secret().unwrap_or("");
+    for (nom, txt) in [("state_json", &st_raw), ("access_list", &acc_raw)] {
+        for secret in [
+            "PRIVATE KEY",
+            "e2e-webhook-secret-999",
+            "e2e-hook-888",
+            "e2e-env-secret-777",
+            "mcc_session",
+            "X-MCC-Session",
+            "x-mcc-session",
+            sess_cookie,
+            sess_secret,
+            c2.as_str(),
+            s2.as_str(),
+        ] {
+            if !secret.is_empty() {
+                assert!(
+                    !txt.contains(secret),
+                    "{nom} ne doit jamais exposer « {secret} »"
+                );
+            }
+        }
+        for line in server_key
+            .lines()
+            .chain(client_key.lines())
+            .filter(|l| l.len() > 24 && !l.starts_with("---"))
+        {
+            assert!(
+                !txt.contains(line),
+                "{nom} ne doit jamais exposer une ligne de clé privée"
+            );
+        }
+    }
+
+    // 6) Actions réservées inatteignables depuis /mcp (ni direct ni par injection),
+    //    même pour un client doté de tous les droits MCP (lecture/pilotage/execution).
+    let client_all = client_appaire(&e, &["lecture", "pilotage", "execution"]);
+    let tl = post_mcp_signe(
+        &e,
+        &client_all,
+        "127.0.0.1",
+        &corps_tools_list(10),
+        None,
+        None,
+    );
+    let tl_txt = tl.text();
+    for interdite in [
+        "access_list",
+        "server_pair",
+        "client_rotate",
+        "litemcp_announcements",
+        "stop_server_force",
+    ] {
+        assert!(!tl_txt.contains(interdite), "{interdite} listée sur /mcp");
+        let direct = post_mcp_signe(
+            &e,
+            &client_all,
+            "127.0.0.1",
+            &corps_tool(interdite, json!({}), 20),
+            None,
+            None,
+        );
+        assert_eq!(
+            direct.json()["error"]["code"],
+            json!(-32602),
+            "appel direct /mcp {interdite} : {}",
+            direct.text()
+        );
+        let inj = post_mcp_signe(
+            &e,
+            &client_all,
+            "127.0.0.1",
+            &corps_tool(
+                "scan_ports",
+                json!({ "from": 1, "to": 2, "action": interdite }),
+                21,
+            ),
+            None,
+            None,
+        );
+        assert_eq!(
+            inj.json()["error"]["code"],
+            json!(-32602),
+            "injection /mcp {interdite} : {}",
+            inj.text()
+        );
+    }
+
+    e.action(&json!({ "action": "kill", "id": srv_id }));
 }
