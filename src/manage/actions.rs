@@ -65,6 +65,8 @@ pub const ACTIONS: &[&str] = &[
     "confirm_deny",
     "grant_revoke",
     "call_tool",
+    "server_unpair",
+    "server_auth_env",
 ];
 
 /// Port HTTP LOCAL d'un serveur (None : stdio, ou serveur distant). Un hôte
@@ -1548,6 +1550,76 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 return json!({"ok": false, "error": "ip manquante"});
             }
             import_peer(state, ip)
+        }
+        "server_unpair" => crate::auth::net::handle_server_unpair(state, body),
+        "server_auth_env" => {
+            let sid = match req.get("id").and_then(|x| x.as_str()) {
+                Some(x) if !x.is_empty() => x.to_string(),
+                _ => return json!({"ok": false, "error": "id manquant"}),
+            };
+            let enable = req.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
+            let ident = {
+                let st = lockv(&state.settings);
+                st.auth
+                    .server
+                    .as_ref()
+                    .map(|i| (i.keyid.clone(), i.public_key.clone()))
+            };
+            let Some((srv_keyid, srv_pub)) = ident else {
+                return json!({"ok": false, "error": "identité Ed25519 de MCP Control indisponible"});
+            };
+            let keys_to_manage = ["MCC_AUTH_KEYID", "MCC_AUTH_PUBKEY", "LITEMCP_TRUSTED_KEYS"];
+            let mut found = false;
+            let mut updated_any = false;
+            {
+                let mut servers = lockv(&state.servers);
+                if let Some(s) = servers.iter_mut().find(|s| s.id == sid) {
+                    found = true;
+                    let auth_st = crate::auth::net::server_auth_status(s);
+                    let trusted_val =
+                        match (auth_st.keyid.as_deref(), auth_st.public_key.as_deref()) {
+                            (Some(ck), Some(cp)) => format!("{srv_keyid}={srv_pub},{ck}={cp}"),
+                            _ => format!("{srv_keyid}={srv_pub}"),
+                        };
+                    let apply_env = |env: &mut Vec<(String, String)>| {
+                        env.retain(|(k, _)| !keys_to_manage.contains(&k.as_str()));
+                        if enable {
+                            env.push(("MCC_AUTH_KEYID".into(), srv_keyid.clone()));
+                            env.push(("MCC_AUTH_PUBKEY".into(), srv_pub.clone()));
+                            env.push(("LITEMCP_TRUSTED_KEYS".into(), trusted_val.clone()));
+                        }
+                    };
+                    if let Some(ref mut sc) = s.start_cmd {
+                        apply_env(&mut sc.env);
+                        updated_any = true;
+                    }
+                    if let Transport::Stdio { ref mut env, .. } = s.transport {
+                        apply_env(env);
+                        updated_any = true;
+                    }
+                }
+            }
+            if !found {
+                return json!({"ok": false, "error": "serveur inconnu"});
+            }
+            if !updated_any {
+                return json!({
+                    "ok": false,
+                    "error": "ce serveur n'a pas de commande locale gérée (utilise « Copier l'identité Ed25519 »)"
+                });
+            }
+            if let Err(e) = save_config_checked(state) {
+                return json!({"ok": false, "error": e});
+            }
+            add_log(
+                state,
+                "info",
+                &format!(
+                    "[auth] variables d'identité Ed25519 {} pour {sid}",
+                    if enable { "activées" } else { "retirées" }
+                ),
+            );
+            json!({"ok": true, "id": sid, "enabled": enable})
         }
         "call_tool" => {
             let sid = match req.get("id").and_then(|x| x.as_str()) {

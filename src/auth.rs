@@ -43,7 +43,7 @@ pub use registry::{
 /// les sept actions d'appairage et de registre du lot M1.
 /// Lot M4 : `server_pair` (appairage sortant de MCP Control avec un serveur
 /// LiteMCP verrouillé, point 5).
-pub const ADMIN_ACTIONS: [&str; 14] = [
+pub const ADMIN_ACTIONS: [&str; 16] = [
     "pair_list",
     "pair_approve",
     "pair_reject",
@@ -56,6 +56,8 @@ pub const ADMIN_ACTIONS: [&str; 14] = [
     "confirm_deny",
     "grant_revoke",
     "server_pair",
+    "server_unpair",
+    "server_auth_env",
     "install_update",
     "call_tool",
 ];

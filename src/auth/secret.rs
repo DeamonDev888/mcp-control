@@ -223,6 +223,21 @@ pub fn load_client_key(service: Option<&str>, account: &str) -> Result<Option<St
     }
 }
 
+/// Supprime la clé privée d'un client sortant du trousseau OS (best-effort :
+/// ignore une entrée absente ou un trousseau indisponible).
+pub fn delete_client_key(service: Option<&str>, account: &str) {
+    #[cfg(feature = "keyring")]
+    if let Some(svc) = service {
+        if let Ok(entry) = keyring::Entry::new(svc, account) {
+            let _ = entry.delete_credential();
+        }
+    }
+    #[cfg(not(feature = "keyring"))]
+    {
+        let _ = (service, account);
+    }
+}
+
 /// Décode 32 octets en hexadécimal minuscule (clé du journal).
 fn decode_cle_hex(hex: &str) -> Result<Vec<u8>, String> {
     let hex = hex.trim();

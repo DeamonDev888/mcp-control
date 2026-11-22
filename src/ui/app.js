@@ -504,19 +504,41 @@ function groupKeys() {
   return keys;
 }
 function srvRow(s) {
-  const ti = s.transport === 'http'
-    ? (s.transport_info.host ? `${esc(s.transport_info.host)}:` : '') + s.transport_info.port
-    : 'stdio &middot; ' + esc(s.transport_info.program);
-  const off = s.tools_disabled.length ? ` &middot; ${s.tools_disabled.length} off` : '';
-  /* Ligne 1 : état + nom + actions (le nom ne se bat plus avec les badges).
-     Ligne 2 : état textuel, transport, badges langage/transport/framework,
-     compteur d'outils. Les badges sont non rétractables : à très faible
-     largeur la fin de la ligne 2 se coupe, jamais le nom ni les actions. */
+  const endpoint = s.transport === 'http'
+    ? (s.transport_info.host && !isLoopbackHost(s.transport_info.host)
+        ? `${esc(s.transport_info.host)}:${s.transport_info.port}`
+        : `:${s.transport_info.port}`)
+    : esc(s.transport_info.program || 'stdio');
+  const offPill = s.tools_disabled.length
+    ? `<span class="cnt-off" title="${s.tools_disabled.length} outil(s) d&eacute;sactiv&eacute;(s)">&minus;${s.tools_disabled.length}</span>`
+    : '';
+  const latPill = (s.state === 'UP' && s.latency_ms != null)
+    ? `<span class="srow-lat">${esc(String(s.latency_ms))}ms</span>`
+    : '';
+  const stPill = s.state !== 'UP'
+    ? `<span class="st ${esc(s.state)}">${esc(s.state)}</span>`
+    : '';
+  const toolsTip = `${s.tools_count} outil${s.tools_count > 1 ? 's' : ''}`
+    + (s.tools_disabled.length ? ` (${s.tools_disabled.length} coup\u00e9s)` : '');
+  /* Ligne 1 : état + nom + compteur d'outils + switch ON/OFF.
+     Ligne 2 : métadonnées (état si hors-ligne, port/programme, latence, badges)
+     à gauche, actions rapides (favori, autoboot, play/stop) séparées à droite. */
   return `<div class="srow ${selectedId===s.id?'sel':''} ${s.enabled?'':'off'}" draggable="true"
     role="listitem" tabindex="0" aria-label="Serveur ${esc(s.label)} (${esc(s.state)})"
     data-act="select" data-id="${esc(s.id)}">
-    <div class="l1"><span class="dot ${esc(s.state)}"></span><span class="nm" title="${esc(s.label)}">${esc(s.label)}</span>${rowFav(s)}${rowAuto(s)}${rowCtl(s)}${rowToggle(s)}</div>
-    <div class="l2"><span class="st ${esc(s.state)}">${esc(s.state)}</span> ${ti}${off}${langChip(s)}${typeBadge(s)}${frameworkBadge(s)}${lockBadge(s)}${s.transport==='stdio'?'<span class="legacy" title="Legacy : serveur stdio uniquement (pas de transport HTTP)">legacy</span>':''}<span class="cnt">${s.tools_count}</span></div>
+    <div class="l1">
+      <span class="dot ${esc(s.state)}"></span>
+      <span class="nm" title="${esc(s.label)}">${esc(s.label)}</span>
+      <div class="l1-right">
+        <span class="cnt" title="${esc(toolsTip)}">${s.tools_count}</span>${offPill}${rowToggle(s)}
+      </div>
+    </div>
+    <div class="l2">
+      <div class="srow-meta">
+        ${stPill}<span class="srow-pill">${endpoint}</span>${latPill}${langChip(s)}${frameworkBadge(s)}${lockBadge(s)}${s.transport==='stdio'?'<span class="legacy" title="Legacy : serveur stdio uniquement (pas de transport HTTP)">stdio</span>':''}
+      </div>
+      <div class="srow-acts">${rowFav(s)}${rowAuto(s)}${rowCtl(s)}</div>
+    </div>
   </div>`;
 }
 /* Replis des groupes mémorisés (localStorage) : 'local' + une clé par machine. */
@@ -723,15 +745,31 @@ function frameworkBadge(s) {
   return `<span class="tag fw fw-${lk}" title="${tip}">${esc(f.label)}</span>`;
 }
 
-// Badge cadenas (lot M4 pt 4) : serveur LiteMCP verrouillé par signature
-// RFC 9421 (appairé = UP, non appairé = 401 WWW-Authenticate LiteMCP).
-function lockBadge(s) {
-  if (!s || !s.locked) return '';
-  const paired = s.state === 'UP';
-  const tip = paired
-    ? 'Serveur LiteMCP verrouill\u00e9 par signature RFC 9421 (appair\u00e9 avec MCP Control)'
-    : 'Serveur LiteMCP joignable mais verrouill\u00e9 (401 Signature) \u2014 appairer MCP Control (action server_pair)';
-  return `<span class="tag lock ${paired ? 'paired' : 'unpaired'}" title="${tip}">${ic('lock')}</span>`;
+// Détecte si les variables d'environnement d'identité MCP Control sont injectées.
+function hasAuthEnv(s) {
+  const envs = [
+    s && s.start_cmd && s.start_cmd.env,
+    s && s.transport_info && s.transport_info.env,
+  ];
+  return envs.some(e => e && typeof e === 'object' && ('LITEMCP_TRUSTED_KEYS' in e || 'MCC_AUTH_PUBKEY' in e));
+}
+
+// Badge cadenas + badge AUTH : serveur verrouillé / appairé RFC 9421 ou env d'auth injecté.
+function lockBadge(s, verbose) {
+  if (!s) return '';
+  let out = '';
+  if (s.locked || s.paired) {
+    const paired = !!s.paired;
+    const tip = paired
+      ? 'Auth MCP Control active (signature RFC 9421, cl\u00e9 ' + (s.auth_keyid || 'mcc-server') + ')'
+      : 'Serveur verrouill\u00e9 (401 Signature) \u2014 clic droit ou bouton Appairer pour l\u2019associer \u00e0 MCP Control';
+    const lbl = verbose ? (paired ? ' Appair&eacute;' : ' Verrouill&eacute;') : '';
+    out += `<span class="tag lock ${paired ? 'paired' : 'unpaired'}" title="${esc(tip)}">${ic('lock')}${lbl}</span>`;
+  }
+  if (hasAuthEnv(s)) {
+    out += `<span class="tag auth-env" title="Variables d&#39;identit&eacute; Ed25519 MCP Control (LITEMCP_TRUSTED_KEYS / MCC_AUTH_PUBKEY) inject&eacute;es au lancement">AUTH</span>`;
+  }
+  return out;
 }
 
 function rowFav(s) {
@@ -1224,7 +1262,7 @@ function renderToolParamsHtml(schema) {
 function renderToolPanelHtml(s, t, expKey) {
   const schema = t.input_schema || null;
   const schemaJson = schema ? JSON.stringify(schema, null, 2) : null;
-  const canRun = s.state === 'UP' && s.transport === 'http' && !s.via_ssh && !s.locked && !t.disabled;
+  const canRun = s.state === 'UP' && s.transport === 'http' && !s.via_ssh && (!s.locked || s.paired) && !t.disabled;
   const draft = toolArgsDraft.has(expKey)
     ? toolArgsDraft.get(expKey)
     : JSON.stringify(buildArgsTemplate(schema), null, 2);
@@ -1461,6 +1499,10 @@ function renderDetail() {
       <button data-act="tools-all-off" data-id="${esc(s.id)}" ${nOn === 0 ? 'disabled' : ''}>${ic('x')} Tout couper</button>
     </div>` : ''}
     <div id="toolsRowsBox">${renderToolsRowsHtml(s)}</div>`;
+  const endpointLabel = s.transport === 'http'
+    ? ((s.transport_info.host || '127.0.0.1') + ':' + s.transport_info.port + (s.transport_info.path || '/mcp'))
+    : ('stdio · ' + (s.transport_info.program || ''));
+  const needsPair = s.transport === 'http' && s.locked && !s.paired;
   contentEl.innerHTML = `
     <div class="crumb">serveurs / <b>${esc(s.label)}</b></div>
     <div class="d-head st-${esc(dispState)}">
@@ -1468,32 +1510,45 @@ function renderDetail() {
         <span class="dot dot-lg ${esc(dispState)}"></span>
         <h1>${esc(s.label)}</h1>
         <span class="pill ${esc(dispState)}" ${starting ? 'title="Process lanc&eacute;, MCP pas encore r&eacute;pondu"' : ''}>${starting ? 'AU D&Eacute;MARRAGE' : esc(s.state)}</span>
+        <span class="d-head-endpoint" title="${esc(endpointLabel)}">${esc(endpointLabel)}</span>
+      </div>
+      <div class="d-meta-strip">
         ${langChip(s)}
         ${typeBadge(s)}
         ${frameworkBadge(s)}
-        ${lockBadge(s)}
+        ${lockBadge(s, true)}
         ${s.transport === 'stdio' ? '<span class="legacy" title="Legacy : serveur stdio uniquement (pas de transport HTTP)">legacy</span>' : ''}
-        <span class="sub">${s.server_name ? esc(s.server_name) + ' v' + esc(s.version || '?') : ''}${s.latency_ms != null ? ' &middot; ' + s.latency_ms + ' ms' : ''}</span>
+        ${s.protocol ? `<span class="d-meta-pill">MCP ${esc(s.protocol)}</span>` : ''}
+        ${s.server_name ? `<span class="d-meta-pill">${esc(s.server_name)}${s.version ? ' v' + esc(s.version) : ''}</span>` : ''}
+        ${s.latency_ms != null ? `<span class="d-meta-pill">${esc(String(s.latency_ms))} ms</span>` : ''}
+        ${s.pid ? `<span class="d-meta-pill">PID ${esc(String(s.pid))}</span>` : ''}
       </div>
       <div class="d-actions">
-        ${s.locked && s.state !== 'UP' ? `<button class="primary" data-act="server-pair" data-id="${esc(s.id)}" title="Appairer MCP Control avec ce serveur LiteMCP verrouill&eacute; par signature RFC 9421">${ic('lock')} Appairer ce serveur</button>` : ''}
-        ${s.can_start && s.state !== 'UP' ? `<button class="primary" data-act="row-act" data-op="start" data-id="${esc(s.id)}">${ic('play')} Start</button>` : ''}
-        ${s.can_start && s.state === 'UP' ? `<button class="danger" data-act="row-act" data-op="kill" data-id="${esc(s.id)}">${ic('stop')} Stop</button>` : ''}
-        <button data-act="row-act" data-op="refresh" data-id="${esc(s.id)}">${ic('activity')} Sonder</button>
-        ${s.can_start ? `<button class="autobtn ${s.auto_restart?'on':''}" role="switch" aria-checked="${s.auto_restart?'true':'false'}" data-act="set-auto" data-id="${esc(s.id)}" data-on="${s.auto_restart?'0':'1'}"
-          title="Autoboot : relance automatique de ce serveur au d&eacute;marrage de MCP Control et apr&egrave;s un crash">${ic('zap')} Autoboot ${s.auto_restart?'ON':'OFF'}</button>` : ''}
-        <button class="favbtn ${s.favorite?'on':''}" role="switch" aria-checked="${s.favorite?'true':'false'}" data-act="set-fav" data-id="${esc(s.id)}" data-on="${s.favorite?'0':'1'}"
-          title="Favori : &eacute;pingle ce serveur en haut de sa section dans l'explorateur (persist&eacute;)">${ic('star')} Favori ${s.favorite?'ON':'OFF'}</button>
-        <button data-act="hide-server" data-id="${esc(s.id)}" title="Masquer ce serveur de l'affichage (session seulement : il revient &agrave; la r&eacute;ouverture de l'app)">${ic('eyeOff')} Masquer</button>
-        <button data-act="row-act" data-op="toggle" data-id="${esc(s.id)}" title="${s.enabled
-          ? 'Mettre en pause : le process est arr&ecirc;t&eacute; et le serveur n&#39;est plus sond&eacute; (il reste dans la liste, r&eacute;activable d&#39;un clic)'
-          : 'Reprendre la supervision : le serveur sera sond&eacute; et d&eacute;marr&eacute; si une commande est connue'}">${s.enabled ? ic('pause') + ' Mettre en pause' : ic('play') + ' Reprendre'}</button>
-        ${s.origin !== 'seed'
-          ? `<button class="danger" data-act="remove-srv" data-id="${esc(s.id)}">${ic('trash')} Supprimer</button>`
-          : `<button class="danger" data-act="remove-seed" data-id="${esc(s.id)}" title="Supprime ce seed de la config : il ne sera pas r&eacute;inject&eacute; au red&eacute;marrage">${ic('trash')} Supprimer d&eacute;finitivement</button>`}
+        <div class="d-act-grp">
+          ${needsPair ? `<button class="primary" data-act="server-pair" data-id="${esc(s.id)}" title="Appairer MCP Control avec ce serveur verrouill&eacute; par signature RFC 9421">${ic('lock')} Appairer</button>` : ''}
+          ${s.can_start && s.state !== 'UP' ? `<button class="primary" data-act="row-act" data-op="start" data-id="${esc(s.id)}">${ic('play')} D&eacute;marrer</button>` : ''}
+          ${s.can_start && s.state === 'UP' ? `<button class="danger" data-act="row-act" data-op="kill" data-id="${esc(s.id)}">${ic('stop')} Arr&ecirc;ter</button>` : ''}
+          <button data-act="row-act" data-op="refresh" data-id="${esc(s.id)}">${ic('activity')} Sonder</button>
+        </div>
+        <span class="d-act-sep" aria-hidden="true"></span>
+        <div class="d-act-grp">
+          ${s.can_start ? `<button class="autobtn ${s.auto_restart?'on':''}" role="switch" aria-checked="${s.auto_restart?'true':'false'}" data-act="set-auto" data-id="${esc(s.id)}" data-on="${s.auto_restart?'0':'1'}"
+            title="Autoboot : relance automatique de ce serveur au d&eacute;marrage de MCP Control et apr&egrave;s un crash">${ic('zap')} Autoboot ${s.auto_restart?'ON':'OFF'}</button>` : ''}
+          <button class="favbtn ${s.favorite?'on':''}" role="switch" aria-checked="${s.favorite?'true':'false'}" data-act="set-fav" data-id="${esc(s.id)}" data-on="${s.favorite?'0':'1'}"
+            title="Favori : &eacute;pingle ce serveur en haut de sa section dans l'explorateur (persist&eacute;)">${ic('star')} Favori ${s.favorite?'ON':'OFF'}</button>
+        </div>
+        <div class="d-act-grp d-act-right">
+          <button class="btn-ghost" data-act="hide-server" data-id="${esc(s.id)}" title="Masquer ce serveur de l'affichage (session seulement : il revient &agrave; la r&eacute;ouverture de l'app)">${ic('eyeOff')} Masquer</button>
+          <button data-act="row-act" data-op="toggle" data-id="${esc(s.id)}" title="${s.enabled
+            ? 'Mettre en pause : le process est arr&ecirc;t&eacute; et le serveur n&#39;est plus sond&eacute; (il reste dans la liste, r&eacute;activable d&#39;un clic)'
+            : 'Reprendre la supervision : le serveur sera sond&eacute; et d&eacute;marr&eacute; si une commande est connue'}">${s.enabled ? ic('pause') + ' Pause' : ic('play') + ' Reprendre'}</button>
+          ${s.origin !== 'seed'
+            ? `<button class="danger" data-act="remove-srv" data-id="${esc(s.id)}">${ic('trash')} Supprimer</button>`
+            : `<button class="danger" data-act="remove-seed" data-id="${esc(s.id)}" title="Supprime ce seed de la config : il ne sera pas r&eacute;inject&eacute; au red&eacute;marrage">${ic('trash')} Supprimer</button>`}
+        </div>
       </div>
     </div>
-    ${s.locked && s.state !== 'UP' ? `<div class="d-lock-banner"><div>${ic('lock')} <b>Serveur LiteMCP verrouill&eacute; par signature Ed25519 (RFC 9421)</b> &mdash; associez l'identit&eacute; locale <code>mcc-server</code> pour autoriser la sonde et le proxy.</div><button class="primary" data-act="server-pair" data-id="${esc(s.id)}">${ic('lock')} Appairer ce serveur</button></div>` : ''}
+    ${needsPair ? `<div class="d-lock-banner"><div>${ic('lock')} <b>Serveur verrouill&eacute; par signature Ed25519 (RFC 9421)</b> &mdash; associez l'identit&eacute; locale <code>mcc-server</code> pour autoriser la sonde et le proxy.</div><button class="primary" data-act="server-pair" data-id="${esc(s.id)}">${ic('lock')} Appairer ce serveur</button></div>` : ''}
     ${s.origin === 'seed' ? '<div class="seed-note">Serveur seed : <b>Retirer durablement</b> l&rsquo;efface m&ecirc;me apr&egrave;s red&eacute;marrage (consign&eacute; dans config.json) ; <b>D&eacute;sactiver</b> l&rsquo;&eacute;teint sans le supprimer.</div>' : ''}
     ${s.last_error ? `<div class="d-err">${ic('warn')} ${esc(s.last_error)}</div>` : ''}
     ${fold('demarrage', 'D&eacute;marrage', `<div class="kv">${kvd}</div>${startCmdForm(s)}`)}
@@ -1707,6 +1762,28 @@ function rowCtx(ev, id) {
         () => act(s.state === 'UP' ? 'kill' : 'start', s.id));
   }
   add(ic('refresh') + ' Sonder maintenant', () => act('refresh', s.id));
+  // Section Auth MCP Control (RFC 9421 / Ed25519 + variables d'env)
+  add('—', null, false);
+  if (s.transport === 'http') {
+    if (s.paired) {
+      add(ic('shield') + ' Auth MCP Control active \u2713 (' + esc(s.auth_keyid || 'mcc-server') + ')', null, true);
+      add(ic('copy') + ' Copier la cl\u00e9 publique appair\u00e9e', () => copyMcpIdentity(s));
+      add(ic('refresh') + ' R\u00e9-appairer l\u2019auth MCP Control', () => serverRepair(s.id));
+      add(ic('trash') + ' Retirer l\u2019auth de ce serveur', () => serverUnpair(s.id));
+    } else {
+      add(ic('shield') + ' Appairer l\u2019auth MCP Control (Ed25519)', () => serverPair(s.id));
+      add(ic('copy') + ' Copier l\u2019identit\u00e9 Ed25519 (cl\u00e9 publique)', () => copyMcpIdentity(s));
+    }
+  } else {
+    add(ic('copy') + ' Copier l\u2019identit\u00e9 Ed25519 (cl\u00e9 publique)', () => copyMcpIdentity(s));
+  }
+  if (s.transport === 'stdio' || s.can_start) {
+    const envOn = hasAuthEnv(s);
+    add(
+      ic('terminal') + (envOn ? ' Retirer l\u2019env d\u2019auth MCP Control' : ' Injecter l\u2019env d\u2019auth MCP Control'),
+      () => toggleServerAuthEnv(s.id, !envOn)
+    );
+  }
   add('—', null, false);
   add(ic('eyeOff') + ' Masquer', () => hideServer(s.id));
   showMenu(ev, items);
@@ -1976,10 +2053,91 @@ async function act(action, id) {
   }
   await load();
 }
+function copyMcpIdentity(s) {
+  const si = (state && state.server_identity) || null;
+  const lines = [];
+  if (s && s.paired && s.auth_public_key) {
+    const kid = s.auth_keyid || 'mcc-server';
+    lines.push('# Cl\u00e9 client appair\u00e9e pour ' + (s.label || s.id));
+    lines.push('LITEMCP_TRUSTED_KEYS=' + kid + '=' + s.auth_public_key);
+    lines.push('MCC_AUTH_KEYID=' + kid);
+    lines.push('MCC_AUTH_PUBKEY=' + s.auth_public_key);
+    if (s.auth_fingerprint) lines.push('# Empreinte : ' + s.auth_fingerprint);
+  } else if (si && si.public_key) {
+    const kid = si.keyid || 'mcc-server';
+    lines.push('# Identit\u00e9 Ed25519 MCP Control');
+    lines.push('LITEMCP_TRUSTED_KEYS=' + kid + '=' + si.public_key);
+    lines.push('MCC_AUTH_KEYID=' + kid);
+    lines.push('MCC_AUTH_PUBKEY=' + si.public_key);
+    if (si.fingerprint) lines.push('# Empreinte : ' + si.fingerprint);
+  }
+  if (!lines.length) {
+    toast('Identit\u00e9 Ed25519 indisponible', 'err');
+    return;
+  }
+  copyText(lines.join('\n'));
+}
+
 async function serverPair(id) {
   const j = await postAction({action: 'server_pair', id});
   if (j && j.ok) {
-    toast('Serveur LiteMCP appair\u00e9 (' + (j.keyid || 'mcc-server') + ')', 'ok');
+    const kid = j.keyid || 'mcc-server';
+    if (j.public_key) {
+      copyText('LITEMCP_TRUSTED_KEYS=' + kid + '=' + j.public_key);
+      toast('Appair\u00e9 (' + kid + ') \u2014 LITEMCP_TRUSTED_KEYS copi\u00e9e', 'ok');
+    } else {
+      toast('Serveur appair\u00e9 (' + kid + ')', 'ok');
+    }
+    await postAction({action: 'refresh', id}, {quiet: true});
+  }
+  await load();
+  if (selectedId === id) {
+    const r2 = await fetch('/api/detail?id=' + encodeURIComponent(id));
+    if (r2.ok) { detailCache = await r2.json(); renderDetail(); }
+  }
+}
+
+async function serverUnpair(id) {
+  const ok = await askConfirm({
+    title: 'Retirer l\u2019auth MCP Control',
+    msg: 'Supprimer la cl\u00e9 Ed25519 appair\u00e9e pour ce serveur ? Les requ\u00eates ne seront plus sign\u00e9es RFC 9421.',
+    okLabel: 'Retirer l\u2019auth',
+    danger: true,
+  });
+  if (!ok) return;
+  const j = await postAction({action: 'server_unpair', id});
+  if (j && j.ok) {
+    toast('Auth MCP Control retir\u00e9e', 'ok');
+    await postAction({action: 'refresh', id}, {quiet: true});
+  }
+  await load();
+  if (selectedId === id) {
+    const r2 = await fetch('/api/detail?id=' + encodeURIComponent(id));
+    if (r2.ok) { detailCache = await r2.json(); renderDetail(); }
+  }
+}
+
+async function serverRepair(id) {
+  const ok = await askConfirm({
+    title: 'R\u00e9-appairer l\u2019auth MCP Control',
+    msg: 'G\u00e9n\u00e9rer une nouvelle paire de cl\u00e9s Ed25519 pour ce serveur ? L\u2019ancienne cl\u00e9 sera remplac\u00e9e.',
+    okLabel: 'R\u00e9-appairer',
+  });
+  if (!ok) return;
+  const ju = await postAction({action: 'server_unpair', id});
+  if (!ju || !ju.ok) return;
+  await serverPair(id);
+}
+
+async function toggleServerAuthEnv(id, enabled) {
+  const j = await postAction({action: 'server_auth_env', id, enabled: !!enabled});
+  if (j && j.ok) {
+    toast(
+      enabled
+        ? 'Variables d\u2019auth MCP Control inject\u00e9es (red\u00e9marrez le serveur pour appliquer)'
+        : 'Variables d\u2019auth MCP Control retir\u00e9es',
+      'ok'
+    );
   }
   await load();
   if (selectedId === id) {

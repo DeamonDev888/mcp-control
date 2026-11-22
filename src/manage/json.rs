@@ -49,6 +49,7 @@ pub(super) fn server_json(s: &Server, managed: bool) -> Value {
         ),
     };
     let origin = s.origin.as_str();
+    let auth = crate::auth::net::server_auth_status(s);
     json!({
         "id": s.id, "label": s.label, "transport": ttype, "transport_info": extra,
         "origin": origin, "enabled": s.enabled, "state": s.state.as_str(),
@@ -62,7 +63,11 @@ pub(super) fn server_json(s: &Server, managed: bool) -> Value {
         "favorite": s.favorite,
         "sse": s.sse, "sse_endpoint": s.sse_endpoint, "ws": s.ws, "lang": s.lang,
         "framework": s.framework,
-        "locked": crate::auth::net::is_server_locked(s),
+        "locked": auth.locked,
+        "paired": auth.paired,
+        "auth_keyid": auth.keyid,
+        "auth_public_key": auth.public_key,
+        "auth_fingerprint": auth.fingerprint,
         "via_ssh": s.via_ssh,
         // contrôle du process : maintenu par CE moteur MCP Control (children) ?
         "managed": managed,
@@ -260,6 +265,19 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
         .unwrap_or(0);
     // Compteur seul : jamais de jeton, cookie ni secret de session ici.
     let sessions_active = crate::auth::session::active_count();
+    // Identité publique Ed25519 de MCP Control (clé publique seule, jamais privée)
+    // pour l'intégration rapide sur les sous-serveurs depuis le menu clic droit.
+    let server_identity = {
+        let st = lockv(&state.settings);
+        st.auth.server.as_ref().map(|ident| {
+            json!({
+                "keyid": ident.keyid,
+                "public_key": ident.public_key,
+                "fingerprint": crate::auth::registry::fingerprint_of(&ident.public_key).unwrap_or_default(),
+                "fingerprint_court": crate::auth::registry::short_fingerprint_of(&ident.public_key).unwrap_or_default(),
+            })
+        })
+    };
     json!({
         "servers": list, "log": logarr,
         "latest_version": latest,
@@ -273,6 +291,7 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
         "access": access,
         "announcements_count": announcements_count,
         "sessions_active": sessions_active,
+        "server_identity": server_identity,
     })
 }
 
@@ -398,7 +417,12 @@ fn hash_server_visible<H: std::hash::Hasher>(
     s.ws.hash(h);
     s.lang.hash(h);
     s.framework.hash(h);
-    crate::auth::net::is_server_locked(s).hash(h);
+    let auth = crate::auth::net::server_auth_status(s);
+    auth.locked.hash(h);
+    auth.paired.hash(h);
+    auth.keyid.hash(h);
+    auth.public_key.hash(h);
+    auth.fingerprint.hash(h);
     s.via_ssh.hash(h);
     managed.hash(h);
     match &s.start_cmd {
@@ -453,6 +477,10 @@ pub fn state_etag(state: &Arc<AppState>) -> String {
         settings.autostart.hash(&mut h);
         settings.notify.desktop.hash(&mut h);
         settings.notify.webhook_url.hash(&mut h);
+        if let Some(ref ident) = settings.auth.server {
+            ident.keyid.hash(&mut h);
+            ident.public_key.hash(&mut h);
+        }
         settings.notify.method.hash(&mut h);
         settings.notify.min_interval_secs.hash(&mut h);
         settings.notify.states.hash(&mut h);

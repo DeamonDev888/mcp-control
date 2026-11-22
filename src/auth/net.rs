@@ -914,32 +914,179 @@ pub fn outbound_identity_for(host: &str, port: u16) -> Result<Option<OutboundIde
     outbound_identity_for_dir(&current_config_dir(), host, port)
 }
 
-/// Un serveur supervisé est-il verrouillé ou appairé par signature LiteMCP ?
-///
-/// Vrai dans deux cas (badge cadenas sur UP/DOWN) :
-/// 1. le serveur a répondu `401` + `WWW-Authenticate` de `litemcp` (son motif
-///    d'erreur ou l'ensemble `locked_servers` le signale) ;
-/// 2. MCP Control détient un épinglage client sortant (`auth/clients/*.pin.json`)
-///    pour l'hôte et le port de ce serveur.
-#[must_use]
-pub fn is_server_locked(s: &Server) -> bool {
-    if s.last_error
+/// État public d'authentification sortante d'un serveur MCP (aucune clé privée).
+#[derive(Clone, Debug, Default)]
+pub struct ServerAuthStatus {
+    pub locked: bool,
+    pub paired: bool,
+    pub keyid: Option<String>,
+    pub public_key: Option<String>,
+    pub fingerprint: Option<String>,
+}
+
+/// Calcule l'état d'authentification sortante d'un serveur (401 observé et/ou
+/// épinglage Ed25519 actif dans `auth/clients/*.pin.json`).
+pub fn server_auth_status(s: &Server) -> ServerAuthStatus {
+    let err_locked = s
+        .last_error
         .as_deref()
-        .is_some_and(|e| e.contains("verrouillé (401 Signature)"))
-    {
-        return true;
-    }
+        .is_some_and(|e| e.contains("verrouillé (401 Signature)"));
     if let Transport::Http { host, port, .. } = &s.transport {
         let h = s
             .bound_host
             .as_deref()
             .or(host.as_deref())
             .unwrap_or("127.0.0.1");
-        if find_existing_pin(&current_config_dir(), h, *port).is_some() {
-            return true;
+        if let Some(pin) = find_existing_pin(&current_config_dir(), h, *port) {
+            let keyid = pin.get("keyid").and_then(|x| x.as_str()).map(String::from);
+            let public_key = pin
+                .get("public_key")
+                .and_then(|x| x.as_str())
+                .map(String::from);
+            let fingerprint = public_key
+                .as_deref()
+                .and_then(crate::auth::registry::short_fingerprint_of);
+            return ServerAuthStatus {
+                locked: true,
+                paired: true,
+                keyid,
+                public_key,
+                fingerprint,
+            };
         }
     }
-    false
+    ServerAuthStatus {
+        locked: err_locked,
+        paired: false,
+        keyid: None,
+        public_key: None,
+        fingerprint: None,
+    }
+}
+
+/// Indique si le serveur est verrouillé par signature RFC 9421 (401 observé ou
+/// déjà appairé localement).
+pub fn is_server_locked(s: &Server) -> bool {
+    server_auth_status(s).locked
+}
+
+/// Retire l'appairage Ed25519 (`.pin.json`, `.key` et trousseau) d'un sous-serveur
+/// HTTP. Action locale uniquement (`ADMIN_ACTIONS`).
+pub fn handle_server_unpair(state: &Arc<AppState>, body: &str) -> Value {
+    set_config_path(&state.config_path);
+    let req: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return json!({"ok": false, "error": format!("JSON invalide : {e}")}),
+    };
+    let mut resolved_id: Option<String> = None;
+    let (host, port) = if let Some(sid) = req.get("id").and_then(|x| x.as_str()) {
+        let servers = lockv(&state.servers);
+        let Some(s) = servers.iter().find(|s| s.id == sid) else {
+            return json!({"ok": false, "error": format!("serveur inconnu : {sid}")});
+        };
+        resolved_id = Some(s.id.clone());
+        match &s.transport {
+            Transport::Http { host, port, .. } => {
+                let h = s
+                    .bound_host
+                    .as_deref()
+                    .or(host.as_deref())
+                    .unwrap_or("127.0.0.1")
+                    .to_string();
+                (h, *port)
+            }
+            Transport::Stdio { .. } => {
+                return json!({
+                    "ok": false,
+                    "error": "server_unpair ne s'applique qu'aux serveurs HTTP"
+                });
+            }
+        }
+    } else {
+        let Some(h) = req
+            .get("host")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return json!({"ok": false, "error": "id ou host+port requis"});
+        };
+        let Some(p) = req
+            .get("port")
+            .and_then(|x| x.as_u64())
+            .and_then(|p| u16::try_from(p).ok())
+        else {
+            return json!({"ok": false, "error": "port valide requis"});
+        };
+        (h.to_string(), p)
+    };
+
+    let config_dir = if state.config_path.trim().is_empty() {
+        current_config_dir()
+    } else {
+        Path::new(&state.config_path)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(current_config_dir)
+    };
+    let dir = clients_dir(&config_dir);
+    let mut removed_keyids: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".pin.json") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if !pin_matches_host_port(&v, &host, port) {
+                continue;
+            }
+            let kid = v
+                .get("keyid")
+                .and_then(|x| x.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| name.trim_end_matches(".pin.json").to_string());
+            let _ = std::fs::remove_file(entry.path());
+            let _ = std::fs::remove_file(dir.join(format!("{kid}.key")));
+            removed_keyids.push(kid);
+        }
+    }
+    let svc = secret::service();
+    let norm = normalize_host(&host);
+    secret::delete_client_key(svc.as_deref(), &format!("client-{host}:{port}"));
+    if norm != host {
+        secret::delete_client_key(svc.as_deref(), &format!("client-{norm}:{port}"));
+    }
+    if removed_keyids.is_empty() {
+        return json!({"ok": false, "error": "aucun appairage actif pour ce serveur"});
+    }
+    if let Some(ref sid) = resolved_id {
+        let mut servers = lockv(&state.servers);
+        if let Some(s) = servers.iter_mut().find(|s| s.id == *sid) {
+            s.last_error = None;
+        }
+    }
+    crate::manage::add_log(
+        state,
+        "info",
+        &format!(
+            "[auth] server_unpair : épinglage retiré pour {host}:{port} ({})",
+            removed_keyids.join(", ")
+        ),
+    );
+    json!({
+        "ok": true,
+        "id": resolved_id,
+        "host": host,
+        "port": port,
+        "removed": removed_keyids.len(),
+        "keyids": removed_keyids,
+    })
 }
 
 // ---------- Action locale `server_pair` (droit `admin`, lot M4 point 5) ----------
