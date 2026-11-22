@@ -26,7 +26,6 @@ ignore = [
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive non maintenu — même chaîne keyring/zbus (Linux seulement)." },
     # --- Avis « unsound » : code fautif non atteint par notre usage ---
     { id = "RUSTSEC-2024-0429", reason = "glib 0.18 unsound (VariantStrIter) — glib est épinglé à 0.18 par webkit2gtk-rs (GTK3, desktop Linux) ; nous n'itérons jamais des chaînes GVariant. Correctif = glib >= 0.20, donc GTK4 côté tauri." },
-    { id = "RUSTSEC-2026-0486", reason = "rustix 1.1.5 unsound (xattr, tampon de longueur nulle) — aucun appel xattr dans le produit ; corrigé en 1.1.6. Un simple `cargo update -p rustix` suffit, hors périmètre de ce lot (Cargo.lock non autorisé)." },
 ]
 
 [licenses]
@@ -62,17 +61,13 @@ exceptions = []
 # 0.8/0.9/1.2, digest/sha2 0.10/0.11…). Ils viennent des écosystèmes amont,
 # pas de nos manifestes : les figer en `skip` cacherait leur évolution.
 multiple-versions = "warn"
-# Le SEUL joker du dépôt est `litemcp = { path = "../litemcp" }` (bibliothèque
-# non publiée en 0.12.0) : c'est exactement le point qui empêche la CI de
-# compiler. Repasser en « deny » quand litemcp sera publiée ou épinglée sur un
-# commit git.
-wildcards = "warn"
+# Toutes les dépendances sont publiées sur crates.io avec version explicite
+# (dont `litemcp = "0.12.0"` depuis la 0.8.0) : aucun joker toléré.
+wildcards = "deny"
 highlight = "all"
 
 [sources]
 # Aucune dépendance hors crates.io : interdit un registre ou un dépôt git tiers.
-# `litemcp` (chemin) n'a pas de source de registre : cargo-deny ne la contrôle
-# pas ici — c'est le point bloquant décrit dans le rapport S3.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = [
