@@ -798,7 +798,9 @@ pub fn restrict_permissions(path: &str) -> std::io::Result<()> {
             .arg("/inheritance:r")
             .arg("/grant:r")
             .arg(format!("*{user}:F"))
+            .arg("/grant:r")
             .arg("*S-1-5-18:F") // SYSTEM — AUTORITE NT\Système
+            .arg("/grant:r")
             .arg("*S-1-5-32-544:F") // BUILTIN\Administrateurs
             .output()?;
         if out.status.success() {

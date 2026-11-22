@@ -53,8 +53,11 @@ jobs:
       # `--locked` partout : le binaire publié est celui du Cargo.lock versionné,
       # pas d'une résolution refaite au moment du tag. `--features tls` active
       # l'écoute TLS 1.3 obligatoire hors loopback.
-      - name: Tests
-        run: cargo test --release --locked --features tls -p mcp-control
+      - name: Tests unitaires
+        run: cargo test --release --locked --features tls -p mcp-control --lib
+
+      - name: Tests E2E
+        run: cargo test --release --locked --features tls -p mcp-control --test e2e -- --test-threads=1
 
       - name: Clippy (strict, tous les targets)
         run: cargo clippy --release --locked -p mcp-control --all-targets --all-features -- -D warnings

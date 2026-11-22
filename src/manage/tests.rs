@@ -817,11 +817,15 @@ fn state_json_compte_bon_les_stats() {
 fn save_config_chemin_vide_ne_cree_pas_point_tmp() {
     let state = test_state();
     assert!(state.config_path.is_empty());
+    let existait_avant = std::path::Path::new(".tmp").exists();
+    assert!(save_config_checked(&state).is_ok());
     save_config(&state);
-    assert!(
-        !std::path::Path::new(".tmp").exists(),
-        "save_config avec config_path vide ne doit jamais écrire '.tmp'"
-    );
+    if !existait_avant {
+        assert!(
+            !std::path::Path::new(".tmp").exists(),
+            "save_config avec config_path vide ne doit jamais écrire '.tmp'"
+        );
+    }
 }
 
 fn test_state() -> Arc<AppState> {
@@ -1682,9 +1686,18 @@ fn echec_d_ecriture_remonte_et_ne_laisse_pas_de_tmp() {
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = dir.join("config.json");
     std::fs::write(&cfg, "{\"servers\":[]}").unwrap();
-    let mut perms = std::fs::metadata(&cfg).unwrap().permissions();
-    perms.set_readonly(true);
-    std::fs::set_permissions(&cfg, perms).unwrap();
+    #[cfg(windows)]
+    {
+        let mut perms = std::fs::metadata(&cfg).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&cfg, perms).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        // Sur Unix, rename() vérifie les droits du DOSSIER parent (pas du fichier cible).
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    }
 
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
@@ -1696,9 +1709,17 @@ fn echec_d_ecriture_remonte_et_ne_laisse_pas_de_tmp() {
     let ok = rep.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
     let err = rep.get("error").and_then(|v| v.as_str()).unwrap_or("");
     // remise en écriture AVANT les assertions (nettoyage garanti)
-    let mut perms = std::fs::metadata(&cfg).unwrap().permissions();
-    perms.set_readonly(false);
-    std::fs::set_permissions(&cfg, perms).unwrap();
+    #[cfg(windows)]
+    {
+        let mut perms = std::fs::metadata(&cfg).unwrap().permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(&cfg, perms).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     assert!(
         !ok,
         "une écriture ratée ne doit pas répondre ok:true : {rep}"
@@ -1784,22 +1805,32 @@ fn acl_config_cache_et_journal_utilisateur_system_administrateurs() {
     for nom in ["config.json", "state-cache.json", "mcc.log"] {
         let p = dir.join(nom);
         let script = format!(
-            "(Get-Acl -LiteralPath '{}').Access | ForEach-Object {{ $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }}",
-            p.to_string_lossy()
+            "(Get-Acl -LiteralPath '{}').Sddl",
+            p.to_string_lossy().replace('\'', "''")
         );
         let out = probe::system_command("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .output()
             .expect("powershell");
-        let sids = String::from_utf8_lossy(&out.stdout).to_string();
+        let sddl = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         assert!(
-            sids.contains(&moi),
-            "{nom} : compte courant absent — {sids}"
+            out.status.success() && !sddl.is_empty(),
+            "{nom} : lecture SDDL échouée ({}) — stderr: {err}",
+            out.status
         );
-        assert!(sids.contains("S-1-5-18"), "{nom} : SYSTEM absent — {sids}");
+        // SDDL est indépendant de la langue : SY = S-1-5-18 (SYSTEM), BA = S-1-5-32-544 (Administrateurs)
         assert!(
-            sids.contains("S-1-5-32-544"),
-            "{nom} : Administrateurs absent — {sids}"
+            sddl.contains(&moi),
+            "{nom} : compte courant ({moi}) absent — {sddl}"
+        );
+        assert!(
+            sddl.contains(";SY)") || sddl.contains("S-1-5-18"),
+            "{nom} : SYSTEM absent — {sddl}"
+        );
+        assert!(
+            sddl.contains(";BA)") || sddl.contains("S-1-5-32-544"),
+            "{nom} : Administrateurs absent — {sddl}"
         );
     }
     let _ = std::fs::remove_dir_all(&dir);

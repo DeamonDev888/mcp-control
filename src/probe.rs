@@ -402,7 +402,10 @@ unsafe fn sid_to_string(sid: *mut u8) -> Option<String> {
 
 #[cfg(not(windows))]
 pub fn current_user_sid() -> Option<String> {
-    None
+    extern "C" {
+        fn geteuid() -> u32;
+    }
+    Some(unsafe { geteuid() }.to_string())
 }
 
 /// SID du PROPRIÉTAIRE d'un fichier. `None` = illisible ou non pris en charge
@@ -455,20 +458,74 @@ pub fn file_owner_sid(path: &std::path::Path) -> Option<String> {
     }
 }
 
-/// Hors Windows : propriétaire comparé à l'uid effectif quand il est lisible
-/// (`/proc/self` sous Linux) ; inconnu ailleurs.
+/// Hors Windows : uid numérique du propriétaire du fichier (comparé à
+/// `geteuid()` via [`current_user_sid`]).
 #[cfg(not(windows))]
 pub fn file_owner_sid(path: &std::path::Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     let owner = std::fs::metadata(path).ok()?.uid();
-    let me = std::fs::metadata("/proc/self").ok().map(|m| m.uid());
-    me.filter(|u| *u == owner).map(|u| u.to_string())
+    Some(owner.to_string())
+}
+
+/// Sous Windows, le jeton du processus courant est-il élevé (ex. Administrateur
+/// / runner CI) ? Un processus élevé crée par défaut ses fichiers avec le
+/// propriétaire NTFS `BUILTIN\Administrators` (`S-1-5-32-544`).
+#[cfg(windows)]
+fn current_token_is_elevated() -> bool {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(process: isize, access: u32, token: *mut isize) -> i32;
+        fn GetTokenInformation(
+            token: isize,
+            class: u32,
+            info: *mut u8,
+            len: u32,
+            ret: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_ELEVATION_CLASS: u32 = 20;
+    unsafe {
+        let mut token: isize = 0;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elevated: u32 = 0;
+        let mut ret: u32 = 0;
+        let ok = GetTokenInformation(
+            token,
+            TOKEN_ELEVATION_CLASS,
+            (&mut elevated as *mut u32).cast::<u8>(),
+            std::mem::size_of::<u32>() as u32,
+            &mut ret,
+        );
+        CloseHandle(token);
+        ok != 0 && elevated != 0
+    }
 }
 
 /// Le fichier appartient-il au compte courant ? `None` = impossible à établir.
 pub fn file_owned_by_current_user(path: &std::path::Path) -> Option<bool> {
     let (file, me) = (file_owner_sid(path)?, current_user_sid()?);
-    Some(file == me)
+    #[cfg(windows)]
+    {
+        if file == me {
+            return Some(true);
+        }
+        if file == "S-1-5-32-544" && current_token_is_elevated() {
+            return Some(true);
+        }
+        Some(false)
+    }
+    #[cfg(not(windows))]
+    {
+        Some(file == me)
+    }
 }
 
 /// Tue l'arbre complet d'un PID (cmd.exe → node.exe). `Child::kill()` ne tue que
@@ -485,7 +542,7 @@ pub fn kill_tree(pid: u32) {
     }
     #[cfg(not(windows))]
     {
-        let _ = pid;
+        kill_pid_unix(pid);
     }
 }
 
