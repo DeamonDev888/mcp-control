@@ -1,81 +1,76 @@
 # Authentification de MCP Control — spécification
 
-Statut : lot A0, figé le 2026-11-15, branche `auth` (`bd650dd`, lot M0 en cours). Portée : MCP Control 0.8.0.
-Décisions appliquées : **DA1 à DA7 = option a** (`TODO-AUTH.md` §3).
+Statut : **livré en 0.8.0**, aligné sur l'implémentation réelle (`M1`–`M5`, `S1`–`S4`, `R-fix`, `litemcp = "0.12.0"` publié sur crates.io).
+Décisions appliquées : **DA1 à DA7 = option a**.
 
 **Autorité.** La requête signée, les identités, les droits, la confirmation externe et TLS sont définis par le
 `docs/auth.md` de `litemcp` 0.12.0, qui fait foi. Ce document ne les redéfinit pas : il fixe ce que MCP Control
 choisit par-dessus, et rien de plus. Un lecteur qui n'a que ce fichier doit pouvoir écrire un client compatible ;
 chaque « DOIT » est testable ; chaque choix cite sa décision.
 
-Les numéros de ligne sont ceux du 2026-11-15. Le lot M0 (compatibilité 0.12.0) décale `src/gateway.rs` sans changer
-les noms de fonctions ni d'outils.
-
 ## 1. Modèle de menace
 
 ### 1.1 Process local sans droits (script, autre application, service)
 
-- **Aujourd'hui** : contrôle total sans aucun secret. `effective_require_access` rend faux dès que la connexion vient
-  du loopback (`src/lib.rs:216-218`), donc le sas de `check_access` ne s'applique pas (`src/lib.rs:531`, `:579-597`) ;
-  `/mcp` est servi (`src/lib.rs:1179`) et `POST /api/action` atteint `handle_action` (`src/lib.rs:1305`) ; le
-  catalogue entier répond, `add_server` et `start_server` compris (`src/gateway.rs:1584`).
-- **Après** : `/mcp` sans signature valide → 401 de corps constant (DA2) ; `/api/*` sans session locale → 401 (§6) ;
-  les outils sont bornés par les droits du client (§4) et tout lancement passe par la confirmation (§5).
+- **Avant 0.8.0** : contrôle total sans aucun secret en loopback (`/mcp` et `POST /api/action` ouverts sans identité,
+  catalogue entier accessible, `add_server` et `start_server` compris).
+- **En 0.8.0** : `/mcp` sans signature valide → `401` de corps constant (DA2) ; `/api/*` sans session locale complète
+  (cookie `mcc_session` **et** en-tête `X-MCC-Session`, §6) → `401` ; les outils sont bornés par les droits du client
+  (§4) et tout lancement passe par la confirmation humaine (§5).
+  *Limite* : un processus qui s'exécute avec le **même compte utilisateur OS** reste dans le même périmètre de confiance
+  (il peut lire le trousseau, le dossier de configuration ou le canal fichier local de session, §1 Hors de portée).
 
 ### 1.2 Page web ouverte dans un navigateur de la machine
 
-- **Aujourd'hui** : ne peut ni lire ni écrire. `Host` inconnu → 403 (`src/lib.rs:544-552`), `Origin` étranger → 403
-  (`:565-570`), `OPTIONS` → 403 (`:536`), `POST /api/action` non JSON → 415 (`:597`), `Access-Control-Allow-Origin`
-  reflété seulement pour une origine autorisée (`:1204-1210`). Elle peut émettre des GET aveugles et mesurer des temps.
-- **Après** : inchangé, plus le cookie de session `SameSite=Strict` (§6) qui n'est jamais envoyé en cross-site et
-  l'absence de tout jeton dans l'URL. Le rebinding DNS reste bloqué par `Host`.
+- **En 0.8.0** : ne peut ni lire ni écrire. `Host` absent ou dupliqué → `400`, `Host` inconnu ou port étranger → `403`,
+  `Origin` dupliqué → `400`, `Origin` étranger → `403`, `OPTIONS` → `403`, `POST /api/action` non JSON → `415`,
+  `Access-Control-Allow-Origin` reflété seulement pour une origine autorisée. Le cookie `mcc_session` est
+  `HttpOnly; SameSite=Strict`, l'en-tête `X-MCC-Session` (secret en mémoire JS) impose un préflight CORS refusé, et
+  la CSP est stricte (`default-src 'none'; script-src 'self'; style-src 'self'`). Le rebinding DNS reste bloqué par
+  `Host`.
 
 ### 1.3 Machine du LAN qui écoute (passive)
 
-- **Aujourd'hui** : capture le code partagé en clair — `X-MCC-Access` (`src/lib.rs:586`) ou `?access=` (`:588`) sur du
-  HTTP sans TLS — puis l'utilise comme en 1.4. Aucun TLS dans le produit ; les sondes de pairs parlent en clair
-  (`src/probe.rs:2505-2540`).
-- **Après** : TLS 1.3 hors loopback (DA5, §7) et signature par requête (DA7). Une requête capturée n'est pas rejouable
-  (nonce, fenêtre ±60 s, cache borné par clé — lib §2.3).
+- **Avant 0.8.0** : capturait le code partagé en clair (`X-MCC-Access` ou `?access=`) sur du HTTP sans TLS.
+- **En 0.8.0** : TLS 1.3 obligatoire hors loopback (DA5, §7) et signature Ed25519 par requête (DA7). Une requête
+  capturée n'est pas rejouable (nonce unique, fenêtre ±60 s, cache borné par clé, refus des requêtes signées avant le
+  démarrage courant `BOOT_TS` et vérification stricte du port dans `Host`, §2.2).
 
 ### 1.4 Machine du LAN active
 
-- **Aujourd'hui** : `GET /api/hello` est pré-authentifié et non signé (`src/lib.rs:579`, `:1257`) ; qui présente le code
-  obtient les 30 outils ; seuls freinent les plafonds de connexions (`src/lib.rs:27-41`) et 30 req/60 s sur
-  `/api/hello` (`:300`).
-- **Après** : sans clé, 401 de corps constant ; échecs comptés par adresse **et** par `keyid`, délai croissant puis
-  blocage temporaire, et une adresse locale ne peut pas être bloquée depuis le LAN (lot M5).
+- **En 0.8.0** : sans clé valide, `401` de corps constant et temps de réponse uniforme ; échecs comptés par adresse
+  **et** par `keyid`, délai croissant (dès 8 échecs) puis blocage temporaire `429` (à 40 échecs), sans jamais bloquer
+  le loopback depuis le LAN (`src/auth/throttle.rs`). Les requêtes avec en-têtes critiques dupliqués (`Host`, `Origin`,
+  `Cookie`, `X-MCC-Session`, `Content-Length`) ou `Content-Length` non numérique sont rejetées en `400 Bad Request`.
 
 ### 1.5 Voleur de `config.json`
 
-- **Aujourd'hui** : obtient `api_access` en clair (`src/manage/config.rs:690`) — donc l'exécution de programmes
-  (audit 05 #2) — et les valeurs `env` des serveurs stdio (`:672-676`). Permissions : 0600 sous Unix, **rien sous
-  Windows** (`:737-745`).
-- **Après** : le fichier ne contient plus aucun secret (§9) : clés publiques, droits, dates. Le code hérité disparaît
-  en 0.9 (DA3). Le fichier reste lisible par le même utilisateur : hors de portée.
+- **Avant 0.8.0** : obtenait `api_access` en clair (équivalent exécution) et les valeurs `env` stdio, sans ACL Windows.
+- **En 0.8.0** : `config.json` ne contient aucune clé privée (§9 : clés publiques, droits, dates). Les fichiers de
+  données (`config.json`, `state-cache.json`, `mcc.log`, `auth-audit.log`) sont écrits de façon atomique avec ACL
+  explicite (`0600` sous Unix ; utilisateur courant + `SYSTEM` + `Administrateurs` sans héritage sous Windows). Les
+  valeurs `env` stdio et les en-têtes webhook restent dans `config.json` (protégés par ces ACL) et ne ressortent jamais
+  par l'API, le gateway ni les journaux. Le code `api_access` hérité disparaît en 0.9.0 (DA3). Un processus du même
+  utilisateur peut toujours lire ces fichiers : hors de portée.
 
 ### 1.6 Voleur d'une clé client
 
-- **Aujourd'hui** : pas de clé client ; l'équivalent est le code partagé, qui vaut tous les droits (audit 05 #2).
-- **Après** : il signe à la place de ce client et obtient exactement ses droits ; `execution` exige en plus une
-  approbation dans la fenêtre locale (§5) ; la révocation prend effet à la requête suivante (lib §4) ; chaque décision
-  est au journal (§11).
+- **En 0.8.0** : il signe à la place de ce client et obtient exactement ses droits ; `execution` exige en plus une
+  approbation dans la fenêtre locale (§5) ; la révocation (`client_revoke` ou `mcp-control auth revoke`) prend effet à
+  la requête suivante (lib §4) ; chaque décision est au journal chaîné (§11).
 
 ### 1.7 Serveur MCP supervisé malveillant
 
-- **Aujourd'hui** : ses réponses reviennent telles quelles à l'agent (`call_server_tool`) ; il peut y glisser des
-  instructions qui feront appeler `add_server`/`start_server`, autorisés sans identité (1.1). Il peut aussi se faire
-  adopter comme commande de lancement par une annonce écrite dans `%TEMP%\litemcp-registry` (`src/manage/litemcp.rs:30`).
-- **Après** : l'injection de contenu reste possible (hors de portée) mais son effet est borné par les droits de
-  l'appelant et par la confirmation (§5) ; l'adoption d'annonce ne crée plus de commande exécutable sans `execution`
-  et confirmation (§4).
+- **En 0.8.0** : l'injection de contenu dans une réponse d'outil reste possible (hors de portée), mais son effet est
+  borné par les droits de l'appelant et par la confirmation humaine (§5). Les annonces écrites dans
+  `%TEMP%\litemcp-registry` ne sont plus adoptées ni démarrées d'office : elles sont listées en lecture seule
+  (`litemcp_announcements`, propriétaire vérifié, plafond 64 Kio / 32 entrées) et nécessitent un ajout explicite.
 
 ### 1.8 Agent IA manipulé par injection de prompt
 
-- **Aujourd'hui** : il pilote tout. Le scénario central : un prompt détourné appelle `add_server` puis `start_server`,
-  et le programme tourne (audit 05 #2).
-- **Après** : il ne peut que ce que ses droits permettent ; un lancement produit une demande visible dans la fenêtre,
-  avec le programme et les arguments exacts (§5) ; la séquence reste au journal (§11).
+- **En 0.8.0** : il ne peut que ce que ses droits permettent ; tout lancement ou appel d'outil distant (`execution`)
+  produit une demande visible dans la fenêtre locale, avec le programme, les arguments exacts et l'identité du client
+  (§5) ; la séquence complète reste au journal d'audit chaîné (§11).
 
 ### Hors de portée (écrit noir sur blanc)
 
@@ -110,8 +105,9 @@ Un client qui n'applique pas ces dix points ne se connecte pas. MCP Control ne t
 | Point | Valeur fixée | Pourquoi |
 |---|---|---|
 | Chemins couverts | `/mcp` exactement, en `POST`. Aucune autre route n'accepte de signature ; une requête signée vers un autre chemin rend 404 **avant** vérification. | Un seul point d'entrée signé : moins de surface (DA2). |
-| `@authority` attendue | La valeur du `Host` reçu, qui DOIT déjà figurer dans `allowed_hosts` (interfaces locales + `ui_port` + `allowed_origins`), sinon 403 avant vérification (`src/lib.rs:544-552`). `X-Forwarded-*` n'est jamais lu. | La liaison au destinataire (lib §2.6) porte sur ce que la machine voit réellement ; pas de proxy supposé. |
-| Fenêtre d'horloge | ±60 s, non élargie. Un refus `clock_skew` est journalisé avec l'écart, jamais renvoyé au client. | Une fenêtre plus large rendrait le rejeu possible plus longtemps (RFC 9421 §7.2.2). |
+| `@authority` attendue | La valeur du `Host` reçu, qui DOIT être unique (doublon → `400`), figurer dans `allowed_hosts` (interfaces locales + `allowed_origins`), et porter exactement `ui_port` (port différent → `403`, port mal formé → `400` ; sur `/mcp`, `Host` sans port refusé en `403` hors ports par défaut `80`/`443`). `X-Forwarded-*` n'est jamais lu. | Empêche le rejeu inter-instances / inter-ports (`R-1`) et le rebinding DNS ; pas de proxy supposé. |
+| Fenêtre d'horloge & redémarrage | ±60 s, non élargie. De plus, le moteur enregistre `BOOT_TS` au démarrage et rejette en `401` uniforme toute requête `/mcp` signée dont `created < boot_ts` (`R-2`). Un refus `clock_skew` est journalisé avec l'écart, jamais renvoyé au client. | Ferme le rejeu dans la fenêtre ±60 s après un redémarrage du moteur, sans E/S disque. |
+| Cadrage & en-têtes critiques | Tout doublon de `Host`, `Origin`, `X-MCC-Session`, cookie `mcc_session=` ou `Content-Length`, ainsi qu'un `Content-Length` non numérique ou `Transfer-Encoding: chunked`, est rejeté en `400 Bad Request` (`R-3`). | Conformité RFC 9110 §7.2 ; prévient toute désynchronisation d'analyse. |
 | Corps | ≤ 2 Mio (`src/lib.rs:27`), digest calculé sur les octets reçus après décadrage. | Le digest doit couvrir exactement ce que le noyau analyse (lib §2.2). |
 | Délai de requête | 5 s (`src/lib.rs:41`), vérification comprise (Ed25519 ≈ 78 µs mesurés par l'audit LR). | Un refus doit coûter moins cher qu'une requête valide (lot M5). |
 | `Mcp-Method` / `Mcp-Name` | Obligatoires et cohérents avec le corps, contrôlés par le transport avant la vérification. | SEP-2243 ; déjà en place. |
@@ -172,7 +168,7 @@ Tous les messages sont en JSON, sur le même port que l'UI. `tls_fp` est vide qu
    deux côtés ne voient pas la même paire de clés ni le même `tls_fp`.
 4. **Utilisateur (fenêtre locale, droit `admin`)** : lit `label`, `keyid`, empreinte courte, `paired_from`, compare le
    code, choisit les droits, approuve ou refuse. Refus et expiration sont définitifs pour ce `pair_id`.
-5. **Client → serveur** : `GET /auth/pair/{pair_id}` toutes les 2 s (5 req/min).
+5. **Client → serveur** : `GET /auth/pair/{pair_id}` toutes les 2 s (limité à 60 req/min/IP par le serveur, `429` au-delà).
    `{ "status": "pending"|"approved"|"rejected"|"expired", "rights": [...], "server_pub", "tls_fp" }`.
    Sur `approved`, le client épingle l'empreinte de `server_pub` **et** `tls_fp` (lib C9, `PinnedServer`), puis range
    `keyid` + clé privée au trousseau (§9). Sur `rejected`/`expired`, il efface la clé générée.
@@ -244,25 +240,37 @@ tableau n'existe pas ; tout ajout DOIT modifier ce tableau dans la même révisi
   jamais par `/mcp`. Ce qui est approuvé est exactement ce qui s'exécute : la politique reçoit les arguments après
   validation et injection des défauts, et le handler reçoit la même valeur (lib §5).
 
-## 6. Session locale de la fenêtre (DA2 = a)
+## 6. Session locale de la fenêtre (DA2 = a, lot S1)
 
-- **Obtention** : au lancement, le moteur tire un jeton d'amorçage (32 octets du système, base64url), valable 5 minutes
-  et **à usage unique**. Le shell Tauri navigue vers `http://127.0.0.1:<port>/#t=<jeton>` (fragment : jamais envoyé au
-  serveur, jamais dans `Referer`, jamais dans `mcc.log`). `app.js` échange le jeton sur `POST /api/session`, reçoit le
-  cookie, puis efface le fragment (`history.replaceState`).
-- **Mode headless** (aucune fenêtre) : le moteur imprime la même URL à usage unique sur la console au démarrage ;
-  l'utilisateur l'ouvre une fois dans son navigateur. Passé 5 minutes, il faut relancer le moteur — aucun jeton ne
-  traîne sur disque.
-- **Forme** : cookie `mcc_session`, `HttpOnly`, `SameSite=Strict`, `Path=/`, sans `Secure` en loopback (HTTP),
-  `Max-Age` = durée de vie du moteur (cookie de session). Aucune valeur en `localStorage`, aucun en-tête `Authorization`
-  côté UI.
-- **Durée** : le cookie meurt avec le process ; une fenêtre déjà ouverte le garde jusqu'à l'arrêt du moteur. Aucun
-  rafraîchissement silencieux.
-- **Protection CSRF conservée** : `Host` et `Origin` restent vérifiés avant tout (`src/lib.rs:544-570`), `OPTIONS`
-  reste 403, `POST /api/action` reste 415 sans JSON, le cookie est `SameSite=Strict`, et toute requête qui change
-  l'état DOIT porter `X-MCC-Request: 1` (un en-tête personnalisé impose un préflight, que le serveur refuse).
-- **Portée** : la session locale porte `admin` et n'est **jamais** acceptée sur `/mcp` (test du lot M2). Elle ne
-  remplace pas la signature : un client MCP, même local, signe.
+- **Obtention** : au lancement, le moteur tire un jeton d'amorçage (32 octets de l'OS, base64url — échec fermé si
+  l'entropie OS est indisponible), valable 5 minutes et **à usage unique**. Le shell Tauri navigue vers
+  `http://127.0.0.1:<port>/#t=<jeton>` (fragment : jamais envoyé au serveur, jamais dans `Referer`, jamais dans
+  `mcc.log`). `app.js` échange le jeton sur `POST /api/session`, reçoit à la fois le cookie `mcc_session` **et** un
+  secret de session en JSON (32 octets base64url, conservé uniquement en mémoire JS), puis purge immédiatement le
+  fragment (`history.replaceState`).
+- **Second lancement & CLI locale (canal fichier utilisateur)** : lorsqu'une instance tourne déjà (fenêtre rouverte,
+  second lancement headless ou commandes CLI `auth list` / `auth revoke`), le processus local demande un jeton
+  d'amorçage à usage unique (2 min) via deux fichiers éphémères (`mcc-session.req` / `mcc-session.grant`) dans le
+  dossier de `config.json`. Chaque fichier est créé atomiquement (`.tmp` vide → ACL restreintes à l'utilisateur courant
+  → écriture + `sync_all` → `rename`), supprimé dès lecture et jamais journalisé.
+  *Limite* : un processus qui s'exécute avec le même compte utilisateur OS est déjà dans le périmètre de confiance (il
+  lit le trousseau et `config.json`, §1 Hors de portée) ; un autre compte utilisateur OS ne peut ni déposer la demande
+  ni lire la réponse.
+- **Forme et double preuve** : toute requête `/api/*` exige **à la fois** :
+  1. le cookie `mcc_session` (`HttpOnly; SameSite=Strict; Path=/`, sans `Secure` en loopback HTTP) ;
+  2. l'en-tête `X-MCC-Session: <secret>` (secret reçu en JSON lors de `POST /api/session`, jamais stocké dans
+     `localStorage` ni dans l'URL).
+  Les deux valeurs sont comparées en temps constant (`ct_eq`). L'ancien en-tête `X-MCC-Request: 1` est supprimé : la
+  présence de l'en-tête personnalisé `X-MCC-Session` suffit à imposer un préflight CORS refusé.
+- **Sessions multiples et durées** : jusqu'à **8 sessions locales simultanées** (la 9ᵉ est refusée). Chaque session
+  expire après **12 h d'inactivité** (`last_seen` mis à jour à chaque requête) ou **24 h absolues**, et meurt au
+  redémarrage du moteur. La route `POST /api/session/close-others` révoque toutes les autres sessions tout en gardant
+  la session courante active (exposée dans l'onglet *Identité & Sessions* de la fenêtre).
+- **Protection CSRF et CSP** : `Host` et `Origin` vérifiés et uniques (`400`/`403`), `OPTIONS` → `403`, `POST /api/action`
+  non JSON → `415`, cookie `SameSite=Strict`, en-tête secret `X-MCC-Session`, et CSP stricte (`default-src 'none';
+  script-src 'self'; style-src 'self'`, 0 script/style inline).
+- **Portée** : la session locale porte `admin` et n'est **jamais** acceptée sur `/mcp`. Elle ne remplace pas la
+  signature : un client MCP, même local, signe.
 
 ## 7. TLS (DA5 = a)
 
@@ -279,7 +287,13 @@ tableau n'existe pas ; tout ajout DOIT modifier ce tableau dans la même révisi
   `TLS13_AES_128_GCM_SHA256`, `TLS13_CHACHA20_POLY1305_SHA256`), non configurables ; ALPN `http/1.1` seulement. TLS 1.2
   échoue à la poignée de main.
 - **Épinglage** : `PinnedServer` refuse toute empreinte différente, sans option de contournement ; `mcp-control auth pair`
-  refuse un serveur dont l'identité a changé et le dit.
+  refuse un serveur dont l'identité ou le certificat a changé et le dit.
+- **Pairs et serveurs LiteMCP verrouillés (lot M4)** : les pairs appairés sont interrogés via `POST /mcp` (`list_servers`)
+  signé en `lecture` (le repli transitoire DA3 0.8.x reste actif pendant 0.8.x). Un serveur LiteMCP distant qui répond
+  `401` avec `WWW-Authenticate: Signature` est classé « joignable mais verrouillé » (`locked: true`, badge cadenas) ;
+  l'action locale `server_pair` (`admin`, inaccessible sur `/mcp`) l'appaire, range la clé cliente dans le trousseau
+  (ou repli `auth/clients/<keyid>.key` + `<keyid>.pin.json`) et active les sondes ainsi que le proxy `call_server_tool`
+  signés de bout en bout.
 
 ## 8. API à ajouter, et correspondance C1–C12
 
@@ -287,15 +301,15 @@ tableau n'existe pas ; tout ajout DOIT modifier ce tableau dans la même révisi
 
 | Ajout | Contenu |
 |---|---|
-| `src/auth.rs` + `src/auth/{registry,pair,session,confirm}.rs` | Registre (`KeyStore`), appairage, session locale, politique de confirmation. |
-| `src/auth/net.rs` | TLS entrant, épinglage sortant. |
-| `src/bridge.rs` | Pont stdio (M5). |
-| `src/audit.rs` | Journal chaîné (§11). |
-| `POST /auth/pair`, `GET /auth/pair/{id}` | Famille d'appairage (§3.4), non authentifiée, limitée par adresse. |
-| `POST /api/session` | Échange du jeton d'amorçage contre le cookie (§6). |
-| `POST /mcp` | Vérifie puis dispatche (C8) ; plus aucun appel direct au noyau. |
+| `src/auth.rs` + `src/auth/{registry,pair,session,confirm,secret,cli,throttle}.rs` | Registre (`KeyStore`), appairage, session locale S1, politique de confirmation M3, stockage atomique des secrets, CLI `auth`, anti-force brute M5. |
+| `src/auth/net.rs` | TLS 1.3 entrant, épinglage sortant, action locale `server_pair` (M4). |
+| `src/bridge.rs` | Pont stdio `mcp-control bridge` (M5). |
+| `src/audit.rs` | Journal d'audit chaîné HMAC + ancre `auth-audit.head` (§11, M5). |
+| `POST /auth/pair`, `GET /auth/pair/{id}` | Famille d'appairage (§3.4), non authentifiée, limitée par adresse (5 req/min sur `POST`, 60 req/min sur `GET`). |
+| `POST /api/session`, `POST /api/session/close-others` | Échange du jeton d'amorçage contre cookie + secret `X-MCC-Session`, et révocation des autres sessions locales (§6). |
+| `POST /mcp` | Vérifie `Host` (port), `BOOT_TS`, signature Ed25519 puis dispatche (C8) ; plus aucun appel direct au noyau. |
 | `config.json` | `auth.server` (`keyid`, `public_key`, `created_at`), `auth.clients[]` (§3.2), `auth.session_bootstrap_secs`, `auth.confirm_secs`, `auth.audit_path`, `tls.cert_path`, `tls.key_path` (chemins seulement). |
-| Suppressions | `?access=` (M2) ; `X-MCC-Access` et la preuve `X-MCC-Proof` en 0.9 (DA3) ; `/api/hello` et ses nonces quand plus rien ne les utilise (M4). |
+| Suppressions | `?access=` supprimé en 0.8.0 (M2) ; `X-MCC-Request` supprimé en 0.8.0 (S1) ; `X-MCC-Access`, `X-MCC-Proof` et `/api/hello` conservés en 0.8.x pour le repli transitoire DA3 des pairs et supprimés en 0.9.0. |
 
 ### 8.2 Contrat de la lib, ligne par ligne
 
@@ -316,15 +330,13 @@ tableau n'existe pas ; tout ajout DOIT modifier ce tableau dans la même révisi
 
 ### 8.3 Features et crates propres à MCP Control
 
-- `litemcp` : `auth-sign` **obligatoire** (sans lui, aucun vérificateur) ; `tls` pour DA5. Sans `tls`, le moteur compile
-  et reste en loopback (§7).
-- `keyring` **4.2.0**, licence MIT OR Apache-2.0, publiée le 2026-08-29, MSRV 1.88, magasins par défaut
-  `windows-native-keyring-store`, `apple-native-keyring-store`, `zbus-secret-service-keyring-store`. Feature `keychain`,
-  version épinglée (`=4.2.0`). **Taille ajoutée au binaire : non mesurée** (aucun build autorisé au lot A0) — mesure
-  exigée au lot M1 avec la méthode du §7 de la lib. **Dernier audit public connu : non établi** (aucune référence
-  consultée à ce jour) — à vérifier au lot M1.
-- `rustls =0.23.46` et `rcgen =0.14.7`, mêmes versions que la lib (lib §7), déclarées directement parce que C10 ne les
-  expose pas ; derrière la feature `tls` de MCP Control.
+- `litemcp = "0.12.0"` (publié sur crates.io) : `auth-sign` **obligatoire** (sans lui, aucun vérificateur) ; `tls` pour
+  DA5. Sans `tls`, le moteur compile et reste en loopback (§7).
+- `keyring = "=4.2.0"` (licence MIT OR Apache-2.0, `default-features = false, features = ["v1"]`), derrière la feature
+  par défaut `keyring`. Taille mesurée sous Windows release (lot S3) : **+1,63 Mo** (3,57 Mo sans feature → 5,20 Mo avec
+  `keyring`) ; sans cette feature, le moteur compile et bascule sur le repli fichier `0600`/ACL journalisé.
+- `rustls = "=0.23.46"` et `rcgen = "=0.14.7"` (`default-features = false`, backend `ring`, sans `tls12`), déclarées
+  derrière la feature `tls` de MCP Control.
 
 ## 9. Stockage des clés
 
@@ -366,8 +378,12 @@ tableau n'existe pas ; tout ajout DOIT modifier ce tableau dans la même révisi
 - **Chaînage** : `mac = HMAC-SHA256(k_audit, prev ‖ ligne_sans_mac)`, `prev` = `mac` de la ligne précédente,
   `prev` de la première ligne = 32 zéros. `mcp-control auth verify-log` recalcule toute la chaîne et rend non nul sur
   une ligne modifiée, supprimée ou insérée (trois tests, lot M5).
-- **Rotation** : à 8 Mio, cinq fichiers ; le `mac` de la dernière ligne passe dans un fichier `head` pour que la chaîne
-  continue d'un fichier à l'autre.
+- **Rotation** : à 8 Mio, cinq fichiers (`.1` à `.5`) ; lorsque le plus ancien segment `.5` est évincé, le `mac` de
+  ancrage est enregistré dans `auth-audit.head` (signé HMAC, écrit atomiquement avec ACL restreintes) afin que la chaîne
+  reste vérifiable de bout en bout par `mcp-control auth verify-log` même après éviction.
+- **Écriture des secrets** : tous les fichiers privés (`auth/server.key`, `auth/audit.key`, `tls/server.key`,
+  `auth/clients/<keyid>.key`, `auth-audit.head`) sont écrits sans fenêtre TOCTOU (création `.tmp` vide → ACL
+  restreintes → écriture + `sync_all` → `rename`, nettoyage du `.tmp` sur erreur).
 - **Ce qui n'y figure jamais** : arguments d'outil, valeurs d'environnement, nonce, signature, clé (publique ou privée),
   code `api_access`, résultat d'outil, contenu de réponse. Le motif précis reste local ; le réseau ne reçoit qu'un
   refus générique.
