@@ -47,7 +47,7 @@
 
 ### Boutique — variables d'environnement à l'installation
 - **L'installation d'un serveur de la boutique accepte un champ `env`** (`{"GITHUB_TOKEN": "…"}`) pour les items à jeton : les variables atteignent le transport et la commande de lancement, survivent au rechargement de la configuration, et **les valeurs ne ressortent jamais** — ni `/api/state`, ni `/api/detail`, ni la réponse, ni le journal (noms seuls).
-- Disponible par l'API locale (`install_store`) et par le tool `install_store_server` du gateway ; le bouton Installer de l'interface ne propose pas encore de champ de saisie (suivi dans `TODO.md`, section 5, R9).
+- Disponible par l'interface (Boutique avec champs `env` masqués et bouton œil, `UI-modern`), par l'API locale (`install_store`) et par le tool `install_store_server` du gateway.
 
 ### Interface — un seul chemin pour les actions, panne moteur vue plus tôt
 - **Tous les envois d'action de la page passent par un helper unique** (`postAction`, 30 sites d'appel, un seul `fetch('/api/action')`) qui lit `ok` et affiche `error` en toast : un refus du moteur ne peut plus passer en silence.

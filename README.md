@@ -140,7 +140,7 @@ Pour brancher un assistant IA sans écrire de code de signature, utilise l'appai
 ### 1. Appairer l'assistant (une seule fois)
 
 ```bash
-mcp-control auth pair http://127.0.0.1:5090 --label "Claude"
+mcp-control auth pair http://127.0.0.1:5090
 ```
 
 1. Un **code de vérification à 6 chiffres** s'affiche dans le terminal.
@@ -162,14 +162,14 @@ mcp-control auth pair http://127.0.0.1:5090 --label "Claude"
 }
 ```
 
-Avec une URL explicite (port personnalisé ou serveur distant en HTTPS) :
+Avec une URL locale explicite (port personnalisé) :
 
 ```json
 {
   "mcpServers": {
     "mcp-control": {
       "command": "mcp-control",
-      "args": ["bridge", "--url", "https://192.168.1.42:5090"]
+      "args": ["bridge", "--url", "http://127.0.0.1:5090"]
     }
   }
 }
@@ -196,7 +196,7 @@ Tu peux alors demander à ton assistant « montre-moi mes serveurs MCP », « re
 2. Sur la machine cliente :
 
 ```bash
-mcp-control auth pair https://<ip-du-serveur>:5090 --label "Portable"
+mcp-control auth pair https://<ip-du-serveur>:5090
 ```
 
 3. Compare le **code à 6 chiffres** affiché des deux côtés — il couvre à la fois la clé publique Ed25519 du serveur (`mcc-server`) et l'empreinte SHA-256 du certificat TLS (`tls_fp`). Approuve dans la fenêtre locale du serveur.
@@ -253,12 +253,12 @@ Spécification complète : [docs/auth.md](docs/auth.md).
 
 ```bash
 # appairer un client local ou distant (TLS 1.3)
-mcp-control auth pair http://127.0.0.1:5090 --label "Mon-Agent"
-mcp-control auth pair https://192.168.1.42:5090 --label "Portable"
+mcp-control auth pair http://127.0.0.1:5090
+mcp-control auth pair https://192.168.1.42:5090
 
-# pont stdio signé pour assistants IA
+# pont stdio signé pour assistants IA (HTTP local)
 mcp-control bridge
-mcp-control bridge --url https://192.168.1.42:5090
+mcp-control bridge --url http://127.0.0.1:5090
 
 # administrer les clés (session locale automatique via canal fichier)
 mcp-control auth list

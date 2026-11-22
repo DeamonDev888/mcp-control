@@ -30,7 +30,7 @@ En `0.7.x`, l'assistant pointait directement sur `http://127.0.0.1:5090/mcp`. En
 ### Étape 1 — Appairer ton poste
 
 ```bash
-mcp-control auth pair http://127.0.0.1:5090 --label "Claude"
+mcp-control auth pair http://127.0.0.1:5090
 ```
 
 1. La commande affiche un **code de vérification à 6 chiffres** (ex. `482 193`).
@@ -55,14 +55,14 @@ Remplace l'ancienne entrée `"url": "http://127.0.0.1:5090/mcp"` par le pont std
 }
 ```
 
-Avec une URL explicite (port personnalisé ou machine distante en HTTPS) :
+Avec une URL locale explicite (port personnalisé) :
 
 ```json
 {
   "mcpServers": {
     "mcp-control": {
       "command": "mcp-control",
-      "args": ["bridge", "--url", "https://192.168.1.42:5090"]
+      "args": ["bridge", "--url", "http://127.0.0.1:5090"]
     }
   }
 }
@@ -85,7 +85,7 @@ Même avec le droit `execution`, **chaque appel d'outil `execution` demande une 
 2. Sur la machine cliente :
 
 ```bash
-mcp-control auth pair https://<ip-du-serveur>:5090 --label "Portable"
+mcp-control auth pair https://<ip-du-serveur>:5090
 ```
 
 3. Compare le **code à 6 chiffres** (qui couvre à la fois la clé Ed25519 du serveur et l'empreinte `tls_fp` du certificat TLS 1.3), puis approuve dans la fenêtre du serveur.
@@ -99,8 +99,8 @@ Les commandes `auth list` et `auth revoke` s'authentifient automatiquement aupr�
 
 | Commande | Rôle |
 |---|---|
-| `mcp-control auth pair <url> [--label <nom>]` | Crée une paire Ed25519, lance l'appairage, affiche le code à 6 chiffres et épingle le serveur après approbation |
-| `mcp-control bridge [--url <url>]` | Pont stdio ↔ HTTP(S) signé pour les assistants IA |
+| `mcp-control auth pair <url>` | Crée une paire Ed25519, lance l'appairage (libellé déduit du nom de machine), affiche le code à 6 chiffres et épingle le serveur après approbation |
+| `mcp-control bridge [--url http://127.0.0.1:<port>]` | Pont stdio ↔ HTTP local signé pour les assistants IA |
 | `mcp-control auth list` | Liste les clients enregistrés, leurs droits, leur statut et leur dernière activité |
 | `mcp-control auth revoke <keyid>` | Révoque immédiatement un client (effet dès la requête suivante) |
 | `mcp-control auth fingerprint` | Affiche l'empreinte Ed25519 du serveur local (`mcc-server`) |
