@@ -1010,6 +1010,7 @@ function renderOverview() {
     : '<div class="empty-note">Aucun &eacute;v&eacute;nement r&eacute;cent.</div>';
   const firstStartGuide = !srvs.length ? `
     <div class="welcome" id="welcome">
+      <div class="welcome-mark">${ic('zap')}</div>
       <div class="big">Bienvenue dans MCP Control</div>
       <div class="hint">Aucun serveur MCP n'est encore configur&eacute;. Lancez un scan local, explorez la boutique ou ajoutez une machine distante :</div>
       <div class="qa">
@@ -1033,27 +1034,27 @@ function renderOverview() {
       </div>
     </div>
     <div class="tiles">
-      <button class="tile${overviewFilter === 'up' ? ' sel' : ''}" data-act="tile" data-mode="up"
+      <button class="tile tile-ok${overviewFilter === 'up' ? ' sel' : ''}" data-act="tile" data-mode="up"
         title="Cliquer : ne montrer que les serveurs UP dans l'explorateur (re-cliquer pour tout afficher)">
-        <div class="n ok">${s.up} / ${s.total}</div>
+        <div class="tile-top"><div class="n ok">${s.up} / ${s.total}</div><span class="tile-ic">${ic('activity')}</span></div>
         <div class="lbl">Serveurs UP / Total</div>
         <div class="meta">${downSrvs.length ? downSrvs.length + ' en panne' : '100 % op\u00e9rationnels'}</div>
       </button>
-      <button class="tile" data-act="tile-tools"
+      <button class="tile tile-acc" data-act="tile-tools"
         title="Cliquer : trier l'explorateur par nombre d'outils expos&eacute;s">
-        <div class="n">${s.tools}</div>
+        <div class="tile-top"><div class="n">${s.tools}</div><span class="tile-ic">${ic('terminal')}</span></div>
         <div class="lbl">Outils expos&eacute;s</div>
         <div class="meta">Passerelle POST /mcp</div>
       </button>
-      <button class="tile" data-act="access-open" data-pending="1"
+      <button class="tile ${pendCount > 0 ? 'tile-warn' : 'tile-ok'}" data-act="access-open" data-pending="1"
         title="Cliquer : ouvrir le centre Acc&egrave;s &amp; S&eacute;curit&eacute;">
-        <div class="n ${pendCount > 0 ? 'warn' : 'ok'}">${pendCount}</div>
+        <div class="tile-top"><div class="n ${pendCount > 0 ? 'warn' : 'ok'}">${pendCount}</div><span class="tile-ic">${ic('shield')}</span></div>
         <div class="lbl">Confirmations &amp; Appairages</div>
         <div class="meta">${a.pending || 0} ex&eacute;cution(s) &middot; ${a.pairs || 0} appairage(s)</div>
       </button>
-      <button class="tile" data-act="access-open"
+      <button class="tile tile-acc" data-act="access-open"
         title="Cliquer : inspecter l'identit&eacute; serveur, les sessions locales et TLS 1.3">
-        <div class="n">${sessActive}</div>
+        <div class="tile-top"><div class="n">${sessActive}</div><span class="tile-ic">${ic('lock')}</span></div>
         <div class="lbl">Sessions locales &amp; TLS</div>
         <div class="meta">${esc(tlsLabel)}</div>
       </button>
@@ -1061,19 +1062,19 @@ function renderOverview() {
     ${firstStartGuide}
     <div class="dash-grid">
       <div class="dash-card">
-        <h3><span>${ic('warn')} Serveurs en panne (${downSrvs.length})</span></h3>
+        <h3><span>${ic('warn')} Serveurs en panne</span><span class="dash-cnt">${downSrvs.length}</span></h3>
         ${downHtml}
       </div>
       <div class="dash-card">
-        <h3><span>${ic('lock')} Serveurs verrouill&eacute;s (${lockedSrvs.length})</span></h3>
+        <h3><span>${ic('lock')} Serveurs verrouill&eacute;s</span><span class="dash-cnt">${lockedSrvs.length}</span></h3>
         ${lockedHtml}
       </div>
       <div class="dash-card">
-        <h3><span>${ic('activity')} D&eacute;tect&eacute;s, non suivis (${unfollowedAnnouncements.length})</span></h3>
+        <h3><span>${ic('activity')} D&eacute;tect&eacute;s, non suivis</span><span class="dash-cnt">${unfollowedAnnouncements.length}</span></h3>
         ${annHtml}
       </div>
       <div class="dash-card">
-        <h3><span>${ic('terminal')} Derniers &eacute;v&eacute;nements du journal</span></h3>
+        <h3><span>${ic('terminal')} Derniers &eacute;v&eacute;nements</span><span class="dash-cnt">${recentLogs.length}</span></h3>
         ${logHtml}
       </div>
     </div>`;
@@ -1112,16 +1113,48 @@ function claudeCmd(s) {
 function copyConf(btn) {
   const pre = btn.closest('.conf-block').querySelector('pre');
   copyText(pre.textContent); // repli execCommand intégré (audit 04 #11)
-  btn.textContent = 'copi\u00e9 \u2713';
-  setTimeout(() => btn.textContent = 'copier', 1500);
+  btn.classList.add('copied');
+  btn.innerHTML = ic('check') + '<span>Copi&eacute;</span>';
+  setTimeout(() => {
+    btn.classList.remove('copied');
+    btn.innerHTML = ic('copy') + '<span>Copier</span>';
+  }, 1500);
+}
+function hlYaml(src) {
+  return String(src || '').split('\n').map(line => {
+    const m = line.match(/^(\s*)([A-Za-z0-9_.-]+)(:)(\s*)(.*)$/);
+    if (!m) return esc(line);
+    const [, ind, key, col, sp, val] = m;
+    let vHtml = esc(val);
+    if (/^(true|false|null|\d+)$/.test(val)) vHtml = '<span class="tok-b">' + esc(val) + '</span>';
+    else if (val) vHtml = '<span class="tok-s">' + esc(val) + '</span>';
+    return esc(ind) + '<span class="tok-k">' + esc(key) + '</span><span class="tok-p">' + esc(col) + '</span>' + esc(sp) + vHtml;
+  }).join('\n');
+}
+function hlJson(src) {
+  return esc(src)
+    .replace(/&quot;([^&]*?)&quot;(\s*:)/g, '<span class="tok-k">&quot;$1&quot;</span><span class="tok-p">$2</span>')
+    .replace(/(:\s*)&quot;([^&]*?)&quot;/g, '$1<span class="tok-s">&quot;$2&quot;</span>')
+    .replace(/(&quot;[^&]*?&quot;)/g, '<span class="tok-s">$1</span>')
+    .replace(/\b(true|false|null)\b/g, '<span class="tok-b">$1</span>');
+}
+function hlCli(src) {
+  return String(src || '').split(' ').map((p, idx) => {
+    if (idx === 0) return '<span class="tok-c">' + esc(p) + '</span>';
+    if (p.startsWith('-')) return '<span class="tok-b">' + esc(p) + '</span>';
+    if (/^https?:\/\//.test(p)) return '<span class="tok-s">' + esc(p) + '</span>';
+    return esc(p);
+  }).join(' ');
 }
 function confAgent(s) {
-  const blk = (t, code) => '<div class="conf-block"><div class="conf-head">' + t + '<button data-act="copy-conf">copier</button></div><pre>' + String(code || '').split('\n').map(esc).join('\n') + '</pre></div>';
+  const blk = (t, lang, html) =>
+    '<div class="conf-block"><div class="conf-head"><span class="conf-lang">' + esc(lang) + '</span><span>' + t +
+    '</span><button class="copy-btn" data-act="copy-conf">' + ic('copy') + '<span>Copier</span></button></div><pre>' + html + '</pre></div>';
   return '<h4 class="sec">Connecter ce serveur &agrave; un agent</h4>' +
     '<div class="conf-note">Copie le bloc de ton agent &mdash; Hermes : colle sous <b>mcp_servers:</b> dans <b>~/.hermes/config.yaml</b>. Cl&eacute;s API : bloc <b>env:</b> (Hermes) ou <b>"env"</b> (JSON) &mdash; voir la desc du serveur.</div>' +
-    blk('Hermes &mdash; config.yaml', hermesYaml(s)) +
-    blk('JSON mcpServers (Claude, Cursor, VS Code&hellip;)', mcpJson(s)) +
-    blk('claude mcp add', claudeCmd(s));
+    blk('Hermes &mdash; config.yaml', 'YAML', hlYaml(hermesYaml(s))) +
+    blk('JSON mcpServers (Claude, Cursor, VS Code&hellip;)', 'JSON', hlJson(mcpJson(s))) +
+    blk('claude mcp add', 'CLI', hlCli(claudeCmd(s)));
 }
 let toolSearchQuery = '';
 const expandedTools = new Set();
@@ -1253,16 +1286,18 @@ function renderDetail() {
     <div id="toolsRowsBox">${renderToolsRowsHtml(s)}</div>`;
   contentEl.innerHTML = `
     <div class="crumb">serveurs / <b>${esc(s.label)}</b></div>
-    <div class="d-head">
-      <span class="dot dot-lg ${esc(dispState)}"></span>
-      <h1>${esc(s.label)}</h1>
-      <span class="pill ${esc(dispState)}" ${starting ? 'title="Process lanc&eacute;, MCP pas encore r&eacute;pondu"' : ''}>${starting ? 'AU D&Eacute;MARRAGE' : esc(s.state)}</span>
-      ${langChip(s)}
-      ${typeBadge(s)}
-      ${frameworkBadge(s)}
-      ${lockBadge(s)}
-      ${s.transport === 'stdio' ? '<span class="legacy" title="Legacy : serveur stdio uniquement (pas de transport HTTP)">legacy</span>' : ''}
-      <span class="sub">${s.server_name ? esc(s.server_name) + ' v' + esc(s.version || '?') : ''}${s.latency_ms != null ? ' &middot; ' + s.latency_ms + ' ms' : ''}</span>
+    <div class="d-head st-${esc(dispState)}">
+      <div class="d-head-top">
+        <span class="dot dot-lg ${esc(dispState)}"></span>
+        <h1>${esc(s.label)}</h1>
+        <span class="pill ${esc(dispState)}" ${starting ? 'title="Process lanc&eacute;, MCP pas encore r&eacute;pondu"' : ''}>${starting ? 'AU D&Eacute;MARRAGE' : esc(s.state)}</span>
+        ${langChip(s)}
+        ${typeBadge(s)}
+        ${frameworkBadge(s)}
+        ${lockBadge(s)}
+        ${s.transport === 'stdio' ? '<span class="legacy" title="Legacy : serveur stdio uniquement (pas de transport HTTP)">legacy</span>' : ''}
+        <span class="sub">${s.server_name ? esc(s.server_name) + ' v' + esc(s.version || '?') : ''}${s.latency_ms != null ? ' &middot; ' + s.latency_ms + ' ms' : ''}</span>
+      </div>
       <div class="d-actions">
         ${s.locked && s.state !== 'UP' ? `<button class="primary" data-act="server-pair" data-id="${esc(s.id)}" title="Appairer MCP Control avec ce serveur LiteMCP verrouill&eacute; par signature RFC 9421">${ic('lock')} Appairer ce serveur</button>` : ''}
         ${s.can_start && s.state !== 'UP' ? `<button class="primary" data-act="row-act" data-op="start" data-id="${esc(s.id)}">${ic('play')} Start</button>` : ''}
@@ -2469,7 +2504,7 @@ const PKG_LOGOS = [
   ['chrome-devtools', 'googlechrome'],
 ];
 function storeLogoSvg(inner) {
-  return `<svg class="slogo" viewBox="0 0 24 24" aria-hidden="true">${inner}</svg>`;
+  return `<span class="slogo-well"><svg class="slogo" viewBox="0 0 24 24" aria-hidden="true">${inner}</svg></span>`;
 }
 function storeLogo(i) {
   if (!storeLogos) return storeLogoSvg(PKG_GLYPH);
@@ -2537,12 +2572,21 @@ function renderStoreItems() {
         <button type="button" class="eye-btn" data-act="toggle-env-eye" aria-label="Afficher ou masquer ${esc(k)}" title="Afficher / masquer">${ic('eye')}</button>
       </div>`).join('')}</div>` : '';
     return `<div class="scard">
-      <div class="scard-top">${storeLogo(i)}<b>${esc(i.name)}</b><span class="tag ${i.kind==='npm'?'npm':'py'}">${esc(i.kind)}</span></div>
+      <div class="scard-top">
+        ${storeLogo(i)}
+        <div class="scard-title">
+          <b>${esc(i.name)}</b>
+          <span class="scard-cat">${esc(i.cat)}</span>
+        </div>
+        <span class="tag ${i.kind==='npm'?'npm':'py'}">${esc(i.kind)}</span>
+      </div>
       <div class="scard-desc">${esc(i.desc)}</div>
       ${envHtml}
-      ${isInst
-        ? `<button class="btn-inst" disabled title="Ce serveur est d&eacute;j&agrave; dans ta liste">${ic('check')} D&eacute;j&agrave; install&eacute;</button>`
-        : `<button class="primary" data-act="install-store" data-id="${esc(i.id)}">${ic('download')} Installer</button>`}
+      <div class="scard-foot">
+        ${isInst
+          ? `<button class="btn-inst" disabled title="Ce serveur est d&eacute;j&agrave; dans ta liste">${ic('check')} D&eacute;j&agrave; install&eacute;</button>`
+          : `<button class="primary" data-act="install-store" data-id="${esc(i.id)}">${ic('download')} Installer</button>`}
+      </div>
     </div>`;
   }).join('') || '<div class="empty-sec">aucun r&eacute;sultat</div>';
 }
@@ -2570,7 +2614,7 @@ async function installStore(id, btn) {
     });
     const dir = res && typeof res === 'object' ? res.dir : '';
     if (!dir || !dir.trim()) {
-      btn.disabled = false; btn.textContent = 'Installer';
+      btn.disabled = false; btn.innerHTML = ic('download') + ' Installer';
       return;
     }
     body.args = ['-y', '@modelcontextprotocol/server-filesystem', dir.trim()];
@@ -2579,7 +2623,7 @@ async function installStore(id, btn) {
   if (j.ok) {
     await load();
     renderStoreItems();
-  } else { btn.disabled = false; btn.textContent = 'R\u00e9essayer'; toast(j.error || 'erreur', 'err', 4000); }
+  } else { btn.disabled = false; btn.innerHTML = ic('refresh') + ' R&eacute;essayer'; toast(j.error || 'erreur', 'err', 4000); }
 }
 
 /* ===== Barre latérale ajustable (largeur mémorisée via data-w, 0 style inline) & repliable (Ctrl+B) ===== */

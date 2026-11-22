@@ -202,8 +202,11 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
   <div class="dlg-body dlg-body-tight">
     <div class="store-head">
       <div class="store-bar">
-        <label for="storeSearch" class="sr-only">Rechercher dans la boutique</label>
-        <input id="storeSearch" placeholder="Rechercher dans la boutique&hellip;" data-act="store-search">
+        <div class="store-search-wrap">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='11' cy='11' r='7'/><path d='m21 21-4.3-4.3'/></svg>
+          <label for="storeSearch" class="sr-only">Rechercher dans la boutique</label>
+          <input id="storeSearch" placeholder="Rechercher un serveur MCP&hellip;" data-act="store-search">
+        </div>
         <label for="storeSort" class="sr-only">Trier les r&eacute;sultats</label>
         <select id="storeSort" data-act="store-sort" title="Trier les r&eacute;sultats">
           <option value="cat">Ordre du catalogue</option>
