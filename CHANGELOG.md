@@ -1,3 +1,31 @@
+## [0.8.3] — 2026-11-22
+
+### Authentification MCP Control sur les sous-serveurs (clic droit)
+- **Menu contextuel Auth Ed25519 (RFC 9421)** : clic droit sur un serveur HTTP pour l'appairer en 1 clic (`server_pair` + copie automatique de `LITEMCP_TRUSTED_KEYS=…`), voir son statut actif (`Auth MCP Control active ✓`), copier la clé publique appairée ou l'identité Ed25519 du serveur, ré-appairer ou retirer l'appairage (`server_unpair`).
+- **Injection d'environnement pour serveurs gérés / `stdio`** : nouvelle action locale `server_auth_env` permettant d'injecter ou retirer `MCC_AUTH_KEYID`, `MCC_AUTH_PUBKEY` et `LITEMCP_TRUSTED_KEYS` dans la commande de lancement (badge `AUTH` visible sur le serveur).
+- **Test direct d'outils sur serveurs appairés** : les serveurs verrouillés mais appairés (`paired`) autorisent désormais l'exécution d'outils dans l'inspecteur en direct.
+
+### Interface & ergonomie
+- **Zone Serveurs & barre d'actions refondues** : explorateur élargi (`320px`), cartes `.srow` aérées sur 2 lignes (état/nom/compteur/switch en haut, métadonnées en pilules + actions rapides séparées en bas) et en-tête de détail structuré (endpoint en pilule, ruban `.d-meta-strip`, barre `.d-actions` divisée en groupes logiques avec séparateurs verticaux).
+- **Palette neutre graphite + indigo** (inspiration Antigravity / Claude, sombre & clair, contraste WCAG 2.2 AA).
+- **Scroll Boutique & modales corrigé** : défilement fluide dans `#storeDlg` et tous les `<dialog>` via layout flex-colonne + `.dlg-body` défilant.
+- **Inspecteur de schéma & testeur d'outils en direct** : cliquer sur un outil déplie son schéma JSON (`inputSchema`), le tableau de ses paramètres, un modèle JSON pré-rempli, la copie du payload `tools/call` et l'exécution directe sur les serveurs HTTP UP (`call_tool`).
+
+### Correctif Windows (fenêtre desktop)
+- **Déplacement de la fenêtre Tauri v2 rétabli** : portée `CapabilityBuilder::remote` étendue (`/*`), `data-tauri-drag-region` posé sur les enfants non interactifs de la barre de titre et gestionnaire `mousedown` / double-clic sur `#titlebar`.
+
+## [0.8.2] — 2026-11-22
+
+### Correctif Windows
+- **Zéro flash de fenêtre console (`icacls`/`reg`/`curl`)** : application de `CREATE_NO_WINDOW` dans `probe::system_command`, supprimant les 5 fenêtres console qui s'ouvraient brièvement lors d'un arrêt serveur ou *Tout couper*.
+
+## [0.8.1] — 2026-11-22
+
+### Boutique, navigation & mise à jour automatique
+- **28 nouveaux MCP (`@tom_doerr`)** ajoutés à la Boutique avec leurs logos SVG dédiés.
+- **Menu « Découverte ▾ »** regroupant *Scanner les ports*, *Scanner le réseau* et *Machines* ; modales *Réglages* et *Accès* agrandies en quasi plein écran.
+- **Auto-mise à jour vérifiée SHA-256** : téléchargement de l'installateur NSIS, vérification de son empreinte contre `SHA256SUMS.txt`, exécution silencieuse (`/S`) et relance automatique de MCP Control.
+
 ## [0.8.0] — 2026-11-21
 
 > **Guide de migration `0.7.x → 0.8.0`** : voir [`docs/migration-0.8.md`](docs/migration-0.8.md) et la spécification [`docs/auth.md`](docs/auth.md).

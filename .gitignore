@@ -5,22 +5,31 @@ state-cache.json
 *.log.old
 *.tmp
 .tmp
+.tmp-*
 
 desktop/gen/
+dist/
+notes.md
+*.cdx.json
 
 # artefacts e2e (captures de pages rendues — contiennent des données internes)
 ui-e2e-*
 
 # audit/projets annexes et rapports internes d'agents
+.obsidian/
 pauvre-router-audit/
 .zwork/
 .lot-wt/
+audit-agents/
 auth-agents/
 audit-v2/
 correctifs-agents/
 restes-agents/
+TODO-AGENTS.md
 TODO-AUTH.md
+TODO-AUTH-LITEMCP.md
 TODO-AUDIT.md
+TODO-CORRECTIFS.md
 TODO-RESTES.md
 
 # parasites Windows (mauvais redirect `> nul` sous Git Bash)

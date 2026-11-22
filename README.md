@@ -99,11 +99,9 @@ node -e "require('http').createServer((q,s)=>s.end('ok')).listen(32100)"
 | Bouton | Effet |
 |---|---|
 | **⟳** | Re-sonde tout et cherche les nouveaux serveurs sur les ports en écoute |
-| **Scanner les ports** | Cherche sur une plage de ports (512 ports au plus par scan) |
-| **Scanner le réseau** | Cherche sur les autres machines du réseau local |
-| **Machines** | Va chercher les serveurs d'une machine distante par SSH, et détecte les autres MCP Control du réseau |
+| **Découverte ▾** | Regroupe **Scanner les ports** (512 ports max), **Scanner le réseau** (LAN) et **Machines** (SSH + pairs MCP Control) |
 | **+ Ajouter un serveur** | Ajout à la main, ou collage d'un bloc `mcpServers` ou d'une URL |
-| **Boutique** | 63 serveurs MCP prêts à installer |
+| **Boutique** | Catalogue de serveurs MCP prêts à installer en un clic avec logos dédiés |
 
 ![Ajouter un serveur à la main, ou coller une configuration existante](assets/readme-ajout.png)
 
@@ -118,6 +116,8 @@ node -e "require('http').createServer((q,s)=>s.end('ok')).listen(32100)"
 | **Mettre en pause** | Le sortir de la surveillance sans le supprimer |
 | **Supprimer** | Le retirer de la liste |
 | Interrupteur d'un outil | Couper un outil précis sans arrêter le serveur |
+| **Clic sur un outil** | Inspecter son `inputSchema`, copier le payload `tools/call` et le tester en direct (serveurs HTTP UP) |
+| **Clic droit sur un serveur** | Appairer / retirer l'auth Ed25519 (RFC 9421), copier la clé publique ou injecter les variables d'env d'auth MCP Control |
 
 **Organiser et régler**
 
@@ -127,7 +127,7 @@ node -e "require('http').createServer((q,s)=>s.end('ok')).listen(32100)"
 - **Auto-boot** (barre du bas) : ouvrir l'app au démarrage de l'ordinateur, réduite dans la zone de notification.
 - **Réglages** : intervalle de sondage, plages de scan, accès réseau, notifications (bureau et webhook), thème, réinitialisation.
 
-![La boutique : 63 serveurs MCP à installer d'un clic](assets/readme-boutique.png)
+![La boutique : catalogue de serveurs MCP à installer d'un clic](assets/readme-boutique.png)
 
 ![Le thème clair](assets/readme-clair.png)
 
