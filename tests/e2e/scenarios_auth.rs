@@ -1996,6 +1996,7 @@ fn bandeau_sans_texte_de_client_et_ecran_local_seulement() {
 // =====================================================================
 
 fn spawn_hidden_cmd(bin: &str) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut cmd = Command::new(bin);
     #[cfg(windows)]
     {
