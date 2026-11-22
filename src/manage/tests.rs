@@ -1804,21 +1804,28 @@ fn acl_config_cache_et_journal_utilisateur_system_administrateurs() {
     let moi = probe::current_user_sid().expect("SID courant");
     for nom in ["config.json", "state-cache.json", "mcc.log"] {
         let p = dir.join(nom);
-        let script = format!(
-            "(Get-Acl -LiteralPath '{}').Sddl",
-            p.to_string_lossy().replace('\'', "''")
-        );
-        let out = probe::system_command("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        let sddl_file = dir.join(format!("{nom}.sddl"));
+        let _ = std::fs::remove_file(&sddl_file);
+        // `icacls <fichier> /save <sddl>` écrit la chaîne SDDL (UTF-16LE,
+        // indépendante de la langue et sans dépendre de PowerShell/PSModulePath).
+        let out = probe::system_command("icacls")
+            .arg(&p)
+            .arg("/save")
+            .arg(&sddl_file)
             .output()
-            .expect("powershell");
-        let sddl = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            .expect("icacls /save");
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         assert!(
-            out.status.success() && !sddl.is_empty(),
-            "{nom} : lecture SDDL échouée ({}) — stderr: {err}",
+            out.status.success() && sddl_file.exists(),
+            "{nom} : icacls /save échoué ({}) — {stderr}",
             out.status
         );
+        let raw = std::fs::read(&sddl_file).expect("lire fichier sddl");
+        let u16s: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let sddl = String::from_utf16_lossy(&u16s);
         // SDDL est indépendant de la langue : SY = S-1-5-18 (SYSTEM), BA = S-1-5-32-544 (Administrateurs)
         assert!(
             sddl.contains(&moi),
