@@ -18,6 +18,10 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("bridge") {
         std::process::exit(mcp_control::bridge::run(&args[2..]));
     }
+    // Auto-mise à jour : si relancé par l'ancienne instance, laisse le port
+    // se libérer, puis nettoie tout binaire `.old` résiduel.
+    manage::wait_if_restarting_from_update();
+    manage::cleanup_old_binary();
     // MCC_CONFIG override ; sinon résolution runtime (dev → manifest, release → exe dir)
     let _config_path =
         manage::resolve_config_path(env!("CARGO_MANIFEST_DIR"), std::env::var("MCC_CONFIG").ok());

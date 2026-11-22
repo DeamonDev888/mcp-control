@@ -2061,28 +2061,61 @@ function browserOs() {
   return null;
 }
 let lastUpdateUrl = null;
-/* ⬆ Mettre à jour : téléchargement DIRECT de l'asset de la dernière release
-   pour CETTE machine (OS du navigateur + type du binaire qui sert l'UI :
-   desktop → installateur, sinon CLI) — plus de détour par la page des
-   releases. L'URL est fabriquée par le moteur depuis une table blanche, jamais
-   par la requête. Repli : si le moteur n'a pas pu lancer de navigateur
-   (headless), l'URL rendue est ouverte ici — utile quand l'UI tourne dans un
-   vrai navigateur. */
+let _updatingNow = false;
+/* ⬆ Mettre à jour & relancer : téléchargement HTTPS + vérification SHA-256 +
+   installation silencieuse (NSIS /S) ou remplacement binaire + redémarrage
+   automatique de la nouvelle version. Repli manuel (`download_update`) si
+   l'auto-installation échoue. */
 async function downloadUpdate() {
-  const body = {action: 'download_update'};
-  const os = browserOs();
-  if (os) body.os = os;
-  const j = await postAction(body, {quiet: true});
-  if (j.netDown) {
-    // moteur injoignable (bandeau déjà armé) : repli sur la dernière URL connue
-    if (lastUpdateUrl) window.open(lastUpdateUrl, '_blank', 'noopener,noreferrer');
-    else toast('moteur injoignable — réessaie plus tard', 'err');
+  if (_updatingNow) return;
+  const ver = (state && state.latest_version) ? ('v' + state.latest_version) : 'la derni\u00e8re version';
+  const ok = await askConfirm({
+    title: 'Mettre \u00e0 jour et relancer',
+    msg: 'T\u00e9l\u00e9charger ' + ver + ', v\u00e9rifier son empreinte SHA-256, installer automatiquement et relancer MCP Control ?',
+    okLabel: 'Installer et relancer',
+    cancelLabel: 'Annuler',
+  });
+  if (!ok) return;
+  _updatingNow = true;
+  const btn = document.getElementById('btnUpdInstall');
+  const msg = document.getElementById('updMsg');
+  if (btn) btn.disabled = true;
+  if (msg) {
+    msg.classList.remove('tone-warn', 'tone-ok');
+    msg.textContent = '\u23f3 T\u00e9l\u00e9chargement et v\u00e9rification SHA-256 de ' + ver + '\u2026';
+  }
+  toast('T\u00e9l\u00e9chargement et v\u00e9rification SHA-256 en cours\u2026', 'ok');
+  const j = await postAction({action: 'install_update'}, {quiet: true});
+  if (j.ok && j.restarting) {
+    if (msg) {
+      msg.classList.add('tone-ok');
+      msg.textContent = '\u2713 v' + (j.version || '') + ' v\u00e9rifi\u00e9e (SHA-256 OK) \u2014 installation et red\u00e9marrage automatique\u2026';
+    }
+    toast('Mise \u00e0 jour v' + (j.version || '') + ' v\u00e9rifi\u00e9e \u2014 red\u00e9marrage en cours\u2026', 'ok');
+    setTimeout(() => { _updatingNow = false; if (btn) btn.disabled = false; load(); }, 4000);
     return;
   }
-  if (j.url) lastUpdateUrl = j.url;
-  if (j.ok) { toast('téléchargement lancé : ' + (j.asset || 'mise à jour'), 'ok'); return; }
-  if (j.url) { window.open(j.url, '_blank', 'noopener,noreferrer'); return; }
-  toast(j.error || 'échec du téléchargement', 'err');
+  _updatingNow = false;
+  if (btn) btn.disabled = false;
+  if (j.netDown) {
+    if (lastUpdateUrl) window.open(lastUpdateUrl, '_blank', 'noopener,noreferrer');
+    else toast('moteur injoignable \u2014 r\u00e9essaie plus tard', 'err');
+    return;
+  }
+  if (msg) {
+    msg.classList.add('tone-warn');
+    msg.textContent = '\u2717 ' + (j.error || '\u00e9chec de la mise \u00e0 jour automatique');
+  }
+  // Si l'auto-mise à jour a échoué (ex. déjà à jour ou refus), afficher l'erreur
+  // et proposer le téléchargement manuel si ce n'est pas « déjà à jour ».
+  toast(j.error || '\u00e9chec de la mise \u00e0 jour', 'err');
+  if (j.error && !String(j.error).includes('d\u00e9j\u00e0 \u00e0 jour') && !String(j.error).includes('SHA-256')) {
+    const manual = {action: 'download_update'};
+    const os = browserOs();
+    if (os) manual.os = os;
+    const dl = await postAction(manual, {quiet: true});
+    if (dl.url) lastUpdateUrl = dl.url;
+  }
 }
 async function resetState(what) {
   const sel = document.getElementById('sResetWhat');

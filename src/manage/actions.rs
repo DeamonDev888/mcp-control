@@ -46,6 +46,7 @@ pub const ACTIONS: &[&str] = &[
     "check_update",
     "open_release_page",
     "download_update",
+    "install_update",
     "open_path",
     "test_notify",
     // Lot M1 — actions LOCALES d'authentification (droit `admin`). Jamais
@@ -1230,6 +1231,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 })
             }
         }
+        "install_update" => perform_auto_update(state),
         "download_update" => {
             // Bouton « ⬆ Mettre à jour » : téléchargement DIRECT du BON asset
             // (installateur desktop ou CLI, pour le BON OS) au lieu de la page

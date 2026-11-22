@@ -80,6 +80,7 @@ pub(crate) use actions::*;
 // update : déplacé vers manage/update.rs (v0.7.20) — réexport pour API stable.
 mod update;
 pub(crate) use update::*;
+pub use update::{cleanup_old_binary, wait_if_restarting_from_update};
 
 // cache : déplacé vers manage/cache.rs (v0.7.20) — réexport pour API stable.
 mod cache;

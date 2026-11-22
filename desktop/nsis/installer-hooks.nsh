@@ -11,6 +11,10 @@
 !macro NSIS_HOOK_POSTINSTALL
   ; Épingler le raccourci du menu Démarrer à la barre des tâches.
   ExecShell "taskbarpin" "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk"
+  ; En mode silencieux (/S, déclenché par l'auto-mise à jour depuis MCP Control),
+  ; relancer automatiquement l'application sitôt l'installation terminée.
+  IfSilent 0 +2
+    Exec '"$INSTDIR\${MAINBINARYNAME}.exe"'
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL

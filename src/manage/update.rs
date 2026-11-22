@@ -334,3 +334,310 @@ pub fn running_asset() -> Option<&'static str> {
     };
     release_asset(kind, engine_os())
 }
+
+// ---------- Auto-mise à jour vérifiée par SHA-256 (téléchargement + relance) ----------
+
+/// Plafond de taille d'un binaire / installateur téléchargé (150 Mio).
+const UPDATE_MAX_BYTES: u64 = 150 * 1024 * 1024;
+
+/// Variable d'environnement posée par l'ancienne instance lors d'un
+/// auto-remplacement binaire autonome pour laisser le port se libérer avant
+/// le `TcpListener::bind` de la nouvelle instance.
+pub const UPDATE_WAIT_ENV: &str = "MCC_UPDATE_WAIT_PID";
+
+/// Attend brièvement au démarrage si le processus vient d'être relancé par une
+/// auto-mise à jour, afin que l'ancienne instance termine sa sortie proprement.
+pub fn wait_if_restarting_from_update() {
+    if std::env::var(UPDATE_WAIT_ENV).is_ok() {
+        std::env::remove_var(UPDATE_WAIT_ENV);
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+    }
+}
+
+/// Supprime silencieusement `<exe>.old` laissé par une auto-mise à jour
+/// précédente (binaire autonome Windows/macOS/Linux).
+pub fn cleanup_old_binary() {
+    if let Ok(exe) = std::env::current_exe() {
+        let mut old = exe.into_os_string();
+        old.push(".old");
+        let old_path = std::path::PathBuf::from(old);
+        if old_path.exists() {
+            let _ = std::fs::remove_file(&old_path);
+        }
+    }
+}
+
+/// Calcule le SHA-256 d'un fichier (borné à `UPDATE_MAX_BYTES`) et le compare
+/// en temps constant à `expected_hex`. En cas d'écart, supprime le fichier
+/// immédiatement (échec fermé : aucun binaire non vérifié ne reste sur disque).
+pub fn verify_file_sha256(path: &std::path::Path, expected_hex: &str) -> Result<String, String> {
+    let Some(expected) = hex64(expected_hex) else {
+        let _ = std::fs::remove_file(path);
+        return Err("empreinte SHA-256 attendue invalide".into());
+    };
+    let meta = std::fs::metadata(path).map_err(|e| {
+        let _ = std::fs::remove_file(path);
+        format!("fichier téléchargé illisible : {e}")
+    })?;
+    if meta.len() == 0 || meta.len() > UPDATE_MAX_BYTES {
+        let _ = std::fs::remove_file(path);
+        return Err(format!(
+            "taille du fichier téléchargé hors bornes ({} octets)",
+            meta.len()
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|e| {
+        let _ = std::fs::remove_file(path);
+        format!("lecture du fichier téléchargé impossible : {e}")
+    })?;
+    let actual = crate::crypto::hex(&crate::crypto::sha256(&bytes));
+    if !crate::crypto::ct_eq(actual.as_bytes(), expected.as_bytes()) {
+        let _ = std::fs::remove_file(path);
+        return Err(format!(
+            "empreinte SHA-256 invalide (attendu {expected}, obtenu {actual}) — fichier supprimé"
+        ));
+    }
+    Ok(actual)
+}
+
+/// URL de téléchargement HTTPS d'un actif de release pour un `tag` validé.
+pub fn release_download_url(tag: &str, asset: &str) -> Option<String> {
+    if !tag_url_safe(tag) {
+        return None;
+    }
+    // Vérifie que `asset` appartient strictement à la table blanche.
+    let valid_asset = [
+        "mcp-control-desktop-windows-x86_64-setup.exe",
+        "mcp-control-desktop-macos-universal",
+        "mcp-control-desktop-linux-x86_64",
+        "mcp-control-cli-windows-x86_64.exe",
+        "mcp-control-cli-macos-universal",
+        "mcp-control-cli-linux-x86_64",
+    ]
+    .contains(&asset);
+    if !valid_asset {
+        return None;
+    }
+    Some(format!(
+        "https://github.com/DeamonDev888/mcp-control/releases/download/{tag}/{asset}"
+    ))
+}
+
+/// Télécharge l'actif de release en HTTPS uniquement (TLS ≥ 1.2) via `curl`
+/// système dans `dest`.
+fn download_release_binary(tag: &str, asset: &str, dest: &std::path::Path) -> Result<(), String> {
+    let url = release_download_url(tag, asset)
+        .ok_or_else(|| "tag ou actif de release hors table blanche".to_string())?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("impossible de créer le dossier de mise à jour : {e}"))?;
+    }
+    let _ = std::fs::remove_file(dest);
+    let mut c = crate::probe::system_command("curl");
+    probe::probe_hidden_cmd(&mut c);
+    let out = c
+        .args([
+            "-fsSL",
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "--max-time",
+            "180",
+            "--max-filesize",
+            &UPDATE_MAX_BYTES.to_string(),
+            "-H",
+            "User-Agent: mcp-control",
+            "-o",
+        ])
+        .arg(dest)
+        .arg(&url)
+        .output()
+        .map_err(|e| format!("téléchargement impossible (curl) : {e}"))?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(dest);
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("téléchargement échoué ({})", out.status)
+        } else {
+            format!("téléchargement échoué : {stderr}")
+        });
+    }
+    Ok(())
+}
+
+/// Remplace atomiquement `target_exe` par `downloaded` en sauvegardant
+/// l'ancien binaire en `<target_exe>.old` (restaure en cas d'échec).
+pub fn replace_binary_file(
+    downloaded: &std::path::Path,
+    target_exe: &std::path::Path,
+) -> Result<(), String> {
+    let mut old_os = target_exe.as_os_str().to_os_string();
+    old_os.push(".old");
+    let old_path = std::path::PathBuf::from(old_os);
+    if old_path.exists() {
+        let _ = std::fs::remove_file(&old_path);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(downloaded, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod +x impossible : {e}"))?;
+    }
+    // Étape 1 : déplacer l'exécutable courant vers `.old` (autorisé même en
+    // cours d'exécution sous Windows, macOS et Linux).
+    std::fs::rename(target_exe, &old_path)
+        .map_err(|e| format!("impossible de déplacer l'exécutable actuel : {e}"))?;
+    // Étape 2 : déplacer ou copier le nouveau binaire vérifié à sa place.
+    let placed = std::fs::rename(downloaded, target_exe).or_else(|_| {
+        std::fs::copy(downloaded, target_exe).map(|_| {
+            let _ = std::fs::remove_file(downloaded);
+        })
+    });
+    if let Err(e) = placed {
+        let _ = std::fs::rename(&old_path, target_exe);
+        return Err(format!("remplacement du binaire impossible : {e}"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(target_exe, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok(())
+}
+
+/// Lance l'installateur silencieux NSIS (Windows Desktop) ou remplace le
+/// binaire autonome puis relance automatiquement la nouvelle version.
+fn launch_verified_update(downloaded: &std::path::Path, asset: &str) -> Result<(), String> {
+    let is_nsis = cfg!(windows) && asset.ends_with("-setup.exe");
+    if is_nsis {
+        let mut cmd = std::process::Command::new(downloaded);
+        // Mode silencieux NSIS : aucun clic de wizard requis ; le hook
+        // `NSIS_HOOK_POSTINSTALL` relance automatiquement l'application.
+        cmd.arg("/S")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0000_0200 | 0x0000_0008);
+        }
+        cmd.spawn()
+            .map_err(|e| format!("lancement de l'installateur impossible : {e}"))?;
+    } else {
+        let current_exe = std::env::current_exe()
+            .map_err(|e| format!("chemin de l'exécutable courant introuvable : {e}"))?;
+        replace_binary_file(downloaded, &current_exe)?;
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let mut cmd = std::process::Command::new(&current_exe);
+        cmd.args(&args)
+            .env(UPDATE_WAIT_ENV, std::process::id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000 | 0x0000_0200 | 0x0000_0008);
+        }
+        cmd.spawn()
+            .map_err(|e| format!("relance de la nouvelle version impossible : {e}"))?;
+    }
+    // Laisse 700 ms à la réponse HTTP `{"ok": true, "restarting": true}` pour
+    // parvenir à l'interface avant de libérer l'exécutable et le port.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        std::process::exit(0);
+    });
+    Ok(())
+}
+
+/// Orchestration complète de l'action locale `install_update` :
+/// 1. Vérifie la dernière release GitHub ;
+/// 2. Lit `SHA256SUMS.txt` de ce même tag (échec fermé si absent/malformé) ;
+/// 3. Télécharge l'actif de la plateforme courante en HTTPS uniquement ;
+/// 4. Vérifie le SHA-256 en temps constant (supprime le fichier si écart) ;
+/// 5. Lance l'installation silencieuse / remplacement + redémarrage automatique.
+pub fn perform_auto_update(state: &Arc<AppState>) -> Value {
+    let tag = match github_latest_tag() {
+        Ok(Some(t)) => t,
+        Ok(None) | Err(_) => {
+            return json!({
+                "ok": false,
+                "error": "impossible de joindre GitHub pour vérifier la dernière release",
+            });
+        }
+    };
+    let version = tag.strip_prefix('v').unwrap_or(&tag).to_string();
+    let current = env!("CARGO_PKG_VERSION");
+    if !version_newer(&version, current) {
+        return json!({
+            "ok": false,
+            "error": format!("déjà à jour (v{current}, dernière release : v{version})"),
+            "current": current,
+            "latest": version,
+        });
+    }
+    let Some(asset) = running_asset() else {
+        return json!({
+            "ok": false,
+            "error": format!("plateforme non prise en charge ({})", engine_os()),
+        });
+    };
+    let expected = match expected_sha256(&tag, asset) {
+        Ok(Sha256Lookup::Found(sum)) => sum,
+        Ok(Sha256Lookup::Absent) => {
+            return json!({
+                "ok": false,
+                "error": format!("empreinte SHA-256 absente de SHA256SUMS.txt pour {asset} — mise à jour refusée par sécurité"),
+            });
+        }
+        Ok(Sha256Lookup::Malformed) => {
+            return json!({
+                "ok": false,
+                "error": "SHA256SUMS.txt invalide ou ambigu — mise à jour refusée par sécurité",
+            });
+        }
+        Err(e) => {
+            return json!({
+                "ok": false,
+                "error": format!("impossible de lire SHA256SUMS.txt ({e}) — mise à jour refusée par sécurité"),
+            });
+        }
+    };
+    let upd_dir = std::env::temp_dir().join("mcp-control-update");
+    let dest = upd_dir.join(asset);
+    add_log(
+        state,
+        "info",
+        &format!("[update] téléchargement de {asset} (v{version})…"),
+    );
+    if let Err(e) = download_release_binary(&tag, asset, &dest) {
+        add_log(state, "warn", &format!("[update] {e}"));
+        return json!({ "ok": false, "error": e, "asset": asset, "version": version });
+    }
+    let verified_sha = match verify_file_sha256(&dest, &expected) {
+        Ok(s) => s,
+        Err(e) => {
+            add_log(state, "warn", &format!("[update] {e}"));
+            return json!({ "ok": false, "error": e, "asset": asset, "version": version });
+        }
+    };
+    add_log(
+        state,
+        "info",
+        &format!("[update] {asset} (v{version}) vérifié (SHA-256 {verified_sha}) — installation et redémarrage automatique"),
+    );
+    if let Err(e) = launch_verified_update(&dest, asset) {
+        let _ = std::fs::remove_file(&dest);
+        add_log(state, "warn", &format!("[update] {e}"));
+        return json!({ "ok": false, "error": e, "asset": asset, "version": version });
+    }
+    json!({
+        "ok": true,
+        "restarting": true,
+        "version": version,
+        "asset": asset,
+        "sha256": verified_sha,
+    })
+}

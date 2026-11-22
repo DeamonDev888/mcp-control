@@ -18,6 +18,10 @@ use tauri::{
 };
 
 fn main() {
+    // Auto-mise à jour : attend la sortie de l'ancienne instance si relancé
+    // juste après remplacement binaire, et nettoie un éventuel `.old`.
+    mcp_control::manage::wait_if_restarting_from_update();
+    mcp_control::manage::cleanup_old_binary();
     // Instance unique garantie à deux niveaux : (1) tauri_plugin_single_instance
     // ci-dessous réaffiche la fenêtre existante si le desktop est relancé ;
     // (2) run_headless se RECONNECTE à un moteur déjà en cours (headless ou

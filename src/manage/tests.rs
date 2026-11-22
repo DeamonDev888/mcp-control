@@ -4532,3 +4532,58 @@ fn p1_servers_summary_json_filtre_et_stats_coherents() {
     assert_eq!(only_up["servers"].as_array().unwrap().len(), 1);
     assert_eq!(only_up["servers"][0]["id"], "up-1");
 }
+
+#[test]
+fn auto_update_verify_sha256_accepte_valide_et_supprime_fichier_altere() {
+    let dir = std::env::temp_dir().join(format!("mcc-upd-sha-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("fake-bin.exe");
+    std::fs::write(&f, b"mcp-control-release-binary-v0.8.1").unwrap();
+    let expected = crate::crypto::hex(&crate::crypto::sha256(b"mcp-control-release-binary-v0.8.1"));
+
+    // Empreinte exacte → OK et le fichier reste présent
+    let got = verify_file_sha256(&f, &expected).expect("SHA-256 exact doit réussir");
+    assert_eq!(got, expected);
+    assert!(f.exists());
+
+    // Empreinte falsifiée → refus + suppression immédiate du fichier
+    let faux = "0".repeat(64);
+    let err = verify_file_sha256(&f, &faux).expect_err("SHA-256 falsifié doit échouer");
+    assert!(err.contains("SHA-256 invalide"), "{err}");
+    assert!(
+        !f.exists(),
+        "un binaire dont le SHA-256 ne correspond pas doit être supprimé immédiatement"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn auto_update_replace_binary_file_echange_atomiquement_avec_old() {
+    let dir = std::env::temp_dir().join(format!("mcc-upd-swap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let current = dir.join("mcp-control.exe");
+    let downloaded = dir.join("downloaded.exe");
+    std::fs::write(&current, b"old-v0.8.0").unwrap();
+    std::fs::write(&downloaded, b"new-v0.8.1").unwrap();
+
+    replace_binary_file(&downloaded, &current).expect("remplacement binaire");
+    assert_eq!(std::fs::read(&current).unwrap(), b"new-v0.8.1");
+    let old = dir.join("mcp-control.exe.old");
+    assert_eq!(std::fs::read(&old).unwrap(), b"old-v0.8.0");
+    assert!(!downloaded.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn auto_update_url_whitelist_et_action_locale_seulement() {
+    assert_eq!(
+        release_download_url("v0.8.1", "mcp-control-desktop-windows-x86_64-setup.exe").as_deref(),
+        Some("https://github.com/DeamonDev888/mcp-control/releases/download/v0.8.1/mcp-control-desktop-windows-x86_64-setup.exe")
+    );
+    assert!(release_download_url("../evil", "mcp-control-cli-linux-x86_64").is_none());
+    assert!(release_download_url("v0.8.1", "evil.exe").is_none());
+    assert!(ACTIONS.contains(&"install_update"));
+    assert!(crate::auth::action_reservee_admin("install_update"));
+}
