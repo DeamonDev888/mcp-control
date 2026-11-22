@@ -11,9 +11,17 @@ desktop/gen/
 # artefacts e2e (captures de pages rendues — contiennent des données internes)
 ui-e2e-*
 
-# audit/projets annexes
+# audit/projets annexes et rapports internes d'agents
 pauvre-router-audit/
 .zwork/
+.lot-wt/
+auth-agents/
+audit-v2/
+correctifs-agents/
+restes-agents/
+TODO-AUTH.md
+TODO-AUDIT.md
+TODO-RESTES.md
 
 # parasites Windows (mauvais redirect `> nul` sous Git Bash)
 nul

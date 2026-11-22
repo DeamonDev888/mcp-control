@@ -1,6 +1,6 @@
 //! TLS 1.3 réseau, épinglage sortant et appairage des serveurs LiteMCP verrouillés.
 //!
-//! Lot M4 de `TODO-AUTH.md`, spécifié par `docs/auth.md` §3.4, §7, §8.1–§8.3, §9 et §10.
+//! Spécifié par `docs/auth.md` §3.4, §7, §8.1–§8.3, §9 et §10.
 //!
 //! - **Écoute hors loopback (DA5 = a)** : TLS 1.3 uniquement (`rustls` 0.23.46 sans
 //!   `tls12`, les trois suites TLS 1.3 de `ring`, ALPN `http/1.1`), certificat
@@ -916,7 +916,7 @@ pub fn outbound_identity_for(host: &str, port: u16) -> Result<Option<OutboundIde
 
 /// Un serveur supervisé est-il verrouillé ou appairé par signature LiteMCP ?
 ///
-/// Vrai dans deux cas (`TODO-AUTH.md` lot M4 pt 4 : « badge cadenas sur UP/DOWN ») :
+/// Vrai dans deux cas (badge cadenas sur UP/DOWN) :
 /// 1. le serveur a répondu `401` + `WWW-Authenticate` de `litemcp` (son motif
 ///    d'erreur ou l'ensemble `locked_servers` le signale) ;
 /// 2. MCP Control détient un épinglage client sortant (`auth/clients/*.pin.json`)

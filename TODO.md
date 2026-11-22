@@ -176,7 +176,7 @@ En Attente après P0 : slowloris (2.6 ci-dessus) · `Host` requis (400 sinon) ·
 
 ## 5. Reste à faire après les lots de correction (état au 2026-11-15)
 
-Lots 0-5 (2026-11-13) et lots A (moteur), B (autostart + sécurité), C (interface), F (finition) livrés (rapports dans `correctifs-agents/` puis `restes-agents/`). La liste 2026-11-13 (5.1 à 5.15) est close : points **livrés** retirés (5.1, 5.2, 5.4, 5.5, 5.6, 5.8, 5.9, 5.11, 5.12, 5.14, 5.15), points **tranchés** (5.10 : `?access=` conservé, D5 = a ; `env` conservé dans le tool `install_store_server`, D6 = a), point **non reproduit** retiré (5.7) et point **corrigé à la racine** (5.13, fixtures `probe_http_*`).
+Lots 0-5 (2026-11-13) et lots A (moteur), B (autostart + sécurité), C (interface), F (finition) livrés. La liste 2026-11-13 (5.1 à 5.15) est close : points **livrés** retirés (5.1, 5.2, 5.4, 5.5, 5.6, 5.8, 5.9, 5.11, 5.12, 5.14, 5.15), points **tranchés** (5.10 : `?access=` conservé, D5 = a ; `env` conservé dans le tool `install_store_server`, D6 = a), point **non reproduit** retiré (5.7) et point **corrigé à la racine** (5.13, fixtures `probe_http_*`).
 
 Ce qui reste ouvert (nouvelle numérotation) :
 

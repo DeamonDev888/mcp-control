@@ -69,9 +69,8 @@ use std::sync::{Arc, OnceLock};
 /// à la surface réellement enregistrée (nom pour nom, aucun outil sans droit).
 /// Tout outil ajouté DOIT modifier cette table dans la même révision.
 ///
-/// Les deux déplacements par rapport à l'ancienne répartition de `TODO-AUTH.md`
-/// §4 (tolérés par la spec finale) sont `toggle_server` et `set_auto_restart`,
-/// passés en `execution` : les deux mènent à l'exécution d'un programme.
+/// `toggle_server` et `set_auto_restart` sont classés en `execution` : les deux
+/// mènent à l'exécution d'un programme.
 pub const TOOL_RIGHTS: [(&str, &str); 30] = [
     ("list_servers", "lecture"),
     ("server_detail", "lecture"),

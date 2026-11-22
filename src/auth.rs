@@ -1,8 +1,6 @@
 //! Authentification forte — **identités, registre des clients, appairage**.
 //!
-//! Lot M1 de `TODO-AUTH.md`, spécifié par `docs/auth.md` §3 et §9. Ce module ne
-//! change le comportement d'AUCUNE route existante : l'authentification n'est
-//! pas encore exigée (c'est le lot M2 qui fermera le sas). Il apporte :
+//! Spécifié par `docs/auth.md` §3 et §9. Il apporte :
 //!
 //! - l'identité Ed25519 du serveur (`mcc-server`), clé privée au trousseau du
 //!   système et **jamais** dans `config.json` (§9) ;

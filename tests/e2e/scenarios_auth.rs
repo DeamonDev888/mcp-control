@@ -1,6 +1,7 @@
-//! Scénarios E2E du lot M1 — **identités, registre des clients, appairage**.
+//! Scénarios E2E d'authentification — **identités, registre des clients, appairage,
+//! confirmation humaine, TLS 1.3, pont stdio et journal d'audit**.
 //!
-//! Critère de fin de `TODO-AUTH.md` : appairage complet entre deux process,
+//! Couvre : appairage complet entre deux process,
 //! demande non approuvée = aucun accès, demande expirée, tempête de 500
 //! demandes bornée avec l'instance toujours debout, `config.json` sans aucune
 //! clé privée, redémarrage → le client reste appairé.

@@ -303,7 +303,7 @@ fn hostile_label_never_in_html() {
 /// Lot S2 : en-têtes de durcissement sur les réponses HTML ET JSON, CSP
 /// stricte sur la coquille, page servie sans aucun gestionnaire en ligne.
 /// C'est le contrat côté serveur ; le contrat côté DOM (aucun script exécuté)
-/// est prouvé par le harnais navigateur d'audit-v2/mesures/S2/.
+/// est vérifié par tests navigateur headless (CDP).
 #[test]
 fn entetes_de_durcissement_et_csp_stricte() {
     let _garde = crate::harness::serial_guard();

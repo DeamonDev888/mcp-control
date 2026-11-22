@@ -1,6 +1,5 @@
 //! Confirmation humaine avant exécution — politique de confirmation (contrat
-//! C5) et état de l'écran « Accès ». Lot M3 de `TODO-AUTH.md`, spécifié par
-//! `docs/auth.md` §5.
+//! C5) et état de l'écran « Accès », spécifié par `docs/auth.md` §5.
 //!
 //! Ce que ce module garantit :
 //!

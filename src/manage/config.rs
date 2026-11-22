@@ -64,7 +64,7 @@ pub fn parse_port_list(arr: &[Value], max: usize) -> Vec<u16> {
 /// Serveurs de base d'une installation neuve : AUCUN (lot S4, point 8).
 ///
 /// L'ancienne liste embarquait huit serveurs avec des chemins propres à la
-/// machine de développement (`C:/Users/Deamon/...`) : une installation neuve
+/// machine de développement (`C:/Users/<user>/...`) : une installation neuve
 /// démarrait avec des serveurs fantômes, et l'app pouvait lancer des
 /// programmes qui n'existent pas chez l'utilisateur. La découverte (ports en
 /// écoute, scan réseau, import mcpServers) remplit la liste à la place.
