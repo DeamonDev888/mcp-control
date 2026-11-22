@@ -9,6 +9,7 @@ const AUTOSTART_RUN_NAME: &str = "MCP Control";
 /// Clé Run utilisée : `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
 /// par défaut. `MCC_AUTOSTART_KEY` la remplace — c'est ce qui permet à l'E2E
 /// d'écrire dans une clé de test au lieu de l'entrée RÉELLE de la machine.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn run_key() -> String {
     std::env::var("MCC_AUTOSTART_KEY")
         .ok()
