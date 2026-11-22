@@ -235,9 +235,13 @@ pub fn system_tool(name: &str) -> std::path::PathBuf {
 }
 
 /// `Command` sur un outil système, chemin absolu sous Windows (voir
-/// [`system_tool`]). Tous les appels hors tests passent par ici.
+/// [`system_tool`]) et `CREATE_NO_WINDOW` appliqué automatiquement pour qu'aucune
+/// fenêtre console ne s'ouvre depuis l'app GUI (Tauri). Tous les appels hors tests
+/// passent par ici.
 pub fn system_command(name: &str) -> Command {
-    Command::new(system_tool(name))
+    let mut cmd = Command::new(system_tool(name));
+    hidden(&mut cmd);
+    cmd
 }
 
 // ---------- identité d'un process (lot S4, point 1) ----------
