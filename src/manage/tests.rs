@@ -1824,9 +1824,8 @@ fn acl_config_cache_et_journal_utilisateur_system_administrateurs() {
             out.status
         );
         let raw = std::fs::read(&sddl_file).expect("lire fichier sddl");
-        let u16s: Vec<u16> = raw
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        let u16s: Vec<u16> = (0..raw.len() / 2)
+            .map(|i| u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]))
             .collect();
         let sddl = String::from_utf16_lossy(&u16s);
         // SDDL est indépendant de la langue :
