@@ -94,6 +94,7 @@ impl SState {
 pub struct ToolInfo {
     pub name: String,
     pub desc: String,
+    pub input_schema: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug)]

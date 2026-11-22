@@ -360,10 +360,12 @@ fn cache_roundtrip_restaure_le_dernier_etat() {
                         crate::types::ToolInfo {
                             name: "a".into(),
                             desc: "premier".into(),
+                            input_schema: None,
                         },
                         crate::types::ToolInfo {
                             name: "b".into(),
                             desc: String::new(),
+                            input_schema: None,
                         },
                     ]
                 } else {
@@ -603,10 +605,12 @@ fn toggle_tool_desactive_et_reactive() {
                 crate::types::ToolInfo {
                     name: "a".into(),
                     desc: String::new(),
+                    input_schema: None,
                 },
                 crate::types::ToolInfo {
                     name: "b".into(),
                     desc: String::new(),
+                    input_schema: None,
                 },
             ],
             latency_ms: None,
@@ -673,14 +677,17 @@ fn tools_actifs_exclut_les_desactives() {
                 crate::types::ToolInfo {
                     name: "a".into(),
                     desc: String::new(),
+                    input_schema: None,
                 },
                 crate::types::ToolInfo {
                     name: "b".into(),
                     desc: String::new(),
+                    input_schema: None,
                 },
                 crate::types::ToolInfo {
                     name: "c".into(),
                     desc: String::new(),
+                    input_schema: None,
                 },
             ],
             latency_ms: None,
@@ -737,6 +744,7 @@ fn state_json_compte_bon_les_stats() {
                 tools: vec![crate::types::ToolInfo {
                     name: "t".into(),
                     desc: String::new(),
+                    input_schema: None,
                 }],
                 latency_ms: None,
                 last_seen_ts: None,
@@ -805,10 +813,12 @@ fn state_json_compte_bon_les_stats() {
                     crate::types::ToolInfo {
                         name: "t_stale_1".into(),
                         desc: String::new(),
+                        input_schema: None,
                     },
                     crate::types::ToolInfo {
                         name: "t_stale_2".into(),
                         desc: String::new(),
+                        input_schema: None,
                     },
                 ],
                 latency_ms: None,
@@ -4184,6 +4194,7 @@ fn p1_save_cache_ne_reecrit_pas_si_contenu_utile_inchange() {
             tools: vec![crate::types::ToolInfo {
                 name: "ping".into(),
                 desc: "ok".into(),
+                input_schema: None,
             }],
             latency_ms: Some(4),
             last_seen_ts: Some(1000),
@@ -4490,6 +4501,7 @@ fn p1_servers_summary_json_filtre_et_stats_coherents() {
                 tools: vec![crate::types::ToolInfo {
                     name: "t1".into(),
                     desc: "d".into(),
+                    input_schema: None,
                 }],
                 latency_ms: Some(2),
                 last_seen_ts: None,

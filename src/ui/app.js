@@ -1165,6 +1165,114 @@ function mdInline(t) {
     .replace(/(^|[^*])\*([^*\s][^*]*)\*/g, '$1<i>$2</i>')
     .replace(/`([^`]+)`/g, '<code>$1</code>');
 }
+const toolArgsDraft = new Map();
+const toolTestState = new Map();
+
+function buildArgsTemplate(schema) {
+  if (!schema || typeof schema !== 'object' || !schema.properties || typeof schema.properties !== 'object') {
+    return {};
+  }
+  const out = {};
+  for (const [k, def] of Object.entries(schema.properties)) {
+    if (!def || typeof def !== 'object') { out[k] = ''; continue; }
+    if (Object.prototype.hasOwnProperty.call(def, 'default')) { out[k] = def.default; continue; }
+    if (Array.isArray(def.enum) && def.enum.length) { out[k] = def.enum[0]; continue; }
+    const ty = Array.isArray(def.type) ? def.type[0] : def.type;
+    if (ty === 'number' || ty === 'integer') out[k] = 0;
+    else if (ty === 'boolean') out[k] = false;
+    else if (ty === 'array') out[k] = [];
+    else if (ty === 'object') out[k] = {};
+    else out[k] = '';
+  }
+  return out;
+}
+function formatSchemaType(def) {
+  if (!def || typeof def !== 'object') return 'any';
+  if (Array.isArray(def.type)) return def.type.join(' | ');
+  if (def.type === 'array' && def.items && def.items.type) return 'array<' + def.items.type + '>';
+  if (def.type) return String(def.type);
+  if (Array.isArray(def.enum)) return 'enum';
+  if (Array.isArray(def.anyOf)) return def.anyOf.map(formatSchemaType).join(' | ');
+  return 'any';
+}
+function renderToolParamsHtml(schema) {
+  const props = schema && typeof schema === 'object' && schema.properties && typeof schema.properties === 'object'
+    ? Object.entries(schema.properties) : [];
+  if (!props.length) {
+    return '<div class="empty-note">Aucun param&egrave;tre d&eacute;clar&eacute; dans le sch&eacute;ma (objet vide <code>{}</code>).</div>';
+  }
+  const req = new Set(Array.isArray(schema.required) ? schema.required : []);
+  const rows = props.map(([name, def]) => {
+    const isReq = req.has(name);
+    const ty = formatSchemaType(def);
+    const dHtml = def && def.description ? mdInline(def.description) : '<span class="t3">&mdash;</span>';
+    const chips = [];
+    if (def && Array.isArray(def.enum) && def.enum.length) {
+      chips.push('<span class="param-chip">enum: ' + esc(def.enum.map(String).join(' | ')) + '</span>');
+    }
+    if (def && Object.prototype.hasOwnProperty.call(def, 'default')) {
+      chips.push('<span class="param-chip">d&eacute;faut: ' + esc(JSON.stringify(def.default)) + '</span>');
+    }
+    return `<tr>
+      <td><code>${esc(name)}</code>${isReq ? '<span class="param-req">requis</span>' : ''}</td>
+      <td class="param-type">${esc(ty)}</td>
+      <td>${dHtml}${chips.length ? '<div class="param-meta">' + chips.join('') + '</div>' : ''}</td>
+    </tr>`;
+  }).join('');
+  return `<table class="tool-params"><thead><tr><th>Param&egrave;tre</th><th>Type</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+function renderToolPanelHtml(s, t, expKey) {
+  const schema = t.input_schema || null;
+  const schemaJson = schema ? JSON.stringify(schema, null, 2) : null;
+  const canRun = s.state === 'UP' && s.transport === 'http' && !s.via_ssh && !s.locked && !t.disabled;
+  const draft = toolArgsDraft.has(expKey)
+    ? toolArgsDraft.get(expKey)
+    : JSON.stringify(buildArgsTemplate(schema), null, 2);
+  const st = toolTestState.get(expKey) || null;
+  let resHtml = '';
+  if (st) {
+    if (st.loading) {
+      resHtml = '<div class="tool-res"><div class="tool-res-head"><span>Ex&eacute;cution en cours&hellip;</span></div></div>';
+    } else if (st.error) {
+      resHtml = `<div class="tool-res"><div class="tool-res-head"><span class="tool-res-err">Erreur</span></div><pre>${esc(st.error)}</pre></div>`;
+    } else if (st.result !== undefined) {
+      const isErr = !!(st.result && st.result.isError);
+      const badge = isErr ? '<span class="tool-res-err">isError: true</span>' : '<span class="tool-res-ok">OK</span>';
+      const ms = st.elapsed_ms != null ? `<span>${esc(String(st.elapsed_ms))} ms</span>` : '';
+      const raw = JSON.stringify(st.result, null, 2);
+      resHtml = `<div class="tool-res"><div class="tool-res-head">${badge}${ms}</div><pre>${hlJson(raw)}</pre></div>`;
+    }
+  }
+  const testerHtml = canRun ? `
+    <div class="tool-sec-h"><span>Tester l'outil en direct</span></div>
+    <textarea class="tool-args-ta" rows="5" spellcheck="false" aria-label="Arguments JSON pour ${esc(t.name)}"
+      data-act="tool-args-input" data-id="${esc(s.id)}" data-tool="${esc(t.name)}">${esc(draft)}</textarea>
+    <div class="tool-actions-bar">
+      <button type="button" class="primary" data-act="tool-run" data-id="${esc(s.id)}" data-tool="${esc(t.name)}">${ic('play')} Ex&eacute;cuter</button>
+      <button type="button" data-act="tool-args-reset" data-id="${esc(s.id)}" data-tool="${esc(t.name)}">R&eacute;initialiser</button>
+    </div>
+    ${resHtml}` : `
+    <div class="empty-note">${t.disabled ? 'Outil d&eacute;sactiv&eacute; &mdash; r&eacute;active-le pour le tester.'
+      : s.transport !== 'http' ? 'Serveur stdio : ex&eacute;cution directe HTTP uniquement (copie le payload <code>tools/call</code> ci-dessus).'
+      : s.via_ssh ? 'Serveur distant via SSH : ex&eacute;cution directe non support&eacute;e.'
+      : s.locked ? 'Serveur verrouill&eacute; : appaire-le d\'abord pour tester ses outils.'
+      : 'Serveur hors ligne (UP requis pour ex&eacute;cuter un outil).'}</div>`;
+  return `<div class="tool-panel">
+    <div class="tool-full-desc">${t.desc ? mdInline(t.desc) : '<span class="t3">Aucune description fournie par le serveur.</span>'}</div>
+    <div class="tool-sec-h"><span>Param&egrave;tres</span></div>
+    ${renderToolParamsHtml(schema)}
+    <div class="conf-block">
+      <div class="conf-head">
+        <span class="conf-lang">JSON Schema</span>
+        <span>inputSchema</span>
+        <button type="button" class="copy-btn" data-act="copy-tool-rpc" data-tool="${esc(t.name)}">${ic('copy')}<span>Copier tools/call</span></button>
+        <button type="button" class="copy-btn" data-act="copy-tool-schema" data-tool="${esc(t.name)}">${ic('copy')}<span>Copier sch&eacute;ma</span></button>
+      </div>
+      <pre>${schemaJson ? hlJson(schemaJson) : '<span class="tok-p">// Aucun inputSchema retourn&eacute; par ce serveur — clique sur « Sonder » pour rafra&icirc;chir</span>'}</pre>
+    </div>
+    ${testerHtml}
+  </div>`;
+}
 function renderToolsRowsHtml(s) {
   const all = s.tools_list || [];
   const q = toolSearchQuery.trim().toLowerCase();
@@ -1175,31 +1283,99 @@ function renderToolsRowsHtml(s) {
   return filtered.map(t => {
     const expKey = s.id + '::' + t.name;
     const isExp = expandedTools.has(expKey);
-    return `<div class="tool ${t.disabled?'off':''} ${isExp?'expanded':''}" data-act="tool-expand" data-tool="${esc(t.name)}" title="Cliquer pour d&eacute;plier / replier la description compl&egrave;te">
-       <code>${esc(t.name)}</code>
-       <span class="desc">${t.desc ? mdInline(t.desc) : '&mdash;'}</span>
-       <button class="tgl ${t.disabled?'off':'on'}" role="switch" aria-checked="${t.disabled?'false':'true'}" aria-label="${t.disabled?'R&eacute;activer':'D&eacute;sactiver'} l'outil ${esc(t.name)}" title="${t.disabled?'R&eacute;activer ce tool':'D&eacute;sactiver ce tool'}"
-               data-act="tool-toggle" data-id="${esc(s.id)}" data-tool="${esc(t.name)}">
-         ${t.disabled ? 'OFF' : 'ON'}
-       </button>
+    const propsCount = t.input_schema && t.input_schema.properties && typeof t.input_schema.properties === 'object'
+      ? Object.keys(t.input_schema.properties).length : 0;
+    const pBadge = propsCount > 0 ? `<span class="tool-pbadge">${propsCount} param.</span>` : '';
+    return `<div class="tool ${t.disabled?'off':''} ${isExp?'expanded':''}" data-tool="${esc(t.name)}">
+       <div class="tool-head" data-act="tool-expand" data-tool="${esc(t.name)}" title="Cliquer pour inspecter le sch&eacute;ma et tester l'outil">
+         <span class="tool-chev" aria-hidden="true">&#9656;</span>
+         <code>${esc(t.name)}</code>
+         <span class="desc">${t.desc ? mdInline(t.desc) : '&mdash;'}</span>
+         ${pBadge}
+         <button class="tgl ${t.disabled?'off':'on'}" role="switch" aria-checked="${t.disabled?'false':'true'}" aria-label="${t.disabled?'R&eacute;activer':'D&eacute;sactiver'} l'outil ${esc(t.name)}" title="${t.disabled?'R&eacute;activer ce tool':'D&eacute;sactiver ce tool'}"
+                 data-act="tool-toggle" data-id="${esc(s.id)}" data-tool="${esc(t.name)}">
+           ${t.disabled ? 'OFF' : 'ON'}
+         </button>
+       </div>
+       ${isExp ? renderToolPanelHtml(s, t, expKey) : ''}
      </div>`;
   }).join('');
 }
-function setToolSearch(el) {
-  toolSearchQuery = el ? el.value : '';
+function refreshToolsBox() {
   const box = document.getElementById('toolsRowsBox');
   if (box && detailCache) box.innerHTML = renderToolsRowsHtml(detailCache);
+}
+function setToolSearch(el) {
+  toolSearchQuery = el ? el.value : '';
+  refreshToolsBox();
 }
 function toggleToolExpand(el) {
   if (!detailCache || !el || !el.dataset.tool) return;
   const expKey = detailCache.id + '::' + el.dataset.tool;
-  if (expandedTools.has(expKey)) {
-    expandedTools.delete(expKey);
-    el.classList.remove('expanded');
-  } else {
-    expandedTools.add(expKey);
-    el.classList.add('expanded');
+  if (expandedTools.has(expKey)) expandedTools.delete(expKey);
+  else expandedTools.add(expKey);
+  refreshToolsBox();
+}
+function copyToolSchema(toolName) {
+  if (!detailCache || !toolName) return;
+  const t = (detailCache.tools_list || []).find(x => x.name === toolName);
+  const txt = t && t.input_schema ? JSON.stringify(t.input_schema, null, 2) : '{}';
+  copyText(txt);
+  toast('Sch\u00e9ma JSON copi\u00e9', 'ok', 1800);
+}
+function copyToolRpc(toolName) {
+  if (!detailCache || !toolName) return;
+  const t = (detailCache.tools_list || []).find(x => x.name === toolName);
+  const expKey = detailCache.id + '::' + toolName;
+  let args = buildArgsTemplate(t && t.input_schema);
+  if (toolArgsDraft.has(expKey)) {
+    try { args = JSON.parse(toolArgsDraft.get(expKey)); } catch (e) {}
   }
+  const rpc = {jsonrpc: '2.0', id: 1, method: 'tools/call', params: {name: toolName, arguments: args}};
+  copyText(JSON.stringify(rpc, null, 2));
+  toast('Payload tools/call copi\u00e9', 'ok', 1800);
+}
+function saveToolArgsDraft(el) {
+  if (!el || !el.dataset.id || !el.dataset.tool) return;
+  toolArgsDraft.set(el.dataset.id + '::' + el.dataset.tool, el.value);
+}
+function resetToolArgsDraft(id, toolName) {
+  if (!detailCache || !id || !toolName) return;
+  const expKey = id + '::' + toolName;
+  const t = (detailCache.tools_list || []).find(x => x.name === toolName);
+  toolArgsDraft.set(expKey, JSON.stringify(buildArgsTemplate(t && t.input_schema), null, 2));
+  toolTestState.delete(expKey);
+  refreshToolsBox();
+}
+async function runToolTest(id, toolName) {
+  if (!id || !toolName) return;
+  const expKey = id + '::' + toolName;
+  const raw = toolArgsDraft.has(expKey)
+    ? toolArgsDraft.get(expKey)
+    : (() => {
+        const t = detailCache && (detailCache.tools_list || []).find(x => x.name === toolName);
+        return JSON.stringify(buildArgsTemplate(t && t.input_schema), null, 2);
+      })();
+  let parsed;
+  try {
+    parsed = raw.trim() ? JSON.parse(raw) : {};
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('Les arguments doivent \u00eatre un objet JSON { ... }.');
+    }
+  } catch (e) {
+    toolTestState.set(expKey, {error: 'JSON invalide : ' + e.message});
+    refreshToolsBox();
+    return;
+  }
+  toolTestState.set(expKey, {loading: true});
+  refreshToolsBox();
+  const j = await postAction({action: 'call_tool', id, tool: toolName, arguments: parsed}, {quiet: true});
+  if (j.ok) {
+    toolTestState.set(expKey, {result: j.result, elapsed_ms: j.elapsed_ms});
+  } else {
+    toolTestState.set(expKey, {error: j.error || 'erreur lors de l\u2019appel'});
+  }
+  refreshToolsBox();
 }
 async function setAllTools(id, enableAll) {
   if (!detailCache || detailCache.id !== id) return;
@@ -1215,7 +1391,8 @@ function renderDetail() {
   const s = detailCache;
   if (!s || s.id !== selectedId) return;
   const aEl = document.activeElement;
-  if (aEl && (aEl.id === 'scProgram' || aEl.id === 'scArgs' || aEl.id === 'scWorkdir' || aEl.id === 'toolSearch')) return;
+  if (aEl && (aEl.id === 'scProgram' || aEl.id === 'scArgs' || aEl.id === 'scWorkdir' || aEl.id === 'toolSearch'
+    || (aEl.closest && aEl.closest('#toolsRowsBox')))) return;
   const sig = JSON.stringify([s, detailTab, toolSearchQuery, Object.keys(FRAMEWORKS).length]);
   const contentEl = document.getElementById('content');
   if (selectedId && sig === _sigDetail && contentEl && contentEl.querySelector('.d-head')) return;
@@ -3348,6 +3525,11 @@ const ACT = {
   'tools-all-off': el => setAllTools(el.dataset.id, false),
   'tool-expand': el => toggleToolExpand(el),
   'tool-toggle': el => toggleTool(el.dataset.id, el.dataset.tool),
+  'copy-tool-schema': el => copyToolSchema(el.dataset.tool),
+  'copy-tool-rpc': el => copyToolRpc(el.dataset.tool),
+  'tool-args-input': el => saveToolArgsDraft(el),
+  'tool-args-reset': el => resetToolArgsDraft(el.dataset.id, el.dataset.tool),
+  'tool-run': el => runToolTest(el.dataset.id, el.dataset.tool),
   'server-pair': el => serverPair(el.dataset.id),
   'copy-self': el => copyText(el.textContent),
   'copy-text': el => copyDataText(el),

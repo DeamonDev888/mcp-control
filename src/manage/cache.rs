@@ -40,7 +40,7 @@ fn useful_cache_signature(servers: &[Server]) -> String {
                 "via_ssh": s.via_ssh,
                 "last_error": s.last_error,
                 "tools": s.tools.iter()
-                    .map(|t| json!({"name": t.name, "desc": t.desc}))
+                    .map(|t| json!({"name": t.name, "desc": t.desc, "input_schema": t.input_schema}))
                     .collect::<Vec<_>>(),
             })
         })
@@ -76,7 +76,7 @@ pub fn save_cache(state: &Arc<AppState>) {
                     "latency_ms": s.latency_ms, "last_seen": s.last_seen_ts,
                     "last_error": s.last_error,
                     "tools": s.tools.iter()
-                        .map(|t| json!({"name": t.name, "desc": t.desc}))
+                        .map(|t| json!({"name": t.name, "desc": t.desc, "input_schema": t.input_schema}))
                         .collect::<Vec<_>>(),
                 })
             })
@@ -172,6 +172,7 @@ pub fn load_cache(state: &Arc<AppState>) {
                                 .and_then(|x| x.as_str())
                                 .unwrap_or("")
                                 .to_string(),
+                            input_schema: t.get("input_schema").filter(|v| !v.is_null()).cloned(),
                         })
                     })
                     .collect();

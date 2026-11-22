@@ -64,6 +64,7 @@ pub const ACTIONS: &[&str] = &[
     "confirm_approve",
     "confirm_deny",
     "grant_revoke",
+    "call_tool",
 ];
 
 /// Port HTTP LOCAL d'un serveur (None : stdio, ou serveur distant). Un hôte
@@ -1547,6 +1548,69 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 return json!({"ok": false, "error": "ip manquante"});
             }
             import_peer(state, ip)
+        }
+        "call_tool" => {
+            let sid = match req.get("id").and_then(|x| x.as_str()) {
+                Some(x) if !x.is_empty() => x.to_string(),
+                _ => return json!({"ok": false, "error": "id manquant"}),
+            };
+            let tool = match req.get("tool").and_then(|x| x.as_str()) {
+                Some(x) if !x.is_empty() => x.to_string(),
+                _ => return json!({"ok": false, "error": "tool manquant"}),
+            };
+            let arguments = match req.get("arguments") {
+                None | Some(Value::Null) => json!({}),
+                Some(v @ Value::Object(_)) => v.clone(),
+                Some(_) => {
+                    return json!({"ok": false, "error": "arguments doit être un objet JSON"});
+                }
+            };
+            let target = {
+                let servers = lockv(&state.servers);
+                let Some(s) = servers.iter().find(|s| s.id == sid) else {
+                    return json!({"ok": false, "error": "serveur inconnu"});
+                };
+                if s.state != SState::Up {
+                    return json!({"ok": false, "error": "serveur hors ligne (UP requis)"});
+                }
+                if s.tools_disabled.iter().any(|t| t == &tool) {
+                    return json!({"ok": false, "error": "outil désactivé"});
+                }
+                if s.via_ssh {
+                    return json!({"ok": false, "error": "serveur SSH : exécution directe non supportée"});
+                }
+                match &s.transport {
+                    Transport::Http { host, port, path } => {
+                        let h = s
+                            .bound_host
+                            .as_deref()
+                            .or(host.as_deref())
+                            .unwrap_or("127.0.0.1")
+                            .to_string();
+                        (h, *port, path.clone(), s.protocol.clone())
+                    }
+                    Transport::Stdio { .. } => {
+                        return json!({"ok": false, "error": "serveur stdio : exécution directe non supportée (HTTP uniquement)"});
+                    }
+                }
+            };
+            let (host, port, path, proto) = target;
+            let timeout_ms: u64 = 15_000;
+            add_log(state, "info", &format!("[ui] call_tool {sid}.{tool}"));
+            match probe::call_http_tool(
+                &host,
+                port,
+                &path,
+                proto.as_deref(),
+                &tool,
+                arguments,
+                timeout_ms,
+            ) {
+                Ok((res, elapsed_ms)) => {
+                    json!({"ok": true, "result": res, "elapsed_ms": elapsed_ms})
+                }
+                Err(e) => json!({"ok": false, "error": e}),
+            }
         }
         "toggle_tool" => {
             let sid = match req.get("id").and_then(|x| x.as_str()) {

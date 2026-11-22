@@ -291,6 +291,7 @@ pub fn detail_json(state: &Arc<AppState>, id: &str) -> Value {
                 .map(|t| {
                     json!({
                         "name": t.name, "desc": t.desc,
+                        "input_schema": t.input_schema,
                         "disabled": s.tools_disabled.contains(&t.name),
                     })
                 })
@@ -417,6 +418,9 @@ fn hash_server_visible<H: std::hash::Hasher>(
         for t in &s.tools {
             t.name.hash(h);
             t.desc.hash(h);
+            if let Some(ref sc) = t.input_schema {
+                sc.to_string().hash(h);
+            }
         }
     }
 }

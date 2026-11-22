@@ -1673,20 +1673,7 @@ pub fn ssh_probe_server(
             .and_then(|t| t.as_array())
         {
             for t in arr {
-                tools.push(ToolInfo {
-                    name: t
-                        .get("name")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("?")
-                        .to_string(),
-                    desc: t
-                        .get("description")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .chars()
-                        .take(160)
-                        .collect(),
-                });
+                tools.push(parse_tool_info(t));
             }
         }
     }
@@ -2712,20 +2699,7 @@ pub fn probe_http_with(port: u16, path: &str, timeout_ms: u64, hint: &ProbeHint<
     ) {
         if let Some(arr) = tr.get("tools").and_then(|t| t.as_array()) {
             for t in arr {
-                tools.push(ToolInfo {
-                    name: t
-                        .get("name")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("?")
-                        .to_string(),
-                    desc: t
-                        .get("description")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .chars()
-                        .take(160)
-                        .collect(),
-                });
+                tools.push(parse_tool_info(t));
             }
         }
     }
@@ -2897,20 +2871,7 @@ pub fn probe_stdio(
                     if let Some(res) = v.get("result") {
                         if let Some(arr) = res.get("tools").and_then(|x| x.as_array()) {
                             for t in arr {
-                                tools.push(ToolInfo {
-                                    name: t
-                                        .get("name")
-                                        .and_then(|x| x.as_str())
-                                        .unwrap_or("?")
-                                        .to_string(),
-                                    desc: t
-                                        .get("description")
-                                        .and_then(|x| x.as_str())
-                                        .unwrap_or("")
-                                        .chars()
-                                        .take(160)
-                                        .collect(),
-                                });
+                                tools.push(parse_tool_info(t));
                             }
                         }
                     }
@@ -3012,6 +2973,119 @@ pub fn rpc_call_host(
 }
 
 /// Un appel JSON-RPC HTTP vers un hôte précis avec en-têtes additionnels (ex. `Mcp-Session-Id`).
+#[allow(clippy::too_many_arguments)]
+/// Extrait un [`ToolInfo`] complet (nom, description jusqu'à 4096 car., schéma JSON
+/// `inputSchema` éventuel) depuis une entrée `tools/list`.
+fn parse_tool_info(t: &Value) -> ToolInfo {
+    ToolInfo {
+        name: t
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?")
+            .to_string(),
+        desc: t
+            .get("description")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(4096)
+            .collect(),
+        input_schema: t.get("inputSchema").filter(|v| !v.is_null()).cloned(),
+    }
+}
+
+/// Exécute un appel `tools/call` sur un serveur MCP HTTP (mode stateless LiteMCP
+/// `2026-07-28` ou MCP HTTP standard avec repli automatique `initialize` pour
+/// récupérer `Mcp-Session-Id`). Retourne `(résultat, durée_ms)`.
+pub fn call_http_tool(
+    host: &str,
+    port: u16,
+    path: &str,
+    protocol: Option<&str>,
+    tool: &str,
+    arguments: Value,
+    timeout_ms: u64,
+) -> Result<(Value, u64), String> {
+    let t0 = Instant::now();
+    let is_litemcp = protocol == Some(crate::LITEMCP_PROTOCOL);
+    let mut params = json!({
+        "name": tool,
+        "arguments": arguments,
+    });
+    if is_litemcp {
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert(
+                "_meta".into(),
+                json!({"mcpProtocolVersion": crate::LITEMCP_PROTOCOL}),
+            );
+        }
+        let hdrs = [
+            ("Mcp-Method", "tools/call"),
+            ("Mcp-Name", tool),
+            ("MCP-Protocol-Version", crate::LITEMCP_PROTOCOL),
+        ];
+        let (res, _) = rpc_call_host_headers(
+            host,
+            port,
+            path,
+            "tools/call",
+            params,
+            10,
+            timeout_ms,
+            &hdrs,
+        )?;
+        return Ok((res, t0.elapsed().as_millis() as u64));
+    }
+
+    // Mode MCP HTTP standard : essai direct, puis repli initialize + Mcp-Session-Id
+    match rpc_call_host_headers(
+        host,
+        port,
+        path,
+        "tools/call",
+        params.clone(),
+        10,
+        timeout_ms,
+        &[],
+    ) {
+        Ok((res, _)) => Ok((res, t0.elapsed().as_millis() as u64)),
+        Err(first_err) => {
+            let init_params = json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "mcp-control", "version": env!("CARGO_PKG_VERSION")},
+            });
+            let Ok((_, head)) = rpc_call_host_headers(
+                host,
+                port,
+                path,
+                "initialize",
+                init_params,
+                1,
+                timeout_ms,
+                &[],
+            ) else {
+                return Err(first_err);
+            };
+            if head.session_id.is_empty() {
+                return Err(first_err);
+            }
+            let hdrs = [("Mcp-Session-Id", head.session_id.as_str())];
+            let (res, _) = rpc_call_host_headers(
+                host,
+                port,
+                path,
+                "tools/call",
+                params,
+                10,
+                timeout_ms,
+                &hdrs,
+            )?;
+            Ok((res, t0.elapsed().as_millis() as u64))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn rpc_call_host_headers(
     host: &str,
@@ -3285,20 +3359,7 @@ pub fn probe_http_host_with(
     ) {
         if let Some(arr) = tr.get("tools").and_then(|t| t.as_array()) {
             for t in arr {
-                tools.push(ToolInfo {
-                    name: t
-                        .get("name")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("?")
-                        .to_string(),
-                    desc: t
-                        .get("description")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .chars()
-                        .take(160)
-                        .collect(),
-                });
+                tools.push(parse_tool_info(t));
             }
         }
     }
