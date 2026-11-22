@@ -81,7 +81,7 @@ fn main() {
                 app.add_capability(
                     tauri::ipc::CapabilityBuilder::new("main-remote-ui-origin")
                         .local(false)
-                        .remote(cap_origin.clone())
+                        .remote(format!("{cap_origin}/*"))
                         .window("main")
                         .permission("core:window:allow-start-dragging")
                         .permission("core:window:allow-minimize")

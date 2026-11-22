@@ -2676,6 +2676,7 @@ function tauriInvoke() {
     const tw = W.getCurrentWindow ? W.getCurrentWindow() : (W.getCurrent ? W.getCurrent() : null);
     if (!tw) return null;
     return cmd => {
+      if (cmd === 'plugin:window|start_dragging') return tw.startDragging();
       if (cmd === 'plugin:window|minimize') return tw.minimize();
       if (cmd === 'plugin:window|toggle_maximize') return tw.toggleMaximize();
       if (cmd === 'plugin:window|close') return tw.close();
@@ -2685,9 +2686,23 @@ function tauriInvoke() {
 /* Boutons de fenêtre visibles seulement si l'API fenêtre existe (desktop) :
    hors Tauri ils resteraient des boutons morts. */
 (function () {
-  if (!tauriInvoke()) return;
+  const inv = tauriInvoke();
+  if (!inv) return;
   const box = document.getElementById('winCtrls');
   if (box) box.classList.add('on');
+  // Déplacement de la fenêtre depuis n'importe quelle zone non-interactive
+  // de la barre de titre (logo, badges, espace libre) + double-clic = maximiser.
+  const tb = document.getElementById('titlebar');
+  if (tb) {
+    tb.addEventListener('mousedown', ev => {
+      if (ev.button !== 0) return;
+      const t = ev.target;
+      if (t && t.closest && t.closest('button,a,input,select,textarea,.tb-menu,#winCtrls')) return;
+      ev.preventDefault();
+      const cmd = ev.detail === 2 ? 'plugin:window|toggle_maximize' : 'plugin:window|start_dragging';
+      try { Promise.resolve(inv(cmd)).catch(() => {}); } catch (e) {}
+    });
+  }
 })();
 function winAction(op) {
   const inv = tauriInvoke();

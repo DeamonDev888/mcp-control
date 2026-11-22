@@ -20,15 +20,15 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='3' y='4' width='18' height='16' rx='2'/><path d='M9 4v16'/></svg>
   </button>
   <span class="logo" data-tauri-drag-region>
-    <svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
+    <svg class="mark" viewBox="0 0 24 24" aria-hidden="true" data-tauri-drag-region>
       <rect x="2.5" y="4.5" width="19" height="15" rx="3.2" fill="none" stroke="currentColor" stroke-width="1.5"/>
       <circle cx="8" cy="10" r="1.7" fill="currentColor"/>
       <path d="M5.5 16.2c1.6-1.5 3.1-2.2 4.6-2.2s3 .7 4.6 2.2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
     </svg>
-    <span class="wordmark">MCP<span class="wm-dim"> Control</span></span>
+    <span class="wordmark" data-tauri-drag-region>MCP<span class="wm-dim" data-tauri-drag-region> Control</span></span>
   </span>
-  <span class="tb-badge ok" title="Serveurs MCP qui répondent, sur le total suivi">UP <b id="stUp">0</b>/<b id="stTotal">0</b></span>
-  <span class="tb-badge" title="Outils MCP exposés par les serveurs UP">outils <b id="stTools">0</b></span>
+  <span class="tb-badge ok" data-tauri-drag-region title="Serveurs MCP qui répondent, sur le total suivi">UP <b id="stUp" data-tauri-drag-region>0</b>/<b id="stTotal" data-tauri-drag-region>0</b></span>
+  <span class="tb-badge" data-tauri-drag-region title="Outils MCP exposés par les serveurs UP">outils <b id="stTools" data-tauri-drag-region>0</b></span>
   <button id="tbLogout" class="tb-logout" hidden data-act="logout"
           aria-label="Oublier le code d'acc&egrave;s enregistr&eacute; dans ce navigateur"
           title="Oublier le code d'accès enregistré dans ce navigateur"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='4.5' y='10.5' width='15' height='10' rx='2'/><path d='M8 10.5V7a4 4 0 0 1 8 0v3.5'/></svg></button>
