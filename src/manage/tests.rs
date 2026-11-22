@@ -297,7 +297,10 @@ fn server_order_est_persiste_et_recharge() {
 
 #[test]
 fn cache_roundtrip_restaure_le_dernier_etat() {
-    let path = tmp_config("cfg_cache.json", None);
+    let dir = std::env::temp_dir().join(format!("mcc-cache-rt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.json").to_string_lossy().to_string();
     let mk = |state_etat: SState, tools: bool| {
         Arc::new(AppState {
             servers: Mutex::new(vec![Server {
@@ -1826,9 +1829,11 @@ fn acl_config_cache_et_journal_utilisateur_system_administrateurs() {
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         let sddl = String::from_utf16_lossy(&u16s);
-        // SDDL est indépendant de la langue : SY = S-1-5-18 (SYSTEM), BA = S-1-5-32-544 (Administrateurs)
+        // SDDL est indépendant de la langue :
+        // SY = S-1-5-18 (SYSTEM), BA = S-1-5-32-544 (Administrateurs),
+        // LA = administrateur local intégré (RID -500, utilisé sur les runners Windows CI).
         assert!(
-            sddl.contains(&moi),
+            sddl.contains(&moi) || (moi.ends_with("-500") && sddl.contains(";LA)")),
             "{nom} : compte courant ({moi}) absent — {sddl}"
         );
         assert!(
