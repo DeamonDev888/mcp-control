@@ -1474,17 +1474,34 @@ fn echec_ecriture_config_remonte_a_l_appelant() {
     let eng = moteur();
     let cfg = eng.tmp_dir().join("config.json");
     assert!(cfg.exists(), "config.json du moteur attendu");
-    let mut perms = std::fs::metadata(&cfg).unwrap().permissions();
-    perms.set_readonly(true);
-    std::fs::set_permissions(&cfg, perms).unwrap();
+    #[cfg(windows)]
+    {
+        let mut perms = std::fs::metadata(&cfg).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&cfg, perms).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        // Sur Unix, rename() vérifie les droits du DOSSIER parent (pas du fichier cible).
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(eng.tmp_dir(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    }
 
     let rep = eng.action(&json!({
         "action": "set_settings", "refresh_secs": 123
     }));
     // Remise en écriture AVANT les assertions (le moteur doit rester utilisable).
-    let mut perms = std::fs::metadata(&cfg).unwrap().permissions();
-    perms.set_readonly(false);
-    std::fs::set_permissions(&cfg, perms).unwrap();
+    #[cfg(windows)]
+    {
+        let mut perms = std::fs::metadata(&cfg).unwrap().permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(&cfg, perms).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(eng.tmp_dir(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     assert_eq!(
         rep.get("ok").and_then(|o| o.as_bool()),

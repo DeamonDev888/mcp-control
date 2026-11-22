@@ -813,8 +813,14 @@ fn gateway_auth_heritee_du_sas_api() {
 #[test]
 fn gateway_tool_refresh_re_sonde_et_decouvre_les_nouveaux() {
     let _garde = serial_guard();
-    let eng = moteur();
+    // Découverte locale ACTIVE : ce scénario éprouve précisément le scan
+    // déclenché par `refresh` (le harnais coupe la découverte par défaut).
+    let eng = crate::harness::spawn_loopback_avec_decouverte();
     let fx = Fixture::spawn_mcp();
+    let _ = eng.action(&json!({
+        "action": "set_settings",
+        "discovery_ports_only": [fx.port()]
+    }));
     let rep = ajoute_http(&eng, fx.port(), "e2e-gw-refresh");
     let _id = rep["id"].as_str().expect("add sans id").to_string();
     attend_up(&eng, fx.port());
@@ -835,6 +841,10 @@ fn gateway_tool_refresh_re_sonde_et_decouvre_les_nouveaux() {
     // 2. la recherche des nouveaux est passée : une fixture lancée APRÈS le
     //    boot n'est connue d'aucun scan — seul le ⟳ (discover) peut la trouver
     let fx2 = Fixture::spawn_mcp();
+    let _ = eng.action(&json!({
+        "action": "set_settings",
+        "discovery_ports_only": [fx.port(), fx2.port()]
+    }));
     let _ = mcp(&eng, &rpc_call("refresh", json!({}), 41));
     let decouvert = wait_until(DELAI_SNAPSHOT, || {
         serveur_par_port(&eng, fx2.port())
