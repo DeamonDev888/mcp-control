@@ -1,181 +1,167 @@
-// Détection litemcp : registre %TEMP%, annonces, import natif, boucle de sondage.
-// (split v0.7.20 : manage.rs reste la racine — API stable via réexport)
+// Détection litemcp : annonces du dossier de l'utilisateur courant (lecture
+// seule), pool de sondes persistant.
+//
+// AUDIT S4 (point 2) : une annonce trouvée sur le disque n'est PLUS adoptée ni
+// écrite dans la configuration. Le boot d'une instance de test avait créé un
+// serveur `litemcp-moltbook` (port 8787) dans le seul but de lire un fichier
+// déposé dans %TEMP%. Désormais le fichier n'est que LISTÉ (« détecté, non
+// suivi ») ; l'adoption reste un geste de l'utilisateur (lot U2).
 use super::*;
 
-/// Lit une annonce du registre litemcp (`%TEMP%/litemcp-registry/<nom>.json`).
-/// Écrites par les serveurs litemcp intégrés (ex : moltbook) au bind réussi —
-/// contient exe/args/cwd/port : tout pour Start/Stop natifs sans scan ni
-/// saisie manuelle. Aucune erreur : fichier absent/corrompu = annonce absente.
-fn read_litemcp_registry(name: &str) -> Option<Value> {
+/// Dossier d'annonces litemcp de l'UTILISATEUR COURANT : `%TEMP%` est per-user
+/// sous Windows (`C:\Users\<moi>\AppData\Local\Temp`) ; sous Unix, `$TMPDIR`
+/// ou `/tmp`. Aucun autre dossier n'est lu, aucun champ n'est exécuté.
+fn registry_dir() -> std::path::PathBuf {
+    // Surcharge de TEST : les scénarios écrivent leurs annonces dans un
+    // dossier temporaire au lieu de %TEMP%\litemcp-registry (qui appartient
+    // à l'utilisateur réel).
+    if let Ok(dir) = std::env::var("MCC_LITEMP_REGISTRY") {
+        if !dir.trim().is_empty() {
+            return std::path::PathBuf::from(dir);
+        }
+    }
     let mut base = std::env::temp_dir();
     if base.as_os_str().is_empty() {
         base = std::path::PathBuf::from("/tmp");
     }
-    if name.contains("..") || name.contains('/') || name.contains('\\') {
-        return None;
-    }
-    let path = base.join("litemcp-registry").join(format!("{name}.json"));
-    let body = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&body).ok()
+    base.join("litemcp-registry")
 }
 
-/// Applique une annonce litemcp à l'état : création si aucun serveur HTTP
-/// LOCAL du même nom n'existe (exe/args/cwd deviennent la commande de
-/// lancement → Start/Stop/autoboot natifs), sinon resync du port et
-/// **adoption** — un serveur découvert par scan (sans commande) reçoit celui
-/// de l'annonce et est promu `manual` (un discovered n'est pas persisté, la
-/// commande serait perdue au reboot). Un serveur avec déjà une commande la
-/// garde : l'annonce ne réécrit jamais un choix de l'utilisateur.
-/// Renvoie true si l'état a changé.
-pub(super) fn apply_announcement(state: &Arc<AppState>, ann: &Value) -> bool {
-    let port = ann.get("port").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
-    let exe = ann.get("exe").and_then(|x| x.as_str()).unwrap_or("");
-    if port == 0 || exe.is_empty() {
-        return false;
-    }
-    let args: Vec<String> = ann
-        .get("args")
-        .and_then(|x| x.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|i| i.as_str().map(String::from))
-                .skip(1) // args[0] = chemin de l'exe lui-même
-                .collect()
-        })
-        .unwrap_or_default();
-    let workdir = ann.get("cwd").and_then(|x| x.as_str()).map(String::from);
-    let label = ann
-        .get("name")
-        .and_then(|x| x.as_str())
-        .unwrap_or("litemcp")
-        .to_string();
-    let version = ann
-        .get("version")
-        .and_then(|x| x.as_str())
-        .map(String::from);
-    let ts = ann.get("ts").and_then(|x| x.as_u64()).unwrap_or(0);
+/// Bornes de lecture : 64 Kio par fichier, 32 fichiers examinés au plus.
+const ANNONCE_MAX_BYTES: u64 = 64 * 1024;
+const ANNONCES_MAX: usize = 32;
 
-    let mut servers = lockv(&state.servers);
-    let existing = servers.iter_mut().find(|s| {
-        matches!(&s.transport, Transport::Http { host: None, .. })
-            && s.label.eq_ignore_ascii_case(&label)
-    });
-    match existing {
-        Some(srv) => {
-            let mut changed = false;
-            // resync du port si le serveur a changé de port d'écoute
-            if let Transport::Http {
-                port: ref mut p, ..
-            } = srv.transport
-            {
-                if *p != port {
-                    add_log(
-                        state,
-                        "info",
-                        &format!("[litemcp] {} : port {} -> {} (annonce)", srv.id, *p, port),
-                    );
-                    *p = port;
-                    changed = true;
-                }
-            }
-            // adoption : découvert par scan sans commande → commande native
-            if srv.start_cmd.is_none() {
-                srv.start_cmd = Some(StartCmd {
-                    program: exe.to_string(),
-                    args,
-                    workdir,
-                    env: Vec::new(),
-                });
-                // un discovered n'est pas persisté : promotion en manual pour
-                // que la commande adoptée survive au redémarrage
-                srv.origin = Origin::Manual;
-                if srv.framework.is_none() {
-                    srv.framework = Some("litemcp".into());
-                }
-                if version.is_some() && srv.version.is_none() {
-                    srv.version = version;
-                }
-                add_log(
-                    state,
-                    "info",
-                    &format!(
-                        "[litemcp] adoption : {} reçoit sa commande de lancement",
-                        srv.id
-                    ),
-                );
-                changed = true;
-            } else if version.is_some() && srv.version.is_none() {
-                srv.version = version;
-                changed = true;
-            }
-            let seen = srv.last_seen_ts.unwrap_or(0);
-            if ts > seen {
-                srv.last_seen_ts = Some(ts);
-                changed = true;
-            }
-            changed
-        }
-        None => {
-            let id = format!("litemcp-{label}");
-            add_log(
-                state,
-                "info",
-                &format!("[litemcp] import natif : {} (port {port})", label),
-            );
-            servers.push(Server {
-                id,
-                label,
-                transport: Transport::Http {
-                    host: None,
-                    port,
-                    path: "/mcp".into(),
-                },
-                origin: Origin::Manual,
-                enabled: true,
-                state: SState::Down,
-                pid: None,
-                bound_host: None,
-                server_name: None,
-                version,
-                protocol: None,
-                sse: false,
-                sse_endpoint: false,
-                ws: false,
-                lang: Some("rust".into()),
-                framework: Some("litemcp".into()),
-                via_ssh: false,
-                tools: vec![],
-                latency_ms: None,
-                last_seen_ts: Some(ts),
-                last_error: None,
-                start_cmd: Some(StartCmd {
-                    program: exe.to_string(),
-                    args,
-                    workdir,
-                    env: Vec::new(),
-                }),
-                auto_restart: true,
-                favorite: false,
-                tools_disabled: vec![],
-            });
-            true
-        }
+/// Une annonce lue sur le disque. Champs d'AFFICHAGE seulement : `exe`, `args`,
+/// `cwd` ne sont ni lus ni rendus (rien d'une annonce n'est exécuté).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Annonce {
+    pub name: String,
+    pub port: Option<u16>,
+    pub version: Option<String>,
+    /// Un serveur de la liste porte-t-il déjà ce nom (ou ce port) ? Purement
+    /// informatif — l'annonce n'est pas « suivie » pour autant.
+    pub suivi: bool,
+}
+
+/// Décision d'acceptation selon le propriétaire du fichier.
+/// Refus seulement quand l'appartenance à un AUTRE compte est PROUVÉE : un
+/// système qui ne sait pas lire le propriétaire (macOS sans /proc) ne doit
+/// pas rendre la liste inutilisable — les bornes de taille/nombre restent.
+pub(super) fn owner_check_result(owned: Option<bool>) -> Result<(), String> {
+    match owned {
+        Some(true) | None => Ok(()),
+        Some(false) => Err("appartient à un autre compte".into()),
     }
 }
 
-/// Import auto des serveurs litemcp annoncés (`%TEMP%/litemcp-registry/`).
-/// Appelé à chaque cycle de `poll_all` : le CC et le serveur litemcp restent
-/// synchronisés (port, commande, vie) sans intervention.
-pub fn import_litemcp_registry(state: &Arc<AppState>) {
-    let names = ["moltbook"];
-    for name in names {
-        let Some(ann) = read_litemcp_registry(name) else {
+/// Le fichier est-il lisible comme annonce (fichier ordinaire, taille bornée,
+/// propriétaire courant quand c'est vérifiable) ?
+fn annonce_lisible(path: &std::path::Path) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("illisible: {e}"))?;
+    if !meta.file_type().is_file() {
+        return Err("n'est pas un fichier ordinaire".into());
+    }
+    if meta.len() > ANNONCE_MAX_BYTES {
+        return Err(format!(
+            "trop volumineux ({} octets > {ANNONCE_MAX_BYTES})",
+            meta.len()
+        ));
+    }
+    owner_check_result(probe::file_owned_by_current_user(path))
+}
+
+/// Liste les annonces du dossier litemcp de l'utilisateur courant. Lecture
+/// seule : aucune adoption, aucune écriture de config, aucun démarrage.
+/// `skipped` porte le motif de chaque fichier écarté (nom + raison).
+pub fn litemcp_announcements(state: &Arc<AppState>) -> Value {
+    let dir = registry_dir();
+    let mut annonces: Vec<Annonce> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => {
+            return json!({
+                "dossier": dir.to_string_lossy(),
+                "detected": 0,
+                "announcements": [],
+                "skipped": [],
+            })
+        }
+    };
+    let mut examines = 0usize;
+    for entry in entries.flatten() {
+        if examines >= ANNONCES_MAX {
+            break;
+        }
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.to_ascii_lowercase().ends_with(".json") {
+            continue;
+        }
+        examines += 1;
+        if let Err(motif) = annonce_lisible(&path) {
+            skipped.push(json!({"name": name, "reason": motif}));
+            continue;
+        }
+        let Ok(body) = std::fs::read(&path) else {
+            skipped.push(json!({"name": name, "reason": "lecture impossible"}));
             continue;
         };
-        if apply_announcement(state, &ann) {
-            save_config(state);
-        }
+        let Ok(v) = serde_json::from_slice::<Value>(&body) else {
+            skipped.push(json!({"name": name, "reason": "JSON invalide"}));
+            continue;
+        };
+        let nom = v
+            .get("name")
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| name.trim_end_matches(".json").to_string());
+        let port = v
+            .get("port")
+            .and_then(|x| x.as_u64())
+            .filter(|p| (1..=65535).contains(p))
+            .map(|p| p as u16);
+        let version = v
+            .get("version")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
+        let suivi = {
+            let servers = lockv(&state.servers);
+            servers.iter().any(|s| {
+                s.label.eq_ignore_ascii_case(&nom)
+                    || matches!(&s.transport, Transport::Http { host, port: p, .. }
+                        if host.as_deref().map(crate::is_loopback_bind).unwrap_or(true)
+                            && Some(*p) == port)
+            })
+        };
+        annonces.push(Annonce {
+            name: nom,
+            port,
+            version,
+            suivi,
+        });
     }
+    annonces.sort_by(|a, b| a.name.cmp(&b.name));
+    let arr: Vec<Value> = annonces
+        .iter()
+        .map(|a| {
+            json!({
+                "name": a.name,
+                "port": a.port,
+                "version": a.version,
+                // jamais « adoptée » : l'interface l'affiche « détecté, non suivi »
+                "detected": true,
+                "followed": a.suivi,
+            })
+        })
+        .collect();
+    json!({
+        "dossier": dir.to_string_lossy(),
+        "detected": arr.len(),
+        "announcements": arr,
+        "skipped": skipped,
+    })
 }
 
 // ---------- pool de sondes persistant (audit 03, constat 2) ----------
@@ -269,7 +255,7 @@ fn worker_sondes() {
         };
         let Travail { state, id } = travail;
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            poll_one(&state, &id);
+            poll_one_bg(&state, &id);
         }));
         // le marqueur est libéré même en cas de panic : le serveur sera
         // re-sondé au cycle suivant (jamais sauté pour toujours)
@@ -312,10 +298,13 @@ fn cycle_via_pool(state: &Arc<AppState>, ids: &[String]) {
 }
 
 pub fn poll_all(state: &Arc<AppState>) {
-    // Import natif des serveurs litemcp (moltbook) : l'annonce écrite au bind
-    // fournit exe/args/cwd/port — gestion Start/Stop/autoboot native, même
-    // hors plage de scan (moltbook 8787 est hors 3000-3200).
-    import_litemcp_registry(state);
+    // P-3 : invalide la table port → process du cycle précédent afin qu'au plus
+    // un seul `netstat` + `tasklist` soit construit pour ce cycle.
+    probe::begin_port_owner_cycle();
+    // Les annonces litemcp NE SONT PLUS importées ici (audit S4, point 2) :
+    // `litemcp_announcements` les liste à la demande, sans adoption ni écriture
+    // de config. Le cycle ne lit donc plus %TEMP% et ne peut plus créer de
+    // serveur que l'utilisateur n'a pas demandé.
     // priorité : l'ordre choisi par glisser-déposer gouverne l'ordre de sondage
     // (utile au boot où le premier cycle est séquentiel) — ids absents en dernier
     let order = lockv(&state.settings).server_order.clone();

@@ -1,0 +1,77 @@
+# cargo-deny — garde-fou de la chaîne de dépendances (lot S3).
+# Lancer : cargo deny check      (installation : cargo install cargo-deny --locked)
+# CI : job « supply-chain » de .github/workflows/ci.yml (chaque push + 1×/semaine).
+#
+# Portée : tout le workspace (moteur + desktop Tauri). Le graphe Suit la
+# plateforme HÔTE : sous Linux (la CI), la pile GTK/webkit du desktop et le
+# Secret Service de keyring entrent dans le graphe et les exceptions ci-dessous
+# s'appliquent ; sous Windows elles sont hors graphe, ce qui produit des
+# avertissements « advisory not detected » sans effet bloquant.
+#
+# Lock : 489 paquets — 344 uniquement atteignables par le desktop Tauri
+# (gtk/webkit sous Linux), 129 par `keyring` (Secret Service / zbus).
+
+[advisories]
+version = 2
+# Un paquet retiré (yanked) n'est pas une vulnérabilité : signalé, non bloquant.
+# `async-executor 1.14.0` est dans ce cas (tiré par zbus ← keyring) ; le remplacer
+# suppose que zbus publie une version qui ne l'épingle plus.
+yanked = "warn"
+unused-ignored-advisory = "warn"
+ignore = [
+    # --- Avis « non maintenu » : aucune faille connue, remplacement à suivre ---
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error non maintenu — macros de compilation uniquement (glib-macros/gtk3-macros, desktop Linux) ; absent du binaire final." },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names non maintenu — Secret Service de keyring v1 (Linux seulement) ; fusionné dans zbus 6, migration à faire au lot D." },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant non maintenu — même chaîne keyring/zbus (Linux seulement)." },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive non maintenu — même chaîne keyring/zbus (Linux seulement)." },
+    # --- Avis « unsound » : code fautif non atteint par notre usage ---
+    { id = "RUSTSEC-2024-0429", reason = "glib 0.18 unsound (VariantStrIter) — glib est épinglé à 0.18 par webkit2gtk-rs (GTK3, desktop Linux) ; nous n'itérons jamais des chaînes GVariant. Correctif = glib >= 0.20, donc GTK4 côté tauri." },
+]
+
+[licenses]
+version = 2
+# Seuil de confiance de la détection par fichier LICENSE (défaut cargo-deny).
+confidence-threshold = 0.8
+# Toutes les licences du lock sont permissives ou faiblement copyleft compatibles
+# avec une distribution binaire (MIT OR Apache-2.0 pour le produit).
+# Les expressions historiques « MIT/Apache-2.0 » (barre oblique = OU) sont
+# interprétées comme des disjonctions par spdx.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception", # target-lexicon
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSD-1-Clause",  # fiat-crypto (au choix avec MIT/Apache)
+    "0BSD",          # adler2 (au choix)
+    "ISC",           # libloading
+    "Zlib",          # foldhash, zlib-rs
+    "MPL-2.0",       # cssparser/selectors/dtoa-short/option-ext : copyleft PAR FICHIER (desktop)
+    "Unicode-3.0",   # données ICU4X (18 paquets) — obligation de notice, pas de copyleft
+    "Unlicense",     # aho-corasick, memchr, jiff… (au choix avec MIT)
+    "CC0-1.0",       # dunce (au choix)
+]
+exceptions = []
+
+[bans]
+# Les doublons de version sont signalés mais ne bloquent pas : 26 noms sont
+# présents en deux versions ou plus (syn 1/2/3, thiserror 1/2, windows-sys
+# 0.45/0.61, base64 0.21/0.22/0.23, toml 0.8/1.1, indexmap 1/2, schemars
+# 0.8/0.9/1.2, digest/sha2 0.10/0.11…). Ils viennent des écosystèmes amont,
+# pas de nos manifestes : les figer en `skip` cacherait leur évolution.
+multiple-versions = "warn"
+# Toutes les dépendances sont publiées sur crates.io avec version explicite
+# (dont `litemcp = "0.12.0"` depuis la 0.8.0) : aucun joker toléré.
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+# Aucune dépendance hors crates.io : interdit un registre ou un dépôt git tiers.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = [
+    "https://github.com/rust-lang/crates.io-index",
+    "sparse+https://index.crates.io/",
+]
+allow-git = []

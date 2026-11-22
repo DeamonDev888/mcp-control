@@ -39,127 +39,42 @@ fn journal_boot(config_path: &str, msg: &str) {
     }
 }
 
-pub(super) fn default_servers() -> Vec<Server> {
-    // Commandes de lancement réelles (launcher MCP MONITOR v7.3) : chaque serveur
-    // est démarré via `node <workdir>/bin/launch.cjs` depuis son workdir.
-    // Ces seeds embarquent les commandes pour que l'app puisse lancer/arrêter
-    // les serveurs même sans config.json (exe distribué, premier démarrage).
-    const BASE: &str = "C:/Users/Deamon/Desktop/Backup/Serveur MCP";
-    let mk = |id: &str, label: &str, port: u16, enabled: bool, workdir: &str| {
-        let wd = if workdir.starts_with("C:/") {
-            workdir.to_string()
-        } else {
-            format!("{}/{}", BASE, workdir)
-        };
-        Server {
-            id: id.to_string(),
-            label: label.to_string(),
-            transport: Transport::Http {
-                host: None,
-                port,
-                path: "/mcp".to_string(),
-            },
-            origin: Origin::Seed,
-            enabled,
-            auto_restart: true,
-            favorite: false,
-            state: if enabled {
-                SState::Down
-            } else {
-                SState::Disabled
-            },
-            pid: None,
-            bound_host: None,
-            server_name: None,
-            version: None,
-            protocol: None,
-            sse: false,
-            sse_endpoint: false,
-            ws: false,
-            lang: None,
-            framework: None,
-            via_ssh: false,
-            tools: vec![],
-            latency_ms: None,
-            last_seen_ts: None,
-            last_error: None,
-            start_cmd: Some(StartCmd {
-                program: "node".to_string(),
-                args: vec![format!("{}/bin/launch.cjs", wd)],
-                workdir: Some(wd.clone()),
-                env: Vec::new(),
-            }),
-            tools_disabled: vec![],
+/// Normalise une liste JSON de ports : entiers 1-65535 seulement, doublons
+/// retirés (premier vu), plafonnée à `max` entrées. Un tableau vide est
+/// significatif (« aucun port imposé » / « aucun port exclu ») : l'appelant
+/// l'affecte tel quel quand la clé est présente.
+pub fn parse_port_list(arr: &[Value], max: usize) -> Vec<u16> {
+    let mut out: Vec<u16> = Vec::new();
+    for v in arr {
+        let Some(p) = v.as_u64() else { continue };
+        if !(1..=65535).contains(&p) {
+            continue;
         }
-    };
-    vec![
-        mk("seed-overmind", "Overmind", 3099, true, "Workflow"),
-        mk(
-            "seed-discord",
-            "serveur_discord",
-            3141,
-            true,
-            "serveur_discord",
-        ),
-        mk(
-            "seed-postgresql",
-            "serveur_PostGreSQL",
-            5433,
-            true,
-            "serveur_PostGreSQL",
-        ),
-        mk(
-            "seed-debats",
-            "debats",
-            3100,
-            false,
-            "C:/SierraChart/ACS_Source/BTCacsil/debats-mcp-server",
-        ),
-        mk("seed-x", "X", 3142, true, "X"),
-        mk("seed-news-btc", "NEWS_BTC", 3143, false, "NEWS_BTC"),
-        mk("seed-news", "NEWS", 3144, false, "NEWS"),
-        // Démo LiteMCP (lib Rust MCP stateless) : binaire produit par
-        // `cargo build --release --example hello` du dépôt litemcp. Sert de
-        // banc d'essai du fingerprint framework (badge « LiteMCP ») — si le
-        // binaire manque, le mécanisme « 3 échecs → auto-restart off » s'applique.
-        Server {
-            id: "seed-litemcp".to_string(),
-            label: "LiteMCP (démo)".to_string(),
-            transport: Transport::Http {
-                host: None,
-                port: 8080,
-                path: "/mcp".to_string(),
-            },
-            origin: Origin::Seed,
-            enabled: true,
-            auto_restart: true,
-            favorite: false,
-            state: SState::Down,
-            pid: None,
-            bound_host: None,
-            server_name: None,
-            version: None,
-            protocol: None,
-            sse: false,
-            sse_endpoint: false,
-            ws: false,
-            lang: None,
-            framework: None,
-            via_ssh: false,
-            tools: vec![],
-            latency_ms: None,
-            last_seen_ts: None,
-            last_error: None,
-            start_cmd: Some(StartCmd {
-                program: "C:/Users/Deamon/Desktop/litemcp/target/release/examples/hello.exe"
-                    .to_string(),
-                args: vec![],
-                workdir: Some("C:/Users/Deamon/Desktop/litemcp".to_string()),
-                env: Vec::new(),
-            }),
-            tools_disabled: vec![],
-        },
-    ]
+        let p = p as u16;
+        if !out.contains(&p) {
+            out.push(p);
+        }
+        if out.len() >= max {
+            break;
+        }
+    }
+    out
+}
+
+/// Serveurs de base d'une installation neuve : AUCUN (lot S4, point 8).
+///
+/// L'ancienne liste embarquait huit serveurs avec des chemins propres à la
+/// machine de développement (`C:/Users/Deamon/...`) : une installation neuve
+/// démarrait avec des serveurs fantômes, et l'app pouvait lancer des
+/// programmes qui n'existent pas chez l'utilisateur. La découverte (ports en
+/// écoute, scan réseau, import mcpServers) remplit la liste à la place.
+///
+/// MIGRATION : un `config.json` existant garde ses entrées `seed-*` telles
+/// quelles — elles sont relues comme n'importe quel serveur manuel (label,
+/// transport, commande de lancement). Rien n'est réinjecté au démarrage ;
+/// `settings.removed_seeds` reste lu pour ne réintroduire aucun identifiant.
+pub(super) fn default_servers() -> Vec<Server> {
+    Vec::new()
 }
 
 /// Résolution du chemin de config au runtime (voir main.rs) :
@@ -235,6 +150,18 @@ pub fn runtime_json(state: &Arc<AppState>) -> Value {
 pub fn load_config(path: &str) -> (Vec<Server>, crate::types::Settings) {
     let defaults = default_servers();
     let settings = crate::types::Settings::default();
+    // Temporaires orphelins d'une écriture interrompue (kill, coupure) : un
+    // `.tmp` complet contient les secrets de la config avec l'ACL héritée du
+    // dossier. Purgés AVANT toute écriture (audit S4, point 4).
+    let purged = purge_orphan_tmp(path);
+    // ACL des fichiers de données existants : config, cache, journal.
+    secure_data_files(path);
+    if purged > 0 {
+        journal_boot(
+            path,
+            &format!("{purged} temporaire(s) d'écriture orphelin(s) supprimé(s)"),
+        );
+    }
     let file = match std::fs::read_to_string(path) {
         Ok(f) => f,
         Err(_) => return (defaults, settings),
@@ -318,7 +245,11 @@ pub fn load_config(path: &str) -> (Vec<Server>, crate::types::Settings) {
             &format!("plage de scan inversée ({from} > {to}) — remise dans l'ordre au chargement"),
         );
     }
-    // « Retirer durablement » : les seeds explicitement retirés ne sont pas réinjectés
+    // « Retirer durablement » : les seeds explicitement retirés ne sont pas
+    // réinjectés. Depuis le lot S4, `default_servers()` est VIDE : les entrées
+    // `seed-*` d'un config.json existant sont relues comme des serveurs
+    // manuels (migration — rien n'est réinjecté au démarrage), et ce filtre ne
+    // peut donc plus retirer que des seeds qui n'existent plus.
     let removed: Vec<String> = settings.removed_seeds.clone();
     servers.retain(|s| !(s.origin == Origin::Seed && removed.contains(&s.id)));
     (servers, settings)
@@ -536,6 +467,15 @@ pub(super) fn parse_settings(v: &Value, mut st: crate::types::Settings) -> crate
                 st.network_ports = ports;
             }
         }
+        // Découverte locale (lot S4, point 3) : ports imposés / exclus. Un
+        // tableau vide EFFACE le réglage (contrairement à network_ports, dont
+        // le vide est ignoré pour ne pas casser une config ancienne).
+        if let Some(arr) = s.get("discovery_ports_only").and_then(|x| x.as_array()) {
+            st.discovery_ports_only = parse_port_list(arr, 512);
+        }
+        if let Some(arr) = s.get("discovery_ports_excluded").and_then(|x| x.as_array()) {
+            st.discovery_ports_excluded = parse_port_list(arr, 512);
+        }
         if let Some(x) = s.get("api_access").and_then(|x| x.as_str()) {
             st.api_access = if x.is_empty() {
                 None
@@ -579,6 +519,11 @@ pub(super) fn parse_settings(v: &Value, mut st: crate::types::Settings) -> crate
                 .collect();
         }
     }
+    // Authentification forte (lot M1) : identité PUBLIQUE du serveur et registre
+    // des clients, à la racine du document (`auth.server`, `auth.clients[]`).
+    if let Some(a) = v.get("auth") {
+        st.auth = crate::auth::AuthState::from_json(a);
+    }
     st
 }
 
@@ -595,10 +540,23 @@ fn save_lock() -> &'static Mutex<()> {
     SAVE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-#[allow(unused_must_use)]
+/// Écrit la configuration sur disque. Signature historique : un échec est
+/// journalisé et AVALÉ — réservé aux chemins sans réponse à rendre (boot,
+/// poller). Les actions API utilisent [`save_config_checked`] et remontent
+/// l'échec (audit S4, point 4 : plus de `ok:true` mensonger).
 pub fn save_config(state: &AppState) {
+    let _ = save_config_checked(state);
+}
+
+/// Écriture atomique de config.json (tmp unique dans le même dossier, puis
+/// renommage), ACL explicite, temporaire supprimé en cas d'échec.
+///
+/// `Err` = le fichier n'a PAS été remplacé ; le message porte la cause. Les
+/// actions qui viennent de modifier l'état doivent le rendre à l'appelant, au
+/// lieu de répondre `ok:true` sur une écriture ratée.
+pub fn save_config_checked(state: &AppState) -> Result<(), String> {
     if state.config_path.is_empty() {
-        return;
+        return Ok(());
     }
     let _garde = lockv(save_lock());
     let servers = lockv(&state.servers).clone();
@@ -687,6 +645,8 @@ pub fn save_config(state: &AppState) {
             "ui_bind": settings.ui_bind,
             "network_enabled": settings.network_enabled,
             "network_ports": settings.network_ports,
+            "discovery_ports_only": settings.discovery_ports_only,
+            "discovery_ports_excluded": settings.discovery_ports_excluded,
             "api_access": settings.api_access,
             "allowed_origins": settings.allowed_origins,
             "removed_seeds": settings.removed_seeds,
@@ -701,48 +661,159 @@ pub fn save_config(state: &AppState) {
         },
         // runtime : backoff d'autoboot + historique des crashs (persiste)
         "runtime": crate::runtime::to_json(&lockv(&state.runtime)),
+        // Authentification forte (lot M1) : clé PUBLIQUE du serveur et registre
+        // des clients. Aucune clé privée, aucune graine, aucun secret ici — la
+        // clé privée vit au trousseau (`auth::secret`).
+        "auth": settings.auth.to_json(),
     });
     let pretty = serde_json::to_string_pretty(&doc).unwrap_or_default();
-    // tmp UNIQUE par écriture (pid + séquence) : même sous le verrou global,
-    // deux écritures ne partagent plus jamais le même chemin — un crash pendant
-    // une écriture ne laisse pas de .tmp réutilisé par la suivante.
+    if let Err(msg) = write_atomic_with(&state.config_path, "config", |tmp| {
+        std::fs::write(tmp, &pretty)
+    }) {
+        add_log(state, "error", &msg);
+        return Err(msg);
+    }
+    secure_data_files(&state.config_path);
+    Ok(())
+}
+
+/// Écriture atomique vers `path` via un temporaire unique (`<path>.<pid>.<seq>.tmp`)
+/// dans le même dossier, puis renommage. Sur échec (disque plein, lecture seule…),
+/// le temporaire est supprimé pour ne laisser aucun secret sur disque (audit S4,
+/// point 4).
+pub(super) fn write_atomic_with<F>(path: &str, label: &str, write_fn: F) -> Result<(), String>
+where
+    F: FnOnce(&str) -> std::io::Result<()>,
+{
     let tmp = format!(
         "{}.{}.{}.tmp",
-        state.config_path,
+        path,
         std::process::id(),
         SAVE_SEQ.fetch_add(1, Ordering::Relaxed)
     );
-    // Écriture atomique tmp+rename — les erreurs sont LOGUÉES (une écriture ratée
-    // silencieuse = ajout perdu au reboot sans aucun indice).
-    if let Err(e) = std::fs::write(&tmp, &pretty) {
-        add_log(
-            state,
-            "error",
-            &format!("config : écriture impossible ({}): {}", tmp, e),
-        );
+    if let Err(e) = write_fn(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{label} : écriture impossible ({tmp}): {e}"));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{label} : remplacement impossible ({path}): {e}"));
+    }
+    Ok(())
+}
+
+/// Applique l'ACL explicite aux fichiers de données posés à côté du
+/// config.json : la configuration, le cache de démarrage et les journaux
+/// (audit S4, point 4). L'ACL contient TOUJOURS le compte courant,
+/// SYSTEM et Administrateurs (voir [`restrict_permissions`]).
+pub fn secure_data_files(config_path: &str) {
+    if config_path.is_empty() {
         return;
     }
-    if let Err(e) = std::fs::rename(&tmp, &state.config_path) {
-        add_log(
-            state,
-            "error",
-            &format!(
-                "config : remplacement impossible ({}): {}",
-                state.config_path, e
-            ),
-        );
-    } else {
-        #[cfg(unix)]
-        {
-            // (lot 3, audit 05 constat 10) config.json contient api_access et
-            // les valeurs env en clair : droits 0600 à l'écriture sous Unix
-            // (std::os::unix, PermissionsExt). Sur Windows : no-op volontaire
-            // (ACL héritées — comportement inchangé), noté au rapport lot 3.
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &state.config_path,
-                std::fs::Permissions::from_mode(0o600),
-            );
+    let cfg = std::path::Path::new(config_path);
+    if cfg.exists() {
+        let _ = restrict_permissions(config_path);
+    }
+    let Some(dir) = cfg.parent() else {
+        return;
+    };
+    for name in [
+        "config.json",
+        "state-cache.json",
+        "mcc.log",
+        "auth-audit.log",
+    ] {
+        let p = dir.join(name);
+        // Le journal applicatif est créé ici s'il n'existe pas encore : il reçoit
+        // ainsi l'ACL explicite dès le premier boot, sans attendre la première
+        // ligne écrite par un autre module.
+        if name == "mcc.log" && !p.exists() {
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&p);
         }
+        if p.exists() {
+            let _ = restrict_permissions(&p.to_string_lossy());
+        }
+    }
+}
+
+/// Supprime les temporaires ORPHELINS d'écriture (`<config>.<pid>.<seq>.tmp`,
+/// `state-cache.json.<pid>.<seq>.tmp`) laissés par un arrêt brutal pendant une
+/// écriture. Appelé au boot, avant toute écriture. Renvoie le nombre de
+/// fichiers purgés.
+pub fn purge_orphan_tmp(config_path: &str) -> usize {
+    if config_path.is_empty() {
+        return 0;
+    }
+    let cfg = std::path::Path::new(config_path);
+    let Some(dir) = cfg.parent() else {
+        return 0;
+    };
+    let cfg_prefix = cfg
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("{s}."));
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut purged = 0usize;
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let candidat = name.ends_with(".tmp")
+            && (name.starts_with("state-cache.json.")
+                || cfg_prefix.as_deref().is_some_and(|p| name.starts_with(p)));
+        if candidat && std::fs::remove_file(e.path()).is_ok() {
+            purged += 1;
+        }
+    }
+    purged
+}
+
+/// Restreint un fichier au compte courant, SYSTEM et Administrateurs : `0600`
+/// sous Unix, ACL `icacls` explicite sous Windows.
+///
+/// `/inheritance:r` coupe les ACE héritées (dont BUILTIN\Users), puis trois
+/// autorisations explicites sont posées : compte courant, SYSTEM et le groupe
+/// Administrateurs. Les deux derniers sont désignés par SID (`*S-1-5-18`,
+/// `*S-1-5-32-544`) : les noms traduits (`Système`, `Administrateurs`)
+/// changeraient l'ACL selon la langue de Windows. L'ancienne version les
+/// RETIRAIT, ce qui cassait les sauvegardes et l'administration du fichier.
+pub fn restrict_permissions(path: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(windows)]
+    {
+        // Aucune crate : l'outil système `icacls` (chemin absolu, point 5).
+        let user = probe::current_user_sid().ok_or_else(|| {
+            std::io::Error::other("SID du compte courant introuvable (OpenProcessToken)")
+        })?;
+        let out = probe::system_command("icacls")
+            .arg(path)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(format!("*{user}:F"))
+            .arg("*S-1-5-18:F") // SYSTEM — AUTORITE NT\Système
+            .arg("*S-1-5-32-544:F") // BUILTIN\Administrateurs
+            .output()?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "icacls a échoué ({}) : {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )))
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(())
     }
 }

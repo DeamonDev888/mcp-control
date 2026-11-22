@@ -119,9 +119,13 @@ fn gateway_initialize_tools_list_et_discover() {
         }),
     );
     let res = rep.get("result").expect("initialize sans result");
+    // Profil protocolaire `Legacy` (2025-11-25) retenu au lot M0 : le gateway sert encore
+    // `initialize` et négocie la révision legacy — sans quoi tout client MCP actuel (Claude
+    // Desktop, Cursor) cesse de fonctionner. Le profil strict 2026-07-28 (`_meta` obligatoire,
+    // pas d'`initialize`) se décide au lot M2 et devra alors changer cette assertion.
     assert_eq!(
-        res["protocolVersion"], "2026-07-28",
-        "le gateway annonce la spec LiteMCP : {res}"
+        res["protocolVersion"], "2025-11-25",
+        "le gateway annonce la révision legacy négociée : {res}"
     );
     assert_eq!(res["serverInfo"]["name"], "mcp-control");
     assert!(
@@ -606,9 +610,22 @@ fn gateway_transport_regles_litemcp() {
     assert_eq!(resp.status, 200);
     assert!(resp.json().get("result").is_some());
 
+    // En-têtes SEP-2243 incohérents → requête REFUSÉE. Depuis le lot M2 la
+    // vérification de signature passe avant le contrôle du noyau, et la
+    // signature couvre `Mcp-Method` : la lib refuse elle-même la requête dont
+    // l'en-tête couvert ne colle pas au corps. Le refus est donc le 401 de
+    // corps constant (`-32600`) ; `-32020` reste le code du noyau sans
+    // vérificateur (tests unitaires). Aucun résultat ne sort dans les deux cas.
     let resp = mcp_with(&eng, &[("Mcp-Method", "ping")], &corps);
     let rep = resp.json();
-    assert_eq!(rep["error"]["code"], -32020, "mismatch SEP-2243 : {rep}");
+    assert!(
+        rep.get("result").is_none(),
+        "un Mcp-Method incohérent ne doit jamais rendre de résultat : {rep}"
+    );
+    assert!(
+        rep["error"]["code"] == json!(-32600) || rep["error"]["code"] == json!(-32020),
+        "refus attendu (401 de corps constant ou -32020) : {rep}"
+    );
 
     let brut = format!(
         "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nMcp-Method: tools/call\r\nMcp-Method: ping\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

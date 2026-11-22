@@ -47,15 +47,63 @@
 use crate::manage;
 use crate::probe;
 use crate::types::{lockv, AppState, SState, Transport};
+use crate::Reply;
+use litemcp::auth::sign::{NonceCache, SignatureVerifier};
+use litemcp::auth::{AuthContext, ProofMethod, VerifiedRequest};
 use litemcp::error::ToolError;
 use litemcp::jsonrpc::ErrorObject;
 use litemcp::protocol::{ResourceContents, ToolAnnotations};
-use litemcp::server::McpHeaders;
+use litemcp::server::{McpHeaders, ProtocolProfile};
 use litemcp::zod;
 use litemcp::{Gateway as LiteGateway, ServerBuilder, ServerCore};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+
+/// Droit exigé par chacun des **30 outils** du gateway — table de
+/// `docs/auth.md` §4, recopiée à l'identique (10 `lecture`, 10 `pilotage`,
+/// 10 `execution`).
+///
+/// C'est la **seule** source de vérité du code : `build_builder` la pose sur le
+/// `ServerBuilder` (`require_right`, contrat C2), et trois tests la confrontent
+/// à la surface réellement enregistrée (nom pour nom, aucun outil sans droit).
+/// Tout outil ajouté DOIT modifier cette table dans la même révision.
+///
+/// Les deux déplacements par rapport à l'ancienne répartition de `TODO-AUTH.md`
+/// §4 (tolérés par la spec finale) sont `toggle_server` et `set_auto_restart`,
+/// passés en `execution` : les deux mènent à l'exécution d'un programme.
+pub const TOOL_RIGHTS: [(&str, &str); 30] = [
+    ("list_servers", "lecture"),
+    ("server_detail", "lecture"),
+    ("list_server_tools", "lecture"),
+    ("journal", "lecture"),
+    ("runtime_history", "lecture"),
+    ("list_peers", "lecture"),
+    ("store_catalog", "lecture"),
+    ("list_frameworks", "lecture"),
+    ("get_settings", "lecture"),
+    ("check_update", "lecture"),
+    ("refresh", "pilotage"),
+    ("scan_ports", "pilotage"),
+    ("scan_network", "pilotage"),
+    ("discover_peers", "pilotage"),
+    ("toggle_tool", "pilotage"),
+    ("reorder_servers", "pilotage"),
+    ("set_host", "pilotage"),
+    ("remove_server", "pilotage"),
+    ("ssh_forget", "pilotage"),
+    ("stop_server", "pilotage"),
+    ("add_server", "execution"),
+    ("start_server", "execution"),
+    ("toggle_server", "execution"),
+    ("set_start_command", "execution"),
+    ("set_auto_restart", "execution"),
+    ("install_store_server", "execution"),
+    ("import_config", "execution"),
+    ("call_server_tool", "execution"),
+    ("ssh_save", "execution"),
+    ("ssh_discover", "execution"),
+];
 
 /// Timeout d'un `tools/call` proxifié vers un serveur détecté.
 const PROXY_TIMEOUT_MS: u64 = 20_000;
@@ -81,22 +129,43 @@ static GATEWAY: OnceLock<Arc<Gateway>> = OnceLock::new();
 /// et le catalogue ne passe jamais par un état à moitié reconstruit.
 pub type Gateway = LiteGateway;
 
-/// Nombre d'outils publiés par un noyau — via son propre `tools/list`
-/// (l'API 0.8 n'expose pas d'introspection directe ; un dispatch local ne
-/// coûte rien au boot).
+/// Nombre d'outils publiés par un noyau. Le noyau du moteur a l'autorisation
+/// ACTIVE : un `dispatch` nu serait refusé (aucune identité) et le boot
+/// annoncerait « 0 outil ». On compte donc avec une identité interne portant
+/// les trois droits — c'est le catalogue complet, pas une vue client.
 pub fn tool_count(core: &ServerCore) -> usize {
-    core.dispatch(br#"{"jsonrpc":"2.0","id":0,"method":"tools/list"}"#)
-        .and_then(|reply| serde_json::from_slice::<Value>(&reply).ok())
-        .and_then(|v| v["result"]["tools"].as_array().map(Vec::len))
-        .unwrap_or(0)
+    let contexte = AuthContext::new("mcc-boot", ProofMethod::Application).with_rights([
+        "lecture",
+        "pilotage",
+        "execution",
+    ]);
+    core.dispatch_authenticated(
+        br#"{"jsonrpc":"2.0","id":0,"method":"tools/list"}"#,
+        None,
+        &contexte,
+    )
+    .and_then(|reply| serde_json::from_slice::<Value>(&reply.body).ok())
+    .and_then(|v| v["result"]["tools"].as_array().map(Vec::len))
+    .unwrap_or(0)
+}
+
+/// Horodatage de démarrage du gateway (R-2) : toute requête signée `/mcp`
+/// créée strictement avant `BOOT_TS` (`created < boot_ts`) est refusée en `401`
+/// même si sa signature Ed25519 reste dans la fenêtre ±60 s, afin de fermer le
+/// rejeu d'un nonce après redémarrage du moteur.
+static BOOT_TS: OnceLock<u64> = OnceLock::new();
+
+fn boot_ts() -> u64 {
+    *BOOT_TS.get_or_init(crate::types::now_ts)
 }
 
 /// Construit le gateway du moteur et l'installe dans le slot global.
 /// À appeler **une fois** par moteur (run_headless).
 pub fn install(state: &Arc<AppState>) -> Arc<Gateway> {
+    let _ = boot_ts();
     // `litemcp::Gateway` prend un `ServerBuilder` et publie le premier
     // snapshot — la reconstruction passe désormais par son API `edit`.
-    let gw = Arc::new(LiteGateway::new(build_builder(state)));
+    let gw = Arc::new(LiteGateway::new(build_builder_guarded(state)));
     let _ = GATEWAY.set(Arc::clone(&gw));
     gw
 }
@@ -117,7 +186,56 @@ pub fn refresh(state: &Arc<AppState>) {
     // Reconstruction + échange atomique via le module officiel : le snapshot
     // publié ne peut jamais être plus ancien que l'état reconstruit.
     let st = Arc::clone(state);
-    gw.edit(move |_builder| build_builder(&st));
+    gw.edit(move |_builder| build_builder_guarded(&st));
+}
+
+/// Vérificateur de signature de `/mcp` (contrat C7/C8) — **instance unique par
+/// process** : `ServerBuilder::verifier` en exige une `Arc`, mais surtout le
+/// cache de nonces doit survivre aux reconstructions du snapshot
+/// (`Gateway::edit` à chaque changement de détection), sinon un rejeu
+/// redeviendrait possible à chaque `refresh`.
+///
+/// Le `KeyStore` est le registre `auth.clients[]` relu **à chaque requête**
+/// (contrat C6) : une révocation prend effet à la requête suivante.
+fn verifier_for(state: &Arc<AppState>) -> Arc<dyn litemcp::auth::Verifier> {
+    static VERIFIER: OnceLock<Arc<dyn litemcp::auth::Verifier>> = OnceLock::new();
+    Arc::clone(VERIFIER.get_or_init(|| {
+        Arc::new(SignatureVerifier::new(
+            Arc::new(crate::auth::RegistryStore {
+                state: Arc::clone(state),
+            }),
+            NonceCache::default(),
+        ))
+    }))
+}
+
+/// Signal événementiel de changement d'état pour le thread de rafraîchissement
+/// du gateway (P-4 / P1 rang 4) : évite le recalcul aveugle toutes les 5 s.
+fn gw_change_signal() -> &'static (std::sync::Mutex<u64>, std::sync::Condvar) {
+    static SIG: OnceLock<(std::sync::Mutex<u64>, std::sync::Condvar)> = OnceLock::new();
+    SIG.get_or_init(|| (std::sync::Mutex::new(0), std::sync::Condvar::new()))
+}
+
+/// Réveille immédiatement le thread de rafraîchissement du gateway.
+pub fn notify_change() {
+    let (m, cv) = gw_change_signal();
+    let mut seq = m.lock().unwrap_or_else(|p| p.into_inner());
+    *seq = seq.wrapping_add(1);
+    cv.notify_all();
+}
+
+/// Attend un changement d'état du gateway (ou l'échéance `timeout` en filet).
+/// Renvoie la nouvelle séquence observée.
+pub fn wait_change(last_seq: u64, timeout: std::time::Duration) -> u64 {
+    let (m, cv) = gw_change_signal();
+    let guard = m.lock().unwrap_or_else(|p| p.into_inner());
+    if *guard != last_seq {
+        return *guard;
+    }
+    let (guard, _) = cv
+        .wait_timeout(guard, timeout)
+        .unwrap_or_else(|p| p.into_inner());
+    *guard
 }
 
 /// Empreinte de l'état qui nourrit le snapshot : ids, états, interrupteurs,
@@ -127,25 +245,16 @@ pub fn refresh(state: &Arc<AppState>) {
 pub fn fingerprint(state: &Arc<AppState>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    let mut lines: Vec<String> = {
-        let servers = lockv(&state.servers);
-        servers
-            .iter()
-            .map(|s| {
-                format!(
-                    "{}|{}|{}|{}|{}",
-                    s.id,
-                    s.state.as_str(),
-                    s.enabled,
-                    s.tools.len(),
-                    s.tools_disabled.len()
-                )
-            })
-            .collect()
-    };
-    lines.sort();
-    for line in &lines {
-        line.hash(&mut h);
+    let servers = lockv(&state.servers);
+    let mut idxs: Vec<usize> = (0..servers.len()).collect();
+    idxs.sort_by(|&a, &b| servers[a].id.cmp(&servers[b].id));
+    for i in idxs {
+        let s = &servers[i];
+        s.id.hash(&mut h);
+        s.state.as_str().hash(&mut h);
+        s.enabled.hash(&mut h);
+        s.tools.len().hash(&mut h);
+        s.tools_disabled.len().hash(&mut h);
     }
     h.finish()
 }
@@ -212,28 +321,79 @@ fn destructive(title: &'static str) -> ToolAnnotations {
 /// Construit un instantané complet du gateway : outils de supervision
 /// (statiques, données lues en direct) + ressources par serveur détecté.
 fn build_builder(state: &Arc<AppState>) -> ServerBuilder {
-    let builder = ServerBuilder::new("mcp-control", env!("CARGO_PKG_VERSION")).on_call({
-        let st = Arc::clone(state);
-        move |ev| {
-            // une ligne par message dispatché : le journal de l'UI raconte
-            // aussi ce que font les clients MCP (audit trail gratuit)
-            manage::add_log(
-                &st,
-                "info",
-                &format!(
-                    "[gateway] {} {} → {:?} en {} ms",
-                    ev.method,
-                    ev.name.unwrap_or("-"),
-                    ev.status,
-                    ev.duration.as_millis()
-                ),
-            );
-        }
-    });
+    // Profil legacy 2025-11-25 assumé : les clients MCP actuels (Claude
+    // Desktop, Cursor, Claude Code) font `initialize` sans `_meta` — le profil
+    // strict 2026-07-28 les refuserait ; le passage au moderne se tranche au M2.
+    let builder = ServerBuilder::new("mcp-control", env!("CARGO_PKG_VERSION"))
+        .protocol_profile(ProtocolProfile::Legacy)
+        .on_call({
+            let st = Arc::clone(state);
+            move |ev| {
+                // une ligne par message dispatché : le journal de l'UI raconte
+                // aussi ce que font les clients MCP (audit trail gratuit)
+                manage::add_log(
+                    &st,
+                    "info",
+                    &format!(
+                        "[gateway] {} {} → {:?} en {} ms",
+                        ev.method,
+                        ev.name.unwrap_or("-"),
+                        ev.status,
+                        ev.duration.as_millis()
+                    ),
+                );
+            }
+        });
     let builder = read_tools(builder, state);
     let builder = action_tools(builder, state);
     let builder = proxy_tools(builder, state);
+    // C2 : le droit de CHAQUE outil (docs/auth.md §4). Posé ici, après tous les
+    // enregistrements, pour qu'un outil ajouté sans droit tombe sous le test de
+    // couverture (noms de `tools/list` ⊂ noms de TOOL_RIGHTS) — et pour que
+    // l'échec fermé de la lib s'applique à toute la surface.
+    let builder = with_rights(builder);
     dynamic_resources(builder, state)
+}
+
+/// Pose les 30 déclarations de droit sur le builder.
+fn with_rights(mut b: ServerBuilder) -> ServerBuilder {
+    for (tool, right) in TOOL_RIGHTS {
+        b = b.require_right(tool, right);
+    }
+    b
+}
+
+/// Le gateway **du moteur** : la surface ci-dessus plus le vérificateur de
+/// signature (contrat C7). C'est le seul constructeur utilisé par `install` et
+/// `refresh` : sans vérificateur, la lib retombe sur son chemin historique
+/// (autorisation inactive) — un moteur ne doit jamais partir ainsi.
+///
+/// Lot M3 : la **confirmation humaine** (contrat C5, `docs/auth.md` §5) est
+/// posée ici, avec le journal des décisions d'autorisation (contrat C4). Les
+/// trois vont ensemble : `require_approval` sans politique est un échec fermé
+/// côté lib, et une politique sans `on_auth_decision` ne laisse aucune trace.
+fn build_builder_guarded(state: &Arc<AppState>) -> ServerBuilder {
+    let b = build_builder(state).verifier(verifier_for(state));
+    let b = with_approval(b, state);
+    let st = Arc::clone(state);
+    b.on_auth_decision(move |ev| crate::auth::confirm::note_decision(&st, ev))
+}
+
+/// Les 10 outils `execution` passent par la confirmation humaine (§5 : « les
+/// dix outils `execution`, sans exception »). Aucun autre outil n'est confirmé :
+/// `stop_server` et `remove_server` sont destructifs mais ne lancent rien.
+///
+/// La politique reçoit les arguments **après validation et injection des
+/// défauts** (contrat C5) : ce qui est approuvé est exactement ce qui s'exécute.
+fn with_approval(mut b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
+    for (tool, right) in TOOL_RIGHTS {
+        if right == crate::auth::RIGHT_EXECUTION {
+            b = b.require_approval(tool);
+        }
+    }
+    b.approval_policy(Arc::new(crate::auth::confirm::Policy {
+        state: Arc::clone(state),
+    }))
 }
 
 // ---------- outils de lecture (l'état est lu EN DIRECT à chaque appel) ----------
@@ -260,31 +420,15 @@ fn read_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
             {
                 let st = Arc::clone(state);
                 move |args| {
-                    let full = manage::state_json(&st);
-                    let mut servers = full["servers"].clone();
-                    if let Some(want) = args.get("state").and_then(Value::as_str) {
-                        let want = want.to_ascii_uppercase();
-                        let want = match want.as_str() {
-                            "PORT_ONLY" => "PORT-ONLY",
-                            w => w,
-                        };
-                        servers = servers
-                            .as_array()
-                            .map(|arr| {
-                                Value::Array(
-                                    arr.iter()
-                                        .filter(|s| s["state"].as_str() == Some(want))
-                                        .cloned()
-                                        .collect(),
-                                )
-                            })
-                            .unwrap_or(Value::Array(vec![]));
-                    }
-                    Ok(json!({
-                        "stats": full["stats"],
-                        "lan_ok": full["lan_ok"],
-                        "servers": servers,
-                    }))
+                    let want_owned = args.get("state").and_then(Value::as_str).map(|w| {
+                        let u = w.to_ascii_uppercase();
+                        if u == "PORT_ONLY" {
+                            "PORT-ONLY".to_string()
+                        } else {
+                            u
+                        }
+                    });
+                    Ok(manage::servers_summary_json(&st, want_owned.as_deref()))
                 }
             },
         );
@@ -541,6 +685,9 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                     // discover = scan_listening). Régression lot A : l'ancien
                     // handler envoyait {"action":"refresh"} sans id — le
                     // dispatcher exige un id → « id manquant » à chaque appel.
+                    // Rafraîchissement manuel explicite : invalide le cache
+                    // tools/list avant de relancer le pool.
+                    manage::invalidate_tools_cache(&st);
                     manage::poll_all(&st);
                     do_action(&st, json!({ "action": "discover" }))
                 }
@@ -901,6 +1048,13 @@ fn proxy_target(s: &crate::types::Server) -> Result<(String, u16, String), ToolE
         )));
     }
     if s.state != SState::Up {
+        if crate::auth::net::is_server_locked(s) {
+            return Err(ToolError::invalid_input(format!(
+                "serveur '{}' joignable mais verrouillé (401 Signature LiteMCP) : \
+                 appairer d'abord MCP Control avec l'action locale server_pair",
+                s.id
+            )));
+        }
         return Err(ToolError::invalid_input(format!(
             "serveur '{}' à l'état {} : seul un serveur UP répond au proxy \
              (start_server pour le démarrer, refresh pour re-sonder)",
@@ -964,7 +1118,8 @@ fn proxy_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                     let id = args["server"].as_str().unwrap_or_default();
                     let tool = args["tool"].as_str().unwrap_or_default();
                     let arguments = args.get("arguments").cloned().unwrap_or(json!({}));
-                    let (host, port, path) = {
+                    crate::auth::net::set_config_path(&st.config_path);
+                    let (host, port, path, protocol) = {
                         let servers = lockv(&st.servers);
                         let Some(s) = servers.iter().find(|s| s.id == id) else {
                             return Err(ToolError::invalid_input(format!(
@@ -977,11 +1132,38 @@ fn proxy_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                                  (toggle_tool pour le rétablir)"
                             )));
                         }
-                        proxy_target(s)?
+                        let (h, p, pth) = proxy_target(s)?;
+                        (h, p, pth, s.protocol.clone())
                     };
+                    // Contrat C1 (`docs/auth.md` §8.2) : journaliser le vrai client
+                    // appelant et non le proxy.
+                    let appelant = litemcp::auth::current()
+                        .map(|ctx| ctx.client().to_string())
+                        .unwrap_or_else(|| "local".to_string());
+                    manage::add_log(
+                        &st,
+                        "info",
+                        &format!("[proxy] call_server_tool {id}.{tool} (client {appelant})"),
+                    );
                     let rpc_id = PROXY_RPC_ID.fetch_add(1, Ordering::Relaxed);
-                    let params = json!({ "name": tool, "arguments": arguments });
-                    match probe::rpc_call_host(
+                    let stateless = protocol.as_deref() == Some(crate::LITEMCP_PROTOCOL);
+                    let params = if stateless {
+                        json!({
+                            "name": tool,
+                            "arguments": arguments,
+                            "_meta": {
+                                "io.modelcontextprotocol/protocolVersion": crate::LITEMCP_PROTOCOL
+                            }
+                        })
+                    } else {
+                        json!({ "name": tool, "arguments": arguments })
+                    };
+                    let mut extra: Vec<(&str, &str)> =
+                        vec![("Mcp-Method", "tools/call"), ("Mcp-Name", tool)];
+                    if stateless {
+                        extra.push(("MCP-Protocol-Version", crate::LITEMCP_PROTOCOL));
+                    }
+                    match probe::rpc_call_host_headers(
                         &host,
                         port,
                         &path,
@@ -989,6 +1171,7 @@ fn proxy_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                         params,
                         rpc_id,
                         PROXY_TIMEOUT_MS,
+                        &extra,
                     ) {
                         Ok((result, _head)) => {
                             // transparence : le résultat du serveur distant
@@ -1031,6 +1214,11 @@ fn dynamic_resources(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                 }
             },
         )
+        // Ressources : droit `lecture` explicite (C2). La table §4 ne parle que
+        // des 30 outils, mais sans déclaration la lib les rend invisibles à
+        // TOUT client authentifié (échec fermé) : les quatre ressources sont
+        // des vues en lecture, elles exigent `lecture`.
+        .require_resource_right("mcp-control://servers", "lecture")
         .resource(
             "mcp-control://journal",
             "Journal",
@@ -1056,6 +1244,7 @@ fn dynamic_resources(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                 }
             },
         )
+        .require_resource_right("mcp-control://journal", "lecture")
         .resource(
             "mcp-control://settings",
             "Réglages",
@@ -1080,7 +1269,8 @@ fn dynamic_resources(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                     })
                 }
             },
-        );
+        )
+        .require_resource_right("mcp-control://settings", "lecture");
     // une ressource par serveur DÉTECTÉ : le snapshot est reconstruit quand
     // l'empreinte de détection change (cf. fingerprint/refresh)
     let ids: Vec<(String, String)> = {
@@ -1109,6 +1299,8 @@ fn dynamic_resources(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                 })
             },
         );
+        // une ressource par serveur : même droit que l'aperçu (lecture)
+        b = b.require_resource_right(&uri, "lecture");
     }
     b
 }
@@ -1198,8 +1390,8 @@ fn sse_event(reply: &[u8]) -> Vec<u8> {
     event
 }
 
-fn err_json(status: u16, body: Value) -> (u16, &'static str, Vec<u8>) {
-    (status, "application/json", body.to_string().into_bytes())
+fn err_json(status: u16, body: Value) -> Reply {
+    Reply::json(status, body)
 }
 
 /// Extrait l'`id` JSON-RPC d'un corps — *best-effort*, pour la réponse -32603
@@ -1213,35 +1405,99 @@ fn extract_id(body: &[u8]) -> Value {
 }
 
 /// Traite une requête HTTP sur `/mcp` — appelée par `handle_conn` APRÈS le
-/// contrôle d'accès (Host/Origin/code hors loopback, cf. `check_access`).
+/// contrôle d'accès (Host/Origin/cadrage/session, cf. `check_access`).
 /// Règles de transport identiques à LiteMCP : POST seul, `Content-Type`
 /// JSON exigé, `Accept` négocié (SSE mono-événement), en-têtes SEP-2243
 /// vérifiés, notification → 202 sans corps.
+///
+/// Lot M2 : l'appel direct au noyau est remplacé par la fonction « vérifie puis
+/// dispatche » de la lib (contrat C8). `legacy` n'ouvre que la LECTURE (code
+/// hérité `X-MCC-Access` / preuve de pair, docs/auth.md §10) : il ne remplace
+/// jamais une signature, il donne une identité `lecture` sans plus.
+/// Extrait le paramètre `created=<u64>` d'un en-tête `Signature-Input` unique
+/// (RFC 9421). Retourne `None` si l'en-tête est absent, dupliqué ou mal formé
+/// (le vérificateur `litemcp` rejettera de toute façon ces cas en `401`).
+pub(crate) fn signature_created(headers: &[(String, String)]) -> Option<u64> {
+    let mut vals = headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("signature-input"))
+        .map(|(_, v)| v.as_str());
+    let v = vals.next()?;
+    if vals.next().is_some() {
+        return None;
+    }
+    let params = v.find(')').map(|pos| &v[pos + 1..])?;
+    for part in params.split(';') {
+        if let Some(raw) = part.trim().strip_prefix("created=") {
+            let raw = raw.trim();
+            if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) {
+                return raw.parse::<u64>().ok();
+            }
+            return None;
+        }
+    }
+    None
+}
+
 pub fn serve(
     method: &str,
+    path: &str,
     headers: &[(String, String)],
     body: &[u8],
-) -> (u16, &'static str, Vec<u8>) {
+    legacy: bool,
+    peer: Option<std::net::IpAddr>,
+) -> Reply {
+    // Adresse source de la requête : la politique de confirmation (C5) ne
+    // reçoit que `(client, outil, arguments, request_id)` ; l'adresse exigée
+    // par `docs/auth.md` §5 vient de ce canal, propre au fil de la connexion.
+    crate::auth::confirm::set_request_peer(peer);
     let Some(gw) = current() else {
-        return (
+        return Reply::new(
             503,
             "application/json",
             br#"{"ok":false,"error":"gateway indisponible"}"#.to_vec(),
         );
     };
-    respond(gw.snapshot().as_ref(), method, headers, body)
+    respond_auth(
+        gw.snapshot().as_ref(),
+        path,
+        method,
+        headers,
+        body,
+        legacy,
+        Some(boot_ts()),
+    )
 }
 
 /// Les règles de transport `/mcp`, appliquées à un noyau explicite — pure et
-/// testée sans le slot global.
+/// testée sans le slot global. Point d'entrée des tests : sans vérificateur
+/// (cas des noyaux de test), la lib dispatche comme avant.
+#[cfg(test)]
 fn respond(
     core: &ServerCore,
     method: &str,
     headers: &[(String, String)],
     body: &[u8],
 ) -> (u16, &'static str, Vec<u8>) {
+    respond_auth(core, "/mcp", method, headers, body, false, None).into_parts()
+}
+
+/// Contrôles de transport puis « vérifie et dispatche » (C8).
+///
+/// L'ordre ne change pas : les refus gratuits (405, cadrage, 415, 406, en-têtes
+/// en double) passent AVANT la vérification de signature — une requête refusée
+/// pour sa forme ne coûte pas un Ed25519, et le client reçoit le vrai motif.
+fn respond_auth(
+    core: &ServerCore,
+    path: &str,
+    method: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    legacy: bool,
+    min_created: Option<u64>,
+) -> Reply {
     if method != "POST" {
-        return (
+        return Reply::new(
             405,
             "application/json",
             br#"{"ok":false,"error":"method not allowed: POST /mcp only (stateless transport)"}"#
@@ -1318,33 +1574,97 @@ fn respond(
         None
     } else {
         Some(McpHeaders {
+            protocol_version: None,
             method: mcp_method,
             name: mcp_name,
+            params: Vec::new(),
         })
     };
-    // dispatch sur le noyau — panique de repli → -32603 avec id repris
+    // Les en-têtes bruts dans l'ordre reçu, tels que la vérification les attend
+    // (aucune normalisation : `@authority` = le Host réellement reçu).
+    let refs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.as_str()))
+        .collect();
+    let authority = headers
+        .iter()
+        .find(|(n, _)| n == "host")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    // panique de repli → -32603 avec id repris
     let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        core.dispatch_with_headers(body, headers_mcp.as_ref())
+        if !core.authorization_active() {
+            // Aucun vérificateur (noyaux de test unitaires uniquement) : chemin
+            // historique, aucune identité à établir.
+            return core
+                .dispatch_with_headers(body, headers_mcp.as_ref())
+                .map(|reply| Reply::new(200, "application/json", reply))
+                .unwrap_or_else(|| Reply::new(202, "application/json", Vec::new()));
+        }
+        // Voie HÉRITÉE (docs/auth.md §10) : un code partagé valide ou une preuve
+        // de pair ne donnent qu'une identité `lecture`, jamais plus, et jamais
+        // à la place d'une signature (celle-ci a la priorité, plus bas).
+        let signed = headers
+            .iter()
+            .any(|(n, _)| n == "signature" || n == "signature-input");
+        if legacy && !signed {
+            let ctx = AuthContext::new(
+                "mcc-legacy",
+                ProofMethod::Token {
+                    issuer: "mcc-access".to_string(),
+                },
+            )
+            .with_right("lecture");
+            return match core.dispatch_authenticated(body, headers_mcp.as_ref(), &ctx) {
+                Some(reply) => Reply::new(reply.status.code(), "application/json", reply.body),
+                None => Reply::new(202, "application/json", Vec::new()),
+            };
+        }
+        // R-2 : refuser en 401 uniforme toute signature créée strictement avant
+        // le démarrage courant du serveur (ferme le rejeu après redémarrage).
+        if let Some(min_ts) = min_created {
+            if signature_created(headers).is_some_and(|c| c < min_ts) {
+                return Reply::new(
+                    401,
+                    "application/json",
+                    br#"{"error":{"code":-32600,"message":"unauthorized"},"id":null,"jsonrpc":"2.0"}"#
+                        .to_vec(),
+                )
+                .with_header(
+                    "WWW-Authenticate",
+                    r#"Signature realm="litemcp", tag="litemcp-auth-v1""#.to_string(),
+                );
+            }
+        }
+        // C8 : vérifie puis dispatche. 401 de corps constant +
+        // `WWW-Authenticate` si la signature manque ou ne vaut rien ; 403
+        // `-32023` si un droit manque ou si l'outil n'en déclare aucun.
+        let request = VerifiedRequest::new(method, path, authority, &refs, body);
+        let response = core.dispatch_verified(&request);
+        Reply {
+            status: response.status,
+            ctype: "application/json",
+            body: response.body,
+            headers: response.headers,
+        }
     }));
     let reply = match dispatched {
-        Ok(Some(reply)) => reply,
-        Ok(None) => {
-            // notification : aucune réponse JSON-RPC attendue
-            return (202, "application/json", Vec::new());
-        }
+        Ok(reply) => reply,
         Err(_) => {
             let payload = json!({
                 "jsonrpc": "2.0",
                 "id": extract_id(body),
                 "error": { "code": ErrorObject::INTERNAL_ERROR, "message": "internal error" }
             });
-            return (200, "application/json", payload.to_string().into_bytes());
+            return Reply::json(200, payload);
         }
     };
-    if accept_sse && !accept_json {
-        return (200, "text/event-stream", sse_event(&reply));
+    // SSE mono-événement réservé aux réponses 200 : un 401/403 garde son corps
+    // JSON-RPC et son statut, même si le client ne veut que du SSE.
+    if accept_sse && !accept_json && reply.status == 200 && !reply.body.is_empty() {
+        return Reply::new(200, "text/event-stream", sse_event(&reply.body));
     }
-    (200, "application/json", reply)
+    reply
 }
 
 // ---------- tests ----------
@@ -1552,8 +1872,15 @@ mod tests {
             current().is_none(),
             "le slot global doit rester vide en tests unitaires"
         );
-        let r = serve("POST", &hs(&[("content-type", "application/json")]), b"{}");
-        assert_eq!(r.0, 503);
+        let r = serve(
+            "POST",
+            "/mcp",
+            &hs(&[("content-type", "application/json")]),
+            b"{}",
+            false,
+            None,
+        );
+        assert_eq!(r.status, 503);
     }
 
     #[test]
@@ -1995,9 +2322,11 @@ mod tests {
         ]
     }
 
-    /// Les 6 actions NON exposées, avec un argument qui les rend observables
-    /// si l'injection passait. open_path : chemin inexistant → même sans
+    /// Les actions NON exposées, avec un argument qui les rend observables si
+    /// l'injection passait. open_path : chemin inexistant → même sans
     /// correctif, explorer ne s'ouvre pas sur la machine de test.
+    /// Lot M1 : les 7 actions LOCALES d'authentification (droit `admin`) sont
+    /// ajoutées ici — elles ne doivent être atteignables par AUCUN tool.
     fn injections_interdites() -> Vec<(&'static str, Value)> {
         vec![
             (
@@ -2012,6 +2341,49 @@ mod tests {
             ("reset_state", json!({ "what": "tout" })),
             ("reset_runtime", json!({})),
             ("open_path", json!({ "path": "Z:\\inexistant-pour-test" })),
+            ("pair_list", json!({})),
+            (
+                "pair_approve",
+                json!({ "pair_id": "00000000000000000000000000000000", "rights": ["execution"] }),
+            ),
+            (
+                "pair_reject",
+                json!({ "pair_id": "00000000000000000000000000000000" }),
+            ),
+            ("client_list", json!({})),
+            (
+                "client_set_scopes",
+                json!({ "keyid": "mcc-a-0000000000000001", "rights": ["execution"] }),
+            ),
+            (
+                "client_revoke",
+                json!({ "keyid": "mcc-a-0000000000000001" }),
+            ),
+            (
+                "client_rotate",
+                json!({ "keyid": "mcc-a-0000000000000001", "new_keyid": "mcc-a-0000000000000002", "public_key": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a" }),
+            ),
+            // Lot M3 : les décisions de confirmation sont locales elles aussi
+            // (session `admin`) — aucun outil ne doit les atteindre.
+            ("access_list", json!({})),
+            (
+                "confirm_approve",
+                json!({ "request_id": "00000000000000000000000000000000", "mode": "window" }),
+            ),
+            (
+                "confirm_deny",
+                json!({ "request_id": "00000000000000000000000000000000" }),
+            ),
+            (
+                "grant_revoke",
+                json!({ "request_id": "00000000000000000000000000000000" }),
+            ),
+            // Lot M4 : appairage sortant de MCP Control avec un serveur LiteMCP
+            // verrouillé (droit `admin`, action locale uniquement).
+            (
+                "server_pair",
+                json!({ "id": "cible", "host": "127.0.0.1", "port": 30_901 }),
+            ),
         ]
     }
 
@@ -2098,7 +2470,11 @@ mod tests {
                 );
             }
         }
-        assert_eq!(essais, 17 * 6, "17 tools × 6 injections");
+        assert_eq!(
+            essais,
+            17 * injections_interdites().len(),
+            "17 tools × toutes les injections interdites"
+        );
         let apres = (
             reglages_json(&state),
             fingerprint(&state),
@@ -2376,5 +2752,275 @@ mod tests {
                 .contains("coupé pour ce serveur"),
             "{err}"
         );
+    }
+
+    // ---------- droits par outil (lot M2, docs/auth.md §4) ----------
+
+    /// Noyau « autorisation active » : même surface que le moteur, avec un
+    /// vérificateur local. Les tests ci-dessous passent un contexte DÉJÀ établi
+    /// à `dispatch_authenticated` — le vérificateur n'est jamais interrogé et
+    /// aucun état global n'est touché (le slot du gateway reste vide en tests
+    /// unitaires).
+    fn core_avec_droits(state: &Arc<AppState>) -> ServerCore {
+        build_builder(state)
+            .verifier(Arc::new(SignatureVerifier::new(
+                Arc::new(litemcp::auth::sign::TestKeyStore::new()),
+                NonceCache::default(),
+            )))
+            .core()
+    }
+
+    /// `tools/call` avec une identité portant `droits` → (statut HTTP, réponse).
+    fn appel_avec(core: &ServerCore, outil: &str, args: &Value, droits: &[&str]) -> (u16, Value) {
+        let ctx = AuthContext::new("mcp-e2e", ProofMethod::Application)
+            .with_rights(droits.iter().map(|d| d.to_string()));
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": outil, "arguments": args }
+        })
+        .to_string();
+        let reply = core
+            .dispatch_authenticated(body.as_bytes(), None, &ctx)
+            .expect("une requête avec id rend toujours une réponse");
+        (
+            reply.status.code(),
+            serde_json::from_slice(&reply.body).unwrap_or(Value::Null),
+        )
+    }
+
+    /// `tools/list` pour une identité portant `droits` → noms publiés.
+    fn liste_pour(core: &ServerCore, droits: &[&str]) -> Vec<String> {
+        let ctx = AuthContext::new("mcp-e2e", ProofMethod::Application)
+            .with_rights(droits.iter().map(|d| d.to_string()));
+        let body = rpc("tools/list", 3);
+        let reply = core
+            .dispatch_authenticated(body.as_bytes(), None, &ctx)
+            .expect("tools/list rend une réponse");
+        let v: Value = serde_json::from_slice(&reply.body).unwrap();
+        v["result"]["tools"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|t| t["name"].as_str().unwrap_or("").to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// La table est celle de `docs/auth.md` §4 : 10 / 10 / 10, aucun doublon.
+    #[test]
+    fn table_des_droits_dix_dix_dix_sans_doublon() {
+        let mut par_droit = std::collections::BTreeMap::new();
+        let mut noms = std::collections::HashSet::new();
+        for (outil, droit) in TOOL_RIGHTS {
+            assert!(!outil.is_empty());
+            assert!(
+                noms.insert(outil),
+                "{outil} déclaré deux fois dans TOOL_RIGHTS"
+            );
+            *par_droit.entry(droit).or_insert(0usize) += 1;
+        }
+        assert_eq!(TOOL_RIGHTS.len(), 30, "la surface fait 30 outils");
+        assert_eq!(par_droit.get("lecture"), Some(&10));
+        assert_eq!(par_droit.get("pilotage"), Some(&10));
+        assert_eq!(par_droit.get("execution"), Some(&10));
+    }
+
+    /// **Le test d'échec exigé par le lot** : un outil enregistré sans droit
+    /// déclaré (ou une entrée de table sans outil) fait tomber ce test.
+    #[test]
+    fn tout_outil_enregistre_a_un_droit_declare() {
+        let core = build_builder(&test_state()).core();
+        let publies: std::collections::BTreeSet<String> =
+            tools_list_names(&core).into_iter().collect();
+        let declares: std::collections::BTreeSet<String> = TOOL_RIGHTS
+            .iter()
+            .map(|(outil, _)| (*outil).to_string())
+            .collect();
+        assert_eq!(
+            publies, declares,
+            "tout outil publié doit figurer dans TOOL_RIGHTS, et réciproquement"
+        );
+        assert_eq!(publies.len(), 30);
+    }
+
+    /// Un client `lecture` voit 10 outils, `pilotage` 10, `execution` 10 — et
+    /// chaque nom publié porte bien le droit annoncé (C3).
+    #[test]
+    fn tools_list_filtre_selon_les_droits_de_l_appelant() {
+        let core = core_avec_droits(&test_state());
+        for droit in ["lecture", "pilotage", "execution"] {
+            let vus = liste_pour(&core, &[droit]);
+            assert_eq!(
+                vus.len(),
+                10,
+                "un client {droit} doit voir 10 outils : {vus:?}"
+            );
+            for nom in &vus {
+                let declare = TOOL_RIGHTS
+                    .iter()
+                    .find(|(outil, _)| outil == nom)
+                    .map(|(_, d)| *d)
+                    .unwrap_or("");
+                assert_eq!(declare, droit, "{nom} publié pour un client {droit}");
+            }
+        }
+        // deux droits → 20 outils
+        assert_eq!(liste_pour(&core, &["lecture", "pilotage"]).len(), 20);
+        // trois droits → toute la surface
+        assert_eq!(
+            liste_pour(&core, &["lecture", "pilotage", "execution"]).len(),
+            30
+        );
+        // aucun droit (clé inerte) → rien du tout (échec fermé)
+        assert!(liste_pour(&core, &[]).is_empty());
+    }
+
+    /// Critère du lot : `add_server` par un client `pilotage` → refus `-32023`
+    /// ET handler non appelé (aucune entrée manuelle créée). Le même appel par
+    /// un client `execution` passe : le refus vient bien du droit.
+    #[test]
+    fn add_server_par_un_client_pilotage_refuse_et_handler_non_appele() {
+        let state = test_state();
+        let core = core_avec_droits(&state);
+        let empreinte_avant = fingerprint(&state);
+        let args = json!({ "transport": "http", "port": 30_998, "label": "refus" });
+        let (status, v) = appel_avec(&core, "add_server", &args, &["lecture", "pilotage"]);
+        assert_eq!(status, 403, "droit insuffisant → 403 : {v}");
+        assert_eq!(v["error"]["code"], -32023, "code JSON-RPC du refus : {v}");
+        assert!(
+            v["error"]["data"]["reason"].is_string(),
+            "data.reason attendu : {v}"
+        );
+        assert!(
+            state.servers.lock().unwrap().is_empty(),
+            "le handler d'add_server ne doit PAS avoir tourné"
+        );
+        assert_eq!(
+            fingerprint(&state),
+            empreinte_avant,
+            "aucun changement d'état après un refus de droit"
+        );
+        // un client `lecture` seul est refusé aussi (aucune élévation)
+        let (status, _) = appel_avec(&core, "add_server", &args, &["lecture"]);
+        assert_eq!(status, 403);
+        assert!(state.servers.lock().unwrap().is_empty());
+        // le même appel par un client `execution` passe (contrôle positif)
+        let (status, v) = appel_avec(&core, "add_server", &args, &["execution"]);
+        assert_eq!(
+            status, 200,
+            "un client execution doit pouvoir ajouter : {v}"
+        );
+        assert_eq!(v["result"]["structuredContent"]["ok"], true, "{v}");
+        assert_eq!(
+            state.servers.lock().unwrap().len(),
+            1,
+            "l'entrée doit exister après le contrôle positif"
+        );
+    }
+
+    /// Un outil qui n'existe pas dans la table reste refusé même à un client
+    /// `execution` : c'est l'échec fermé de la lib (§4).
+    #[test]
+    fn outil_hors_table_refuse_meme_a_un_client_execution() {
+        let state = test_state();
+        let core = core_avec_droits(&state);
+        let (status, v) = appel_avec(
+            &core,
+            "outil_qui_n_existe_pas",
+            &json!({}),
+            &["lecture", "pilotage", "execution"],
+        );
+        assert!(
+            status == 403 || v["error"].is_object() || v["result"]["isError"] == json!(true),
+            "un outil inconnu ne doit jamais rendre un résultat : {v}"
+        );
+    }
+
+    #[test]
+    fn signature_created_extrait_horodatage_ou_refuse_doublon() {
+        let ok = vec![(
+            "signature-input".to_string(),
+            r#"sig1=("@method" "@path");created=1763740000;nonce="n1";keyid="mcc-a-0000000000000001";alg="ed25519";tag="litemcp-auth-v1""#.to_string(),
+        )];
+        assert_eq!(signature_created(&ok), Some(1763740000));
+        let doublon = vec![ok[0].clone(), ok[0].clone()];
+        assert_eq!(signature_created(&doublon), None);
+        let invalide = vec![(
+            "signature-input".to_string(),
+            r#"sig1=("@method");created=abc;nonce="n1""#.to_string(),
+        )];
+        assert_eq!(signature_created(&invalide), None);
+        assert_eq!(signature_created(&[]), None);
+    }
+
+    #[test]
+    fn requete_signee_avant_boot_ts_refusee_en_401_uniforme() {
+        use litemcp::auth::sign::{RequestToSign, Signer, SigningKey};
+
+        let state = test_state();
+        let sk = SigningKey::generate();
+        let pub_hex = crate::crypto::hex(&sk.verifying_key().to_bytes());
+        let keyid = "mcc-r2-0000000000000001";
+        {
+            let mut st = lockv(&state.settings);
+            st.auth
+                .insert(crate::auth::registry::ClientRecord::new(
+                    keyid.to_string(),
+                    "test-r2".to_string(),
+                    pub_hex,
+                    vec!["lecture".to_string()],
+                    "127.0.0.1".to_string(),
+                ))
+                .expect("client inséré");
+        }
+        let verifier: Arc<dyn litemcp::auth::Verifier> = Arc::new(SignatureVerifier::new(
+            Arc::new(crate::auth::RegistryStore {
+                state: Arc::clone(&state),
+            }),
+            NonceCache::default(),
+        ));
+        let core = build_builder(&state).verifier(verifier).core();
+        let signer = Signer::new(sk).with_keyid(keyid);
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let now = crate::types::now_ts();
+        let boot = now;
+
+        let sign_at = |ts: u64, nonce: [u8; 16]| -> Vec<(String, String)> {
+            let base = [
+                ("Content-Type", "application/json"),
+                ("Mcp-Method", "tools/list"),
+            ];
+            let req = RequestToSign::new("POST", "/mcp", "127.0.0.1:5090", &base, body);
+            let mut hdrs = vec![
+                ("host".to_string(), "127.0.0.1:5090".to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+                ("mcp-method".to_string(), "tools/list".to_string()),
+            ];
+            for (n, v) in signer.headers_at(&req, ts, &nonce).iter() {
+                hdrs.push((n.to_ascii_lowercase(), v.to_string()));
+            }
+            hdrs
+        };
+
+        // created = boot - 1 : signature valide dans ±60 s, MAIS antérieure au boot → 401
+        let avant = sign_at(boot.saturating_sub(1), [0x11u8; 16]);
+        let rep_avant = respond_auth(&core, "/mcp", "POST", &avant, body, false, Some(boot));
+        assert_eq!(rep_avant.status, 401, "created < boot_ts doit rendre 401");
+        let v_avant: Value = serde_json::from_slice(&rep_avant.body).expect("json 401");
+        assert_eq!(v_avant["error"]["code"], -32600);
+        assert_eq!(v_avant["error"]["message"], "unauthorized");
+        assert!(
+            rep_avant
+                .headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("www-authenticate")),
+            "WWW-Authenticate attendu sur 401"
+        );
+
+        // created == boot : autorisé → 200
+        let egal = sign_at(boot, [0x22u8; 16]);
+        let rep_egal = respond_auth(&core, "/mcp", "POST", &egal, body, false, Some(boot));
+        assert_eq!(rep_egal.status, 200, "created == boot_ts doit passer");
     }
 }

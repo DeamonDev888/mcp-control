@@ -4,16 +4,38 @@ members = [".", "desktop"]
 
 [package]
 name = "mcp-control"
-version = "0.7.21"
+version = "0.8.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
 serde_json = "1"
+# Trousseau du système (lot M1, docs/auth.md §9) : Windows Credential Manager
+# (DPAPI), Keychain macOS, Secret Service Linux — couverts par la feature `v1`.
+# Version ÉPINGLÉE, `default-features = false`, et feature Cargo optionnelle :
+# sans elle, le moteur compile et se rabat sur le fichier 0600 (repli
+# journalisé). Activable par defaut : le produit livré protège la clé.
+keyring = { version = "=4.2.0", default-features = false, features = ["v1"], optional = true }
 # Gateway MCP : la console elle-même devient un serveur MCP (POST /mcp sur le
 # port UI) — dispatch MCP 2026-07-28 embarqué (ServerCore::dispatch), catalogues
-# dynamiques. Sans features optionnelles : serde + serde_json seulement.
-litemcp = "0.9"
+# dynamiques, signatures Ed25519 (`auth-sign`) et TLS 1.3 (`tls`).
+# `default-features` reste actif : les macros servent (`litemcp::zod`).
+litemcp = { version = "0.12.0", features = ["auth-sign"] }
+# TLS 1.3 hors loopback (lot M4, docs/auth.md §7 et §8.3, DA5 = a) : mêmes
+# versions épinglées que litemcp (`default-features = false`, backend `ring`,
+# sans `tls12` donc TLS 1.2 incompilable).
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"], optional = true }
+rcgen = { version = "=0.14.7", default-features = false, features = ["ring"], optional = true }
+
+[features]
+# `keyring` actif = clé privée au trousseau du système. Sans lui : repli fichier
+# 0600 / ACL utilisateur seule, journalisé à chaque démarrage.
+default = ["keyring"]
+keyring = ["dep:keyring"]
+# `tls` = écoute TLS 1.3 obligatoire hors loopback (DA5 = a) + épinglage sortant
+# des pairs et serveurs LiteMCP verrouillés. Sans cette feature, le moteur
+# compile sans rustls/rcgen et refuse d'écouter hors loopback.
+tls = ["litemcp/tls", "dep:rustls", "dep:rcgen"]
 
 [[bin]]
 name = "mcp-control"

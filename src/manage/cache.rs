@@ -12,29 +12,32 @@ fn cache_path_of(config_path: &str) -> String {
         .to_string()
 }
 
-/// Dernier cache sérialisé (écriture skippée si inchangé — 1 cycle = 0 I/O).
-fn cache_last_slot() -> &'static std::sync::Mutex<Option<String>> {
-    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
-    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+/// Empreinte du dernier contenu utile écrit par chemin de cache
+/// (écriture + `icacls` skippés si le contenu utile est inchangé — 0 I/O au repos).
+fn cache_last_slot() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Enregistre l'état courant (champs d'affichage : nom, version, tools, via_ssh…)
-/// dans le cache de démarrage. Écriture atomique, skippée si rien n'a changé.
-pub fn save_cache(state: &Arc<AppState>) {
-    if state.config_path.is_empty() {
-        return;
-    }
-    let path = cache_path_of(&state.config_path);
-    let servers = lockv(&state.servers);
+/// Empreinte canonique du contenu utile des serveurs (hors horodatages volatils
+/// `saved_at`, `last_seen_ts` et `latency_ms` qui changent à chaque sonde).
+fn useful_cache_signature(servers: &[Server]) -> String {
     let arr: Vec<Value> = servers
         .iter()
         .map(|s| {
             json!({
-                "id": s.id, "state": s.state.as_str(),
-                "server_name": s.server_name, "version": s.version, "protocol": s.protocol,
-                "sse": s.sse, "sse_endpoint": s.sse_endpoint, "ws": s.ws, "lang": s.lang,
-                "framework": s.framework, "via_ssh": s.via_ssh,
-                "latency_ms": s.latency_ms, "last_seen": s.last_seen_ts,
+                "id": s.id,
+                "state": s.state.as_str(),
+                "server_name": s.server_name,
+                "version": s.version,
+                "protocol": s.protocol,
+                "sse": s.sse,
+                "sse_endpoint": s.sse_endpoint,
+                "ws": s.ws,
+                "lang": s.lang,
+                "framework": s.framework,
+                "via_ssh": s.via_ssh,
                 "last_error": s.last_error,
                 "tools": s.tools.iter()
                     .map(|t| json!({"name": t.name, "desc": t.desc}))
@@ -42,30 +45,59 @@ pub fn save_cache(state: &Arc<AppState>) {
             })
         })
         .collect();
-    drop(servers);
+    serde_json::to_string(&arr).unwrap_or_default()
+}
+
+/// Enregistre l'état courant (champs d'affichage : nom, version, tools, via_ssh…)
+/// dans le cache de démarrage. Écriture atomique + ACL, skippées si le contenu
+/// utile n'a pas changé (P1 rang 1 : 0 écriture/min et 0 `icacls.exe`/min au repos).
+pub fn save_cache(state: &Arc<AppState>) {
+    if state.config_path.is_empty() {
+        return;
+    }
+    let path = cache_path_of(&state.config_path);
+    let (sig, arr) = {
+        let servers = lockv(&state.servers);
+        let sig = useful_cache_signature(&servers);
+        {
+            let slot = cache_last_slot().lock().unwrap_or_else(|p| p.into_inner());
+            if slot.get(&path).map(String::as_str) == Some(sig.as_str()) {
+                return;
+            }
+        }
+        let arr: Vec<Value> = servers
+            .iter()
+            .map(|s| {
+                json!({
+                    "id": s.id, "state": s.state.as_str(),
+                    "server_name": s.server_name, "version": s.version, "protocol": s.protocol,
+                    "sse": s.sse, "sse_endpoint": s.sse_endpoint, "ws": s.ws, "lang": s.lang,
+                    "framework": s.framework, "via_ssh": s.via_ssh,
+                    "latency_ms": s.latency_ms, "last_seen": s.last_seen_ts,
+                    "last_error": s.last_error,
+                    "tools": s.tools.iter()
+                        .map(|t| json!({"name": t.name, "desc": t.desc}))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        (sig, arr)
+    };
     let doc = json!({
         "app": env!("CARGO_PKG_VERSION"),
         "saved_at": crate::types::now_ts(),
         "servers": arr,
     });
     let body = serde_json::to_string(&doc).unwrap_or_default();
-    {
-        let mut slot = cache_last_slot().lock().unwrap_or_else(|p| p.into_inner());
-        if slot.as_deref() == Some(body.as_str()) {
-            return;
-        }
-        *slot = Some(body.clone());
-    }
-    let tmp = format!("{}.tmp", path);
-    if let Err(e) = std::fs::write(&tmp, &body) {
-        add_log(
-            state,
-            "warn",
-            &format!("cache : écriture impossible ({}): {}", tmp, e),
-        );
+    // tmp UNIQUE par écriture (pid + séquence) dans le même dossier, supprimé
+    // en cas d'échec, puis ACL explicite après renommage (audit S4, point 4).
+    if let Err(msg) = write_atomic_with(&path, "cache", |tmp| std::fs::write(tmp, &body)) {
+        add_log(state, "warn", &msg);
         return;
     }
-    let _ = std::fs::rename(&tmp, &path);
+    let _ = restrict_permissions(&path);
+    let mut slot = cache_last_slot().lock().unwrap_or_else(|p| p.into_inner());
+    slot.insert(path, sig);
 }
 
 /// Au boot, avant la première sonde : restaure les champs d'affichage des

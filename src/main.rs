@@ -7,6 +7,17 @@
 use mcp_control::manage;
 
 fn main() {
+    // Sous-commandes `auth` (lot M1) : elles n'ouvrent AUCUN moteur — elles
+    // parlent au moteur local (ou lisent config.json) et sortent.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("auth") {
+        std::process::exit(mcp_control::auth::cli::run(&args[2..]));
+    }
+    // Pont stdio (lot M5, DA6 = a) : parle MCP sur stdin/stdout et signe pour
+    // le client local. N'ouvre AUCUN moteur — un client MCP standard le lance.
+    if args.get(1).map(String::as_str) == Some("bridge") {
+        std::process::exit(mcp_control::bridge::run(&args[2..]));
+    }
     // MCC_CONFIG override ; sinon résolution runtime (dev → manifest, release → exe dir)
     let _config_path =
         manage::resolve_config_path(env!("CARGO_MANIFEST_DIR"), std::env::var("MCC_CONFIG").ok());
@@ -20,6 +31,19 @@ fn main() {
             "mcp-control : un moteur tourne déjà sur {} — rien à lancer, sortie.",
             outcome.url
         );
+        // S-1 pt 3 : second lancement = jeton d'amorçage par le canal fichier
+        // (dossier de config, permissions utilisateur, 2 min, usage unique).
+        match mcp_control::auth::session::request_bootstrap(
+            &outcome.config_path,
+            std::time::Duration::from_secs(5),
+        ) {
+            Ok(jeton) => println!(
+                "[session] {}/#t={}",
+                outcome.url.trim_end_matches('/'),
+                jeton
+            ),
+            Err(e) => eprintln!("[session] {e}"),
+        }
         return;
     }
     println!("mcp-control v{} (headless)", env!("CARGO_PKG_VERSION"));

@@ -1,15 +1,15 @@
 {
     "$schema": "https://schema.tauri.app/config/2",
     "productName": "MCP Control",
-    "version": "0.7.21",
+    "version": "0.8.0",
     "identifier": "com.deamondev.mcp-control",
     "build": {
         "frontendDist": "../ui-dist"
     },
     "app": {
-        "withGlobalTauri": true,
+        "withGlobalTauri": false,
         "security": {
-            "csp": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+            "csp": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
         },
         "windows": []
     },

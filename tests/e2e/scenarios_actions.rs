@@ -51,7 +51,7 @@
 //! - ssh_discover avec user lancerait un ssh réel — jamais testé ; on ne
 //!   vérifie que le refus sans machine enregistrée.
 
-use crate::harness::{free_port, spawn_loopback, wait_until, Engine, Fixture, SEED_IDS};
+use crate::harness::{free_port, spawn_loopback, wait_until, Engine, Fixture};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -148,9 +148,14 @@ fn post_json_long(eng: &Engine, v: &Value, lecture: Duration) -> (u16, Value) {
     flux.set_read_timeout(Some(lecture)).ok();
     flux.set_write_timeout(Some(Duration::from_secs(5))).ok();
     let corps = v.to_string();
+    // Lot S1 : `/api/action` exige la session locale — cookie `mcc_session` ET
+    // en-tête secret `X-MCC-Session` (l'ancien `X-MCC-Request: 1` a disparu) —
+    // ce client HTTP minimal les présente comme le fait app.js.
     let requete = format!(
-        "POST /api/action HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST /api/action HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nX-MCC-Session: {}\r\nCookie: mcc_session={}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         eng.port,
+        eng.session_secret().unwrap_or(""),
+        eng.session_cookie().unwrap_or(""),
         corps.len(),
         corps
     );
@@ -245,6 +250,9 @@ fn contrat() -> Vec<(&'static str, Attendu)> {
         ),
         ("import_peer", Attendu::Erreur("ip manquante")),
         ("toggle_tool", Attendu::Erreur("id manquant")),
+        // Lot S4 : annonces en LECTURE SEULE et arrêt forcé explicite.
+        ("litemcp_announcements", Attendu::Vrai),
+        ("stop_server_force", Attendu::Erreur("id manquant")),
         ("install_store", Attendu::Erreur("item inconnu")),
         ("import_mcp", Attendu::Erreur("texte vide")), // dispatcher-only
         (
@@ -297,6 +305,12 @@ fn contrat_id_inconnu() -> Vec<(&'static str, Value, Attendu)> {
         (
             "remove",
             json!({"action": "remove", "id": bogus}),
+            Attendu::Erreur("serveur inconnu"),
+        ),
+        // arrêt forcé d'un id inconnu : même refus explicite
+        (
+            "stop_server_force",
+            json!({"action": "stop_server_force", "id": bogus}),
             Attendu::Erreur("serveur inconnu"),
         ),
         (
@@ -1189,7 +1203,9 @@ fn pairs_et_import_peer_graceful() {
 #[test]
 fn reset_state_detection_purge_decouvertes() {
     let _garde = crate::harness::serial_guard();
-    let eng = moteur();
+    // Découverte ACTIVE : ce scénario fabrique une entrée `discovered` par un
+    // scan réel (le reste de la suite tourne découverte coupée — point 3).
+    let eng = crate::harness::spawn_loopback_avec_decouverte();
     let fx = Fixture::spawn_mcp();
 
     let rep = eng.action(&json!({
@@ -1251,33 +1267,25 @@ fn reset_state_detection_purge_decouvertes() {
     );
 }
 
-/// Scénario A13 — reset_state what="tout" : placement + detection + oublis en
-/// une fois — server_order vidé, machines SSH oubliées, seeds retirés
-/// durablement RÉINJECTÉS (les 8 de la config e2e).
-///
-/// ANTI-SPAWN : les seeds réinjectés portent une start_cmd réelle (le harnais
-/// les retire précisément pour ça). Le poller relit refresh_secs à CHAQUE
-/// cycle (src/lib.rs) : on relève le réglage à 3600 s AVANT, on laisse passer
-/// le cycle déjà armé (≤5 s, liste vide à ce moment), puis on réinitialise —
-/// plus aucun sondage pendant le test, aucun seed n'est jamais lancé.
+/// Scénario A13 — reset_state what="tout" sur une installation NEUVE (aucun
+/// serveur par défaut depuis le lot S4) : placement + detection + oublis en
+/// une fois — server_order vidé, machines SSH oubliées, et AUCUN serveur
+/// réinjecté (`reinjected: 0`). config.json reste une liste vide.
 #[test]
-fn reset_state_tout_reinjecte_seeds() {
+fn reset_state_tout_ne_reinjecte_aucun_serveur() {
     let _garde = crate::harness::serial_guard();
     let eng = moteur();
 
-    // 1. Poller endormi pour 1 h (clamp max = 3600).
+    // Poller ralenti (clamp max = 3600) : aucun scan/sondage parasite pendant
+    // les assertions, comme l'ancien scénario seeds.
     let rep = eng.action(&json!({"action": "set_settings", "refresh_secs": 3600}));
     assert!(ok_de(&rep), "set_settings refusé : {rep}");
+    std::thread::sleep(Duration::from_secs(6));
 
-    // 2. Le cycle de poll DÉJÀ ARMÉ (sommeil de 5 s posé au boot, liste encore
-    //    vide) doit s'écouler AVANT la réinjection : attente bornée à 8 s.
-    std::thread::sleep(Duration::from_secs(8));
-
-    // 3. Une machine SSH à oublier (jamais contactée : cf. A10).
+    // Une machine SSH à oublier (jamais contactée).
     let rep = eng.action(&json!({"action": "ssh_save", "ip": "203.0.113.78", "user": "e2e-user"}));
     assert!(ok_de(&rep), "{rep}");
 
-    // 4. reset_state "tout".
     let rep = eng.action(&json!({"action": "reset_state", "what": "tout"}));
     assert!(ok_de(&rep), "reset_state tout refusé : {rep}");
     assert_eq!(
@@ -1291,20 +1299,16 @@ fn reset_state_tout_reinjecte_seeds() {
     );
     assert_eq!(
         rep.get("reinjected").and_then(|r| r.as_u64()),
-        Some(SEED_IDS.len() as u64),
-        "les 8 seeds retirés durablement doivent être réinjectés : {rep}"
+        Some(0),
+        "aucun serveur par défaut ne doit être réinjecté : {rep}"
     );
 
-    // 5. /api/state : les 8 seeds sont de retour, origin "seed", sans machine
-    //    SSH.
-    let serveurs = serveurs_etat(&eng);
-    for id in SEED_IDS {
-        let s = serveurs
-            .iter()
-            .find(|s| champ(s, "id") == *id)
-            .unwrap_or_else(|| panic!("seed {id} non réinjecté : {serveurs:?}"));
-        assert_eq!(champ(s, "origin"), "seed", "{s}");
-    }
+    // Aucun serveur, aucune machine SSH, et config.json toujours vide.
+    assert!(
+        serveurs_etat(&eng).is_empty(),
+        "installation neuve : liste vide attendue, obtenu {:?}",
+        serveurs_etat(&eng)
+    );
     assert!(
         reglages_etat(&eng)
             .get("ssh_hosts")
@@ -1313,31 +1317,21 @@ fn reset_state_tout_reinjecte_seeds() {
             .unwrap_or(false),
         "les machines SSH doivent être oubliées par what=tout"
     );
-
-    // 6. config.json : removed_seeds vidé, ssh_hosts vidé, seeds persistés.
     let cfg = config_du_moteur(&eng);
-    let reg_cfg = cfg.get("settings").cloned().unwrap_or(Value::Null);
     assert!(
-        reg_cfg
-            .get("removed_seeds")
+        cfg.get("servers")
+            .and_then(|s| s.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(false),
+        "config.json ne doit contenir aucun serveur : {cfg}"
+    );
+    assert!(
+        cfg.get("settings")
+            .and_then(|s| s.get("removed_seeds"))
             .and_then(|r| r.as_array())
             .map(|a| a.is_empty())
             .unwrap_or(false),
         "removed_seeds doit être vidé : {cfg}"
-    );
-    assert!(
-        reg_cfg
-            .get("ssh_hosts")
-            .and_then(|h| h.as_array())
-            .map(|a| a.is_empty())
-            .unwrap_or(false),
-        "ssh_hosts doit être vidé dans config.json : {cfg}"
-    );
-    assert_eq!(
-        serveurs_config(&eng).len(),
-        SEED_IDS.len(),
-        "les 8 seeds doivent être persistés : {:?}",
-        config_du_moteur(&eng)
     );
 }
 
@@ -1467,5 +1461,128 @@ fn start_kill_boutons_sur_serveur_eteint() {
         s.get("pid").and_then(|p| p.as_u64()),
         None,
         "kill doit retirer le pid : {s}"
+    );
+}
+
+/// Scénario A15 (audit S4, point 4) — une écriture de config qui échoue est
+/// REMONTÉE à l'appelant : `ok:false` avec la cause, plus de `ok:true`
+/// mensonger, et aucun `.tmp` ne subsiste (fichier en lecture seule).
+#[test]
+#[allow(clippy::permissions_set_readonly_false)] // test : remise en écriture après l'assertion
+fn echec_ecriture_config_remonte_a_l_appelant() {
+    let _garde = crate::harness::serial_guard();
+    let eng = moteur();
+    let cfg = eng.tmp_dir().join("config.json");
+    assert!(cfg.exists(), "config.json du moteur attendu");
+    let mut perms = std::fs::metadata(&cfg).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&cfg, perms).unwrap();
+
+    let rep = eng.action(&json!({
+        "action": "set_settings", "refresh_secs": 123
+    }));
+    // Remise en écriture AVANT les assertions (le moteur doit rester utilisable).
+    let mut perms = std::fs::metadata(&cfg).unwrap().permissions();
+    perms.set_readonly(false);
+    std::fs::set_permissions(&cfg, perms).unwrap();
+
+    assert_eq!(
+        rep.get("ok").and_then(|o| o.as_bool()),
+        Some(false),
+        "une écriture ratée doit répondre ok:false : {rep}"
+    );
+    let err = rep.get("error").and_then(|e| e.as_str()).unwrap_or("");
+    assert!(
+        err.contains("config non écrite"),
+        "le motif doit être explicite : {err}"
+    );
+    let tmp: Vec<String> = std::fs::read_dir(eng.tmp_dir())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(tmp.is_empty(), "aucun .tmp ne doit rester : {tmp:?}");
+}
+
+/// Scénario A16 (audit S4, point 6) — une instance qui n'est pas
+/// l'installation enregistrée ne réécrit pas l'entrée de démarrage d'une autre
+/// installation sans confirmation explicite. Tout se passe dans la clé Run de
+/// TEST du moteur ; l'entrée RÉELLE de la machine est prouvée inchangée.
+#[cfg(windows)]
+#[test]
+fn set_autostart_demande_confirmation_pour_une_autre_installation() {
+    let _garde = crate::harness::serial_guard();
+    let entree_reelle = || -> Option<String> {
+        let out = std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                "MCP Control",
+            ])
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let avant = entree_reelle();
+    let eng = moteur();
+    let cle = eng.reg_key().to_string();
+    // Entrée étrangère dans la clé de TEST (autre installation).
+    let etrangere = "\"C:\\Autre\\installation\\mcp-control.exe\" --hidden";
+    let st = std::process::Command::new("reg")
+        .args([
+            "add",
+            &cle,
+            "/v",
+            "MCP Control",
+            "/t",
+            "REG_SZ",
+            "/d",
+            etrangere,
+            "/f",
+        ])
+        .output()
+        .expect("reg add");
+    assert!(st.status.success());
+
+    let rep = eng.action(&json!({"action": "set_autostart", "enabled": true}));
+    assert_eq!(
+        rep.get("ok").and_then(|o| o.as_bool()),
+        Some(false),
+        "une entrée étrangère exige confirmation : {rep}"
+    );
+    assert_eq!(rep.get("needs_confirm"), Some(&json!(true)), "{rep}");
+    // l'entrée n'a pas bougé
+    let lu = std::process::Command::new("reg")
+        .args(["query", &cle, "/v", "MCP Control"])
+        .output()
+        .expect("reg query");
+    assert!(
+        String::from_utf8_lossy(&lu.stdout).contains("Autre"),
+        "l'entrée étrangère ne doit pas être réécrite sans confirmation"
+    );
+
+    // Confirmation explicite : l'entrée de la clé de TEST est reprise.
+    let rep = eng.action(&json!({
+        "action": "set_autostart", "enabled": true, "confirm": true
+    }));
+    assert_eq!(rep.get("ok").and_then(|o| o.as_bool()), Some(true), "{rep}");
+    let lu = std::process::Command::new("reg")
+        .args(["query", &cle, "/v", "MCP Control"])
+        .output()
+        .expect("reg query");
+    let texte = String::from_utf8_lossy(&lu.stdout).to_string();
+    assert!(
+        !texte.contains("Autre"),
+        "après confirmation, l'entrée de test est celle du moteur : {texte}"
+    );
+    // L'entrée RÉELLE de la machine n'a pas changé (preuve avant/après).
+    assert_eq!(
+        avant,
+        entree_reelle(),
+        "l'entrée Run réelle de la machine ne doit jamais être touchée par l'E2E"
     );
 }

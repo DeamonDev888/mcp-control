@@ -9,12 +9,68 @@ use super::*;
 /// bloquant le cycle (audit 03, constats 2 et 3).
 const START_WINDOW_SECS: u64 = 30;
 
-#[allow(unused_must_use)]
+/// Durée de vie du cache `tools/list` pour un serveur déjà UP dont ni le nom
+/// ni la version n'ont changé (P1 rang 2 : évite 455 `tools/list`/min au repos).
+const TOOLS_REFRESH_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn tools_cache_slot(
+) -> &'static std::sync::Mutex<std::collections::HashMap<(usize, String), std::time::Instant>> {
+    static SLOT: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(usize, String), std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Invalide le cache `tools/list` pour tous les serveurs de cet `AppState`
+/// (appelé sur un rafraîchissement manuel explicite).
+pub fn invalidate_tools_cache(state: &Arc<AppState>) {
+    let key_ptr = Arc::as_ptr(state) as usize;
+    lockv(tools_cache_slot()).retain(|(ptr, _), _| *ptr != key_ptr);
+}
+
+fn tools_cache_fresh(state: &Arc<AppState>, id: &str) -> bool {
+    let key = (Arc::as_ptr(state) as usize, id.to_string());
+    lockv(tools_cache_slot())
+        .get(&key)
+        .is_some_and(|t| t.elapsed() < TOOLS_REFRESH_TTL)
+}
+
+fn tools_cache_mark(state: &Arc<AppState>, id: &str) {
+    let key = (Arc::as_ptr(state) as usize, id.to_string());
+    lockv(tools_cache_slot()).insert(key, std::time::Instant::now());
+}
+
+fn tools_cache_clear_one(state: &Arc<AppState>, id: &str) {
+    let key = (Arc::as_ptr(state) as usize, id.to_string());
+    lockv(tools_cache_slot()).remove(&key);
+}
+
+/// Sonde manuelle d'un serveur : force le rechargement complet (`tools/list`).
 pub fn poll_one(state: &Arc<AppState>, id: &str) {
-    let (transport, enabled) = {
+    poll_one_inner(state, id, true);
+}
+
+/// Sonde de fond (pool du poller) : réutilise `tools/list` tant que le serveur
+/// reste UP, que ses `name`/`version` n'ont pas changé et que le TTL n'est pas échu.
+pub(crate) fn poll_one_bg(state: &Arc<AppState>, id: &str) {
+    poll_one_inner(state, id, false);
+}
+
+#[allow(unused_must_use)]
+fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
+    crate::auth::net::set_config_path(&state.config_path);
+    let (transport, enabled, via_ssh, was_up, has_tools, prev_name, prev_version) = {
         let servers = lockv(&state.servers);
         match servers.iter().find(|s| s.id == id) {
-            Some(s) => (s.transport.clone(), s.enabled),
+            Some(s) => (
+                s.transport.clone(),
+                s.enabled,
+                s.via_ssh,
+                s.state == SState::Up,
+                !s.tools.is_empty(),
+                s.server_name.clone(),
+                s.version.clone(),
+            ),
             None => return,
         }
     };
@@ -26,11 +82,16 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
             // serveurs via_ssh : la sonde tourne DEPUIS la machine (curl interne
             // sur 127.0.0.1 via la connexion ssh) — l'extérieur est souvent
             // bloqué (bind localhost, ufw)
-            let via_ssh = lockv(&state.servers)
-                .iter()
-                .find(|s| s.id == id)
-                .map(|s| s.via_ssh)
-                .unwrap_or(false);
+            let can_reuse = !force_full
+                && was_up
+                && has_tools
+                && prev_name.is_some()
+                && tools_cache_fresh(state, id);
+            let hint = probe::ProbeHint {
+                reuse_metadata_if_unchanged: can_reuse,
+                prev_name: prev_name.as_deref(),
+                prev_version: prev_version.as_deref(),
+            };
             let mut res = if via_ssh {
                 match &host {
                     Some(h) => {
@@ -56,13 +117,13 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
                     // mais vivant (réponse en ~6 s) doit rester classé UP —
                     // le port muet, lui, est coupé dès la 1re forme sans octet
                     // (probe_http, bail précoce) au lieu d'encaisser 3 timeout.
-                    Some(h) => probe::probe_http_host(h, port, &path, 8000),
-                    None => probe::probe_http(port, &path, 8000),
+                    Some(h) => probe::probe_http_host_with(h, port, &path, 8000, &hint),
+                    None => probe::probe_http_with(port, &path, 8000, &hint),
                 }
             };
             // Auto-start : serveur HTTP LOCAL éteint + commande de lancement configurée
-            // (jamais pour un serveur distant, host.is_none() gate)
-            if !res.mcp_up && host.is_none() {
+            // (jamais pour un serveur distant, ni pour un serveur déjà en écoute mais verrouillé 401)
+            if !res.mcp_up && !res.locked && host.is_none() {
                 // État du process lancé par nous, s'il existe : vivant ? code de sortie ?
                 let (child_alive, exit_code) = {
                     let children = lockv(&state.children);
@@ -218,22 +279,30 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
                 (false, false, en_cours)
             };
             let mut log_event: Option<(&'static str, String)> = None;
+            let mut gw_changed = false;
             {
                 let mut servers = lockv(&state.servers);
                 if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
                     if res.mcp_up {
                         let changed = srv.server_name != res.name || srv.state != SState::Up;
+                        let tools_changed =
+                            !res.metadata_reused && srv.tools.len() != res.tools.len();
+                        if changed || tools_changed {
+                            gw_changed = true;
+                        }
                         srv.state = SState::Up;
                         srv.bound_host = res.host.clone();
                         srv.server_name = res.name.clone();
                         srv.version = res.version.clone();
                         srv.protocol = res.protocol.clone();
-                        srv.sse = res.sse;
-                        srv.sse_endpoint = res.sse_endpoint;
-                        srv.ws = res.ws;
-                        srv.lang = res.lang.clone();
-                        srv.framework = res.framework.clone();
-                        srv.tools = res.tools.clone();
+                        if !res.metadata_reused {
+                            srv.sse = res.sse;
+                            srv.sse_endpoint = res.sse_endpoint;
+                            srv.ws = res.ws;
+                            srv.lang = res.lang.clone();
+                            srv.framework = res.framework.clone();
+                            srv.tools = res.tools.clone();
+                        }
                         srv.latency_ms = Some(res.latency_ms);
                         srv.last_seen_ts = Some(crate::types::now_ts());
                         srv.last_error = None;
@@ -262,11 +331,26 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
                         } else {
                             let was_up = srv.state == SState::Up;
                             // port fermé = DOWN ; port ouvert sans MCP = PORT-ONLY (zombie)
-                            srv.state = if res.port_open {
+                            let new_state = if res.port_open {
                                 SState::PortOnly
                             } else {
                                 SState::Down
                             };
+                            if srv.state != new_state {
+                                gw_changed = true;
+                            }
+                            srv.state = new_state;
+                            if res.locked {
+                                if res.host.is_some() {
+                                    srv.bound_host = res.host.clone();
+                                }
+                                if res.framework.is_some() {
+                                    srv.framework = res.framework.clone();
+                                }
+                                if res.lang.is_some() {
+                                    srv.lang = res.lang.clone();
+                                }
+                            }
                             srv.last_error = res.error.clone();
                             srv.latency_ms = None;
                             if !res.port_open && host.is_none() {
@@ -292,6 +376,18 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
                         }
                     }
                 }
+            }
+            if res.mcp_up {
+                if !res.metadata_reused {
+                    tools_cache_mark(state, id);
+                }
+            } else {
+                // Serveur tombé ou redémarré : force le rechargement de tools/list
+                // dès son retour UP.
+                tools_cache_clear_one(state, id);
+            }
+            if gw_changed {
+                crate::gateway::notify_change();
             }
             if etait_en_demarrage {
                 runtime_event(
@@ -442,6 +538,29 @@ pub fn poll_one(state: &Arc<AppState>, id: &str) {
 /// plage issue des réglages — un balayage synchrone séquentiel de plage large
 /// figeait l'API (~313 ms/port mesurés, soit 5 min pour 1 000 ports).
 pub const SCAN_MAX_PORTS: usize = 512;
+/// Découverte locale DÉSACTIVÉE par l'environnement (`MCC_NO_LOCAL_DISCOVERY=1`).
+/// Réservé aux instances de test : sans cela, un moteur de test importe les
+/// serveurs réels de la machine (scan local au boot + scan réseau à +30 s).
+pub fn local_discovery_disabled() -> bool {
+    std::env::var("MCC_NO_LOCAL_DISCOVERY")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Ce port doit-il être sondé par la découverte locale ?
+/// `excluded` gagne toujours ; `only` vide = tous les ports.
+pub(super) fn discovery_port_allowed(port: u16, only: &[u16], excluded: &[u16]) -> bool {
+    !excluded.contains(&port) && (only.is_empty() || only.contains(&port))
+}
+
+/// Réglages de découverte lus en une fois (only, excluded).
+fn discovery_ports(state: &Arc<AppState>) -> (Vec<u16>, Vec<u16>) {
+    let s = lockv(&state.settings);
+    (
+        s.discovery_ports_only.clone(),
+        s.discovery_ports_excluded.clone(),
+    )
+}
 
 /// Taille du pool std éphémère du balayage. Le pool PERSISTANT du cycle de vie
 /// (poll_one) reste inchangé — ici un pool est créé et joint à chaque scan.
@@ -479,6 +598,14 @@ pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) -> u32 {
         return 0;
     }
     let (from, to) = scan_plafonne(brut.0, brut.1);
+    if local_discovery_disabled() {
+        add_log(
+            state,
+            "info",
+            "scan local ignoré : MCC_NO_LOCAL_DISCOVERY=1 (instance de test)",
+        );
+        return 0;
+    }
     if (from, to) != brut {
         add_log(
             state,
@@ -539,6 +666,7 @@ pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) -> u32 {
     open.sort();
     open.dedup();
     let own_ui = lockv(&state.settings).ui_port;
+    let (seulement, exclus) = discovery_ports(state);
     let known: Vec<u16> = lockv(&state.servers)
         .iter()
         .filter_map(|s| match &s.transport {
@@ -558,18 +686,35 @@ pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) -> u32 {
     let candidats: Vec<(u16, String)> = open
         .into_iter()
         .filter(|(p, _)| *p != own_ui && !known.contains(p))
+        .filter(|(p, _)| {
+            // « ports exclus » vaut aussi pour une plage explicite ; « ports à
+            // sonder » ne s'applique qu'au balayage des réglages (range=None),
+            // sinon une plage explicite ne trouverait jamais rien.
+            !exclus.contains(p)
+                && (range.is_some() || seulement.is_empty() || seulement.contains(p))
+        })
         .collect();
     let (mtx, mrx) = std::sync::mpsc::channel::<(u16, String, &'static str, probe::McpProbe)>();
-    std::thread::scope(|scope| {
-        for (port, host) in candidats {
-            let mtx = mtx.clone();
-            scope.spawn(move || {
-                if let Some((path, p)) = probe::probe_mcp_any_path(port, 4000) {
-                    let _ = mtx.send((port, host, path, p));
-                }
-            });
-        }
-    });
+    if !candidats.is_empty() {
+        let workers = SCAN_WORKERS.min(candidats.len()).max(1);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let mtx = mtx.clone();
+                let next = &next;
+                let candidats = &candidats;
+                scope.spawn(move || loop {
+                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((port, host)) = candidats.get(idx) else {
+                        break;
+                    };
+                    if let Some((path, p)) = probe::probe_mcp_any_path(*port, 4000) {
+                        let _ = mtx.send((*port, host.clone(), path, p));
+                    }
+                });
+            }
+        });
+    }
     drop(mtx);
     let mut decouverts: Vec<(u16, String, &'static str, probe::McpProbe)> =
         mrx.into_iter().collect();
@@ -596,7 +741,11 @@ pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) -> u32 {
                 },
                 origin: Origin::Discovered,
                 enabled: true,
-                state: SState::Up,
+                state: if p.mcp_up {
+                    SState::Up
+                } else {
+                    SState::PortOnly
+                },
                 auto_restart: true,
                 favorite: false,
                 pid: p.pid,
@@ -611,9 +760,9 @@ pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) -> u32 {
                 framework: p.framework.clone(),
                 via_ssh: false,
                 tools: p.tools,
-                latency_ms: Some(p.latency_ms),
+                latency_ms: if p.mcp_up { Some(p.latency_ms) } else { None },
                 last_seen_ts: Some(crate::types::now_ts()),
-                last_error: None,
+                last_error: p.error.clone(),
                 start_cmd: None,
                 tools_disabled: vec![],
             });
@@ -629,6 +778,9 @@ pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) -> u32 {
                 ),
             );
         }
+    }
+    if found > 0 {
+        crate::gateway::notify_change();
     }
     add_log(
         state,
@@ -655,7 +807,19 @@ pub(super) fn discovery_candidates(ports: &[u16], known_local: &[u16], own_ui: u
 /// découverts (non persistés : re-découverts à chaque boot, comme le range scan).
 #[allow(unused_must_use)]
 pub fn scan_listening(state: &Arc<AppState>) {
-    let ports = probe::local_listening_ports();
+    if local_discovery_disabled() {
+        add_log(
+            state,
+            "info",
+            "scan local ignoré : MCC_NO_LOCAL_DISCOVERY=1 (instance de test)",
+        );
+        return;
+    }
+    let (seulement, exclus) = discovery_ports(state);
+    let ports: Vec<u16> = probe::local_listening_ports()
+        .into_iter()
+        .filter(|p| discovery_port_allowed(*p, &seulement, &exclus))
+        .collect();
     let own_ui = lockv(&state.settings).ui_port;
     let known_local: Vec<u16> = lockv(&state.servers)
         .iter()
@@ -679,20 +843,36 @@ pub fn scan_listening(state: &Arc<AppState>) {
         ),
     );
     let mut found = 0u32;
-    // sondes PARALLÈLES : un service silencieux (ports RPC Windows & co)
-    // encaisse la connexion sans jamais répondre et coûte son timeout entier
-    // (4 s) — en séquentiel, une trentaine de ports bavards paralysait la
-    // découverte des minutes durant. Ajouts sérialisés ensuite (verrou servers).
-    // Chaque port est sondé sur les chemins MCP usuels (/mcp, /, /api/mcp).
-    let handles: Vec<_> = candidates
-        .into_iter()
-        .map(|port| std::thread::spawn(move || (port, probe::probe_mcp_any_path(port, 4000))))
-        .collect();
-    for h in handles {
-        let (port, probe_res) = match h.join() {
-            Ok(x) => x,
-            Err(_) => continue,
-        };
+    // Sondes PARALLÈLES sur pool borné (S-10 : plafond SCAN_LISTENING_WORKERS
+    // au lieu d'un thread par port en écoute). Chaque port est sondé sur les
+    // chemins MCP usuels (/mcp, /, /api/mcp).
+    const SCAN_LISTENING_WORKERS: usize = 16;
+    let results: Vec<(u16, Option<(&'static str, probe::McpProbe)>)> = if candidates.is_empty() {
+        Vec::new()
+    } else {
+        let workers = SCAN_LISTENING_WORKERS.min(candidates.len()).max(1);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let tx = tx.clone();
+                let next = &next;
+                let candidates = &candidates;
+                scope.spawn(move || loop {
+                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&port) = candidates.get(idx) else {
+                        break;
+                    };
+                    let _ = tx.send((port, probe::probe_mcp_any_path(port, 4000)));
+                });
+            }
+        });
+        drop(tx);
+        let mut v: Vec<_> = rx.into_iter().collect();
+        v.sort_by_key(|(p, _)| *p);
+        v
+    };
+    for (port, probe_res) in results {
         let Some((path, p)) = probe_res else {
             continue;
         };
@@ -718,7 +898,11 @@ pub fn scan_listening(state: &Arc<AppState>) {
             },
             origin: Origin::Discovered,
             enabled: true,
-            state: SState::Up,
+            state: if p.mcp_up {
+                SState::Up
+            } else {
+                SState::PortOnly
+            },
             auto_restart: true,
             favorite: false,
             pid: p.pid,
@@ -733,9 +917,9 @@ pub fn scan_listening(state: &Arc<AppState>) {
             framework: p.framework.clone(),
             via_ssh: false,
             tools: p.tools,
-            latency_ms: Some(p.latency_ms),
+            latency_ms: if p.mcp_up { Some(p.latency_ms) } else { None },
             last_seen_ts: Some(crate::types::now_ts()),
-            last_error: None,
+            last_error: p.error.clone(),
             start_cmd: None,
             tools_disabled: vec![],
         });
@@ -752,6 +936,9 @@ pub fn scan_listening(state: &Arc<AppState>) {
             ),
         );
     }
+    if found > 0 {
+        crate::gateway::notify_change();
+    }
     add_log(
         state,
         "info",
@@ -761,8 +948,47 @@ pub fn scan_listening(state: &Arc<AppState>) {
 
 // ---------- scan réseau local (MCP distants) ----------
 
+/// Garde anti-réentrance sur `scan_network` (P-5 / P1 rang 4) : empêche deux
+/// scans réseau concurrents de saturer le LAN et la table de serveurs.
+static NETWORK_SCAN_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(super) struct NetworkScanGuard;
+
+impl NetworkScanGuard {
+    pub(super) fn try_acquire() -> Option<Self> {
+        NETWORK_SCAN_RUNNING
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .ok()
+            .map(|_| NetworkScanGuard)
+    }
+}
+
+impl Drop for NetworkScanGuard {
+    fn drop(&mut self) {
+        NETWORK_SCAN_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[allow(unused_must_use)]
 pub fn scan_network(state: &Arc<AppState>, range: Option<(u16, u16)>) {
+    let Some(_guard) = NetworkScanGuard::try_acquire() else {
+        add_log(state, "info", "scan réseau déjà en cours — appel ignoré");
+        return;
+    };
+    if local_discovery_disabled() {
+        add_log(
+            state,
+            "info",
+            "scan réseau ignoré : MCC_NO_LOCAL_DISCOVERY=1 (instance de test)",
+        );
+        return;
+    }
     let (from, to) = match range {
         Some(r) => r,
         None => {
@@ -907,10 +1133,10 @@ pub(super) fn prune_dead_network_servers(state: &Arc<AppState>) {
 pub fn local_ips() -> Vec<String> {
     let mut ips = std::collections::BTreeSet::new();
     let output = if cfg!(windows) {
-        let mut c = Command::new("ipconfig");
+        let mut c = Command::new(probe::system_tool("ipconfig"));
         probe::hidden(&mut c).output()
     } else {
-        let mut c = Command::new("hostname");
+        let mut c = Command::new(probe::system_tool("hostname"));
         probe::hidden(&mut c).arg("-I").output()
     };
     if let Ok(o) = output {
@@ -982,151 +1208,157 @@ pub fn scan_network_range(
         })
         .collect();
 
-    use std::sync::atomic::{AtomicU32, Ordering};
-    let found = std::sync::Arc::new(AtomicU32::new(0));
-    let tested = std::sync::Arc::new(AtomicU32::new(0));
-    let mut handles = Vec::new();
-    for last in 1u16..=254 {
-        let ip = format!("{}.{}", prefix, last);
-        if ip == self_ip {
-            continue;
-        } // ne pas se scanner soi-même (scan loopback déjà couvert)
-        let ports = ports.clone();
-        let known = known_hosts_ports.clone();
-        let state = state.clone();
-        let found = found.clone();
-        let tested = tested.clone();
-        handles.push(std::thread::spawn(move || {
-            let mut hit = false;
-            for port in &ports {
-                if !probe::port_open(&ip, *port, std::time::Duration::from_millis(400)) {
-                    continue;
-                }
-                hit = true;
-                if known
-                    .iter()
-                    .any(|(h, p)| h.as_deref() == Some(ip.as_str()) && p == port)
-                {
-                    continue;
-                }
-                let p = probe::probe_http_host(&ip, *port, "/mcp", 3000);
-                if p.mcp_up {
-                    found.fetch_add(1, Ordering::Relaxed);
-                    let label = p.name.clone().unwrap_or_else(|| format!("{}:{}", ip, port));
-                    let mut servers = lockv(&state.servers);
-                    // DÉ-DUPLICATION : un serveur déjà connu (même hôte+port) est
-                    // ignoré ; un serveur qui a CHANGÉ DE PORT (même nom, même
-                    // hôte) remplace l'entrée fantôme au lieu de créer un doublon.
-                    let known: Vec<(Option<String>, Option<String>, u16)> = servers
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    let found = AtomicU32::new(0);
+    let tested = AtomicU32::new(0);
+    let targets: Vec<String> = (1u16..=254)
+        .map(|last| format!("{}.{}", prefix, last))
+        .filter(|ip| ip != self_ip)
+        .collect();
+    let workers = SCAN_WORKERS.min(targets.len()).max(1);
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let ports = &ports;
+            let known = &known_hosts_ports;
+            let targets = &targets;
+            let found = &found;
+            let tested = &tested;
+            let next = &next;
+            scope.spawn(move || loop {
+                let idx = next.fetch_add(1, Ordering::Relaxed);
+                let Some(ip) = targets.get(idx) else {
+                    break;
+                };
+                let mut hit = false;
+                for port in ports {
+                    if !probe::port_open(ip, *port, std::time::Duration::from_millis(400)) {
+                        continue;
+                    }
+                    hit = true;
+                    if known
                         .iter()
-                        .filter_map(|s| match &s.transport {
-                            Transport::Http { host, port, .. } => {
-                                Some((s.server_name.clone(), host.clone(), *port))
+                        .any(|(h, p)| h.as_deref() == Some(ip.as_str()) && p == port)
+                    {
+                        continue;
+                    }
+                    let p = probe::probe_http_host(ip, *port, "/mcp", 3000);
+                    if p.mcp_up {
+                        found.fetch_add(1, Ordering::Relaxed);
+                        let label = p.name.clone().unwrap_or_else(|| format!("{}:{}", ip, port));
+                        let mut servers = lockv(&state.servers);
+                        // DÉ-DUPLICATION : un serveur déjà connu (même hôte+port) est
+                        // ignoré ; un serveur qui a CHANGÉ DE PORT (même nom, même
+                        // hôte) remplace l'entrée fantôme au lieu de créer un doublon.
+                        let known_srv: Vec<(Option<String>, Option<String>, u16)> = servers
+                            .iter()
+                            .filter_map(|s| match &s.transport {
+                                Transport::Http { host, port, .. } => {
+                                    Some((s.server_name.clone(), host.clone(), *port))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        let decision = crate::validate::dedup_decide(
+                            &known_srv,
+                            p.name.as_deref(),
+                            Some(ip.as_str()),
+                            *port,
+                        );
+                        let target_id = match decision {
+                            crate::validate::DedupDecision::Duplicate => {
+                                // déjà connu : on met à jour ses métadonnées (framework,
+                                // tools) sans créer d'entrée
+                                if let Some(s) = servers.iter_mut().find(|s| {
+                                    matches!(&s.transport,
+                                        Transport::Http { host: Some(h), port: sp, .. } if h == ip && sp == port)
+                                }) {
+                                    s.server_name = p.name.clone();
+                                    s.version = p.version.clone();
+                                    s.framework = p.framework.clone();
+                                    s.lang = p.lang.clone();
+                                    s.tools = p.tools;
+                                    s.latency_ms = Some(p.latency_ms);
+                                    s.last_seen_ts = Some(crate::types::now_ts());
+                                }
+                                drop(servers);
+                                continue;
                             }
-                            _ => None,
-                        })
-                        .collect();
-                    let decision = crate::validate::dedup_decide(
-                        &known,
-                        p.name.as_deref(),
-                        Some(ip.as_str()),
-                        *port,
-                    );
-                    let target_id = match decision {
-                        crate::validate::DedupDecision::Duplicate => {
-                            // déjà connu : on met à jour ses métadonnées (framework,
-                            // tools) sans créer d'entrée
-                            if let Some(s) = servers.iter_mut().find(|s| {
-                                matches!(&s.transport,
-                                    Transport::Http { host: Some(h), port: sp, .. } if h == &ip && sp == port)
-                            }) {
-                                s.server_name = p.name.clone();
-                                s.version = p.version.clone();
-                                s.framework = p.framework.clone();
-                                s.lang = p.lang.clone();
-                                s.tools = p.tools;
-                                s.latency_ms = Some(p.latency_ms);
-                                s.last_seen_ts = Some(crate::types::now_ts());
+                            crate::validate::DedupDecision::Replace(idx) => {
+                                // l'ancien port est fantôme : on le remplace
+                                let old = servers.remove(idx);
+                                let id = old.id;
+                                add_log(
+                                    state,
+                                    "info",
+                                    &format!(
+                                        "[réseau] {} a changé de port ({} → {}) — entrée fantôme remplacée",
+                                        label,
+                                        known_srv.get(idx).map(|(_, _, p)| *p).unwrap_or(0),
+                                        port
+                                    ),
+                                );
+                                id
                             }
+                            crate::validate::DedupDecision::Add => format!("net-{}.{}", ip, port),
+                        };
+                        if !servers.iter().any(|s| {
+                            matches!(&s.transport,
+                            Transport::Http { host: Some(h), port: sp, .. } if h == ip && sp == port)
+                        }) {
+                            servers.push(Server {
+                                id: target_id,
+                                label,
+                                transport: Transport::Http {
+                                    host: Some(ip.clone()),
+                                    port: *port,
+                                    path: "/mcp".into(),
+                                },
+                                origin: Origin::Discovered,
+                                enabled: true,
+                                state: SState::Up,
+                                auto_restart: true,
+                                favorite: false,
+                                pid: None,
+                                bound_host: Some(ip.clone()),
+                                server_name: p.name.clone(),
+                                version: p.version.clone(),
+                                protocol: p.protocol.clone(),
+                                sse: p.sse,
+                                sse_endpoint: p.sse_endpoint,
+                                ws: p.ws,
+                                lang: p.lang.clone(),
+                                framework: p.framework.clone(),
+                                via_ssh: false,
+                                tools: p.tools,
+                                latency_ms: Some(p.latency_ms),
+                                last_seen_ts: Some(crate::types::now_ts()),
+                                last_error: None,
+                                start_cmd: None,
+                                tools_disabled: vec![],
+                            });
                             drop(servers);
-                            continue;
-                        }
-                        crate::validate::DedupDecision::Replace(idx) => {
-                            // l'ancien port est fantôme : on le remplace
-                            let old = servers.remove(idx);
-                            let id = old.id;
+                            crate::gateway::notify_change();
                             add_log(
-                                &state,
+                                state,
                                 "info",
                                 &format!(
-                                    "[réseau] {} a changé de port ({} → {}) — entrée fantôme remplacée",
-                                    label,
-                                    known.get(idx).map(|(_, _, p)| *p).unwrap_or(0),
-                                    port
+                                    "[réseau] serveur MCP distant découvert : {}:{} — {} v{}",
+                                    ip,
+                                    port,
+                                    p.name.as_deref().unwrap_or("?"),
+                                    p.version.as_deref().unwrap_or("?")
                                 ),
                             );
-                            id
                         }
-                        crate::validate::DedupDecision::Add => format!("net-{}.{}", ip, port),
-                    };
-                    if !servers.iter().any(|s| {
-                        matches!(&s.transport,
-                        Transport::Http { host: Some(h), port: sp, .. } if h == &ip && sp == port)
-                    }) {
-                        servers.push(Server {
-                            id: target_id,
-                            label,
-                            transport: Transport::Http {
-                                host: Some(ip.clone()),
-                                port: *port,
-                                path: "/mcp".into(),
-                            },
-                            origin: Origin::Discovered,
-                            enabled: true,
-                            state: SState::Up,
-                            auto_restart: true,
-                            favorite: false,
-                            pid: None,
-                            bound_host: Some(ip.clone()),
-                            server_name: p.name.clone(),
-                            version: p.version.clone(),
-                            protocol: p.protocol.clone(),
-                            sse: p.sse,
-                            sse_endpoint: p.sse_endpoint,
-                            ws: p.ws,
-                            lang: p.lang.clone(),
-                            framework: p.framework.clone(),
-                            via_ssh: false,
-                            tools: p.tools,
-                            latency_ms: Some(p.latency_ms),
-                            last_seen_ts: Some(crate::types::now_ts()),
-                            last_error: None,
-                            start_cmd: None,
-                            tools_disabled: vec![],
-                        });
-                        drop(servers);
-                        add_log(
-                            &state,
-                            "info",
-                            &format!(
-                                "[réseau] serveur MCP distant découvert : {}:{} — {} v{}",
-                                ip,
-                                port,
-                                p.name.as_deref().unwrap_or("?"),
-                                p.version.as_deref().unwrap_or("?")
-                            ),
-                        );
                     }
                 }
-            }
-            if hit {
-                tested.fetch_add(1, Ordering::Relaxed);
-            }
-        }));
-    }
-    for h in handles {
-        let _ = h.join();
-    }
+                if hit {
+                    tested.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+    });
     (
         found.load(Ordering::Relaxed),
         tested.load(Ordering::Relaxed),

@@ -176,6 +176,13 @@ pub struct Settings {
     pub ui_bind: String,
     pub network_enabled: bool,
     pub network_ports: Vec<u16>,
+    /// Découverte locale : ne sonder QUE ces ports (vide = tous les ports en
+    /// écoute de la machine). Réglage de `config.json` (`settings.discovery_ports_only`).
+    pub discovery_ports_only: Vec<u16>,
+    /// Découverte locale : ports JAMAIS sondés — prioritaire sur
+    /// `discovery_ports_only`. Réglage de `config.json`
+    /// (`settings.discovery_ports_excluded`).
+    pub discovery_ports_excluded: Vec<u16>,
     /// Code d'accès API exigé sur /api/* quand le bind n'est pas loopback.
     /// Sources : env MCC_API_TOKEN, sinon config, sinon généré au boot (persisté).
     /// Pour les pairs, mettre la MÊME valeur des deux côtés.
@@ -197,6 +204,10 @@ pub struct Settings {
     pub autostart: bool,
     /// Notifications (desktop + webhook) sur incident serveur.
     pub notify: crate::notify::NotifyConfig,
+    /// Authentification forte (lot M1) : identité publique du serveur, registre
+    /// des clients (`auth.clients[]`) et demandes d'appairage en cours. Persisté
+    /// dans `config.json` sous la clé `auth` — aucune clé privée n'y figure.
+    pub auth: crate::auth::AuthState,
 }
 
 impl Default for Settings {
@@ -211,6 +222,8 @@ impl Default for Settings {
             ui_bind: "127.0.0.1".to_string(),
             network_enabled: true,
             network_ports: vec![5090, 5091],
+            discovery_ports_only: vec![],
+            discovery_ports_excluded: vec![],
             api_access: std::env::var("MCC_API_ACCESS")
                 .ok()
                 .filter(|v| !v.is_empty()),
@@ -220,6 +233,7 @@ impl Default for Settings {
             server_order: vec![],
             autostart: true,
             notify: crate::notify::NotifyConfig::default(),
+            auth: crate::auth::AuthState::default(),
         }
     }
 }

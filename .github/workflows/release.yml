@@ -6,7 +6,8 @@ on:
       - "v*"
   workflow_dispatch:
 
-# contenu write réservé au job release — build/desktop n'en ont pas besoin
+# Contenu en lecture partout ; le job release demande explicitement contents:write
+# (créer la release) + id-token/attestations (provenance et signature).
 permissions:
   contents: read
 
@@ -34,8 +35,11 @@ jobs:
             rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
             artifact: mcp-control-cli-macos-universal
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (épinglé SHA — supply-chain)
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable (épinglé SHA)
         with:
@@ -46,11 +50,14 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # `--locked` partout : le binaire publié est celui du Cargo.lock versionné,
+      # pas d'une résolution refaite au moment du tag. `--features tls` active
+      # l'écoute TLS 1.3 obligatoire hors loopback.
       - name: Tests
-        run: cargo test --release -p mcp-control
+        run: cargo test --release --locked --features tls -p mcp-control
 
       - name: Clippy (strict, tous les targets)
-        run: cargo clippy --release -p mcp-control --all-targets -- -D warnings
+        run: cargo clippy --release --locked -p mcp-control --all-targets --all-features -- -D warnings
 
       - name: Build
         shell: bash
@@ -58,10 +65,10 @@ jobs:
           if [ -n "${{ matrix.rust_targets }}" ]; then
             # cible universelle : compiler chaque architecture (lipo fusionne ensuite)
             for t in $(echo "${{ matrix.rust_targets }}" | tr ',' ' '); do
-              cargo build --release -p mcp-control --target "$t"
+              cargo build --release --locked --features tls -p mcp-control --target "$t"
             done
           else
-            cargo build --release -p mcp-control --target ${{ matrix.target }}
+            cargo build --release --locked --features tls -p mcp-control --target ${{ matrix.target }}
           fi
 
       - name: Collecter le binaire
@@ -107,8 +114,11 @@ jobs:
             rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
             artifact: mcp-control-desktop-macos-universal
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (épinglé SHA)
+        with:
+          persist-credentials: false
 
       - name: Dépendances système (Linux — WebKitGTK)
         if: runner.os == 'Linux'
@@ -134,10 +144,10 @@ jobs:
           if [ -n "${{ matrix.rust_targets }}" ]; then
             # cible universelle : compiler chaque architecture (lipo fusionne ensuite)
             for t in $(echo "${{ matrix.rust_targets }}" | tr ',' ' '); do
-              cargo build --release -p mcp-control-desktop --target "$t"
+              cargo build --release --locked -p mcp-control-desktop --target "$t"
             done
           else
-            cargo build --release -p mcp-control-desktop --target ${{ matrix.target }}
+            cargo build --release --locked -p mcp-control-desktop --target ${{ matrix.target }}
           fi
 
       # Installateur Windows (wizard NSIS : langue, dossier, raccourcis).
@@ -150,7 +160,8 @@ jobs:
         if: runner.os == 'Windows'
         working-directory: desktop
         shell: bash
-        run: npx tauri build --bundles nsis --target ${{ matrix.target }}
+        # `-- --locked` : mêmes dépendances que le binaire déjà compilé.
+        run: npx tauri build --bundles nsis --target ${{ matrix.target }} -- --locked
 
       - name: Collecter le binaire
         shell: bash
@@ -189,16 +200,37 @@ jobs:
   release:
     needs: [build, desktop]
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
-      contents: write # seule étape qui crée la release GitHub
+      contents: write # créer la release GitHub
+      id-token: write # cosign keyless + attestation de provenance (OIDC)
+      attestations: write # actions/attest-build-provenance
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (épinglé SHA)
+        with:
+          persist-credentials: false
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4 (épinglé SHA)
         with:
           merge-multiple: true
           path: dist
+
+      # SBOM CycloneDX (un par crate livré) — généré depuis les manifestes, donc
+      # avec les licences, pas seulement des noms de paquets.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable (épinglé SHA)
+        with:
+          toolchain: stable
+
+      - name: Installer cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked --version 0.5.10
+
+      - name: Générer les SBOM
+        run: |
+          cargo cyclonedx --format json --spec-version 1.5
+          cp mcp-control.cdx.json dist/
+          cp desktop/mcp-control-desktop.cdx.json dist/
+          ls -l dist/*.cdx.json
 
       # Le glob s'étend AVANT la création du fichier : SHA256SUMS.txt ne se
       # liste jamais lui-même. Publié comme asset de la release (dist/*).
@@ -207,6 +239,31 @@ jobs:
           cd dist
           sha256sum * | sort -k2 > SHA256SUMS.txt
           wc -l SHA256SUMS.txt
+
+      # Provenance : GitHub signe (Sigstore) une attestation liant chaque artefact
+      # au commit + au workflow qui l'a construit. Vérification côté utilisateur :
+      #   gh attestation verify <fichier> --repo DeamonDev888/mcp-control
+      - uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: |
+            dist/mcp-control-*
+            dist/SHA256SUMS.txt
+
+      # Signature keyless (pas de clé privée à stocker) : le certificat éphémère
+      # porte l'identité du workflow et le tag, et la signature entre dans le
+      # journal de transparence Sigstore. Vérification :
+      #   cosign verify-blob --certificate SHA256SUMS.txt.pem \
+      #     --signature SHA256SUMS.txt.sig \
+      #     --certificate-identity-regexp '^https://github.com/DeamonDev888/mcp-control/.github/workflows/release.yml@refs/tags/' \
+      #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      #     SHA256SUMS.txt
+      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+      - name: Signer SHA256SUMS.txt
+        run: |
+          cosign sign-blob --yes \
+            --output-signature dist/SHA256SUMS.txt.sig \
+            --output-certificate dist/SHA256SUMS.txt.pem \
+            dist/SHA256SUMS.txt
 
       - name: Extraire les notes du CHANGELOG
         run: python3 scripts/extract_notes.py > notes.md
@@ -239,6 +296,29 @@ jobs:
 
           Après téléchargement sur macOS/Linux : `chmod +x <fichier>` puis `./<fichier>`.
           Premier lancement macOS : clic droit sur le fichier → **Ouvrir** si Gatekeeper s'en mêle.
+
+          ## 🔐 Vérifier un téléchargement
+
+          `SHA256SUMS.txt` est signé (cosign keyless) et chaque binaire possède une
+          attestation de provenance GitHub.
+
+          ```sh
+          # 1. signature des sommes (identité = ce workflow, ce tag)
+          cosign verify-blob --certificate SHA256SUMS.txt.pem \
+            --signature SHA256SUMS.txt.sig \
+            --certificate-identity-regexp '^https://github.com/DeamonDev888/mcp-control/.github/workflows/release.yml@refs/tags/' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            SHA256SUMS.txt
+
+          # 2. provenance du binaire
+          gh attestation verify mcp-control-desktop-windows-x86_64-setup.exe \
+            --repo DeamonDev888/mcp-control
+
+          # 3. somme du fichier
+          sha256sum -c SHA256SUMS.txt --ignore-missing
+          ```
+
+          `*.cdx.json` : liste des composants (SBOM CycloneDX) de chaque crate livré.
           MDEOF
 
       - name: Créer la release

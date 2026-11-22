@@ -102,6 +102,22 @@ fn fuzz_lite() {
     flood.extend_from_slice(&big);
     let too_big = e.raw(&flood, 0);
     assert_eq!(too_big.status, 413, "corps > 2 MiB → 413");
+    assert_eq!(
+        too_big.header("content-type").unwrap_or_default(),
+        "application/json"
+    );
+    for (nom, attendu) in [
+        ("x-content-type-options", "nosniff"),
+        ("referrer-policy", "no-referrer"),
+        ("cross-origin-opener-policy", "same-origin"),
+        ("cross-origin-resource-policy", "same-origin"),
+    ] {
+        assert_eq!(
+            too_big.header(nom).unwrap_or_default(),
+            attendu,
+            "en-tête {nom} absent sur 413"
+        );
+    }
     assert!(
         too_big.text().contains("body trop grand"),
         "message « body trop grand » attendu, obtenu : {}",
@@ -283,6 +299,116 @@ fn hostile_label_never_in_html() {
 }
 
 // ---------- lot 5 : sécurité HTTP (audit 05 #1, #2, #4, #5, #7) ----------
+
+/// Lot S2 : en-têtes de durcissement sur les réponses HTML ET JSON, CSP
+/// stricte sur la coquille, page servie sans aucun gestionnaire en ligne.
+/// C'est le contrat côté serveur ; le contrat côté DOM (aucun script exécuté)
+/// est prouvé par le harnais navigateur d'audit-v2/mesures/S2/.
+#[test]
+fn entetes_de_durcissement_et_csp_stricte() {
+    let _garde = crate::harness::serial_guard();
+    let e = spawn_loopback();
+
+    let racine = e.get("/");
+    assert_eq!(racine.status, 200);
+    assert_eq!(
+        racine.header("content-type").unwrap_or_default(),
+        "text/html; charset=utf-8",
+        "Content-Type exact attendu sur la coquille"
+    );
+    for (nom, attendu) in [
+        ("x-content-type-options", "nosniff"),
+        ("referrer-policy", "no-referrer"),
+        ("cross-origin-opener-policy", "same-origin"),
+        ("cross-origin-resource-policy", "same-origin"),
+    ] {
+        assert_eq!(
+            racine.header(nom).unwrap_or_default(),
+            attendu,
+            "en-tête {nom} absent ou faux sur /"
+        );
+    }
+    let csp = racine.header("content-security-policy").unwrap_or_default();
+    for attendu in ["script-src 'self'", "style-src 'self'"] {
+        assert!(csp.contains(attendu), "CSP sans {attendu} : {csp}");
+    }
+    for interdit in ["unsafe-inline", "unsafe-eval", "nonce-"] {
+        assert!(
+            !csp.contains(interdit),
+            "CSP permissive ({interdit}) : {csp}"
+        );
+    }
+    let html = racine.text();
+    for interdit in ["onclick=", "onchange=", "oninput=", "onsubmit=", "style=\""] {
+        assert!(
+            !html.contains(interdit),
+            "la page servie contient encore {interdit}"
+        );
+    }
+
+    // même durcissement sur les assets et les réponses JSON (200 et 404), Content-Type exact
+    for (path, ctype_attendu) in [
+        ("/app.css", "text/css; charset=utf-8"),
+        ("/app-boot.js", "text/javascript; charset=utf-8"),
+        ("/app.js", "text/javascript; charset=utf-8"),
+        ("/api/state", "application/json"),
+        ("/api/hello", "application/json"),
+        ("/api/store", "application/json"),
+        ("/api/detail?id=inexistant", "application/json"),
+        ("/route-inconnue", "application/json"),
+    ] {
+        let rep = e.get(path);
+        assert_eq!(
+            rep.header("content-type").unwrap_or_default(),
+            ctype_attendu,
+            "Content-Type inattendu sur {path}"
+        );
+        for (nom, attendu) in [
+            ("x-content-type-options", "nosniff"),
+            ("referrer-policy", "no-referrer"),
+            ("cross-origin-opener-policy", "same-origin"),
+            ("cross-origin-resource-policy", "same-origin"),
+        ] {
+            assert_eq!(
+                rep.header(nom).unwrap_or_default(),
+                attendu,
+                "en-tête {nom} absent ou faux sur {path}"
+            );
+        }
+    }
+
+    // S-5 (Tauri) : withGlobalTauri: false, CSP stricte, aucune origine distante
+    // statique (ni localhost ni plage 5090..5099), confinement de navigation.
+    let tauri_conf = include_str!("../../desktop/tauri.conf.json");
+    assert!(
+        tauri_conf.contains("\"withGlobalTauri\": false"),
+        "withGlobalTauri doit être false"
+    );
+    for attendu in ["script-src 'self'", "style-src 'self'"] {
+        assert!(
+            tauri_conf.contains(attendu),
+            "tauri.conf.json sans {attendu}"
+        );
+    }
+    for interdit in ["unsafe-inline", "unsafe-eval", "nonce-"] {
+        assert!(
+            !tauri_conf.contains(interdit),
+            "tauri.conf.json permissif ({interdit})"
+        );
+    }
+    let cap = include_str!("../../desktop/capabilities/main-remote-ui.json");
+    assert!(
+        !cap.contains("http://localhost:") && !cap.contains("http://127.0.0.1:509"),
+        "la capacité statique ne doit plus lister localhost ni la plage 5090..5099"
+    );
+    let desktop_main = include_str!("../../desktop/src/main.rs");
+    for attendu in ["CapabilityBuilder", ".on_navigation", ".on_new_window"] {
+        assert!(
+            desktop_main.contains(attendu),
+            "desktop/src/main.rs sans {attendu}"
+        );
+    }
+}
 
 /// Récepteur HTTP local minimal qui enregistre les corps reçus : cible des
 /// webhooks de test (127.0.0.1, port éphémère — un webhook vers un service
@@ -921,4 +1047,61 @@ fn set_notify_reponse_masquee_et_motif_precis() {
         !err3.contains("ou https"),
         "l'ancien message générique ne doit plus sortir"
     );
+}
+
+/// R-3 (audit R) : en-têtes critiques dupliqués (`Host`, `Origin`, `Cookie`,
+/// `X-MCC-Session`) et `Content-Length` non numérique → `400 Bad Request`.
+#[test]
+fn r3_entetes_dupliques_et_content_length_invalide_rejetes_400() {
+    let _garde = crate::harness::serial_guard();
+    let e = spawn_loopback();
+    let port = e.port;
+
+    let cases: [(&str, String); 6] = [
+        (
+            "Host dupliqué",
+            format!(
+                "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nHost: evil.example:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        (
+            "Origin dupliqué",
+            format!(
+                "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nOrigin: https://evil.example\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        (
+            "X-MCC-Session dupliqué",
+            format!(
+                "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-MCC-Session: a\r\nX-MCC-Session: b\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        (
+            "Cookie mcc_session dupliqué (2 en-têtes)",
+            format!(
+                "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nCookie: mcc_session=a\r\nCookie: mcc_session=b\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        (
+            "Cookie mcc_session dupliqué (1 en-tête)",
+            format!(
+                "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nCookie: mcc_session=a; mcc_session=b\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        (
+            "Content-Length non numérique",
+            format!(
+                "POST /api/action HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: abc\r\nConnection: close\r\n\r\n{{}}"
+            ),
+        ),
+    ];
+
+    for (label, raw_req) in &cases {
+        let resp = e.raw(raw_req.as_bytes(), 0);
+        assert_eq!(
+            resp.status, 400,
+            "{label} doit rendre 400, vu {}",
+            resp.status
+        );
+    }
 }

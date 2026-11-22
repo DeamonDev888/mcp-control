@@ -25,6 +25,9 @@ pub struct McpProbe {
     pub mcp_up: bool,
     #[allow(dead_code)] // réservé : distinguer port fermé vs MCP muet côté UI
     pub port_open: bool,
+    /// Serveur LiteMCP verrouillé (a répondu 401 + `WWW-Authenticate` de la lib,
+    /// ou est sondé avec une identité cliente signée — badge cadenas sur UP/DOWN).
+    pub locked: bool,
     pub pid: Option<u32>,
     pub host: Option<String>,
     pub name: Option<String>,
@@ -50,8 +53,22 @@ pub struct McpProbe {
     /// GET /health répond 200 « ok » (deux signatures documentées de litemcp).
     pub framework: Option<String>,
     pub tools: Vec<ToolInfo>,
+    /// Vrai quand une sonde légère sur serveur déjà UP (nom + version inchangés)
+    /// a sauté `tools/list` et les sondes annexes (`/sse`, WS, `/health`).
+    /// L'appelant conserve alors les métadonnées/outils en cache.
+    pub metadata_reused: bool,
     pub latency_ms: u64,
     pub error: Option<String>,
+}
+
+/// Indice de sonde légère pour un serveur déjà UP (P1 rang 2) : si `initialize`
+/// renvoie les mêmes `name` et `version`, la sonde saute `tools/list` et les
+/// vérifications annexes (`/sse`, WS, `/health`, `port_owner_lang`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProbeHint<'a> {
+    pub reuse_metadata_if_unchanged: bool,
+    pub prev_name: Option<&'a str>,
+    pub prev_version: Option<&'a str>,
 }
 
 impl McpProbe {
@@ -59,6 +76,7 @@ impl McpProbe {
         McpProbe {
             mcp_up: false,
             port_open,
+            locked: false,
             pid: None,
             host: None,
             name: None,
@@ -70,8 +88,42 @@ impl McpProbe {
             lang: None,
             framework: None,
             tools: vec![],
+            metadata_reused: false,
             latency_ms: 0,
             error: Some(err),
+        }
+    }
+
+    /// Serveur LiteMCP joignable mais verrouillé (`401` + `WWW-Authenticate`
+    /// `Signature realm="litemcp", tag="litemcp-auth-v1"`, lot M4 point 4).
+    pub fn locked_litemcp(host: String, health: bool, latency_ms: u64) -> McpProbe {
+        let fw = crate::frameworks::detect(
+            None,
+            Some(crate::LITEMCP_PROTOCOL),
+            health,
+            false,
+            false,
+            Some("rust"),
+        )
+        .or_else(|| crate::frameworks::by_id("litemcp"));
+        McpProbe {
+            mcp_up: false,
+            port_open: true,
+            locked: true,
+            pid: None,
+            host: Some(host),
+            name: None,
+            version: None,
+            protocol: Some(crate::LITEMCP_PROTOCOL.to_string()),
+            sse: false,
+            sse_endpoint: false,
+            ws: false,
+            lang: Some("rust".to_string()),
+            framework: fw.map(|f| f.id.to_string()),
+            tools: vec![],
+            metadata_reused: false,
+            latency_ms,
+            error: Some(crate::auth::net::LOCKED_SERVER_MSG.to_string()),
         }
     }
 }
@@ -84,6 +136,9 @@ impl McpProbe {
 pub struct StdioHandle {
     /// PID du process lancé (kill_tree, affichage).
     pub pid: u32,
+    /// Date de création du process au moment du spawn (identité : un PID
+    /// recyclé n'a jamais la même date). `None` si l'API n'a pas répondu.
+    pub started: Option<u64>,
     /// Code de sortie ; None tant que le process est en cours. Récolté par le
     /// watcher (signal non exprimable → -1).
     pub exit: std::sync::Arc<std::sync::Mutex<Option<i32>>>,
@@ -94,6 +149,7 @@ pub struct StdioHandle {
 /// Construit le handle et démarre le watcher qui récolte la sortie du process.
 fn handle_de_child(mut child: Child, stdin: Option<ChildStdin>) -> StdioHandle {
     let pid = child.id();
+    let started = process_creation(pid);
     let exit = std::sync::Arc::new(std::sync::Mutex::new(None));
     let slot = std::sync::Arc::clone(&exit);
     std::thread::spawn(move || {
@@ -102,7 +158,12 @@ fn handle_de_child(mut child: Child, stdin: Option<ChildStdin>) -> StdioHandle {
             *slot = Some(code);
         }
     });
-    StdioHandle { pid, exit, stdin }
+    StdioHandle {
+        pid,
+        started,
+        exit,
+        stdin,
+    }
 }
 
 fn resolve_windows_cmd(program: &str) -> String {
@@ -134,12 +195,288 @@ pub fn hidden(cmd: &mut std::process::Command) -> &mut std::process::Command {
     cmd
 }
 
+// ---------- outils système par chemin ABSOLU (lot S4, point 5) ----------
+
+/// Chemin absolu d'un outil système Windows : un `netstat.exe` (ou `reg.exe`,
+/// `taskkill.exe`…) déposé dans le dossier courant ne peut plus être pris à la
+/// place de l'outil du système, quel que soit le PATH ou le cwd de l'app.
+/// Hors Windows, les outils (`ss`, `lsof`, `kill`, `ip`…) restent résolus par
+/// le PATH : la convention y est `/usr/bin` ou `/bin`, sans dossier courant.
+pub fn system_tool(name: &str) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let root = std::path::PathBuf::from(root);
+        match name {
+            // PowerShell 5.1 n'est pas à la racine de System32
+            "powershell" => root
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe"),
+            // explorer.exe vit à la racine de %SystemRoot%, pas dans System32
+            "explorer" => root.join("explorer.exe"),
+            // OpenSSH Windows vit dans System32\OpenSSH (repli PATH si absent)
+            "ssh" => {
+                let p = root.join("System32").join("OpenSSH").join("ssh.exe");
+                if p.exists() {
+                    p
+                } else {
+                    std::path::PathBuf::from("ssh")
+                }
+            }
+            other => root.join("System32").join(format!("{other}.exe")),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::path::PathBuf::from(name)
+    }
+}
+
+/// `Command` sur un outil système, chemin absolu sous Windows (voir
+/// [`system_tool`]). Tous les appels hors tests passent par ici.
+pub fn system_command(name: &str) -> Command {
+    Command::new(system_tool(name))
+}
+
+// ---------- identité d'un process (lot S4, point 1) ----------
+
+/// Date de création d'un process (ticks FILETIME Windows, 100 ns depuis 1601).
+/// Sert d'identité : un PID recyclé par l'OS n'a pas la même date de création,
+/// donc un arrêt ne peut plus viser un process différent de celui lancé.
+/// `None` = process inexistant ou information indisponible (hors Windows).
+#[cfg(windows)]
+pub fn process_creation(pid: u32) -> Option<u64> {
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn GetProcessTimes(
+            handle: isize,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    // PROCESS_QUERY_LIMITED_INFORMATION : suffit pour GetProcessTimes, et
+    // n'exige pas plus de droits que l'affichage de l'état du process.
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h == 0 {
+            return None;
+        }
+        let mut creation = FileTime { low: 0, high: 0 };
+        let mut exit = FileTime { low: 0, high: 0 };
+        let mut kernel = FileTime { low: 0, high: 0 };
+        let mut user = FileTime { low: 0, high: 0 };
+        let ok = GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user);
+        CloseHandle(h);
+        if ok == 0 {
+            return None;
+        }
+        Some(((creation.high as u64) << 32) | creation.low as u64)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn process_creation(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Nom d'image d'un PID (`tasklist` sous Windows, `ps` ailleurs) — pour NOMMER
+/// le process qui tient un port dans un refus, jamais pour l'exécuter.
+pub fn process_image_name(pid: u32) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let mut c = system_command("tasklist");
+        let out = hidden(&mut c)
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let first = text.lines().next()?.trim();
+        if !first.starts_with('"') {
+            return None;
+        }
+        Some(first.split('"').nth(1)?.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        let mut c = Command::new("ps");
+        let out = c
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+            .ok()?;
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+}
+
+/// Tue une liste de PID (taskkill /F sous Windows, kill -9 ailleurs).
+pub fn kill_pids(pids: &[u32]) {
+    for pid in pids {
+        kill_tree(*pid);
+    }
+}
+
+// ---------- SID utilisateur / propriétaire d'un fichier (points 2 et 4) ----------
+
+/// SID du compte qui exécute l'application (`S-1-5-21-…`). Sert à écrire des
+/// ACL indépendantes de la langue du système (`Administrateurs` /
+/// `Administrators`).
+#[cfg(windows)]
+pub fn current_user_sid() -> Option<String> {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(process: isize, access: u32, token: *mut isize) -> i32;
+        fn GetTokenInformation(
+            token: isize,
+            class: u32,
+            info: *mut u8,
+            len: u32,
+            ret: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const TOKEN_QUERY: u32 = 0x0008;
+    // TOKEN_USER = 1 : SID_AND_ATTRIBUTES, le SID commence au premier champ.
+    const TOKEN_USER_CLASS: u32 = 1;
+    unsafe {
+        let mut token: isize = 0;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let mut len: u32 = 0;
+        GetTokenInformation(token, TOKEN_USER_CLASS, std::ptr::null_mut(), 0, &mut len);
+        let mut buf = vec![0u8; len.max(64) as usize];
+        let ok = GetTokenInformation(
+            token,
+            TOKEN_USER_CLASS,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            &mut len,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            return None;
+        }
+        let sid = std::ptr::read_unaligned(buf.as_ptr() as *const *mut u8);
+        sid_to_string(sid)
+    }
+}
+
+#[cfg(windows)]
+unsafe fn sid_to_string(sid: *mut u8) -> Option<String> {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn ConvertSidToStringSidW(sid: *mut u8, out: *mut *mut u16) -> i32;
+        fn LocalFree(mem: isize) -> isize;
+    }
+    if sid.is_null() {
+        return None;
+    }
+    let mut wide: *mut u16 = std::ptr::null_mut();
+    if ConvertSidToStringSidW(sid, &mut wide) == 0 || wide.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    while *wide.add(len) != 0 {
+        len += 1;
+    }
+    let s = String::from_utf16_lossy(std::slice::from_raw_parts(wide, len));
+    LocalFree(wide as isize);
+    Some(s)
+}
+
+#[cfg(not(windows))]
+pub fn current_user_sid() -> Option<String> {
+    None
+}
+
+/// SID du PROPRIÉTAIRE d'un fichier. `None` = illisible ou non pris en charge
+/// (hors Windows) — l'appelant refuse alors par prudence.
+#[cfg(windows)]
+pub fn file_owner_sid(path: &std::path::Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn GetNamedSecurityInfoW(
+            object: *const u16,
+            object_type: u32,
+            security_info: u32,
+            owner: *mut *mut u8,
+            group: *mut *mut u8,
+            dacl: *mut *mut u8,
+            sacl: *mut *mut u8,
+            descriptor: *mut *mut u8,
+        ) -> u32;
+        fn LocalFree(mem: isize) -> isize;
+    }
+    const SE_FILE_OBJECT: u32 = 1;
+    const OWNER_SECURITY_INFORMATION: u32 = 1;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mut owner: *mut u8 = std::ptr::null_mut();
+        let mut descriptor: *mut u8 = std::ptr::null_mut();
+        let rc = GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        if rc != 0 {
+            return None;
+        }
+        let sid = sid_to_string(owner);
+        if !descriptor.is_null() {
+            LocalFree(descriptor as isize);
+        }
+        sid
+    }
+}
+
+/// Hors Windows : propriétaire comparé à l'uid effectif quand il est lisible
+/// (`/proc/self` sous Linux) ; inconnu ailleurs.
+#[cfg(not(windows))]
+pub fn file_owner_sid(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(path).ok()?.uid();
+    let me = std::fs::metadata("/proc/self").ok().map(|m| m.uid());
+    me.filter(|u| *u == owner).map(|u| u.to_string())
+}
+
+/// Le fichier appartient-il au compte courant ? `None` = impossible à établir.
+pub fn file_owned_by_current_user(path: &std::path::Path) -> Option<bool> {
+    let (file, me) = (file_owner_sid(path)?, current_user_sid()?);
+    Some(file == me)
+}
+
 /// Tue l'arbre complet d'un PID (cmd.exe → node.exe). `Child::kill()` ne tue que
 /// le lanceur .cmd : les serveurs détachés survivent et gardent leur console.
 pub fn kill_tree(pid: u32) {
     #[cfg(windows)]
     {
-        let mut c = std::process::Command::new("taskkill");
+        let mut c = std::process::Command::new(system_tool("taskkill"));
         let _ = hidden(&mut c)
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .stdout(Stdio::null())
@@ -179,11 +516,11 @@ pub fn pids_listening_on(netstat_text: &str, port: u16) -> Vec<u32> {
 
 #[cfg(windows)]
 pub fn kill_port(port: u16) {
-    let mut c = Command::new("netstat");
+    let mut c = Command::new(system_tool("netstat"));
     if let Ok(out) = hidden(&mut c).args(["-ano"]).output() {
         let text = String::from_utf8_lossy(&out.stdout);
         for pid in pids_listening_on(&text, port) {
-            let mut t = Command::new("taskkill");
+            let mut t = Command::new(system_tool("taskkill"));
             let _ = hidden(&mut t)
                 .args(["/F", "/PID", &pid.to_string()])
                 .stdout(Stdio::null())
@@ -191,6 +528,55 @@ pub fn kill_port(port: u16) {
                 .status();
         }
     }
+}
+
+/// PIDs qui écoutent sur `port` (notre propre PID exclu) + nom d'image.
+pub fn port_listeners(port: u16) -> Vec<(u32, String)> {
+    #[cfg(windows)]
+    let pids = {
+        let mut c = system_command("netstat");
+        match hidden(&mut c).args(["-ano"]).output() {
+            Ok(out) => pids_listening_on(&String::from_utf8_lossy(&out.stdout), port),
+            Err(_) => Vec::new(),
+        }
+    };
+    #[cfg(not(windows))]
+    let pids = listening_pids_unix(port);
+    pids.into_iter()
+        .map(|pid| {
+            let image = process_image_name(pid).unwrap_or_else(|| "process".to_string());
+            (pid, image)
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn listening_pids_unix(port: u16) -> Vec<u32> {
+    let mut c = Command::new("ss");
+    probe_hidden_cmd(&mut c);
+    if let Ok(out) = c.args(["-tlnp"]).output() {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let pids = pids_listening_on_ss(&text, port);
+        if !pids.is_empty() {
+            return pids;
+        }
+    }
+    let mut out = Vec::new();
+    let mut c = Command::new("lsof");
+    probe_hidden_cmd(&mut c);
+    if let Ok(o) = c
+        .args(["-ti", &format!(":{}", port), "-sTCP:LISTEN"])
+        .output()
+    {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            if let Ok(pid) = line.trim().parse::<u32>() {
+                if pid != std::process::id() && !out.contains(&pid) {
+                    out.push(pid);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Parse la sortie `ss -tlnp` : PIDs (notre propre PID exclu) des listeners sur
@@ -392,28 +778,49 @@ pub fn detect_lang_http(head: &RespHead, name: Option<&str>) -> Option<String> {
     Some(lang.to_string())
 }
 
+/// Génération du cycle de sondage pour mutualiser la table port → process
+/// (P-3 : une seule construction `netstat` + `tasklist` par cycle, partagée
+/// par tous les workers sans tempête de spawns concurrents).
+static PORT_OWNER_CYCLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Démarre un nouveau cycle de sondage : invalide la table port → process
+/// construite au cycle précédent (appelé au début de `poll_all`).
+pub fn begin_port_owner_cycle() {
+    PORT_OWNER_CYCLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Langage inféré du process qui écoute réellement un port local
-/// (Windows : netstat -ano → PID → tasklist → image). Cache 10 s.
+/// (Windows : netstat -ano → PID → tasklist → image).
+/// Mutualisé par cycle de sondage (verrou unique : 12 workers parallèles ne
+/// déclenchent qu'UN SEUL `netstat` + `tasklist`, plus repli TTL 10 s hors cycle).
 #[cfg(windows)]
 pub fn port_owner_lang(port: u16) -> Option<String> {
     use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
-    static CACHE: OnceLock<Mutex<(Instant, HashMap<u16, String>)>> = OnceLock::new();
-    let cache = CACHE
-        .get_or_init(|| Mutex::new((Instant::now() - Duration::from_secs(60), HashMap::new())));
-    if let Ok(g) = cache.lock() {
-        let (t, map) = &*g;
-        if t.elapsed() < Duration::from_secs(10) {
-            return map.get(&port).and_then(|img| detect_lang_from_image(img));
-        }
+    struct PortOwnerCache {
+        cycle: u64,
+        built_at: Instant,
+        map: HashMap<u16, String>,
     }
-    let map = build_port_owner_map();
-    let lang = map.get(&port).and_then(|img| detect_lang_from_image(img));
-    if let Ok(mut g) = cache.lock() {
-        *g = (Instant::now(), map);
+    static CACHE: OnceLock<Mutex<PortOwnerCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| {
+        Mutex::new(PortOwnerCache {
+            cycle: 0,
+            built_at: Instant::now() - Duration::from_secs(60),
+            map: HashMap::new(),
+        })
+    });
+    let cur_cycle = PORT_OWNER_CYCLE.load(Ordering::Relaxed);
+    let mut g = cache.lock().unwrap_or_else(|p| p.into_inner());
+    let fresh = g.cycle == cur_cycle && g.built_at.elapsed() < Duration::from_secs(10);
+    if !fresh {
+        g.map = build_port_owner_map();
+        g.cycle = cur_cycle;
+        g.built_at = Instant::now();
     }
-    lang
+    g.map.get(&port).and_then(|img| detect_lang_from_image(img))
 }
 
 #[cfg(not(windows))]
@@ -427,7 +834,7 @@ fn build_port_owner_map() -> std::collections::HashMap<u16, String> {
     use std::collections::HashMap;
     use std::process::Command;
     let mut ports: Vec<(u16, u32)> = Vec::new();
-    let mut c = Command::new("netstat");
+    let mut c = Command::new(system_tool("netstat"));
     if let Ok(out) = hidden(&mut c).args(["-ano"]).output() {
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             let toks: Vec<&str> = line.split_whitespace().collect();
@@ -444,7 +851,7 @@ fn build_port_owner_map() -> std::collections::HashMap<u16, String> {
         }
     }
     let mut names: HashMap<u32, String> = HashMap::new();
-    let mut t = Command::new("tasklist");
+    let mut t = Command::new(system_tool("tasklist"));
     if let Ok(out) = hidden(&mut t).args(["/FO", "CSV", "/NH"]).output() {
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             let cols: Vec<&str> = line.split("\",\"").collect();
@@ -650,7 +1057,7 @@ fn push_gateway(out: &mut Vec<String>, cand: &str) {
 pub fn default_gateways() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if cfg!(windows) {
-        let mut c = Command::new("ipconfig");
+        let mut c = Command::new(system_tool("ipconfig"));
         hidden(&mut c);
         if let Ok(o) = c.output() {
             let text = String::from_utf8_lossy(&o.stdout).to_string();
@@ -681,7 +1088,7 @@ pub fn default_gateways() -> Vec<String> {
         }
         if out.is_empty() {
             // macOS
-            let mut c2 = Command::new("netstat");
+            let mut c2 = Command::new(system_tool("netstat"));
             probe_hidden_cmd(&mut c2);
             if let Ok(o) = c2.args(["-rn"]).output() {
                 let text = String::from_utf8_lossy(&o.stdout).to_string();
@@ -703,7 +1110,7 @@ pub fn default_gateways() -> Vec<String> {
 /// la passerelle LAN ; jamais bloquant au-delà de `timeout_ms`.
 pub fn ping_ok(host: &str, timeout_ms: u64) -> bool {
     let ms = timeout_ms.clamp(200, 3000);
-    let mut c = Command::new("ping");
+    let mut c = Command::new(system_tool("ping"));
     hidden(&mut c);
     let status = if cfg!(windows) {
         c.args(["-n", "1", "-w", &ms.to_string(), host]).output()
@@ -727,22 +1134,44 @@ pub fn lan_reachable() -> Option<bool> {
 /// GET /health sur un hôte précis — vrai si 2xx avec un corps contenant « ok ».
 /// Sonde de vie documentée de litemcp ; second signal du fingerprint du framework.
 pub fn health_ok_host(host: &str, port: u16, timeout_ms: u64) -> bool {
+    let timeout = Duration::from_millis(timeout_ms);
+    let host_hdr = http_host_header(host, port);
+    let req = format!(
+        "GET /health HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        host_hdr
+    );
+    if let Ok(Some(ident)) = crate::auth::net::outbound_identity_for(host, port) {
+        if !ident.tls_fp.is_empty() {
+            let Ok((data, _)) = crate::auth::net::https_exchange_raw(
+                host,
+                port,
+                req.as_bytes(),
+                timeout,
+                Some(&ident.tls_fp),
+                MAX_PROBE_READ_SMALL,
+            ) else {
+                return false;
+            };
+            let Some(sep) = find_sub(&data, b"\r\n\r\n") else {
+                return false;
+            };
+            let head = String::from_utf8_lossy(&data[..sep]).to_lowercase();
+            return (head.starts_with("http/1.1 2") || head.starts_with("http/1.0 2"))
+                && String::from_utf8_lossy(&data[sep + 4..])
+                    .to_lowercase()
+                    .contains("ok");
+        }
+    }
     let addr = match socket_addr(host, port) {
         Ok(a) => a,
         Err(_) => return false,
     };
-    let timeout = Duration::from_millis(timeout_ms);
     let mut stream = match TcpStream::connect_timeout(&addr, timeout) {
         Ok(s) => s,
         Err(_) => return false,
     };
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
-    let host_hdr = http_host_header(host, port);
-    let req = format!(
-        "GET /health HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        host_hdr
-    );
     if stream.write_all(req.as_bytes()).is_err() {
         return false;
     }
@@ -799,7 +1228,7 @@ fn detect_framework(
 pub fn probe_mcp_any_path(port: u16, timeout_ms: u64) -> Option<(&'static str, McpProbe)> {
     for path in ["/mcp", "/", "/api/mcp"] {
         let p = probe_http(port, path, timeout_ms);
-        if p.mcp_up {
+        if p.mcp_up || p.locked {
             return Some((path, p));
         }
     }
@@ -928,7 +1357,7 @@ fn ssh_exec(
 ) -> Result<String, String> {
     let host = ssh_safe(host).ok_or_else(|| "hôte invalide".to_string())?;
     let user = ssh_safe(user).ok_or_else(|| "utilisateur SSH invalide".to_string())?;
-    let mut cmd = Command::new("ssh");
+    let mut cmd = system_command("ssh");
     cmd.args([
         "-o",
         "BatchMode=yes",
@@ -984,12 +1413,12 @@ pub fn ssh_netstat(host: &str, user: &str, timeout_secs: u64) -> Result<Vec<u16>
 /// invisible avec scan_from/scan_to = 3000-3200).
 pub fn local_listening_ports() -> Vec<u16> {
     let out = if cfg!(windows) {
-        let mut c = Command::new("netstat");
+        let mut c = Command::new(system_tool("netstat"));
         hidden(&mut c).args(["-ano"]).output()
     } else if cfg!(target_os = "macos") {
         // BSD netstat : ni `ss` ni `-tln` — `-an -p tcp` liste les sockets TCP
         // et le parseur filtre sur l'état LISTEN (format à séparateur '.').
-        let mut c = Command::new("netstat");
+        let mut c = Command::new(system_tool("netstat"));
         probe_hidden_cmd(&mut c);
         c.args(["-an", "-p", "tcp"]).output()
     } else {
@@ -999,7 +1428,7 @@ pub fn local_listening_ports() -> Vec<u16> {
         match c.args(["-tln"]).output() {
             Ok(o) if o.status.success() => Ok(o),
             _ => {
-                let mut c2 = Command::new("netstat");
+                let mut c2 = Command::new(system_tool("netstat"));
                 probe_hidden_cmd(&mut c2);
                 c2.args(["-tln"]).output()
             }
@@ -1203,6 +1632,7 @@ pub fn ssh_probe_server(
     McpProbe {
         mcp_up: true,
         port_open: true,
+        locked: false,
         pid: None,
         host: Some(host.to_string()),
         name,
@@ -1214,6 +1644,7 @@ pub fn ssh_probe_server(
         lang,
         framework,
         tools,
+        metadata_reused: false,
         latency_ms: latency,
         error: None,
     }
@@ -1504,6 +1935,39 @@ fn http_request_trusted(
     }
     Err(last_err)
 }
+/// Extrait la méthode JSON-RPC et éventuellement `params.name` / `params.uri`
+/// d'un corps de requête JSON-RPC sortant pour aligner les en-têtes
+/// `Mcp-Method` / `Mcp-Name` avant signature RFC 9421.
+fn extract_rpc_meta(body: &str) -> (Option<String>, Option<String>) {
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        return (None, None);
+    };
+    let m = v
+        .get("method")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let name = match m.as_deref() {
+        Some("tools/call" | "prompts/get") => v
+            .get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        Some("resources/read") => v
+            .get("params")
+            .and_then(|p| p.get("uri"))
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        _ => None,
+    };
+    (m, name)
+}
+
 fn http_request(
     method: &str,
     host: &str,
@@ -1515,7 +1979,115 @@ fn http_request(
 ) -> Result<(Vec<u8>, RespHead), String> {
     let timeout = Duration::from_millis(timeout_ms);
     let mut last_err = String::new();
-    {
+    let outbound = if path != "/api/state" && path != "/api/hello" {
+        crate::auth::net::outbound_identity_for(host, port)
+            .map_err(|e| format!("{}: {}", host, e))?
+    } else {
+        crate::auth::net::outbound_identity_for(host, port)
+            .ok()
+            .flatten()
+    };
+
+    // Host exact (le "localhost" historique casse les vhosts sur hôte distant)
+    let host_hdr = http_host_header(host, port);
+    // path sans CR/LF ni espace : il est placé tel quel dans la ligne de
+    // requête — un path configuré ne doit pas pouvoir injecter d'en-têtes
+    let path = sanitize_http_path(path, "/mcp");
+    let mut req = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\nAccept: application/json, text/event-stream\r\n",
+        method, path, host_hdr
+    );
+    let mut req_headers: Vec<(String, String)> = Vec::new();
+    if body.is_some() {
+        req.push_str("Content-Type: application/json\r\n");
+        req_headers.push(("Content-Type".to_string(), "application/json".to_string()));
+        // Le protocole par défaut est 2024-11-05. Un appelant qui
+        // sonde le protocole stateless fournit SON en-tête
+        // (2026-07-28) : envoyer les deux valeurs dans la même
+        // requête fait répondre 400 aux serveurs stricts.
+        let has_proto = extra_headers
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("MCP-Protocol-Version"));
+        if !has_proto {
+            req.push_str("MCP-Protocol-Version: 2024-11-05\r\n");
+            req_headers.push(("MCP-Protocol-Version".to_string(), "2024-11-05".to_string()));
+        }
+    }
+    for (n, v) in extra_headers {
+        // SÉCURITÉ (audit 2026-10-25 + lot M4) : la valeur ne doit contenir
+        // ni CR/LF ni caractère de contrôle (request splitting impossible) ;
+        // les caractères ASCII imprimables (0x20..=0x7E) sont autorisés pour
+        // supporter les en-têtes RFC 9421 (`Signature-Input`, `Signature`).
+        let name_ok = !n.is_empty()
+            && n.len() <= 128
+            && n.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        let val_ok =
+            !v.is_empty() && v.len() <= 1024 && v.bytes().all(|b| (0x20..=0x7E).contains(&b));
+        if name_ok && val_ok {
+            req.push_str(&format!("{}: {}\r\n", n, v));
+            req_headers.push(((*n).to_string(), (*v).to_string()));
+        }
+    }
+    if let (Some(ident), Some(b)) = (outbound.as_ref(), body) {
+        if method.eq_ignore_ascii_case("POST") && path != "/api/state" {
+            let (rpc_method, rpc_name) = extract_rpc_meta(b);
+            if let Some(m) = rpc_method {
+                let has_method = req_headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("Mcp-Method"));
+                if !has_method && m.bytes().all(|c| (0x21..=0x7E).contains(&c)) {
+                    req.push_str(&format!("Mcp-Method: {}\r\n", m));
+                    req_headers.push(("Mcp-Method".to_string(), m));
+                }
+            }
+            if let Some(nm) = rpc_name {
+                let has_name = req_headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("Mcp-Name"));
+                if !has_name && nm.bytes().all(|c| (0x20..=0x7E).contains(&c)) {
+                    req.push_str(&format!("Mcp-Name: {}\r\n", nm));
+                    req_headers.push(("Mcp-Name".to_string(), nm));
+                }
+            }
+            let hdr_refs: Vec<(&str, &str)> = req_headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            for (k, v) in ident.sign_headers("POST", path, &host_hdr, &hdr_refs, b.as_bytes()) {
+                req.push_str(&format!("{}: {}\r\n", k, v));
+            }
+        }
+    }
+    match body {
+        Some(b) => req.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            b.len(),
+            b
+        )),
+        None => req.push_str("Connection: close\r\n\r\n"),
+    }
+
+    let mut data: Vec<u8> = Vec::new();
+    let mut header_len: Option<usize> = None;
+    let mut status_ok = false;
+
+    if let Some(ident) = outbound.as_ref().filter(|id| !id.tls_fp.is_empty()) {
+        let (tls_data, _) = crate::auth::net::https_exchange_raw(
+            host,
+            port,
+            req.as_bytes(),
+            timeout,
+            Some(&ident.tls_fp),
+            MAX_PROBE_READ,
+        )?;
+        data = tls_data;
+        if let Some(p) = find_sub(&data, b"\r\n\r\n") {
+            header_len = Some(p + 4);
+            let head = String::from_utf8_lossy(&data[..p]).to_lowercase();
+            status_ok = head.starts_with("http/1.1 2") || head.starts_with("http/1.0 2");
+        }
+    } else {
         let addr: SocketAddr = match socket_addr(host, port) {
             Ok(a) => a,
             Err(e) => return Err(format!("addr {}: {}", host, e)),
@@ -1524,63 +2096,12 @@ fn http_request(
             Ok(mut stream) => {
                 stream.set_read_timeout(Some(timeout)).ok();
                 stream.set_write_timeout(Some(timeout)).ok();
-                // Host exact (le "localhost" historique casse les vhosts sur hôte distant)
-                let host_hdr = http_host_header(host, port);
-                // path sans CR/LF ni espace : il est placé tel quel dans la ligne de
-                // requête — un path configuré ne doit pas pouvoir injecter d'en-têtes
-                let path = sanitize_http_path(path, "/mcp");
-                let mut req = format!(
-                    "{} {} HTTP/1.1\r\nHost: {}\r\nAccept: application/json, text/event-stream\r\n",
-                    method, path, host_hdr
-                );
-                if body.is_some() {
-                    req.push_str("Content-Type: application/json\r\n");
-                    // Le protocole par défaut est 2024-11-05. Un appelant qui
-                    // sonde le protocole stateless fournit SON en-tête
-                    // (2026-07-28) : envoyer les deux valeurs dans la même
-                    // requête fait répondre 400 aux serveurs stricts.
-                    let has_proto = extra_headers
-                        .iter()
-                        .any(|(n, _)| n.eq_ignore_ascii_case("MCP-Protocol-Version"));
-                    if !has_proto {
-                        req.push_str("MCP-Protocol-Version: 2024-11-05\r\n");
-                    }
-                }
-                for (n, v) in extra_headers {
-                    // SÉCURITÉ (audit 2026-10-25) : la VALEUR d'un en-tête
-                    // additionnel arrive de sources distantes (le nonce renvoyé
-                    // par /api/hello d'un pair). Écrite telle quelle, une valeur
-                    // contenant \r\n permet le request splitting (injecter des
-                    // en-têtes, voire une seconde requête). On n'écrit que les
-                    // valeurs du jeu sûr (hex/base64/jeton) — le nonce est hex,
-                    // la preuve est hex.
-                    let ok = !v.is_empty()
-                        && v.len() <= 256
-                        && v.chars().all(|c| {
-                            c.is_ascii_alphanumeric()
-                                || matches!(c, '/' | '+' | '=' | '.' | '_' | '-' | '~' | ':')
-                        });
-                    if ok {
-                        req.push_str(&format!("{}: {}\r\n", n, v));
-                    }
-                }
-                match body {
-                    Some(b) => req.push_str(&format!(
-                        "Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        b.len(),
-                        b
-                    )),
-                    None => req.push_str("Connection: close\r\n\r\n"),
-                }
                 if let Err(e) = stream.write_all(req.as_bytes()) {
                     return Err(format!("{} write: {}", host, e));
                 }
-                let mut data = Vec::new();
                 let mut tmp = [0u8; 16384];
                 let deadline = Instant::now() + timeout;
                 // lit l'en-tête puis s'arrête dès que le corps est complet (Content-Length / 0-chunk)
-                let mut header_len: Option<usize> = None;
-                let mut status_ok = false;
                 loop {
                     let remain = deadline.saturating_duration_since(Instant::now());
                     if remain.is_zero() {
@@ -1628,76 +2149,98 @@ fn http_request(
                         }
                     }
                 }
-                if data.is_empty() {
-                    if last_err.is_empty() {
-                        last_err = format!("{}: réponse vide", host);
-                    }
-                    return Err(last_err);
-                }
-                if data.len() > MAX_PROBE_READ {
-                    // Dépassement explicite (audit 02, constat 6) : au lieu de
-                    // laisser le parse conclure « réponse non JSON (N octets) »
-                    // sur un corps tronqué, on nomme la vraie cause : la lecture
-                    // a été coupée au plafond mémoire.
-                    return Err(format!(
-                        "{}: réponse trop grande (plafond de lecture de {} Mio dépassé)",
-                        host,
-                        MAX_PROBE_READ / (1024 * 1024)
-                    ));
-                }
-                if header_len.is_some() && !status_ok {
-                    return Err(format!(
-                        "{}: réponse HTTP non-2xx (port occupé par un non-MCP ?)",
-                        host
-                    ));
-                }
-                // ROBUSTESSE (audit 2026-10-25) : une réponse sans séparateur
-                // CRLFCRLF (serveur qui répond 1-3 octets puis ferme) faisait
-                // panicer sur `data[sep + 4..]` (sep=0, len<4) → le thread du
-                // POLLER mourait en silence (fenêtre desktop : aucune console)
-                // et la supervision des serveurs s'arrêtait définitivement.
-                // On borne l'extraction du corps au contenu réellement reçu.
-                let sep = find_sub(&data, b"\r\n\r\n").unwrap_or(0);
-                let raw_head = String::from_utf8_lossy(&data[..sep]);
-                let head = raw_head.to_lowercase();
-                let header = |name: &str| -> String {
-                    head.lines()
-                        .find_map(|l| l.strip_prefix(name))
-                        .map(|v| v.trim().to_string())
-                        .unwrap_or_default()
-                };
-                // Mcp-Session-Id : nom d'en-tête insensible à la casse, mais la
-                // VALEUR du jeton de session doit conserver sa casse exacte.
-                let session_id = raw_head
-                    .lines()
-                    .find_map(|l| {
-                        let (k, v) = l.split_once(':')?;
-                        if k.trim().eq_ignore_ascii_case("mcp-session-id") {
-                            Some(v.trim().to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-                let resp_head = RespHead {
-                    content_type: header("content-type:"),
-                    server: header("server:"),
-                    powered_by: header("x-powered-by:"),
-                    session_id,
-                };
-                let body_start = sep.saturating_add(4).min(data.len());
-                let mut body_bytes = data[body_start..].to_vec();
-                if head.contains("transfer-encoding: chunked") {
-                    body_bytes = dechunk(&body_bytes);
-                }
-                return Ok((body_bytes, resp_head));
             }
             Err(e) => {
-                last_err = format!("{}: {}", host, e);
+                return Err(format!("{}: {}", host, e));
             }
         }
     }
-    Err(last_err)
+
+    if data.is_empty() {
+        if last_err.is_empty() {
+            last_err = format!("{}: réponse vide", host);
+        }
+        return Err(last_err);
+    }
+    if data.len() > MAX_PROBE_READ {
+        // Dépassement explicite (audit 02, constat 6) : au lieu de
+        // laisser le parse conclure « réponse non JSON (N octets) »
+        // sur un corps tronqué, on nomme la vraie cause : la lecture
+        // a été coupée au plafond mémoire.
+        return Err(format!(
+            "{}: réponse trop grande (plafond de lecture de {} Mio dépassé)",
+            host,
+            MAX_PROBE_READ / (1024 * 1024)
+        ));
+    }
+    if header_len.is_some() && !status_ok {
+        let sep = find_sub(&data, b"\r\n\r\n").unwrap_or(0);
+        let raw_head = String::from_utf8_lossy(&data[..sep]);
+        let first_line = raw_head.lines().next().unwrap_or("");
+        let status_code = first_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse::<u16>().ok())
+            .unwrap_or(0);
+        let www_auth = raw_head
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                if k.trim().eq_ignore_ascii_case("www-authenticate") {
+                    Some(v.trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+        if status_code == 401 && crate::auth::net::is_litemcp_auth_challenge(&www_auth) {
+            return Err(format!("{}: {}", host, crate::auth::net::LOCKED_SERVER_MSG));
+        }
+        return Err(format!(
+            "{}: réponse HTTP non-2xx (port occupé par un non-MCP ?)",
+            host
+        ));
+    }
+    // ROBUSTESSE (audit 2026-10-25) : une réponse sans séparateur
+    // CRLFCRLF (serveur qui répond 1-3 octets puis ferme) faisait
+    // panicer sur `data[sep + 4..]` (sep=0, len<4) → le thread du
+    // POLLER mourait en silence (fenêtre desktop : aucune console)
+    // et la supervision des serveurs s'arrêtait définitivement.
+    // On borne l'extraction du corps au contenu réellement reçu.
+    let sep = find_sub(&data, b"\r\n\r\n").unwrap_or(0);
+    let raw_head = String::from_utf8_lossy(&data[..sep]);
+    let head = raw_head.to_lowercase();
+    let header = |name: &str| -> String {
+        head.lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default()
+    };
+    // Mcp-Session-Id : nom d'en-tête insensible à la casse, mais la
+    // VALEUR du jeton de session doit conserver sa casse exacte.
+    let session_id = raw_head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case("mcp-session-id") {
+                Some(v.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+    let resp_head = RespHead {
+        content_type: header("content-type:"),
+        server: header("server:"),
+        powered_by: header("x-powered-by:"),
+        session_id,
+    };
+    let body_start = sep.saturating_add(4).min(data.len());
+    let mut body_bytes = data[body_start..].to_vec();
+    if head.contains("transfer-encoding: chunked") {
+        body_bytes = dechunk(&body_bytes);
+    }
+    Ok((body_bytes, resp_head))
 }
 
 fn dechunk(data: &[u8]) -> Vec<u8> {
@@ -1803,6 +2346,11 @@ pub fn rpc_call(
 
 /// Probe MCP streamable-HTTP complète : initialize + tools/list.
 pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
+    probe_http_with(port, path, timeout_ms, &ProbeHint::default())
+}
+
+/// Probe MCP streamable-HTTP avec indice de sonde légère (P1 rang 2).
+pub fn probe_http_with(port: u16, path: &str, timeout_ms: u64, hint: &ProbeHint<'_>) -> McpProbe {
     let quick = Duration::from_millis(timeout_ms.min(1500));
     let open_host = if port_open("::1", port, quick) {
         "::1"
@@ -1883,6 +2431,11 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
                     break 'probe;
                 }
                 Err(e) => {
+                    if e.contains(crate::auth::net::LOCKED_SERVER_MSG) {
+                        err_hote = Some(e);
+                        muet = true;
+                        break 'probe;
+                    }
                     if host == open_host {
                         // PORT MUET (lot A) : la forme a expiré sans AUCUN octet
                         // de l'hôte vérifié ouvert — rejouer les formes suivantes
@@ -1965,6 +2518,14 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
             let motif = err_hote
                 .or(err_repli)
                 .unwrap_or_else(|| "pas de réponse initialize".to_string());
+            if motif.contains(crate::auth::net::LOCKED_SERVER_MSG) {
+                let health = health_ok_host(open_host, port, timeout_ms.clamp(400, 1200));
+                return McpProbe::locked_litemcp(
+                    open_host.to_string(),
+                    health,
+                    t0.elapsed().as_millis() as u64,
+                );
+            }
             return McpProbe::fail(motif, true);
         }
     };
@@ -1998,6 +2559,39 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
                 .map(String::from)
         });
 
+    // Sonde légère (P1 rang 2) : si le serveur était déjà UP et que
+    // serverInfo.name + version n'ont pas changé, on saute /sse, WS,
+    // port_owner_lang, /health et tools/list (réutilisés en cache).
+    let sse = head.sse();
+    if hint.reuse_metadata_if_unchanged
+        && name.as_deref() == hint.prev_name
+        && version.as_deref() == hint.prev_version
+    {
+        let locked = crate::auth::net::outbound_identity_for(&host, port)
+            .ok()
+            .flatten()
+            .is_some();
+        return McpProbe {
+            mcp_up: true,
+            port_open: true,
+            locked,
+            pid: None,
+            host: Some(host),
+            name,
+            version,
+            protocol,
+            sse,
+            sse_endpoint: false,
+            ws: false,
+            lang: None,
+            framework: None,
+            tools: Vec::new(),
+            metadata_reused: true,
+            latency_ms: latency,
+            error: None,
+        };
+    }
+
     // Classification transport — le Content-Type de l'initialize NE SUFFIT PAS :
     // FastMCP httpStream répond en text/event-stream (mcp-proxy encode les
     // réponses JSON-RPC en événements SSE, enableJsonResponse=false par défaut)
@@ -2005,7 +2599,6 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
     // sse = encodage SSE des réponses ; sse_endpoint = /sse legacy co-servi.
     // Le transport réel est streamable HTTP dans tous les cas ici (le POST
     // initialize a été répondu) — un vrai serveur SSE-only échouerait avant.
-    let sse = head.sse();
     let sse_path = if path == "/sse" { path } else { "/sse" };
     let sse_endpoint = sse_get_host(&host, port, sse_path, timeout_ms.clamp(500, 1200));
     // Transport WS : upgrade WebSocket acceptée (101) → badge « WS » dans l'UI.
@@ -2075,9 +2668,14 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
             }
         }
     }
+    let locked = crate::auth::net::outbound_identity_for(&host, port)
+        .ok()
+        .flatten()
+        .is_some();
     McpProbe {
         mcp_up: true,
         port_open: true,
+        locked,
         pid: None,
         host: Some(host),
         name,
@@ -2089,6 +2687,7 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
         lang,
         framework,
         tools,
+        metadata_reused: false,
         latency_ms: latency,
         error: None,
     }
@@ -2292,6 +2891,7 @@ pub fn probe_stdio(
             McpProbe {
                 mcp_up: true,
                 port_open: true,
+                locked: false,
                 pid: Some(pid),
                 host: None,
                 name,
@@ -2303,6 +2903,7 @@ pub fn probe_stdio(
                 lang,
                 framework,
                 tools,
+                metadata_reused: false,
                 latency_ms: latency,
                 error: None,
             },
@@ -2315,6 +2916,7 @@ pub fn probe_stdio(
             McpProbe {
                 mcp_up: true,
                 port_open: true,
+                locked: false,
                 pid: Some(pid),
                 host: None,
                 name,
@@ -2326,6 +2928,7 @@ pub fn probe_stdio(
                 lang,
                 framework,
                 tools,
+                metadata_reused: false,
                 latency_ms: latency,
                 error: None,
             },
@@ -2387,22 +2990,139 @@ pub fn rpc_call_host_headers(
 
 /// Probe MCP streamable-HTTP sur un hôte précis : initialize + tools/list.
 pub fn probe_http_host(host: &str, port: u16, path: &str, timeout_ms: u64) -> McpProbe {
+    probe_http_host_with(host, port, path, timeout_ms, &ProbeHint::default())
+}
+
+/// Probe MCP streamable-HTTP sur un hôte précis avec indice de sonde légère (P1 rang 2).
+pub fn probe_http_host_with(
+    host: &str,
+    port: u16,
+    path: &str,
+    timeout_ms: u64,
+    hint: &ProbeHint<'_>,
+) -> McpProbe {
     if !port_open(host, port, Duration::from_millis(timeout_ms.min(1500))) {
         return McpProbe::fail(format!("{}:{} injoignable", host, port), false);
     }
     let t0 = Instant::now();
+    let client_info = json!({
+        "name": "mcp-control",
+        "version": env!("CARGO_PKG_VERSION")
+    });
     let init_params = json!({
         "protocolVersion": "2024-11-05",
         "capabilities": {},
-        "clientInfo": {"name": "mcp-control", "version": env!("CARGO_PKG_VERSION")}
+        "clientInfo": client_info.clone()
     });
-    let (res, head) =
-        match rpc_call_host(host, port, path, "initialize", init_params, 1, timeout_ms) {
-            Ok(x) => x,
-            Err(e) => return McpProbe::fail(e, true),
-        };
-    let latency = t0.elapsed().as_millis() as u64;
-    let si = res.get("serverInfo");
+    let strict_meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": client_info.clone(),
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    let init_strict = json!({
+        "protocolVersion": "2026-07-28",
+        "capabilities": {},
+        "clientInfo": client_info,
+        "_meta": strict_meta.clone()
+    });
+    let strict_init_hdrs: [(&str, &str); 2] = [
+        ("MCP-Protocol-Version", "2026-07-28"),
+        ("Mcp-Method", "initialize"),
+    ];
+
+    let mut attempt: Option<(serde_json::Value, RespHead, u64, bool)> = None;
+    let mut err_hote: Option<String> = None;
+    let mut muet = false;
+    for (params, hdrs, stateless) in [
+        (&init_params, &[][..], false),
+        (&init_strict, &strict_init_hdrs[..], true),
+    ] {
+        match rpc_call_host_headers(
+            host,
+            port,
+            path,
+            "initialize",
+            params.clone(),
+            1,
+            timeout_ms,
+            hdrs,
+        ) {
+            Ok((r, h)) => {
+                attempt = Some((r, h, t0.elapsed().as_millis() as u64, stateless));
+                break;
+            }
+            Err(e) => {
+                let is_locked = e.contains(crate::auth::net::LOCKED_SERVER_MSG);
+                let muet_forme = zero_octets(&e, host);
+                err_hote = Some(e);
+                if is_locked || muet_forme {
+                    muet = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut discovered: Option<serde_json::Value> = None;
+    if attempt.is_none() && !muet {
+        let discover_hdrs: [(&str, &str); 2] = [
+            ("MCP-Protocol-Version", "2026-07-28"),
+            ("Mcp-Method", "server/discover"),
+        ];
+        if let Ok((r, h)) = rpc_call_host_headers(
+            host,
+            port,
+            path,
+            "server/discover",
+            json!({ "_meta": strict_meta.clone() }),
+            1,
+            timeout_ms,
+            &discover_hdrs,
+        ) {
+            let proof = r
+                .get("_meta")
+                .and_then(|m| m.get("io.modelcontextprotocol/serverInfo"))
+                .and_then(|si| si.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|n| !n.trim().is_empty())
+                .unwrap_or(false);
+            if proof {
+                discovered = Some(r);
+                attempt = Some((
+                    serde_json::Value::Null,
+                    h,
+                    t0.elapsed().as_millis() as u64,
+                    true,
+                ));
+            } else {
+                err_hote =
+                    Some("server/discover sans serverInfo : ce port ne parle pas MCP".to_string());
+            }
+        }
+    }
+
+    let (res, head, latency, stateless_mode) = match attempt {
+        Some(x) => x,
+        None => {
+            let motif = err_hote.unwrap_or_else(|| "pas de réponse initialize".to_string());
+            if motif.contains(crate::auth::net::LOCKED_SERVER_MSG) {
+                let health = health_ok_host(host, port, timeout_ms.clamp(400, 1200));
+                return McpProbe::locked_litemcp(
+                    host.to_string(),
+                    health,
+                    t0.elapsed().as_millis() as u64,
+                );
+            }
+            return McpProbe::fail(motif, true);
+        }
+    };
+    let si = discovered
+        .as_ref()
+        .and_then(|d| {
+            d.get("_meta")
+                .and_then(|m| m.get("io.modelcontextprotocol/serverInfo"))
+        })
+        .or_else(|| res.get("serverInfo"));
     let name = si
         .and_then(|s| s.get("name"))
         .and_then(|x| x.as_str())
@@ -2414,12 +3134,53 @@ pub fn probe_http_host(host: &str, port: u16, path: &str, timeout_ms: u64) -> Mc
     let protocol = res
         .get("protocolVersion")
         .and_then(|x| x.as_str())
-        .map(String::from);
+        .map(String::from)
+        .or_else(|| {
+            discovered
+                .as_ref()
+                .and_then(|d| d.get("supportedVersions"))
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|x| x.as_str())
+                .map(String::from)
+        });
+
+    // Sonde légère (P1 rang 2) : si le serveur était déjà UP et que
+    // serverInfo.name + version n'ont pas changé, on saute /sse, WS, /health
+    // et tools/list (réutilisés en cache).
+    let sse = head.sse();
+    if hint.reuse_metadata_if_unchanged
+        && name.as_deref() == hint.prev_name
+        && version.as_deref() == hint.prev_version
+    {
+        let locked = crate::auth::net::outbound_identity_for(host, port)
+            .ok()
+            .flatten()
+            .is_some();
+        return McpProbe {
+            mcp_up: true,
+            port_open: true,
+            locked,
+            pid: None,
+            host: Some(host.to_string()),
+            name,
+            version,
+            protocol,
+            sse,
+            sse_endpoint: false,
+            ws: false,
+            lang: None,
+            framework: None,
+            tools: Vec::new(),
+            metadata_reused: true,
+            latency_ms: latency,
+            error: None,
+        };
+    }
 
     // Même classification que probe_http (voir le commentaire là-bas) :
     // POST initialize répondu = streamable HTTP ; sse = encodage SSE des
     // réponses ; sse_endpoint = /sse legacy co-servi (FastMCP).
-    let sse = head.sse();
     let sse_path = if path == "/sse" { path } else { "/sse" };
     let sse_endpoint = sse_get_host(host, port, sse_path, timeout_ms.clamp(500, 1200));
     // Transport WS : upgrade WebSocket acceptée (101) → badge « WS » dans l'UI.
@@ -2441,13 +3202,22 @@ pub fn probe_http_host(host: &str, port: u16, path: &str, timeout_ms: u64) -> Mc
     if !head.session_id.is_empty() {
         session_hdr.push(("Mcp-Session-Id", head.session_id.as_str()));
     }
+    if stateless_mode {
+        session_hdr.push(("MCP-Protocol-Version", "2026-07-28"));
+        session_hdr.push(("Mcp-Method", "tools/list"));
+    }
+    let tools_params = if stateless_mode {
+        json!({ "_meta": strict_meta })
+    } else {
+        json!({})
+    };
     let mut tools = Vec::new();
     if let Ok((tr, _)) = rpc_call_host_headers(
         host,
         port,
         path,
         "tools/list",
-        json!({}),
+        tools_params,
         2,
         timeout_ms,
         &session_hdr,
@@ -2471,9 +3241,14 @@ pub fn probe_http_host(host: &str, port: u16, path: &str, timeout_ms: u64) -> Mc
             }
         }
     }
+    let locked = crate::auth::net::outbound_identity_for(host, port)
+        .ok()
+        .flatten()
+        .is_some();
     McpProbe {
         mcp_up: true,
         port_open: true,
+        locked,
         pid: None,
         host: Some(host.to_string()),
         name,
@@ -2485,6 +3260,7 @@ pub fn probe_http_host(host: &str, port: u16, path: &str, timeout_ms: u64) -> Mc
         lang,
         framework,
         tools,
+        metadata_reused: false,
         latency_ms: latency,
         error: None,
     }
@@ -2497,17 +3273,67 @@ pub struct PeerProbe {
     pub servers: Option<Value>,
 }
 
-/// Sonde /api/state d'un moteur MCP Control distant (cache de pairs).
-/// `access` : code d'accès API partagé (même valeur des deux côtés).
+/// Sonde un moteur MCP Control distant (cache de pairs).
 ///
-/// SÉCURITÉ (audit 2026-10-24) : le code n'est plus envoyé en clair à la cible —
-/// il était diffusé à toutes les cibles sondées du LAN. Déroulé en deux phases :
-/// 1. GET /api/hello (préauth) → un moteur MCP Control répond avec un nonce à usage unique ;
-/// 2. POST /api/state avec X-MCC-Nonce + X-MCC-Proof = HMAC-SHA256(code, nonce)
-///    (cf. crypto.rs) — un observateur réseau ne récupère qu'une preuve morte.
-///
-/// Un pair en bind loopback accepte aussi la sonde sans preuve (pas de garde).
+/// Lot M4 (point 3, `docs/auth.md` §10) :
+/// 1. Si ce pair est appairé (identité cliente épinglée dans `auth/clients/`),
+///    la sonde utilise `POST /mcp` (`tools/call` `list_servers`, droit
+///    `lecture`), signé avec l'identité cliente et vérifiant `PinnedServer`
+///    en TLS 1.3 hors loopback — plus aucun secret partagé `X-MCC-Proof`.
+/// 2. Repli transitoire DA3 (0.8.x) : si aucun appairage n'existe encore pour
+///    cette cible, conserve le chemin lecture seule `/api/hello` + `/api/state`
+///    avec `X-MCC-Proof` (ou sans preuve sur loopback).
 pub fn probe_peer(ip: &str, port: u16, access: Option<&str>) -> PeerProbe {
+    match crate::auth::net::outbound_identity_for(ip, port) {
+        Err(_) => {
+            return PeerProbe {
+                alive: false,
+                servers: None,
+            };
+        }
+        Ok(Some(_)) => {
+            let hdrs = [("Mcp-Method", "tools/call"), ("Mcp-Name", "list_servers")];
+            let Ok((res, _)) = rpc_call_host_headers(
+                ip,
+                port,
+                "/mcp",
+                "tools/call",
+                json!({ "name": "list_servers", "arguments": {} }),
+                1,
+                2000,
+                &hdrs,
+            ) else {
+                return PeerProbe {
+                    alive: false,
+                    servers: None,
+                };
+            };
+            let doc = res
+                .get("structuredContent")
+                .cloned()
+                .or_else(|| {
+                    res.get("content")
+                        .and_then(|c| c.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|item| item.get("text"))
+                        .and_then(|t| t.as_str())
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                })
+                .unwrap_or(res);
+            if doc.get("servers").is_some() && doc.get("stats").is_some() {
+                return PeerProbe {
+                    alive: true,
+                    servers: Some(doc),
+                };
+            }
+            return PeerProbe {
+                alive: false,
+                servers: None,
+            };
+        }
+        Ok(None) => {}
+    }
+
     let nonce: Option<String> = match http_get_host(ip, port, "/api/hello", 1200) {
         Ok((bytes, _)) => match serde_json::from_slice::<Value>(&bytes) {
             Ok(v) if v.get("app").and_then(|x| x.as_str()) == Some("mcp-control") => {
@@ -2569,7 +3395,7 @@ pub fn probe_peer(ip: &str, port: u16, access: Option<&str>) -> PeerProbe {
 /// IPs voisines depuis le cache ARP local (Windows: arp -a, Linux/mac: arp -a).
 /// Filtrées sur le /24 demandé, sans self.
 pub fn arp_hosts(prefix: &str, self_ip: &str) -> Vec<String> {
-    let mut c = Command::new("arp");
+    let mut c = Command::new(system_tool("arp"));
     let out = hidden(&mut c).arg("-a").output();
     let stdout = match out {
         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
@@ -2633,6 +3459,33 @@ pub fn control_ui_at_hosts(port: u16, hosts: &[&str]) -> Option<String> {
                         format!("{}:{}", host, port)
                     };
                     return Some(format!("http://{}", h));
+                }
+            }
+        } else if !crate::is_loopback_bind(host) {
+            let host_hdr = http_host_header(host, port);
+            let req = format!(
+                "GET /api/hello HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                host_hdr
+            );
+            if let Ok((raw, _)) = crate::auth::net::https_exchange_raw(
+                host,
+                port,
+                req.as_bytes(),
+                Duration::from_millis(2000),
+                None,
+                MAX_PROBE_READ_SMALL,
+            ) {
+                if let Some(sep) = find_sub(&raw, b"\r\n\r\n") {
+                    if let Ok(v) = serde_json::from_slice::<Value>(&raw[sep + 4..]) {
+                        if v.get("app").and_then(|x| x.as_str()) == Some("mcp-control") {
+                            let h = if host.contains(':') {
+                                format!("[{}]:{}", host, port)
+                            } else {
+                                format!("{}:{}", host, port)
+                            };
+                            return Some(format!("http://{}", h));
+                        }
+                    }
                 }
             }
         }
@@ -3770,6 +4623,49 @@ tcp4       0      0  127.0.0.1.135          *.*                    LISTEN\n";
         assert!(
             !err.contains("réponse non JSON"),
             "l'ancien message trompeur ne doit plus apparaître : {err}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system_tool_utilise_chemin_absolu_et_ignore_le_dossier_courant() {
+        for nom in [
+            "netstat",
+            "tasklist",
+            "taskkill",
+            "reg",
+            "icacls",
+            "powershell",
+            "explorer",
+            "rundll32",
+            "ipconfig",
+            "ping",
+            "arp",
+        ] {
+            let p = system_tool(nom);
+            assert!(p.is_absolute(), "{nom} doit être un chemin absolu : {p:?}");
+            assert!(
+                p.exists(),
+                "{nom} introuvable à l'emplacement système : {p:?}"
+            );
+        }
+        // Négatif : un faux reg.exe déposé dans le dossier de travail n'est pas
+        // pris par system_command (seul System32\reg.exe est exécuté).
+        let dir = std::env::temp_dir().join(format!("mcc-systool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let leurre = dir.join("reg.exe");
+        std::fs::write(&leurre, b"ceci n'est pas un executable valide").unwrap();
+        assert_ne!(system_tool("reg"), leurre);
+        let out = system_command("reg")
+            .arg("/?")
+            .current_dir(&dir)
+            .output()
+            .expect("reg.exe système");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            out.status.success(),
+            "le vrai reg.exe doit répondre même avec un leurre dans cwd"
         );
     }
 }

@@ -59,40 +59,59 @@ fn tmp_config(nom: &str, contenu: Option<&str>) -> String {
 }
 
 #[test]
-fn config_absente_renvoie_les_seeds() {
+fn installation_neuve_demarre_sans_serveur() {
+    // Audit S4, point 8 : plus AUCUN serveur ni chemin propre à une machine.
+    // Une installation neuve = liste vide (la découverte la remplit) ; les
+    // réglages par défaut restent ceux du produit.
     let (servers, st) = load_config(&tmp_config("inexistant_aucune_chance.json", None));
-    assert_eq!(servers.len(), 8);
-    assert_eq!(servers[0].id, "seed-overmind");
+    assert!(
+        servers.is_empty(),
+        "default_servers() doit être vide, obtenu : {:?}",
+        servers.iter().map(|s| &s.id).collect::<Vec<_>>()
+    );
     assert_eq!(st.refresh_secs, 15);
-    for id in ["seed-debats", "seed-news-btc", "seed-news"] {
-        let s = servers.iter().find(|s| s.id == id).unwrap();
-        assert!(!s.enabled, "{} doit etre desactive par defaut", id);
-        assert_eq!(s.state, SState::Disabled);
-    }
-    for id in [
-        "seed-overmind",
-        "seed-discord",
-        "seed-postgresql",
-        "seed-x",
-        "seed-litemcp",
-    ] {
-        assert!(servers.iter().find(|s| s.id == id).unwrap().enabled);
-    }
+    assert_eq!(st.ui_port, 5090);
+    assert!(!default_servers().iter().any(|s| s.start_cmd.is_some()));
+}
+
+#[test]
+fn migration_les_entrees_seed_existantes_restent() {
+    // Migration : un config.json écrit par une version antérieure garde ses
+    // entrées `seed-*` telles quelles (relues comme des serveurs manuels).
+    // Rien n'est réinjecté au démarrage, `removed_seeds` ne les supprime pas
+    // puisqu'elles sont persistées.
+    let cfg = r#"{"servers":[
+        {"id":"seed-overmind","label":"Overmind","transport":"http","port":3099,"path":"/mcp","program":"node","args":["C:/ws/Workflow/bin/launch.cjs"],"workdir":"C:/ws/Workflow","enabled":true},
+        {"id":"seed-news","label":"NEWS","transport":"http","port":3144,"path":"/mcp","enabled":false}
+    ],"settings":{"removed_seeds":["seed-news"]}}"#;
+    let (servers, st) = load_config(&tmp_config("cfg_migration_seeds.json", Some(cfg)));
+    assert_eq!(servers.len(), 2, "les deux entrées persistées restent");
+    let ov = servers.iter().find(|s| s.id == "seed-overmind").unwrap();
+    assert_eq!(ov.origin, Origin::Manual, "relu comme un serveur manuel");
+    assert_eq!(ov.label, "Overmind");
+    assert_eq!(
+        ov.start_cmd.as_ref().map(|c| c.program.as_str()),
+        Some("node")
+    );
+    assert!(
+        servers.iter().any(|s| s.id == "seed-news" && !s.enabled),
+        "removed_seeds ne retire pas une entrée persistée"
+    );
+    assert_eq!(st.removed_seeds, vec!["seed-news".to_string()]);
 }
 
 #[test]
 fn seed_retire_durablement_nest_pas_reinjecte() {
-    // « Retirer durablement » : settings.removed_seeds filtre les seeds
-    // réinjectés par défaut au chargement de la config
+    // « Retirer durablement » : settings.removed_seeds ne réintroduit AUCUN
+    // serveur au chargement. Depuis le lot S4 il n'y a plus de seeds par
+    // défaut : le réglage reste lu (compatibilité) et une config qui ne
+    // contient rien donne une liste vide.
     let cfg = "{\"settings\":{\"removed_seeds\":[\"seed-news\"]}}";
     let (servers, st) = load_config(&tmp_config("cfg_seed_retire.json", Some(cfg)));
     assert!(
-        servers.iter().all(|s| s.id != "seed-news"),
-        "seed-news retiré durablement ne doit pas être réinjecté"
-    );
-    assert!(
-        servers.iter().any(|s| s.id == "seed-litemcp"),
-        "les autres seeds restent"
+        servers.is_empty(),
+        "aucun seed ne doit être réinjecté : {:?}",
+        servers.iter().map(|s| &s.id).collect::<Vec<_>>()
     );
     assert_eq!(st.removed_seeds, vec!["seed-news".to_string()]);
 }
@@ -102,13 +121,11 @@ fn remove_durable_consigne_le_seed_dans_la_config() {
     // Roundtrip complet : action API « remove durable » → config.json
     // → rechargement : le seed n'est plus là
     let path = tmp_config("cfg_remove_durable.json", None);
+    let mut seed = srv_http("seed-news", None, "NEWS", None, 3144, Origin::Seed, None);
+    seed.enabled = false;
+    seed.state = SState::Disabled;
     let state = Arc::new(AppState {
-        servers: Mutex::new(
-            default_servers()
-                .into_iter()
-                .filter(|s| s.id == "seed-news")
-                .collect(),
-        ),
+        servers: Mutex::new(vec![seed]),
         log: Mutex::new(VecDeque::new()),
         settings: Mutex::new(Settings::default()),
         children: Mutex::new(std::collections::HashMap::new()),
@@ -174,8 +191,12 @@ fn autostart_est_persiste_et_expose() {
     let d = state_json(&state);
     assert_eq!(d["autostart"], serde_json::json!(false));
     // l'action reflète la valeur demandée — apply_autostart est neutralisé
-    // sous cfg(test) (jamais d'écriture OS depuis les tests)
-    let j = handle_action(&state, "{\"action\":\"set_autostart\",\"enabled\":true}");
+    // sous cfg(test) (jamais d'écriture OS depuis les tests). confirm:true
+    // évite de dépendre d'une éventuelle entrée Run réelle sur la machine hôte.
+    let j = handle_action(
+        &state,
+        "{\"action\":\"set_autostart\",\"enabled\":true,\"confirm\":true}",
+    );
     assert_eq!(j["ok"], serde_json::json!(true));
     assert!(lockv(&state.settings).autostart);
     // NB : j["active"] reflète le registre/fichier RÉEL — non testé (effet OS)
@@ -374,52 +395,35 @@ fn cache_roundtrip_restaure_le_dernier_etat() {
 }
 
 #[test]
-fn seeds_ont_une_commande_de_lancement() {
+fn aucun_serveur_par_defaut_ne_porte_de_chemin_de_machine() {
+    // Garde du point 8 : la liste par défaut est vide, donc aucun chemin
+    // `C:/Users/...` ni serveur personnel ne peut être lancé sur une
+    // installation neuve. Le test échoue si quelqu'un réintroduit un seed.
     let servers = default_servers();
-    for s in &servers {
-        let cmd = s
-            .start_cmd
-            .as_ref()
-            .unwrap_or_else(|| panic!("{} doit avoir une start_cmd", s.id));
-        if s.id == "seed-litemcp" {
-            // démo litemcp : binaire Rust release, pas un launcher node
-            assert!(
-                cmd.program
-                    .ends_with("/litemcp/target/release/examples/hello.exe"),
-                "seed-litemcp doit lancer hello.exe, pas {}",
-                cmd.program
-            );
-        } else {
-            assert_eq!(cmd.program, "node");
-            assert!(
-                cmd.args
-                    .first()
-                    .map(|a| a.ends_with("/bin/launch.cjs"))
-                    .unwrap_or(false),
-                "{} doit lancer son bin/launch.cjs",
-                s.id
-            );
-        }
-        assert!(cmd.workdir.is_some(), "{} doit avoir un workdir", s.id);
-    }
-    let ov = servers.iter().find(|s| s.id == "seed-overmind").unwrap();
-    let cmd = ov.start_cmd.as_ref().unwrap();
-    assert!(cmd.args[0].ends_with("/Workflow/bin/launch.cjs"));
-    assert!(cmd.workdir.as_deref().unwrap().ends_with("/Workflow"));
-    let lm = servers.iter().find(|s| s.id == "seed-litemcp").unwrap();
     assert!(
-        matches!(&lm.transport, Transport::Http { port: 8080, .. }),
-        "seed-litemcp doit viser le port 8080"
+        servers.is_empty(),
+        "aucun serveur par défaut attendu, obtenu : {:?}",
+        servers.iter().map(|s| &s.id).collect::<Vec<_>>()
     );
+    let cfg = tmp_config("cfg_defauts_vides.json", None);
+    let (charges, _) = load_config(&cfg);
+    assert!(charges.is_empty());
 }
 
 #[test]
 fn load_config_reactive_un_seed_et_ajoute_un_inconnu() {
-    let cfg = "{\"servers\":[{\"id\":\"seed-debats\",\"enabled\":true},{\"id\":\"mon-mcp\",\"label\":\"Mon MCP\",\"transport\":\"http\",\"port\":4567,\"path\":\"/x\",\"enabled\":false}]}";
+    // Une entrée `seed-*` persistée est relue comme n'importe quel serveur
+    // (plus de seed par défaut à « réactiver ») ; un inconnu est ajouté.
+    let cfg = "{\"servers\":[{\"id\":\"seed-debats\",\"label\":\"debats\",\"transport\":\"http\",\"port\":3100,\"path\":\"/mcp\",\"enabled\":true},{\"id\":\"mon-mcp\",\"label\":\"Mon MCP\",\"transport\":\"http\",\"port\":4567,\"path\":\"/x\",\"enabled\":false}]}";
     let (servers, _) = load_config(&tmp_config("cfg_mixte.json", Some(cfg)));
     let debats = servers.iter().find(|s| s.id == "seed-debats").unwrap();
     assert!(debats.enabled);
     assert_eq!(debats.state, SState::Down);
+    assert_eq!(
+        debats.origin,
+        Origin::Manual,
+        "une entrée persistée ne redevient pas un seed"
+    );
     let m = servers.iter().find(|s| s.id == "mon-mcp").unwrap();
     assert_eq!(m.origin, Origin::Manual);
     assert!(!m.enabled);
@@ -1483,189 +1487,322 @@ fn set_start_cmd_refuse_seed_et_distant_persiste_le_local() {
     );
 }
 
+/// Verrou sérialisant les tests qui modifient `MCC_LITEMP_REGISTRY` en
+/// parallèle dans le même process de test.
+fn litemp_env_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// Helper : dossier d'annonces isolé pour un test (jamais %TEMP% réel).
+fn dossier_annonces(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("mcc-annonces-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("créer le dossier d'annonces");
+    dir
+}
+
 #[test]
-fn annonce_litemcp_importe_adopte_et_resynchronise() {
-    // Persistance MCP Control <-> litemcp : une annonce (%TEMP%/
-    // litemcp-registry/<nom>.json écrite par la lib au bind) crée le
-    // serveur avec sa commande native, ADOpte un serveur découvert par
-    // scan (sans commande → promotion manual), resynchronise le port,
-    // et ne réécrit jamais une commande déjà posée.
-    let path = tmp_config("cfg_litemcp.json", Some("{\"servers\":[]}"));
+fn annonces_litemcp_listees_sans_adoption_ni_ecriture() {
+    let _env_garde = litemp_env_guard();
+    // Audit S4, point 2 : une annonce trouvée est LISTÉE (« détecté, non
+    // suivi »), jamais adoptée : aucun serveur créé, aucun config.json écrit,
+    // aucun champ exécuté (exe/args ne sortent même pas de la lecture).
+    let dir = dossier_annonces("lecture");
+    std::fs::write(
+        dir.join("moltbook.json"),
+        r#"{"name":"moltbook","port":8787,"version":"0.3.0","exe":"C:/ws/moltbook.exe","args":["C:/ws/moltbook.exe"],"cwd":"C:/ws"}"#,
+    )
+    .unwrap();
+    // au-delà de 64 Kio : écarté, jamais lu
+    std::fs::write(dir.join("enorme.json"), "x".repeat(64 * 1024 + 1)).unwrap();
+    std::fs::write(dir.join("casse.json"), "pas du json").unwrap();
+    // un dossier nommé *.json n'est pas une annonce
+    std::fs::create_dir_all(dir.join("dossier.json")).unwrap();
+    let path = tmp_config("cfg_annonces.json", None);
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
         Err(_) => panic!("test_state doit être unique"),
     };
     base.config_path = path.clone();
     let state = Arc::new(base);
-    {
-        let mut st = lockv(&state.settings);
-        st.autostart = false;
-    }
-    {
-        let mut servers = lockv(&state.servers);
-        // découvert par scan : même nom, sans commande (cas moltbook réel)
-        servers.push(Server {
-            id: "disc-8787".into(),
-            label: "moltbook".into(),
-            transport: Transport::Http {
-                host: None,
-                port: 3166,
-                path: "/mcp".into(),
-            },
-            origin: Origin::Discovered,
-            enabled: true,
-            state: SState::Down,
-            pid: None,
-            bound_host: None,
-            server_name: None,
-            version: None,
-            protocol: None,
-            sse: false,
-            sse_endpoint: false,
-            ws: false,
-            lang: Some("rust".into()),
-            framework: Some("litemcp".into()),
-            via_ssh: false,
-            tools: vec![],
-            latency_ms: None,
-            last_seen_ts: None,
-            last_error: None,
-            start_cmd: None,
-            auto_restart: true,
-            favorite: false,
-            tools_disabled: vec![],
-        });
-        // même serveur mais avec une commande déjà posée (choix utilisateur)
-        servers.push(Server {
-            id: "man-cmd".into(),
-            label: "deja-cmd".into(),
-            transport: Transport::Http {
-                host: None,
-                port: 9001,
-                path: "/mcp".into(),
-            },
-            origin: Origin::Manual,
-            enabled: true,
-            state: SState::Down,
-            pid: None,
-            bound_host: None,
-            server_name: None,
-            version: None,
-            protocol: None,
-            sse: false,
-            sse_endpoint: false,
-            ws: false,
-            lang: None,
-            framework: None,
-            via_ssh: false,
-            tools: vec![],
-            latency_ms: None,
-            last_seen_ts: None,
-            last_error: None,
-            start_cmd: Some(StartCmd {
-                program: "python".into(),
-                args: vec!["serve.py".into()],
-                workdir: None,
-                env: Vec::new(),
-            }),
-            auto_restart: true,
-            favorite: false,
-            tools_disabled: vec![],
-        });
-    }
+    std::env::set_var("MCC_LITEMP_REGISTRY", &dir);
 
-    // 1. création : annonce d'un serveur absent de la liste
-    let j = serde_json::json!({
-        "name": "nouveau", "version": "1.2.3", "port": 9999, "pid": 42,
-        "exe": "C:/apps/nouveau.exe", "args": ["C:/apps/nouveau.exe", "--bind", "9999"],
-        "cwd": "C:/apps", "ts": 1000
-    });
+    let v = litemcp_announcements(&state);
+    std::env::remove_var("MCC_LITEMP_REGISTRY");
+
+    let arr = v.get("announcements").and_then(|a| a.as_array()).unwrap();
+    let molt = arr
+        .iter()
+        .find(|a| a.get("name") == Some(&serde_json::json!("moltbook")))
+        .expect("moltbook listé");
+    assert_eq!(molt.get("port"), Some(&serde_json::json!(8787)));
+    assert_eq!(molt.get("followed"), Some(&serde_json::json!(false)));
+    assert_eq!(molt.get("detected"), Some(&serde_json::json!(true)));
     assert!(
-        apply_announcement(&state, &j),
-        "une annonce d'inconnu doit créer le serveur"
+        molt.get("exe").is_none() && molt.get("args").is_none(),
+        "aucun champ exécutable ne doit sortir de la lecture : {molt}"
     );
-    {
-        let servers = lockv(&state.servers);
-        let s = servers
-            .iter()
-            .find(|s| s.id == "litemcp-nouveau")
-            .expect("créé");
-        assert_eq!(s.origin, Origin::Manual);
-        assert_eq!(s.version.as_deref(), Some("1.2.3"));
-        let cmd = s.start_cmd.as_ref().expect("commande native");
-        assert_eq!(cmd.program, "C:/apps/nouveau.exe");
-        assert_eq!(
-            cmd.args,
-            vec!["--bind".to_string(), "9999".to_string()],
-            "args[0] (l'exe) doit être ignoré"
-        );
-        assert_eq!(cmd.workdir.as_deref(), Some("C:/apps"));
-    }
-
-    // 2. adoption : disc-8787 (moltbook, port 3166 sans commande) reçoit
-    //    la commande de l'annonce + resync du port 8787 + promotion manual
-    let j2 = serde_json::json!({
-        "name": "moltbook", "version": "0.3.0", "port": 8787, "pid": 25044,
-        "exe": "C:/ws/target/debug/moltbook-mcp.exe", "args": ["C:/ws/target/debug/moltbook-mcp.exe"],
-        "cwd": "C:/ws", "ts": 2000
-    });
-    assert!(apply_announcement(&state, &j2));
-    {
-        let servers = lockv(&state.servers);
-        let s = servers
-            .iter()
-            .find(|s| s.id == "disc-8787")
-            .expect("existant");
-        assert_eq!(s.origin, Origin::Manual, "adoption = promotion manual");
-        let Transport::Http { port, .. } = s.transport else {
-            panic!("http")
-        };
-        assert_eq!(port, 8787, "port resynchronisé depuis l'annonce");
-        let cmd = s.start_cmd.as_ref().expect("commande adoptée");
-        assert_eq!(cmd.program, "C:/ws/target/debug/moltbook-mcp.exe");
-        assert!(cmd.args.is_empty(), "moltbook tourne sans argument");
-        assert_eq!(
-            cmd.workdir.as_deref(),
-            Some("C:/ws"),
-            "cwd = là où vivent les état json"
-        );
-        assert_eq!(s.version.as_deref(), Some("0.3.0"));
-    }
-
-    // 3. pas de réécriture : deja-cmd garde SA commande
-    let j3 = serde_json::json!({
-        "name": "deja-cmd", "version": "2.0", "port": 9001, "pid": 7,
-        "exe": "C:/autre/autre.exe", "args": ["C:/autre/autre.exe"], "cwd": "C:/autre", "ts": 3000
-    });
+    let skipped = v.get("skipped").and_then(|a| a.as_array()).unwrap();
     assert!(
-        apply_announcement(&state, &j3),
-        "le ts plus récent compte comme changement"
-    );
-    {
-        let servers = lockv(&state.servers);
-        let s = servers
+        skipped
             .iter()
-            .find(|s| s.id == "man-cmd")
-            .expect("existant");
-        let cmd = s
-            .start_cmd
-            .as_ref()
-            .expect("la commande de l'utilisateur est conservée");
-        assert_eq!(cmd.program, "python");
-        assert_eq!(cmd.args, vec!["serve.py".to_string()]);
-    }
-
-    // 4. annonce invalide (port 0 / exe vide) → ignorée, rien ne change
-    let n_avant = lockv(&state.servers).len();
-    let j4 = serde_json::json!({"name": "cassé", "port": 0, "exe": "x"});
-    assert!(!apply_announcement(&state, &j4));
-    let j5 = serde_json::json!({"name": "cassé", "port": 8080, "exe": ""});
-    assert!(!apply_announcement(&state, &j5));
+            .any(|s| s.to_string().contains("trop volumineux")),
+        "le fichier > 64 Kio doit être écarté : {skipped:?}"
+    );
+    assert!(
+        skipped
+            .iter()
+            .any(|s| s.to_string().contains("JSON invalide")),
+        "le JSON invalide doit être écarté : {skipped:?}"
+    );
+    assert!(
+        skipped
+            .iter()
+            .any(|s| s.to_string().contains("fichier ordinaire")),
+        "un dossier .json doit être écarté : {skipped:?}"
+    );
+    // la garde de propriété est bien appliquée (positif + négatif)
     assert_eq!(
-        lockv(&state.servers).len(),
-        n_avant,
-        "aucun serveur cassé créé"
+        probe::file_owned_by_current_user(&dir.join("moltbook.json")),
+        Some(true),
+        "l'annonce de test appartient au compte courant"
     );
+    assert!(owner_check_result(Some(true)).is_ok());
+    assert!(owner_check_result(None).is_ok());
+    let refus =
+        owner_check_result(Some(false)).expect_err("un autre propriétaire doit être refusé");
+    assert!(refus.contains("autre compte"), "{refus}");
+    #[cfg(windows)]
+    {
+        let sys_file = std::path::Path::new(r"C:\Windows\System32\notepad.exe");
+        if sys_file.exists() {
+            assert_ne!(
+                probe::file_owned_by_current_user(sys_file),
+                Some(true),
+                "un binaire système (TrustedInstaller) ne doit pas passer le contrôle de propriété"
+            );
+        }
+    }
+    // aucune adoption : liste vide, aucun config.json créé
+    assert!(lockv(&state.servers).is_empty(), "aucun serveur adopté");
+    assert!(
+        !std::path::Path::new(&path).exists(),
+        "la lecture d'annonces ne doit RIEN écrire sur le disque"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Nombre borné : 40 fichiers, 32 examinés au plus.
+    let dir = dossier_annonces("borne");
+    for i in 0..40 {
+        std::fs::write(
+            dir.join(format!("filler-{i}.json")),
+            format!(r#"{{"name":"filler-{i}","port":{} }}"#, 20000 + i),
+        )
+        .unwrap();
+    }
+    std::env::set_var("MCC_LITEMP_REGISTRY", &dir);
+    let v = litemcp_announcements(&state);
+    std::env::remove_var("MCC_LITEMP_REGISTRY");
+    let n = v
+        .get("announcements")
+        .and_then(|a| a.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert!(n <= 32, "32 fichiers examinés au plus, obtenu {n}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+#[test]
+fn reglages_de_decouverte_parses_et_appliques() {
+    // Point 3 : validation des ports de découverte (1-65535, doublons, plafond)
+    // et filtre « seulement / exclus ».
+    let cfg = r#"{"settings":{"discovery_ports_only":[8787,8787,0,70000,"x",3000],"discovery_ports_excluded":[3131]}}"#;
+    let (_, st) = load_config(&tmp_config("cfg_decouverte.json", Some(cfg)));
+    assert_eq!(st.discovery_ports_only, vec![8787, 3000]);
+    assert_eq!(st.discovery_ports_excluded, vec![3131]);
+    assert!(discovery_port_allowed(8787, &st.discovery_ports_only, &[]));
+    assert!(!discovery_port_allowed(8788, &st.discovery_ports_only, &[]));
+    assert!(!discovery_port_allowed(
+        3131,
+        &[],
+        &st.discovery_ports_excluded
+    ));
+    assert!(discovery_port_allowed(
+        3132,
+        &[],
+        &st.discovery_ports_excluded
+    ));
+    assert!(
+        !discovery_port_allowed(8787, &[8787], &[8787]),
+        "excluded doit toujours primer sur only"
+    );
+    // plafond : 512 entrées max, aucun doublon
+    let arr: Vec<serde_json::Value> = (1..=700).map(|p| serde_json::json!(p)).collect();
+    let ports = parse_port_list(&arr, 512);
+    assert_eq!(ports.len(), 512);
+    assert_eq!(ports.first(), Some(&1));
+    assert_eq!(ports.last(), Some(&512));
+}
+
+#[test]
+fn temporaires_orphelins_purges_au_chargement() {
+    // Point 4 : un kill pendant l'écriture laissait un `.tmp` complet (secrets
+    // compris). Le boot les supprime avant toute écriture.
+    let dir = std::env::temp_dir().join(format!("mcc-tmp-purge-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("config.json");
+    std::fs::write(&cfg, "{\"servers\":[]}").unwrap();
+    std::fs::write(dir.join("config.json.123.0.tmp"), "secrets").unwrap();
+    std::fs::write(dir.join("state-cache.json.123.1.tmp"), "cache").unwrap();
+    std::fs::write(dir.join("mcc.log"), "journal").unwrap();
+    let (_, _) = load_config(&cfg.to_string_lossy());
+    assert!(
+        !dir.join("config.json.123.0.tmp").exists(),
+        "tmp config purgé"
+    );
+    assert!(
+        !dir.join("state-cache.json.123.1.tmp").exists(),
+        "tmp cache purgé"
+    );
+    assert!(cfg.exists(), "la config elle-même reste intacte");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[allow(clippy::permissions_set_readonly_false)] // test : remise en écriture après l'assertion
+fn echec_d_ecriture_remonte_et_ne_laisse_pas_de_tmp() {
+    // Point 4 : plus de `ok:true` mensonger. Un config.json en lecture seule
+    // fait échouer l'écriture : l'action rend ok:false avec la cause, aucun
+    // `.tmp` ne subsiste.
+    let dir = std::env::temp_dir().join(format!("mcc-ro-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("config.json");
+    std::fs::write(&cfg, "{\"servers\":[]}").unwrap();
+    let mut perms = std::fs::metadata(&cfg).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&cfg, perms).unwrap();
+
+    let mut base = match Arc::try_unwrap(test_state()) {
+        Ok(s) => s,
+        Err(_) => panic!("test_state doit être unique"),
+    };
+    base.config_path = cfg.to_string_lossy().to_string();
+    let state = Arc::new(base);
+    let rep = handle_action(&state, "{\"action\":\"set_settings\",\"refresh_secs\":42}");
+    let ok = rep.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+    let err = rep.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    // remise en écriture AVANT les assertions (nettoyage garanti)
+    let mut perms = std::fs::metadata(&cfg).unwrap().permissions();
+    perms.set_readonly(false);
+    std::fs::set_permissions(&cfg, perms).unwrap();
+    assert!(
+        !ok,
+        "une écriture ratée ne doit pas répondre ok:true : {rep}"
+    );
+    assert!(
+        err.contains("config non écrite"),
+        "le motif doit être explicite : {rep}"
+    );
+    let tmp: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(tmp.is_empty(), "aucun .tmp ne doit rester : {tmp:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ecriture_atomique_disque_plein_laisse_config_intacte_et_aucun_tmp() {
+    // Point 4 (disque plein simulé) : si l'écriture dans le `.tmp` échoue à
+    // mi-chemin (ENOSPC), le temporaire partiel est supprimé et le fichier
+    // cible reste intact et parsable.
+    let dir = std::env::temp_dir().join(format!("mcc-enospc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("config.json");
+    let intact = r#"{"servers":[{"id":"s1","label":"Intact","transport":"http","port":4123,"path":"/mcp"}]}"#;
+    std::fs::write(&cfg, intact).unwrap();
+
+    let res = write_atomic_with(&cfg.to_string_lossy(), "config", |tmp| {
+        std::fs::write(tmp, b"{\"servers\":[tronque")?;
+        Err(std::io::Error::other(
+            "No space left on device (ENOSPC simulé)",
+        ))
+    });
+    assert!(res.is_err(), "un échec ENOSPC doit remonter en Err");
+    let contenu = std::fs::read_to_string(&cfg).unwrap();
+    assert_eq!(
+        contenu, intact,
+        "config.json doit rester intact après ENOSPC"
+    );
+    let tmp: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(
+        tmp.is_empty(),
+        "aucun .tmp partiel ne doit rester : {tmp:?}"
+    );
+
+    // save_config_checked vers un dossier inexistant → Err, aucun .tmp créé
+    let mut base = match Arc::try_unwrap(test_state()) {
+        Ok(s) => s,
+        Err(_) => panic!("test_state doit être unique"),
+    };
+    base.config_path = dir
+        .join("absent")
+        .join("config.json")
+        .to_string_lossy()
+        .to_string();
+    let state = Arc::new(base);
+    assert!(save_config_checked(&state).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ACL Windows : l'utilisateur, SYSTEM et le groupe Administrateurs. Vérifié
+/// par les SID (indépendants de la langue) via Get-Acl.
+#[cfg(windows)]
+#[test]
+fn acl_config_cache_et_journal_utilisateur_system_administrateurs() {
+    let dir = std::env::temp_dir().join(format!("mcc-acl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("config.json");
+    std::fs::write(&cfg, "{\"servers\":[]}").unwrap();
+    std::fs::write(dir.join("state-cache.json"), "{}").unwrap();
+    std::fs::write(dir.join("mcc.log"), "").unwrap();
+    secure_data_files(&cfg.to_string_lossy());
+    let moi = probe::current_user_sid().expect("SID courant");
+    for nom in ["config.json", "state-cache.json", "mcc.log"] {
+        let p = dir.join(nom);
+        let script = format!(
+            "(Get-Acl -LiteralPath '{}').Access | ForEach-Object {{ $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }}",
+            p.to_string_lossy()
+        );
+        let out = probe::system_command("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .expect("powershell");
+        let sids = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            sids.contains(&moi),
+            "{nom} : compte courant absent — {sids}"
+        );
+        assert!(sids.contains("S-1-5-18"), "{nom} : SYSTEM absent — {sids}");
+        assert!(
+            sids.contains("S-1-5-32-544"),
+            "{nom} : Administrateurs absent — {sids}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -1857,6 +1994,83 @@ fn release_asset_table_blanche_couvre_toutes_les_plateformes() {
 }
 
 #[test]
+fn sha256sums_somme_presente_est_lue_et_normalisee() {
+    // Format exact de release.yml : `sha256sum * | sort -k2` → « somme  nom ».
+    // La ligne binaire (`somme *nom`) et les majuscules restent acceptées.
+    let a = "a".repeat(64);
+    let sums = format!(
+        "{a}  mcp-control-cli-linux-x86_64\n{} *mcp-control-desktop-windows-x86_64-setup.exe\n",
+        "B".repeat(64)
+    );
+    assert_eq!(
+        sha256_for_asset(&sums, "mcp-control-cli-linux-x86_64"),
+        Sha256Lookup::Found(a)
+    );
+    assert_eq!(
+        sha256_for_asset(&sums, "mcp-control-desktop-windows-x86_64-setup.exe"),
+        Sha256Lookup::Found("b".repeat(64)),
+        "ligne binaire `*nom` tolérée, majuscules normalisées"
+    );
+}
+
+#[test]
+fn sha256sums_somme_absente_ou_fichier_vide() {
+    // Actif non listé = Absent, PAS une erreur : le fichier a été lu, la somme
+    // manque — à distinguer d'un échec réseau (Err).
+    let sums = format!("{}  mcp-control-cli-linux-x86_64\n", "c".repeat(64));
+    assert_eq!(
+        sha256_for_asset(&sums, "mcp-control-desktop-macos-universal"),
+        Sha256Lookup::Absent
+    );
+    assert_eq!(
+        sha256_for_asset("", "mcp-control-cli-linux-x86_64"),
+        Sha256Lookup::Absent
+    );
+    assert_eq!(
+        sha256_for_asset("\n\n  \n", "mcp-control-cli-linux-x86_64"),
+        Sha256Lookup::Absent
+    );
+}
+
+#[test]
+fn sha256sums_somme_malformee_est_signalee() {
+    let asset = "mcp-control-cli-windows-x86_64.exe";
+    // somme tronquée (63 caractères)
+    assert_eq!(
+        sha256_for_asset(&format!("{}  {asset}\n", "d".repeat(63)), asset),
+        Sha256Lookup::Malformed
+    );
+    // 64 caractères mais pas hexadécimaux
+    assert_eq!(
+        sha256_for_asset(&format!("{}z  {asset}\n", "d".repeat(63)), asset),
+        Sha256Lookup::Malformed
+    );
+    // deux lignes contradictoires pour le même actif : on ne choisit pas
+    let conflit = format!("{}  {asset}\n{}  {asset}\n", "d".repeat(64), "e".repeat(64));
+    assert_eq!(sha256_for_asset(&conflit, asset), Sha256Lookup::Malformed);
+    // ligne sans nom : ignorée, donc Absent et non Malformed
+    assert_eq!(
+        sha256_for_asset(&format!("{}\n", "d".repeat(64)), asset),
+        Sha256Lookup::Absent
+    );
+}
+
+#[test]
+fn sha256sums_url_refuse_un_tag_hors_gabarit() {
+    assert_eq!(
+        sha256sums_url("v0.7.21").as_deref(),
+        Some(
+            "https://github.com/DeamonDev888/mcp-control/releases/download/v0.7.21/SHA256SUMS.txt"
+        )
+    );
+    for mauvais in ["", "v1/../x", "v1?x=1", "v1#f", "v 1", &"9".repeat(65)] {
+        assert_eq!(sha256sums_url(mauvais), None, "tag refusé : {mauvais:?}");
+    }
+    // Tag refusé ≠ réseau : l'échec est immédiat, sans lancer curl.
+    assert!(expected_sha256("v1/../x", "mcp-control-cli-linux-x86_64").is_err());
+}
+
+#[test]
 fn surface_actions_sans_doublon_et_dispatch_connu() {
     // La const partagée (UI / gateway / tests) ne doit jamais dériver du
     // dispatcher : pas de doublon, et un échantillon dispatché doit
@@ -2001,9 +2215,9 @@ fn reset_state_placements_detection_et_oublis() {
             ip: "192.168.40.9".into(),
             user: "demon".into(),
         });
-        // un VRAI seed retiré durablement (le premier de la config par défaut)
-        let seed_id = default_servers()[0].id.clone();
-        st.removed_seeds.push(seed_id);
+        // un identifiant de seed retiré durablement (les seeds par défaut
+        // n'existent plus : le réglage reste lu, rien n'est réinjecté)
+        st.removed_seeds.push("seed-news".to_string());
     }
     {
         let mut servers = lockv(&state.servers);
@@ -2137,10 +2351,15 @@ fn reset_state_placements_detection_et_oublis() {
     }
     assert!(lockv(&state.peers).is_empty());
 
-    // 3. oublis → machines SSH vidées + seed réinjecté + removed_seeds vide
+    // 3. oublis → machines SSH vidées + removed_seeds vide + AUCUNE
+    // réinjection (plus de serveur par défaut depuis le lot S4)
     let j3 = handle_action(&state, "{\"action\":\"reset_state\",\"what\":\"oublis\"}");
     assert_eq!(j3["ok"], serde_json::json!(true));
-    assert_eq!(j3["reinjected"], serde_json::json!(1));
+    assert_eq!(
+        j3["reinjected"],
+        serde_json::json!(0),
+        "aucun seed ne doit être réinjecté"
+    );
     {
         let st = lockv(&state.settings);
         assert!(st.ssh_hosts.is_empty());
@@ -2148,8 +2367,8 @@ fn reset_state_placements_detection_et_oublis() {
     }
     assert_eq!(
         lockv(&state.servers).len(),
-        2,
-        "le seed retiré est réinjecté immédiatement"
+        1,
+        "seul le serveur manuel conservé reste : rien n'est réinjecté"
     );
 
     // 4. what inconnu → refus propre, rien ne change
@@ -2641,7 +2860,10 @@ fn save_config_concurrent_50_adds_tous_persistes() {
 fn config_corrompue_renommee_et_defauts() {
     let path = tmp_config("cfg_corrompue.json", Some("{servers: [ pas du json"));
     let (servers, _) = load_config(&path);
-    assert_eq!(servers.len(), 8, "défauts attendus après config corrompue");
+    assert!(
+        servers.is_empty(),
+        "défauts attendus après config corrompue (liste vide depuis le lot S4)"
+    );
     assert!(
         !std::path::Path::new(&path).exists(),
         "l'original doit être renommé"
@@ -2662,7 +2884,10 @@ fn config_corrompue_renommee_et_defauts() {
 fn config_vide_renommee_comme_corrompue() {
     let path = tmp_config("cfg_vide.json", Some(""));
     let (servers, _) = load_config(&path);
-    assert_eq!(servers.len(), 8, "défauts attendus après config vide");
+    assert!(
+        servers.is_empty(),
+        "défauts attendus après config vide (liste vide depuis le lot S4)"
+    );
     assert!(!std::path::Path::new(&path).exists(), "doit être renommé");
 }
 
@@ -2788,13 +3013,28 @@ fn scan_handler_refuse_une_plage_trop_large() {
     assert!(err.contains("512"), "le plafond doit être cité : {err}");
 }
 
-/// (lot 3, audit 03 constat 9) : un serveur lancé par l'app via un lanceur qui
-/// DÉTACHE son enfant (ici powershell Start-Process → node) survit au
-/// kill_tree du lanceur — remove doit libérer le port. Réciproquement, un
-/// serveur NON lancé par l'app (pas de handle) ne doit pas être tué : garanti
-/// par la garde was_managed, testée ici par construction (handle présent).
+/// node est-il disponible ? (les tests qui lancent un vrai serveur sautent sinon)
+fn node_disponible_tests() -> bool {
+    std::process::Command::new("node")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// (lot 3 constat 9, refondu lot S4 point 1) : un serveur lancé par l'app via
+/// un lanceur qui DÉTACHE son enfant (ici node → node détaché) laisse un
+/// process que l'app ne peut plus identifier (le handle du lanceur est mort).
+/// `stop_server` REFUSE alors de le tuer (nom + pid rendus à l'appelant) ;
+/// `stop_server_force`, geste explicite, l'arrête et libère le port.
 #[test]
-fn remove_libere_le_port_dun_serveur_lance_par_lapp() {
+fn stop_refuse_puis_force_arrete_un_orphelin_detache() {
+    if !node_disponible_tests() {
+        eprintln!("SKIP stop_refuse_puis_force_arrete_un_orphelin_detache : node indisponible");
+        return;
+    }
     let port = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
@@ -2819,9 +3059,6 @@ fn remove_libere_le_port_dun_serveur_lance_par_lapp() {
     let _garde = PortNettoie(port);
 
     let state = state_lot3("");
-    // handle du LANCEUR dans children (comme le moteur) : le lanceur node
-    // détache le vrai serveur (child_process.spawn detached + unref, cas réel
-    // bin/launch.cjs) puis SORT — le serveur survit au kill_tree du lanceur.
     let js_arg = js.display().to_string().replace('\\', "/");
     let script = format!(
         "const cp=require('child_process');const p=cp.spawn(process.execPath,['{}'],{{detached:true,stdio:'ignore'}});p.unref();",
@@ -2830,18 +3067,164 @@ fn remove_libere_le_port_dun_serveur_lance_par_lapp() {
     let lanceur = probe::spawn_process("node", &["-e".to_string(), script], None, &[])
         .expect("spawn du lanceur");
     lockv(&state.children).insert("lc-detach".to_string(), lanceur);
+    lockv(&state.servers).push(srv_http(
+        "lc-detach",
+        None,
+        "Lanceur détaché",
+        None,
+        port,
+        Origin::Manual,
+        None,
+    ));
+
+    // le process détaché doit écouter avant l'arrêt (attente bornée)
+    let mut ouvert = false;
+    for _ in 0..50 {
+        if probe::port_open("127.0.0.1", port, std::time::Duration::from_millis(500)) {
+            ouvert = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(ouvert, "l'orphelin doit écouter avant l'arrêt");
+    // laisser le lanceur sortir : le handle ne désigne plus le process du port
+    std::thread::sleep(std::time::Duration::from_millis(800));
+
+    // 1. stop_server refuse : le port est tenu par un process non identifié
+    let rep = handle_action(
+        &state,
+        &json!({"action": "kill", "id": "lc-detach"}).to_string(),
+    );
+    assert_eq!(
+        rep.get("ok").and_then(|o| o.as_bool()),
+        Some(false),
+        "stop_server doit refuser : {rep}"
+    );
+    assert_eq!(rep.get("needs_force"), Some(&json!(true)), "{rep}");
+    let err = rep.get("error").and_then(|e| e.as_str()).unwrap_or("");
+    assert!(
+        err.contains(&format!("{port}")),
+        "le refus doit nommer le port : {err}"
+    );
+    assert!(
+        err.contains("pid"),
+        "le refus doit nommer le process (nom + pid) : {err}"
+    );
+    assert!(
+        probe::port_open("127.0.0.1", port, std::time::Duration::from_millis(500)),
+        "le process tiers ne doit PAS être tué par stop_server"
+    );
+
+    // 2. « arrêter quand même » : geste explicite, le port est libéré
+    let rep = handle_action(
+        &state,
+        &json!({"action": "stop_server_force", "id": "lc-detach"}).to_string(),
+    );
+    assert_eq!(rep.get("ok").and_then(|o| o.as_bool()), Some(true), "{rep}");
+    assert_eq!(rep.get("forced"), Some(&json!(true)));
+    let mut libere = false;
+    for _ in 0..40 {
+        if !probe::port_open("127.0.0.1", port, std::time::Duration::from_millis(500)) {
+            libere = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    assert!(libere, "stop_server_force doit libérer le port");
+}
+
+/// Supprimer une entrée ne tue JAMAIS un process que l'app n'a pas lancé :
+/// le port reste tenu, l'entrée disparaît, le journal explique.
+#[test]
+fn remove_ne_tue_pas_un_processus_tiers() {
+    if !node_disponible_tests() {
+        eprintln!("SKIP remove_ne_tue_pas_un_processus_tiers : node indisponible");
+        return;
+    }
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let mut enfant = std::process::Command::new("node")
+        .args([
+            "-e",
+            &format!("require('http').createServer((q,s)=>s.end('ok')).listen({port},'127.0.0.1')"),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("node");
+    for _ in 0..50 {
+        if probe::port_open("127.0.0.1", port, std::time::Duration::from_millis(500)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let state = state_lot3("");
+    lockv(&state.servers).push(srv_http(
+        "tiers-remove",
+        None,
+        "Tiers",
+        None,
+        port,
+        Origin::Manual,
+        None,
+    ));
+    let rep = handle_action(
+        &state,
+        &json!({"action": "remove", "id": "tiers-remove"}).to_string(),
+    );
+    assert_eq!(rep.get("ok").and_then(|o| o.as_bool()), Some(true), "{rep}");
+    assert!(
+        lockv(&state.servers).iter().all(|s| s.id != "tiers-remove"),
+        "l'entrée doit être supprimée"
+    );
+    assert!(
+        probe::port_open("127.0.0.1", port, std::time::Duration::from_millis(500)),
+        "le process tiers doit survivre à la suppression (non lancé par l'app)"
+    );
+    let _ = enfant.kill();
+    let _ = enfant.wait();
+}
+
+/// Audit S4, point 1 (PID recyclé + arrêt positif) :
+/// - Négatif : si un handle enregistré porte un PID vivant dont la date de
+///   création diffère (PID recyclé par l'OS), `kill` et `toggle` OFF ne
+///   doivent PAS le tuer.
+/// - Positif : si l'app a lancé le process (même PID + même date), `kill` le tue.
+#[cfg(windows)]
+#[test]
+fn kill_et_toggle_ne_tuent_pas_un_pid_recycle_a_date_differente() {
+    if !node_disponible_tests() {
+        eprintln!(
+            "SKIP kill_et_toggle_ne_tuent_pas_un_pid_recycle_a_date_differente : node indisponible"
+        );
+        return;
+    }
+    let mut innocent = std::process::Command::new("node")
+        .args(["-e", "setInterval(()=>{},60000)"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("node innocent");
+    let pid_innocent = innocent.id();
+    let vraie_date = probe::process_creation(pid_innocent).expect("date de création lisible");
+
+    // 1. Négatif : handle avec fausse date de création (simule un PID recyclé)
+    let state = state_lot3("");
     lockv(&state.servers).push(Server {
-        id: "lc-detach".into(),
-        label: "Lanceur détaché".into(),
-        transport: Transport::Http {
-            host: None,
-            port,
-            path: "/mcp".into(),
+        id: "stdio-recycle".into(),
+        label: "Recyclé".into(),
+        transport: Transport::Stdio {
+            program: "node".into(),
+            args: vec![],
+            workdir: None,
+            env: vec![],
         },
         origin: Origin::Manual,
         enabled: true,
-        state: SState::Down,
-        pid: None,
+        state: SState::Up,
+        pid: Some(pid_innocent),
         bound_host: None,
         server_name: None,
         version: None,
@@ -2857,41 +3240,69 @@ fn remove_libere_le_port_dun_serveur_lance_par_lapp() {
         last_seen_ts: None,
         last_error: None,
         start_cmd: None,
-        auto_restart: true,
+        auto_restart: false,
         favorite: false,
         tools_disabled: vec![],
     });
-
-    // le process détaché doit écouter avant remove (attente bornée)
-    let mut ouvert = false;
-    for _ in 0..50 {
-        if probe::port_open("127.0.0.1", port, std::time::Duration::from_millis(500)) {
-            ouvert = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    assert!(ouvert, "l'orphelin doit écouter avant remove");
-
-    let rep = handle_action(
-        &state,
-        &json!({"action": "remove", "id": "lc-detach"}).to_string(),
+    lockv(&state.children).insert(
+        "stdio-recycle".into(),
+        probe::StdioHandle {
+            pid: pid_innocent,
+            started: Some(vraie_date.saturating_sub(1)),
+            exit: Arc::new(Mutex::new(None)),
+            stdin: None,
+        },
     );
-    assert_eq!(rep.get("ok").and_then(|o| o.as_bool()), Some(true), "{rep}");
+    let _ = handle_action(&state, r#"{"action":"kill","id":"stdio-recycle"}"#);
+    assert!(
+        innocent.try_wait().ok().flatten().is_none(),
+        "un PID recyclé (date différente) ne doit pas être tué par kill"
+    );
 
-    // le port doit être libéré (kill_port sur l'orphelin détaché)
-    let mut libere = false;
-    for _ in 0..40 {
-        if !probe::port_open("127.0.0.1", port, std::time::Duration::from_millis(500)) {
-            libere = true;
+    // Même garde sur toggle OFF
+    lockv(&state.children).insert(
+        "stdio-recycle".into(),
+        probe::StdioHandle {
+            pid: pid_innocent,
+            started: Some(vraie_date.saturating_sub(1)),
+            exit: Arc::new(Mutex::new(None)),
+            stdin: None,
+        },
+    );
+    let _ = handle_action(&state, r#"{"action":"toggle","id":"stdio-recycle"}"#);
+    assert!(
+        innocent.try_wait().ok().flatten().is_none(),
+        "un PID recyclé (date différente) ne doit pas être tué par toggle OFF"
+    );
+
+    // 2. Positif : quand le handle vient d'un vrai spawn_process (date identique),
+    //    `kill` tue effectivement le process.
+    let lance = probe::spawn_process(
+        "node",
+        &["-e".into(), "setInterval(()=>{},60000)".into()],
+        None,
+        &[],
+    )
+    .expect("spawn_process");
+    let pid_lance = lance.pid;
+    lockv(&state.children).insert("stdio-recycle".into(), lance);
+    let rep = handle_action(&state, r#"{"action":"kill","id":"stdio-recycle"}"#);
+    assert_eq!(rep.get("ok").and_then(|o| o.as_bool()), Some(true), "{rep}");
+    let mut mort = false;
+    for _ in 0..30 {
+        if probe::process_creation(pid_lance).is_none() {
+            mort = true;
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     assert!(
-        libere,
-        "le port doit être libéré après remove (orphelin tué)"
+        mort,
+        "le vrai process lancé par l'app doit être tué par kill"
     );
+
+    let _ = innocent.kill();
+    let _ = innocent.wait();
 }
 
 // ==================== Lot A — moteur ====================
@@ -3112,4 +3523,970 @@ fn kill_et_remove_id_inconnu_refusent_avec_motif() {
         lockv(&state.servers).iter().all(|s| s.id != "inconnu-lotF"),
         "aucun serveur ne doit être créé par un refus"
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn system_tool_curl_utilise_chemin_absolu_et_ignore_le_dossier_courant() {
+    let p = probe::system_tool("curl");
+    assert!(p.is_absolute(), "curl doit être un chemin absolu : {p:?}");
+    assert!(
+        p.exists(),
+        "curl introuvable à l'emplacement système : {p:?}"
+    );
+    // Négatif : un faux curl.exe déposé dans le dossier de travail n'est pas
+    // pris par system_command (seul System32\curl.exe est exécuté).
+    let dir = std::env::temp_dir().join(format!("mcc-systool-curl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let leurre = dir.join("curl.exe");
+    std::fs::write(&leurre, b"ceci n'est pas un executable valide").unwrap();
+    assert_ne!(probe::system_tool("curl"), leurre);
+    let out = probe::system_command("curl")
+        .arg("--version")
+        .current_dir(&dir)
+        .output()
+        .expect("curl.exe système");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success(),
+        "le vrai curl.exe doit répondre même avec un leurre dans cwd"
+    );
+}
+
+#[test]
+fn m4_json_expose_locked_et_etat_tls() {
+    let state = test_state();
+    {
+        let mut servers = lockv(&state.servers);
+        let mut s_locked = srv_http(
+            "srv-lock",
+            Some("litemcp-srv"),
+            "LiteMCP",
+            Some("127.0.0.1"),
+            39991,
+            Origin::Manual,
+            Some(100),
+        );
+        s_locked.state = SState::PortOnly;
+        s_locked.last_error = Some(crate::auth::net::LOCKED_SERVER_MSG.to_string());
+        servers.push(s_locked);
+
+        let s_open = srv_http(
+            "srv-open",
+            Some("open-srv"),
+            "Open",
+            Some("127.0.0.1"),
+            39992,
+            Origin::Manual,
+            Some(100),
+        );
+        servers.push(s_open);
+    }
+    {
+        let mut st = lockv(&state.settings);
+        st.auth.tls_bind_refused = true;
+        st.auth.tls_notice = Some("écoute hors loopback refusée sans tls".to_string());
+    }
+    let j = state_json(&state);
+    assert_eq!(j["servers"][0]["locked"], serde_json::json!(true));
+    assert_eq!(j["servers"][1]["locked"], serde_json::json!(false));
+    assert_eq!(
+        j["settings"]["tls"]["bind_refused"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        j["settings"]["tls"]["notice"],
+        serde_json::json!("écoute hors loopback refusée sans tls")
+    );
+}
+
+#[test]
+fn ui_api_state_json_expose_decouverte_annonces_sessions_et_revision() {
+    let _env_garde = litemp_env_guard();
+    let dir = dossier_annonces("ui-api-state");
+    // 2 annonces non suivies + 1 annonce déjà suivie par label/port + 1 JSON cassé
+    std::fs::write(
+        dir.join("libre-1.json"),
+        r#"{"name":"libre-1","port":18781,"version":"0.1.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("libre-2.json"),
+        r#"{"name":"libre-2","port":18782}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("deja-suivi.json"),
+        r#"{"name":"Suivi","port":18783}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("invalide.json"), "{pas json").unwrap();
+
+    let cfg_dir = std::env::temp_dir().join(format!("mcc-uiapi-state-cfg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cfg_dir);
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    let cfg_path = cfg_dir.join("config.json");
+
+    let mut base = match Arc::try_unwrap(test_state()) {
+        Ok(s) => s,
+        Err(_) => panic!("test_state doit être unique"),
+    };
+    base.config_path = cfg_path.to_string_lossy().to_string();
+    let state = Arc::new(base);
+    {
+        let mut st = lockv(&state.settings);
+        st.discovery_ports_only = vec![8787, 3000];
+        st.discovery_ports_excluded = vec![3131, 5090];
+        st.auth.server = Some(crate::auth::ServerIdentity {
+            keyid: crate::auth::SERVER_KEYID.into(),
+            public_key: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a".into(),
+            created_at: crate::types::iso_utc(crate::types::now_ts()),
+        });
+    }
+    lockv(&state.servers).push(srv_http(
+        "srv-suivi",
+        None,
+        "Suivi",
+        None,
+        18783,
+        Origin::Manual,
+        Some(100),
+    ));
+
+    std::env::set_var("MCC_LITEMP_REGISTRY", &dir);
+    let j1 = state_json(&state);
+    let j2 = state_json(&state);
+    std::env::remove_var("MCC_LITEMP_REGISTRY");
+
+    assert_eq!(
+        j1["settings"]["discovery_ports_only"],
+        serde_json::json!([8787, 3000])
+    );
+    assert_eq!(
+        j1["settings"]["discovery_ports_excluded"],
+        serde_json::json!([3131, 5090])
+    );
+    assert_eq!(
+        j1["announcements_count"],
+        serde_json::json!(2),
+        "seules les 2 annonces non suivies doivent compter : {j1}"
+    );
+    // Lecture seule : aucune adoption, aucun config.json créé
+    assert_eq!(lockv(&state.servers).len(), 1);
+    assert!(!cfg_path.exists());
+    assert!(j1["sessions_active"].is_u64());
+
+    let rev0 = j1["access"]["revision"]
+        .as_u64()
+        .expect("access.revision u64 attendu");
+    assert_eq!(
+        j2["access"]["revision"].as_u64(),
+        Some(rev0),
+        "revision doit rester identique sans changement"
+    );
+
+    // Changement 1 : demande d'appairage ajoutée → revision change
+    let now = crate::types::now_ts();
+    let req_pair = serde_json::json!({
+        "keyid": "mcc-ui-0000000000000001",
+        "label": "client-ui",
+        "public_key": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        "created": now,
+    })
+    .to_string();
+    let (status, _, body) = crate::auth::pair::handle_post(&state, req_pair.as_bytes(), None, now);
+    assert_eq!(status, 200);
+    let pair_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["pair_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    std::env::set_var("MCC_LITEMP_REGISTRY", &dir);
+    let rev_pair = state_json(&state)["access"]["revision"].as_u64().unwrap();
+    std::env::remove_var("MCC_LITEMP_REGISTRY");
+    assert_ne!(rev_pair, rev0);
+
+    // Changement 2 : approbation (client inscrit + paire décidée) → revision change
+    let ok = handle_action(
+        &state,
+        &serde_json::json!({
+            "action": "pair_approve",
+            "pair_id": pair_id,
+            "rights": ["lecture"],
+        })
+        .to_string(),
+    );
+    assert_eq!(ok["ok"], serde_json::json!(true));
+    std::env::set_var("MCC_LITEMP_REGISTRY", &dir);
+    let rev_approved = state_json(&state)["access"]["revision"].as_u64().unwrap();
+    std::env::remove_var("MCC_LITEMP_REGISTRY");
+    assert_ne!(rev_approved, rev_pair);
+
+    // Changement 3 : modification des droits puis révocation → revision change
+    let ok = handle_action(
+        &state,
+        r#"{"action":"client_set_scopes","keyid":"mcc-ui-0000000000000001","rights":["lecture","pilotage"]}"#,
+    );
+    assert_eq!(ok["ok"], serde_json::json!(true));
+    std::env::set_var("MCC_LITEMP_REGISTRY", &dir);
+    let rev_scopes = state_json(&state)["access"]["revision"].as_u64().unwrap();
+    std::env::remove_var("MCC_LITEMP_REGISTRY");
+    assert_ne!(rev_scopes, rev_approved);
+
+    let ok = handle_action(
+        &state,
+        r#"{"action":"client_revoke","keyid":"mcc-ui-0000000000000001"}"#,
+    );
+    assert_eq!(ok["ok"], serde_json::json!(true));
+    std::env::set_var("MCC_LITEMP_REGISTRY", &dir);
+    let rev_revoked = state_json(&state)["access"]["revision"].as_u64().unwrap();
+    std::env::remove_var("MCC_LITEMP_REGISTRY");
+    assert_ne!(rev_revoked, rev_scopes);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&cfg_dir);
+}
+
+#[test]
+fn ui_api_access_list_expose_identite_sessions_tls_url_et_stale_180d() {
+    let dir = std::env::temp_dir().join(format!("mcc-uiapi-access-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Crée une vraie clé serveur en repli fichier (service = None → zéro trousseau OS)
+    let loaded = crate::auth::secret::load_or_create_server(&dir, None).expect("clé serveur");
+    let srv_pub_hex = crate::crypto::hex(&loaded.key.verifying_key().to_bytes());
+    let srv_block = loaded.key.export();
+
+    let mut base = match Arc::try_unwrap(test_state()) {
+        Ok(s) => s,
+        Err(_) => panic!("test_state doit être unique"),
+    };
+    base.config_path = dir.join("config.json").to_string_lossy().to_string();
+    let state = Arc::new(base);
+
+    let now = crate::types::now_ts();
+    let cle_pub = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+    let mut frais = crate::auth::ClientRecord::new(
+        "mcc-a-0000000000000001".into(),
+        "frais".into(),
+        cle_pub.into(),
+        vec!["lecture".into()],
+        "127.0.0.1".into(),
+    );
+    frais.created_at = crate::types::iso_utc(now - 3600);
+
+    let mut ancien = crate::auth::ClientRecord::new(
+        "mcc-a-0000000000000002".into(),
+        "ancien".into(),
+        cle_pub.into(),
+        vec!["lecture".into()],
+        "127.0.0.1".into(),
+    );
+    ancien.created_at = crate::types::iso_utc(now - crate::auth::registry::STALE_180D_SECS - 120);
+
+    let mut revoque_ancien = crate::auth::ClientRecord::new(
+        "mcc-a-0000000000000003".into(),
+        "revoque".into(),
+        cle_pub.into(),
+        vec!["lecture".into()],
+        "127.0.0.1".into(),
+    );
+    revoque_ancien.created_at =
+        crate::types::iso_utc(now - crate::auth::registry::STALE_180D_SECS - 120);
+    revoque_ancien.status = "revoked".into();
+
+    let ident = crate::auth::ServerIdentity {
+        keyid: crate::auth::SERVER_KEYID.into(),
+        public_key: srv_pub_hex.clone(),
+        created_at: crate::types::iso_utc(now),
+    };
+    let tls_fp = format!("sha256:{}", "ab".repeat(32));
+    {
+        let mut st = lockv(&state.settings);
+        st.ui_bind = "0.0.0.0".into();
+        st.ui_port = 5544;
+        st.auth.server = Some(ident.clone());
+        st.auth.tls_fp = tls_fp.clone();
+        st.auth.tls_bind_refused = false;
+        st.auth.tls_notice = None;
+        st.auth.insert(frais).unwrap();
+        st.auth.insert(ancien).unwrap();
+        st.auth.insert(revoque_ancien).unwrap();
+    }
+
+    let j = handle_action(&state, r#"{"action":"access_list"}"#);
+    assert_eq!(j["ok"], serde_json::json!(true), "{j}");
+
+    // server_identity sans aucune clé privée
+    assert_eq!(
+        j["server_identity"]["keyid"],
+        serde_json::json!("mcc-server")
+    );
+    assert_eq!(
+        j["server_identity"]["fingerprint"],
+        serde_json::json!(crate::auth::registry::fingerprint_of(&srv_pub_hex).unwrap())
+    );
+    assert_eq!(
+        j["server_identity"]["fingerprint_court"],
+        serde_json::json!(crate::auth::registry::short_fingerprint_of(&srv_pub_hex).unwrap())
+    );
+    assert_eq!(
+        j["server_identity"]["storage"],
+        serde_json::json!("file_fallback")
+    );
+    assert_eq!(
+        server_storage_kind(&ident, &base_path_or(&dir), Some(&srv_block)),
+        "keyring"
+    );
+    // Une autre clé au trousseau ne trompe pas la détection file_fallback
+    let autre_cle = ::litemcp::auth::sign::SigningKey::generate().export();
+    assert_eq!(
+        server_storage_kind(&ident, &base_path_or(&dir), Some(&autre_cle)),
+        "file_fallback"
+    );
+
+    // sessions { active, max: 8 }
+    assert!(j["sessions"]["active"].is_u64());
+    assert_eq!(j["sessions"]["max"], serde_json::json!(8));
+
+    // tls + ui_url (0.0.0.0 + TLS actif -> https://127.0.0.1:5544)
+    assert_eq!(
+        j["tls"]["compiled"],
+        serde_json::json!(crate::auth::net::tls_compiled())
+    );
+    assert_eq!(j["tls"]["active"], serde_json::json!(true));
+    assert_eq!(j["tls"]["fingerprint"], serde_json::json!(tls_fp));
+    assert_eq!(j["tls"]["bind_refused"], serde_json::json!(false));
+    assert!(j["tls"]["notice"].is_null());
+    assert_eq!(j["ui_url"], serde_json::json!("https://127.0.0.1:5544"));
+
+    // Variantes ui_url (loopback, IP LAN, IPv6, bind refusé)
+    assert_eq!(
+        current_ui_url("127.0.0.1", 5090, false, false),
+        "http://127.0.0.1:5090"
+    );
+    assert_eq!(
+        current_ui_url("0.0.0.0", 5090, false, true),
+        "http://127.0.0.1:5090"
+    );
+    assert_eq!(
+        current_ui_url("192.168.1.25", 5090, true, false),
+        "https://192.168.1.25:5090"
+    );
+    assert_eq!(
+        current_ui_url("192.168.1.25", 5090, false, true),
+        "http://127.0.0.1:5090"
+    );
+    assert_eq!(
+        current_ui_url("::1", 5090, false, false),
+        "http://[::1]:5090"
+    );
+
+    // clients[] : stale_180d
+    let clients = j["clients"].as_array().unwrap();
+    let find_c = |id: &str| clients.iter().find(|c| c["keyid"] == id).unwrap();
+    assert_eq!(
+        find_c("mcc-a-0000000000000001")["stale_180d"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        find_c("mcc-a-0000000000000002")["stale_180d"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        find_c("mcc-a-0000000000000003")["stale_180d"],
+        serde_json::json!(false)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn base_path_or(dir: &std::path::Path) -> String {
+    dir.join("config.json").to_string_lossy().to_string()
+}
+
+#[test]
+fn ui_api_check_update_sha256_etats() {
+    let asset = Some("mcp-control-cli-windows-x86_64.exe");
+    let sum = "a".repeat(64);
+    let found = check_update_sha256_json(true, Some("0.8.0"), asset, |tag, a| {
+        assert_eq!(tag, "v0.8.0");
+        assert_eq!(a, "mcp-control-cli-windows-x86_64.exe");
+        Ok(Sha256Lookup::Found(sum.clone()))
+    })
+    .unwrap();
+    assert_eq!(
+        found["asset"],
+        serde_json::json!("mcp-control-cli-windows-x86_64.exe")
+    );
+    assert_eq!(found["sha256"], serde_json::json!(sum));
+    assert!(found["note"].is_null());
+
+    let absent = check_update_sha256_json(true, Some("v0.8.0"), asset, |tag, _| {
+        assert_eq!(tag, "v0.8.0");
+        Ok(Sha256Lookup::Absent)
+    })
+    .unwrap();
+    assert!(absent["sha256"].is_null());
+    assert!(absent["note"].as_str().unwrap().contains("SHA256SUMS.txt"));
+
+    let malformed = check_update_sha256_json(true, Some("0.8.0"), asset, |_, _| {
+        Ok(Sha256Lookup::Malformed)
+    })
+    .unwrap();
+    assert!(malformed["sha256"].is_null());
+    assert!(malformed["note"].as_str().is_some());
+
+    let err =
+        check_update_sha256_json(true, Some("0.8.0"), asset, |_, _| Err("réseau coupé")).unwrap();
+    assert!(err["sha256"].is_null());
+    assert_eq!(err["note"], serde_json::json!("réseau coupé"));
+
+    assert!(check_update_sha256_json(true, None, asset, |_, _| panic!("pas appelé")).is_none());
+    assert!(
+        check_update_sha256_json(false, Some("0.8.0"), asset, |_, _| panic!("pas appelé"))
+            .is_none()
+    );
+}
+
+#[test]
+fn ui_api_aucun_secret_ni_fuite_gateway() {
+    let dir = std::env::temp_dir().join(format!("mcc-uiapi-sec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("auth").join("clients")).unwrap();
+
+    let loaded = crate::auth::secret::load_or_create_server(&dir, None).expect("clé serveur");
+    let srv_pub = crate::crypto::hex(&loaded.key.verifying_key().to_bytes());
+    let srv_priv_block = loaded.key.export();
+    let client_priv_key = ::litemcp::auth::sign::SigningKey::generate().export();
+    let client_key_path = dir
+        .join("auth")
+        .join("clients")
+        .join("mcc-out-0000000000000001.key");
+    std::fs::write(&client_key_path, &client_priv_key).unwrap();
+
+    let mut base = match Arc::try_unwrap(test_state()) {
+        Ok(s) => s,
+        Err(_) => panic!("test_state doit être unique"),
+    };
+    base.config_path = dir.join("config.json").to_string_lossy().to_string();
+    let state = Arc::new(base);
+    {
+        let mut st = lockv(&state.settings);
+        st.api_access = Some("secret-legacy-api-access-999".into());
+        st.notify.headers =
+            "Authorization: Bearer secret-webhook-bearer-888\nX-Hook-Secret: hook-777".into();
+        st.auth.server = Some(crate::auth::ServerIdentity {
+            keyid: crate::auth::SERVER_KEYID.into(),
+            public_key: srv_pub,
+            created_at: crate::types::iso_utc(crate::types::now_ts()),
+        });
+        st.auth
+            .insert(crate::auth::ClientRecord::new(
+                "mcc-c-0000000000000001".into(),
+                "client".into(),
+                "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a".into(),
+                vec!["lecture".into()],
+                "127.0.0.1".into(),
+            ))
+            .unwrap();
+    }
+    lockv(&state.servers).push(Server {
+        id: "stdio-sec".into(),
+        label: "Stdio Secret".into(),
+        transport: Transport::Stdio {
+            program: "node".into(),
+            args: vec!["srv.js".into()],
+            workdir: None,
+            env: vec![("SECRET_TOKEN".into(), "secret-env-value-555".into())],
+        },
+        origin: Origin::Manual,
+        enabled: true,
+        state: SState::Down,
+        pid: None,
+        bound_host: None,
+        server_name: None,
+        version: None,
+        protocol: None,
+        sse: false,
+        sse_endpoint: false,
+        ws: false,
+        lang: None,
+        framework: None,
+        via_ssh: false,
+        tools: vec![],
+        latency_ms: None,
+        last_seen_ts: None,
+        last_error: None,
+        start_cmd: Some(StartCmd {
+            program: "node".into(),
+            args: vec!["srv.js".into()],
+            workdir: None,
+            env: vec![("SECRET_TOKEN".into(), "secret-env-value-555".into())],
+        }),
+        auto_restart: false,
+        favorite: false,
+        tools_disabled: vec![],
+    });
+
+    let st_str = state_json(&state).to_string();
+    let acc_str = handle_action(&state, r#"{"action":"access_list"}"#).to_string();
+
+    for (nom, txt) in [("state_json", &st_str), ("access_list", &acc_str)] {
+        for interdit in [
+            "PRIVATE KEY",
+            "secret-legacy-api-access-999",
+            "secret-webhook-bearer-888",
+            "hook-777",
+            "secret-env-value-555",
+            "mcc_session",
+            "X-MCC-Session",
+            "x-mcc-session",
+        ] {
+            assert!(
+                !txt.contains(interdit),
+                "{nom} ne doit JAMAIS contenir « {interdit} » : {txt}"
+            );
+        }
+        for line in srv_priv_block
+            .lines()
+            .chain(client_priv_key.lines())
+            .filter(|l| l.len() > 24 && !l.starts_with("---"))
+        {
+            assert!(
+                !txt.contains(line),
+                "{nom} a divulgué une ligne de clé privée"
+            );
+        }
+    }
+
+    // Aucune de ces actions admin/sensibles ne doit figurer au catalogue /mcp
+    for interdite in [
+        "access_list",
+        "server_pair",
+        "client_rotate",
+        "litemcp_announcements",
+        "stop_server_force",
+    ] {
+        assert!(
+            !crate::gateway::TOOL_RIGHTS
+                .iter()
+                .any(|(name, _)| *name == interdite),
+            "{interdite} ne doit jamais être exposée sur /mcp"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn p1_save_cache_ne_reecrit_pas_si_contenu_utile_inchange() {
+    use std::collections::{HashMap, HashSet};
+    let dir = std::env::temp_dir().join(format!(
+        "mcc-p1-cache-{}-{}",
+        std::process::id(),
+        crate::types::now_ts()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let cfg = dir.join("config.json");
+    let cache = dir.join("state-cache.json");
+
+    let state = Arc::new(AppState {
+        servers: Mutex::new(vec![Server {
+            id: "s1".into(),
+            label: "S1".into(),
+            transport: Transport::Http {
+                host: Some("127.0.0.1".into()),
+                port: 19991,
+                path: "/mcp".into(),
+            },
+            origin: Origin::Manual,
+            enabled: true,
+            state: SState::Up,
+            pid: None,
+            bound_host: Some("127.0.0.1".into()),
+            server_name: Some("demo".into()),
+            version: Some("1.0.0".into()),
+            protocol: Some("2024-11-05".into()),
+            sse: false,
+            sse_endpoint: false,
+            ws: false,
+            lang: Some("node".into()),
+            framework: None,
+            via_ssh: false,
+            tools: vec![crate::types::ToolInfo {
+                name: "ping".into(),
+                desc: "ok".into(),
+            }],
+            latency_ms: Some(4),
+            last_seen_ts: Some(1000),
+            last_error: None,
+            start_cmd: None,
+            auto_restart: false,
+            favorite: false,
+            tools_disabled: vec![],
+        }]),
+        log: Mutex::new(VecDeque::new()),
+        settings: Mutex::new(Settings::default()),
+        children: Mutex::new(HashMap::new()),
+        config_path: cfg.to_string_lossy().to_string(),
+        peers: Mutex::new(HashMap::new()),
+        allowed_origins: Mutex::new(vec![]),
+        allowed_hosts: Mutex::new(vec![]),
+        spawn_fails: Mutex::new(HashMap::new()),
+        runtime: Mutex::new(crate::runtime::RuntimeLog::new()),
+        spawning: Mutex::new(HashSet::new()),
+        update_latest: Mutex::new(None),
+        lan_ok: Mutex::new(None),
+    });
+
+    // 1re écriture : le fichier est créé.
+    save_cache(&state);
+    assert!(
+        cache.exists(),
+        "state-cache.json doit être écrit la 1re fois"
+    );
+    let first_bytes = std::fs::read(&cache).expect("lecture cache 1");
+
+    // Seuls les champs volatils changent (latency_ms, last_seen_ts) :
+    // on remplace le fichier par un marqueur pour prouver qu'aucune écriture
+    // disque n'a lieu lors du second save_cache.
+    std::fs::write(&cache, b"SENTINEL_UNTOUCHED").expect("écriture sentinelle");
+    {
+        let mut srvs = lockv(&state.servers);
+        srvs[0].latency_ms = Some(99);
+        srvs[0].last_seen_ts = Some(2000);
+    }
+    save_cache(&state);
+    let after_unchanged = std::fs::read(&cache).expect("lecture sentinelle");
+    assert_eq!(
+        after_unchanged, b"SENTINEL_UNTOUCHED",
+        "save_cache ne doit PAS réécrire sur disque quand seul latency_ms/last_seen_ts/saved_at change"
+    );
+
+    // Changement réel (version) : le cache DOIT être réécrit.
+    {
+        let mut srvs = lockv(&state.servers);
+        srvs[0].version = Some("2.0.0".into());
+    }
+    save_cache(&state);
+    let after_changed = std::fs::read(&cache).expect("lecture cache 2");
+    assert_ne!(after_changed, b"SENTINEL_UNTOUCHED");
+    assert_ne!(after_changed, first_bytes);
+    assert!(String::from_utf8_lossy(&after_changed).contains("2.0.0"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn p1_tools_list_mis_en_cache_sur_serveur_up_et_invalide_sur_changement_version() {
+    use std::collections::{HashMap, HashSet};
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+    let port = listener.local_addr().unwrap().port();
+    let init_count = Arc::new(AtomicUsize::new(0));
+    let tools_count = Arc::new(AtomicUsize::new(0));
+    let version = Arc::new(Mutex::new("1.0.0".to_string()));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let ic = Arc::clone(&init_count);
+    let tc = Arc::clone(&tools_count);
+    let ver = Arc::clone(&version);
+    let stp = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        let _ = listener.set_nonblocking(false);
+        for stream in listener.incoming() {
+            if stp.load(Ordering::Relaxed) {
+                break;
+            }
+            let Ok(mut s) = stream else { break };
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            for _ in 0..8 {
+                match s.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                }
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let req = String::from_utf8_lossy(&buf);
+            if !req.contains("\r\n\r\n") {
+                continue;
+            }
+            let body = if req.contains("\"tools/list\"") {
+                tc.fetch_add(1, Ordering::SeqCst);
+                r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"ok"}]}}"#
+                    .to_string()
+            } else if req.contains("\"initialize\"") {
+                ic.fetch_add(1, Ordering::SeqCst);
+                let v = ver.lock().unwrap().clone();
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2024-11-05","serverInfo":{{"name":"p1-demo","version":"{v}"}}}}}}"#
+                )
+            } else {
+                r#"{"ok":false}"#.to_string()
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = s.write_all(resp.as_bytes());
+        }
+    });
+
+    let state = Arc::new(AppState {
+        servers: Mutex::new(vec![Server {
+            id: "p1-s".into(),
+            label: "P1-S".into(),
+            transport: Transport::Http {
+                host: Some("127.0.0.1".into()),
+                port,
+                path: "/mcp".into(),
+            },
+            origin: Origin::Manual,
+            enabled: true,
+            state: SState::Down,
+            pid: None,
+            bound_host: None,
+            server_name: None,
+            version: None,
+            protocol: None,
+            sse: false,
+            sse_endpoint: false,
+            ws: false,
+            lang: None,
+            framework: None,
+            via_ssh: false,
+            tools: vec![],
+            latency_ms: None,
+            last_seen_ts: None,
+            last_error: None,
+            start_cmd: None,
+            auto_restart: false,
+            favorite: false,
+            tools_disabled: vec![],
+        }]),
+        log: Mutex::new(VecDeque::new()),
+        settings: Mutex::new(Settings::default()),
+        children: Mutex::new(HashMap::new()),
+        config_path: String::new(),
+        peers: Mutex::new(HashMap::new()),
+        allowed_origins: Mutex::new(vec![]),
+        allowed_hosts: Mutex::new(vec![]),
+        spawn_fails: Mutex::new(HashMap::new()),
+        runtime: Mutex::new(crate::runtime::RuntimeLog::new()),
+        spawning: Mutex::new(HashSet::new()),
+        update_latest: Mutex::new(None),
+        lan_ok: Mutex::new(None),
+    });
+
+    // Cycle 1 (DOWN → UP) : initialize + tools/list exécutés.
+    poll_one_bg(&state, "p1-s");
+    assert_eq!(init_count.load(Ordering::SeqCst), 1);
+    assert_eq!(tools_count.load(Ordering::SeqCst), 1);
+    assert_eq!(lockv(&state.servers)[0].tools.len(), 1);
+
+    // Cycle 2 (UP → UP, même version) : initialize seul, tools/list SAUTÉ !
+    poll_one_bg(&state, "p1-s");
+    assert_eq!(init_count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        tools_count.load(Ordering::SeqCst),
+        1,
+        "tools/list ne doit pas être redemandé sur un serveur UP inchangé"
+    );
+    assert_eq!(lockv(&state.servers)[0].tools.len(), 1);
+
+    // Cycle 3 : changement de version → tools/list rechargé !
+    *version.lock().unwrap() = "2.0.0".to_string();
+    poll_one_bg(&state, "p1-s");
+    assert_eq!(init_count.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        tools_count.load(Ordering::SeqCst),
+        2,
+        "tools/list doit être rechargé quand la version change"
+    );
+    assert_eq!(lockv(&state.servers)[0].version.as_deref(), Some("2.0.0"));
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+}
+
+#[test]
+fn p1_scan_network_guard_anti_reentrance() {
+    let g1 = scans::NetworkScanGuard::try_acquire();
+    assert!(g1.is_some(), "premier verrou scan réseau doit passer");
+    assert!(
+        scans::NetworkScanGuard::try_acquire().is_none(),
+        "second verrou concurrent doit être refusé"
+    );
+    drop(g1);
+    assert!(
+        scans::NetworkScanGuard::try_acquire().is_some(),
+        "après libération, un nouveau scan réseau est autorisé"
+    );
+}
+
+#[test]
+fn p1_refresh_lan_state_saute_sans_distant_ni_network_enabled() {
+    use std::collections::{HashMap, HashSet};
+    let settings = Settings {
+        network_enabled: false,
+        ..Settings::default()
+    };
+    let state = Arc::new(AppState {
+        servers: Mutex::new(vec![Server {
+            id: "local-1".into(),
+            label: "Local".into(),
+            transport: Transport::Http {
+                host: Some("127.0.0.1".into()),
+                port: 19992,
+                path: "/mcp".into(),
+            },
+            origin: Origin::Manual,
+            enabled: true,
+            state: SState::Up,
+            pid: None,
+            bound_host: Some("127.0.0.1".into()),
+            server_name: None,
+            version: None,
+            protocol: None,
+            sse: false,
+            sse_endpoint: false,
+            ws: false,
+            lang: None,
+            framework: None,
+            via_ssh: false,
+            tools: vec![],
+            latency_ms: None,
+            last_seen_ts: None,
+            last_error: None,
+            start_cmd: None,
+            auto_restart: false,
+            favorite: false,
+            tools_disabled: vec![],
+        }]),
+        log: Mutex::new(VecDeque::new()),
+        settings: Mutex::new(settings),
+        children: Mutex::new(HashMap::new()),
+        config_path: String::new(),
+        peers: Mutex::new(HashMap::new()),
+        allowed_origins: Mutex::new(vec![]),
+        allowed_hosts: Mutex::new(vec![]),
+        spawn_fails: Mutex::new(HashMap::new()),
+        runtime: Mutex::new(crate::runtime::RuntimeLog::new()),
+        spawning: Mutex::new(HashSet::new()),
+        update_latest: Mutex::new(None),
+        lan_ok: Mutex::new(Some(true)),
+    });
+    let t0 = std::time::Instant::now();
+    refresh_lan_state(&state);
+    assert!(
+        t0.elapsed() < std::time::Duration::from_millis(200),
+        "sans serveur distant ni network_enabled, aucun ipconfig/ping ne doit être lancé"
+    );
+    assert_eq!(*lockv(&state.lan_ok), None);
+}
+
+#[test]
+fn p1_servers_summary_json_filtre_et_stats_coherents() {
+    use std::collections::{HashMap, HashSet};
+    let state = Arc::new(AppState {
+        servers: Mutex::new(vec![
+            Server {
+                id: "up-1".into(),
+                label: "Up1".into(),
+                transport: Transport::Http {
+                    host: None,
+                    port: 19993,
+                    path: "/mcp".into(),
+                },
+                origin: Origin::Manual,
+                enabled: true,
+                state: SState::Up,
+                pid: None,
+                bound_host: None,
+                server_name: Some("u".into()),
+                version: Some("1".into()),
+                protocol: None,
+                sse: false,
+                sse_endpoint: false,
+                ws: false,
+                lang: None,
+                framework: None,
+                via_ssh: false,
+                tools: vec![crate::types::ToolInfo {
+                    name: "t1".into(),
+                    desc: "d".into(),
+                }],
+                latency_ms: Some(2),
+                last_seen_ts: None,
+                last_error: None,
+                start_cmd: None,
+                auto_restart: false,
+                favorite: false,
+                tools_disabled: vec![],
+            },
+            Server {
+                id: "down-1".into(),
+                label: "Down1".into(),
+                transport: Transport::Http {
+                    host: None,
+                    port: 19994,
+                    path: "/mcp".into(),
+                },
+                origin: Origin::Manual,
+                enabled: true,
+                state: SState::Down,
+                pid: None,
+                bound_host: None,
+                server_name: None,
+                version: None,
+                protocol: None,
+                sse: false,
+                sse_endpoint: false,
+                ws: false,
+                lang: None,
+                framework: None,
+                via_ssh: false,
+                tools: vec![],
+                latency_ms: None,
+                last_seen_ts: None,
+                last_error: None,
+                start_cmd: None,
+                auto_restart: false,
+                favorite: false,
+                tools_disabled: vec![],
+            },
+        ]),
+        log: Mutex::new(VecDeque::new()),
+        settings: Mutex::new(Settings::default()),
+        children: Mutex::new(HashMap::new()),
+        config_path: String::new(),
+        peers: Mutex::new(HashMap::new()),
+        allowed_origins: Mutex::new(vec![]),
+        allowed_hosts: Mutex::new(vec![]),
+        spawn_fails: Mutex::new(HashMap::new()),
+        runtime: Mutex::new(crate::runtime::RuntimeLog::new()),
+        spawning: Mutex::new(HashSet::new()),
+        update_latest: Mutex::new(None),
+        lan_ok: Mutex::new(None),
+    });
+
+    let all = servers_summary_json(&state, None);
+    assert_eq!(all["stats"]["total"], 2);
+    assert_eq!(all["stats"]["up"], 1);
+    assert_eq!(all["stats"]["tools"], 1);
+    assert_eq!(all["servers"].as_array().unwrap().len(), 2);
+
+    let only_up = servers_summary_json(&state, Some("UP"));
+    assert_eq!(only_up["stats"]["total"], 2);
+    assert_eq!(only_up["servers"].as_array().unwrap().len(), 1);
+    assert_eq!(only_up["servers"][0]["id"], "up-1");
 }
