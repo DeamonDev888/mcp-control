@@ -3207,13 +3207,49 @@ function armPolling() {
    évaluées, jamais concaténées dans du code : une valeur venue du moteur ne
    peut pas devenir du JavaScript. Tout texte affiché passe par esc() au
    moment où le HTML est écrit. */
+/* ===== Menu « Découverte » (barre de titre : ports, réseau, machines) ===== */
+function closeDiscoverMenu() {
+  const menu = document.getElementById('discoverMenu');
+  const btn = document.getElementById('tbDiscover');
+  if (menu) menu.hidden = true;
+  if (btn) btn.setAttribute('aria-expanded', 'false');
+}
+function toggleDiscoverMenu() {
+  const menu = document.getElementById('discoverMenu');
+  const btn = document.getElementById('tbDiscover');
+  if (!menu || !btn) return;
+  const open = menu.hidden;
+  menu.hidden = !open;
+  btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open) {
+    const first = menu.querySelector('.tb-menu-item');
+    if (first) first.focus();
+  }
+}
+document.addEventListener('click', ev => {
+  const menu = document.getElementById('discoverMenu');
+  if (!menu || menu.hidden) return;
+  const wrap = document.getElementById('tbDiscoverWrap');
+  if (wrap && !wrap.contains(ev.target)) closeDiscoverMenu();
+});
+document.addEventListener('keydown', ev => {
+  if (ev.key !== 'Escape') return;
+  const menu = document.getElementById('discoverMenu');
+  if (menu && !menu.hidden) {
+    closeDiscoverMenu();
+    const btn = document.getElementById('tbDiscover');
+    if (btn) btn.focus();
+  }
+});
+
 const ACT = {
   // -- barre de titre, bandeaux, journal
   'toggle-explorer': () => toggleExplorer(),
   'logout': () => logout(),
-  'scan': () => doScan(),
-  'scan-net': () => doScanNet(),
-  'machines': () => openMachineDlg(),
+  'discover-toggle': () => toggleDiscoverMenu(),
+  'scan': () => { closeDiscoverMenu(); doScan(); },
+  'scan-net': () => { closeDiscoverMenu(); doScanNet(); },
+  'machines': () => { closeDiscoverMenu(); openMachineDlg(); },
   'store': () => openStore(),
   'access-open': el => openAccessDlg(el.dataset.pending === '1'),
   'settings-open': () => openSettingsDlg(),

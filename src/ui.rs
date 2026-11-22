@@ -34,9 +34,29 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
           title="Oublier le code d'accès enregistré dans ce navigateur"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='4.5' y='10.5' width='15' height='10' rx='2'/><path d='M8 10.5V7a4 4 0 0 1 8 0v3.5'/></svg></button>
   <span class="tb-spacer" data-tauri-drag-region></span>
   <div class="tb-actions" role="toolbar" aria-label="Actions principales">
-    <button class="primary" data-act="scan" title="Balayer les ports locaux pour d&eacute;couvrir les serveurs MCP"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='11' cy='11' r='7'/><path d='m21 21-4.3-4.3'/></svg><span class="tb-lbl">Scanner les ports</span></button>
-    <button data-act="scan-net" title="Balayer le r&eacute;seau local pour d&eacute;couvrir les serveurs MCP distants"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='8.5'/><path d='M3.5 12h17M12 3.5c2.4 2.4 3.8 5.3 3.8 8.5s-1.4 6.1-3.8 8.5c-2.4-2.4-3.8-5.3-3.8-8.5s1.4-6.1 3.8-8.5Z'/></svg><span class="tb-lbl">Scanner le r&eacute;seau</span></button>
-    <button data-act="machines" title="Machines distantes (SSH) et d&eacute;tection des moteurs MCP Control du LAN"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='2.5' y='4' width='19' height='13' rx='2'/><path d='M8 21h8M12 17v4'/></svg><span class="tb-lbl">Machines</span></button>
+    <div id="tbDiscoverWrap" class="tb-menu-wrap">
+      <button id="tbDiscover" class="primary tb-menu-btn" data-act="discover-toggle"
+              aria-haspopup="menu" aria-expanded="false" aria-controls="discoverMenu"
+              title="D&eacute;couverte : scanner les ports locaux, le r&eacute;seau ou g&eacute;rer les machines distantes">
+        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='8.5'/><circle cx='12' cy='12' r='3.5'/><path d='M12 3.5V7M12 17v3.5M3.5 12H7M17 12h3.5'/></svg>
+        <span class="tb-lbl">D&eacute;couverte</span>
+        <svg class="ic tb-caret" viewBox="0 0 24 24" aria-hidden="true"><path d='m6 9 6 6 6-6'/></svg>
+      </button>
+      <div id="discoverMenu" class="tb-menu" role="menu" aria-labelledby="tbDiscover" hidden>
+        <button type="button" class="tb-menu-item" role="menuitem" data-act="scan" title="Balayer les ports locaux pour d&eacute;couvrir les serveurs MCP">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='11' cy='11' r='7'/><path d='m21 21-4.3-4.3'/></svg>
+          <span class="tb-menu-txt"><span class="tb-menu-t">Scanner les ports</span><span class="tb-menu-sub">Ports locaux de cette machine</span></span>
+        </button>
+        <button type="button" class="tb-menu-item" role="menuitem" data-act="scan-net" title="Balayer le r&eacute;seau local pour d&eacute;couvrir les serveurs MCP distants">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='8.5'/><path d='M3.5 12h17M12 3.5c2.4 2.4 3.8 5.3 3.8 8.5s-1.4 6.1-3.8 8.5c-2.4-2.4-3.8-5.3-3.8-8.5s1.4-6.1 3.8-8.5Z'/></svg>
+          <span class="tb-menu-txt"><span class="tb-menu-t">Scanner le r&eacute;seau</span><span class="tb-menu-sub">Serveurs MCP sur le LAN</span></span>
+        </button>
+        <button type="button" class="tb-menu-item" role="menuitem" data-act="machines" title="Machines distantes (SSH) et d&eacute;tection des moteurs MCP Control du LAN">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='2.5' y='4' width='19' height='13' rx='2'/><path d='M8 21h8M12 17v4'/></svg>
+          <span class="tb-menu-txt"><span class="tb-menu-t">Machines</span><span class="tb-menu-sub">H&ocirc;tes SSH &amp; moteurs du LAN</span></span>
+        </button>
+      </div>
+    </div>
     <button data-act="store" title="Catalogue de serveurs MCP pr&ecirc;ts &agrave; installer"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='9' cy='20' r='1.4'/><circle cx='17' cy='20' r='1.4'/><path d='M2.5 3.5h2.2l2.5 11.5h10.3l2-8H6'/></svg><span class="tb-lbl">Boutique</span></button>
     <button id="tbAccess" data-act="access-open" title="Acc&egrave;s &mdash; clients appair&eacute;s, demandes d'appairage et confirmations avant ex&eacute;cution"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 3 4.5 6v5.5c0 4.4 3.1 8.3 7.5 9.5 4.4-1.2 7.5-5.1 7.5-9.5V6L12 3Z'/><path d='m8.8 11.8 2.2 2.2 4.2-4.4'/></svg><span class="tb-lbl">Acc&egrave;s</span><span id="tbAccessN" class="tb-count" hidden>0</span></button>
     <button data-act="settings-open" title="R&eacute;glages du client"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='3.1'/><path d='M12 2.8v2.6M12 18.6v2.6M2.8 12h2.6M18.6 12h2.6M5.5 5.5l1.9 1.9M16.6 16.6l1.9 1.9M18.5 5.5l-1.9 1.9M7.4 16.6l-1.9 1.9'/></svg><span class="tb-lbl">R&eacute;glages</span></button>
@@ -1065,15 +1085,20 @@ mod tests {
             "#winCtrls doit être non compressible (visible à toute largeur)"
         );
         for lbl in [
-            "Scanner les ports",
-            "Scanner le r&eacute;seau",
-            "Machines",
+            "D&eacute;couverte",
             "Boutique",
+            "Acc&egrave;s",
             "R&eacute;glages",
         ] {
             assert!(
                 INDEX_HTML.contains(&format!(r#"<span class="tb-lbl">{lbl}</span>"#)),
                 "libellé de la barre de titre non encapsulé pour le repli : {lbl}"
+            );
+        }
+        for item in ["Scanner les ports", "Scanner le r&eacute;seau", "Machines"] {
+            assert!(
+                INDEX_HTML.contains(&format!(r#"<span class="tb-menu-t">{item}</span>"#)),
+                "entrée manquante dans le menu Découverte : {item}"
             );
         }
     }

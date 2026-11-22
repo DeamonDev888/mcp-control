@@ -48,6 +48,30 @@ fn store_catalogue_sain() {
     );
 }
 
+#[test]
+fn store_github_logos_valides_et_complets() {
+    let logos: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(crate::logos::LOGOS_JSON)
+            .expect("LOGOS_JSON doit être un objet JSON valide");
+    assert!(
+        crate::store_github::STORE_GITHUB.len() >= 30,
+        "STORE_GITHUB doit contenir les 3 originaux + les 27 nouveaux MCP"
+    );
+    for it in crate::store_github::STORE_GITHUB {
+        let svg = logos
+            .get(it.id)
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("logo manquant dans LOGOS_JSON pour {}", it.id));
+        assert!(!svg.trim().is_empty(), "logo vide pour {}", it.id);
+        let low = svg.to_ascii_lowercase();
+        assert!(
+            !low.contains("<script") && !low.contains("onload=") && !low.contains("onerror="),
+            "logo non sûr pour {}",
+            it.id
+        );
+    }
+}
+
 fn tmp_config(nom: &str, contenu: Option<&str>) -> String {
     let dir = std::env::temp_dir().join("mcpcc_tests");
     std::fs::create_dir_all(&dir).unwrap();
