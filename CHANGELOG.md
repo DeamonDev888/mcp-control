@@ -1,3 +1,16 @@
+## [0.8.4] — 2026-11-22
+
+### Pont hybride Streamable HTTP + Auth LiteMCP Ed25519 pour serveurs `stdio`
+- **Couche Streamable HTTP native (`POST /mcp/s/<id>`)** : chaque serveur `stdio` supervisé par MCP Control (notamment les serveurs installés depuis la Boutique comme Mermaid, Filesystem, GitHub…) est automatiquement exposé en HTTP Streamable (JSON + SSE) sans ouvrir de port supplémentaire, protégé par la même signature **Ed25519 RFC 9421 + RFC 9530** que `POST /mcp` (`lecture` pour `initialize`/`ping`/`tools/list`, `execution` pour `tools/call`, filtrage strict des outils désactivés).
+- **Canal JSON-RPC persistant & test d'outils en direct** : `StdioHandle` maintient le pipe `stdin/stdout` vivant (`StdioRpc`), débloquant l'exécution en direct dans l'inspecteur d'outils pour les serveurs `stdio` UP.
+- **Délai `npx`/`uvx`/`bunx` porté à 45 s** : évite le timeout à 15 s lors du premier téléchargement de paquet (ex. `npx -y mcp-mermaid`).
+
+### Logos Boutique dans l'interface
+- **Logos conservés partout dans l'UI** : préchargement de `/api/store-logos` au démarrage et affichage du logo SVG de marque dans la liste des serveurs et l'en-tête de détail pour tous les serveurs issus de la Boutique (`store-*`), accompagné du badge `HTTP+AUTH` et du bloc **Conf agent** hybride.
+
+### Correctif Windows (déplacement de la fenêtre)
+- **Drag natif Tauri 2.12 sans course** : passage de `#titlebar` à `data-tauri-drag-region="deep"`, suppression du listener `mousedown` dupliqué qui appelait `start_dragging` deux fois en concurrence avec le `drag.js` natif de Tauri, et élargissement de `CapabilityBuilder` à `http`/`https` sur tout loopback (`127.0.0.1`, `localhost`, `[::1]`).
+
 ## [0.8.3] — 2026-11-22
 
 ### Authentification MCP Control sur les sous-serveurs (clic droit)
