@@ -3084,6 +3084,20 @@ function tauriInvoke() {
   if (!inv) return;
   const box = document.getElementById('winCtrls');
   if (box) box.classList.add('on');
+  // Filet de sécurité : écouteur sur WINDOW (phase bulle, donc APRÈS celui de
+  // drag.js posé sur document). Si drag.js a pris le clic, il a appelé
+  // stopImmediatePropagation → on ne reçoit rien (pas de double appel). S'il
+  // ne l'a pas pris (script non injecté sur l'URL loopback, régression
+  // Tauri…), on lance nous-mêmes le déplacement.
+  window.addEventListener('mousedown', ev => {
+    if (ev.button !== 0 || ev.defaultPrevented) return;
+    const t = ev.target;
+    if (!t || !t.closest || !t.closest('#titlebar')) return;
+    if (t.closest('button,a,input,select,textarea,label,[role="menu"],[role="menuitem"],[tabindex]:not([tabindex="-1"]),#winCtrls')) return;
+    ev.preventDefault();
+    const cmd = ev.detail === 2 ? 'plugin:window|toggle_maximize' : 'plugin:window|start_dragging';
+    try { Promise.resolve(inv(cmd)).catch(() => {}); } catch (e) {}
+  });
 })();
 function winAction(op) {
   const inv = tauriInvoke();

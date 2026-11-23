@@ -1,3 +1,12 @@
+## [0.8.5] — 2026-11-22
+
+### Refonte visuelle Studio Graphite & Platinum
+- **Suppression complète des bleus/indigos vifs** : remplacement intégral par une palette exécutive **Studio Graphite / Platinum** (thèmes sombre et clair, contraste WCAG 2.2 AA), réservant la couleur exclusivement aux états sémantiques (émeraude feutré `UP`, ambre `WARN`, corail `DOWN`).
+- **Boutons primaires, barre de titre & contrôles** : CTA primaires monochromes haute lisibilité avec relief d'arête subtil et micro-retour tactile, barre de titre graphite brossé, onglets et filtres harmonisés.
+- **Explorateur, Dashboard, Détail & Inspecteur d'outils** : filet de sélection net de `2px` sans halo, séparateur `#grip` de précision `1px`, barre de révélation discrète sur les outils, coloration syntaxique JSON éditoriale adoucie et badges `HYBRIDE · HTTP + AUTH` / `AUTH ENV` raffinés.
+- **Modales, Boutique, Centre d'accès, Menu contextuel & Toasts** : harmonisation complète de `<dialog>`, des cartes Boutique, du code d'appairage `.acc-code`, de `#ctxmenu` et de `#toast` en stricte conformité CSP (`'self'`, zéro style en ligne).
+- **Filet de sécurité drag fenêtre (Windows / Tauri)** : écouteur `mousedown` en phase bulle sur `window` dans `src/ui/app.js` prenant le relais uniquement si `drag.js` natif n'a pas déjà intercepté le clic.
+
 ## [0.8.4] — 2026-11-22
 
 ### Pont hybride Streamable HTTP + Auth LiteMCP Ed25519 pour serveurs `stdio`
