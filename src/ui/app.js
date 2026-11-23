@@ -147,21 +147,25 @@ const sessionReady = exchangeSession();
 
 window.fetch = async (url, opts = {}) => {
   const isApi = typeof url === 'string' && url.startsWith('/api/');
-  if (isApi) {
-    await sessionReady;
-    // Session perdue : plus AUCUNE requête /api/* ne part (U-9) — sans cela le
-    // polleur rejouerait un 401 à chaque cycle. Réponse synthétique locale.
-    if (sessionLost) {
-      return new Response(JSON.stringify({ok: false, error: SESSION_LOST_MSG}),
-        {status: 401, headers: {'Content-Type': 'application/json'}});
-    }
+  // Hors /api/* : requête transmise TELLE QUELLE. Indispensable pour l'IPC
+  // Tauri (POST http://ipc.localhost/…) dont les en-têtes arrivent en objet
+  // Headers — les recopier via Object.assign les perdait (Tauri-Invoke-Key
+  // absent → 500, plus aucun drag / réduire / agrandir / fermer).
+  if (!isApi) return _mccFetch(url, opts);
+  await sessionReady;
+  // Session perdue : plus AUCUNE requête /api/* ne part (U-9) — sans cela le
+  // polleur rejouerait un 401 à chaque cycle. Réponse synthétique locale.
+  if (sessionLost) {
+    return new Response(JSON.stringify({ok: false, error: SESSION_LOST_MSG}),
+      {status: 401, headers: {'Content-Type': 'application/json'}});
   }
-  const h = Object.assign({}, opts.headers || {});
+  // new Headers() accepte objet simple, tableau ou Headers sans rien perdre.
+  const h = new Headers(opts.headers || {});
   const code = accessCode();
-  if (isApi && code) h['X-MCC-Access'] = code;
-  if (isApi && sessionSecret) h['X-MCC-Session'] = sessionSecret;
+  if (code) h.set('X-MCC-Access', code);
+  if (sessionSecret) h.set('X-MCC-Session', sessionSecret);
   const r = await _mccFetch(url, Object.assign({}, opts, {headers: h}));
-  if (isApi && r.status === 401) onUnauthorized();
+  if (r.status === 401) onUnauthorized();
   return r;
 };
 /* 401 de session (U-9) : on n'ouvre plus le dialogue de l'ancien code d'accès.
@@ -3096,7 +3100,8 @@ function tauriInvoke() {
     if (t.closest('button,a,input,select,textarea,label,[role="menu"],[role="menuitem"],[tabindex]:not([tabindex="-1"]),#winCtrls')) return;
     ev.preventDefault();
     const cmd = ev.detail === 2 ? 'plugin:window|toggle_maximize' : 'plugin:window|start_dragging';
-    try { Promise.resolve(inv(cmd)).catch(() => {}); } catch (e) {}
+    try { Promise.resolve(inv(cmd)).catch(err => console.warn('[mcc] ' + cmd + ' refusé :', err)); }
+    catch (e) { console.warn('[mcc] ' + cmd + ' a levé :', e); }
   });
 })();
 function winAction(op) {
