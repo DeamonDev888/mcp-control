@@ -463,17 +463,7 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                         .and_then(|s| s.start_cmd.clone())
                 };
                 if let Some(cmd) = cmd {
-                    let prog_low = std::path::Path::new(&cmd.program)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(&cmd.program)
-                        .to_ascii_lowercase();
-                    let timeout_ms =
-                        if matches!(prog_low.as_str(), "npx" | "uvx" | "bunx" | "pnpx" | "dlx") {
-                            45_000
-                        } else {
-                            15_000
-                        };
+                    let timeout_ms = stdio_start_timeout_ms(&cmd.program, &cmd.args);
                     match probe::probe_stdio(
                         &cmd.program,
                         &cmd.args,
@@ -552,6 +542,94 @@ pub const SCAN_MAX_PORTS: usize = 512;
 /// Découverte locale DÉSACTIVÉE par l'environnement (`MCC_NO_LOCAL_DISCOVERY=1`).
 /// Réservé aux instances de test : sans cela, un moteur de test importe les
 /// serveurs réels de la machine (scan local au boot + scan réseau à +30 s).
+/// Délai du handshake `initialize` au démarrage d'un serveur stdio.
+///
+/// Un lanceur de paquets (npx, uvx…) télécharge le paquet au PREMIER
+/// lancement : couper ce téléchargement à 45 s laissait un cache npx à moitié
+/// installé (ex. mcp-mermaid → playwright-core sans index.js), et chaque
+/// démarrage suivant plantait. D'où :
+/// - npx avec paquet déjà en cache → 45 s (démarrage normal) ;
+/// - npx sans cache → 5 min (installation complète) ;
+/// - autres lanceurs (cache non détecté) → 2 min ;
+/// - binaire direct → 15 s.
+/// Un process qui meurt est signalé tout de suite (probe_stdio), donc un long
+/// délai ne fait attendre que les serveurs réellement bloqués.
+pub(super) fn stdio_start_timeout_ms(program: &str, args: &[String]) -> u64 {
+    let stem = std::path::Path::new(program)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    match stem.as_str() {
+        "npx" => match npx_package_name(args) {
+            Some(pkg) if npx_package_cached(&npx_cache_dirs(), &pkg) => 45_000,
+            _ => 300_000,
+        },
+        "uvx" | "bunx" | "pnpx" | "dlx" => 120_000,
+        _ => 15_000,
+    }
+}
+
+/// Nom du paquet lancé par npx, sans version (`@scope/nom@1.2` → `@scope/nom`).
+pub(super) fn npx_package_name(args: &[String]) -> Option<String> {
+    let mut it = args.iter();
+    let mut spec = None;
+    while let Some(a) = it.next() {
+        if a == "-p" || a == "--package" {
+            spec = it.next().cloned();
+            break;
+        }
+        if let Some(v) = a.strip_prefix("--package=") {
+            spec = Some(v.to_string());
+            break;
+        }
+        if !a.starts_with('-') {
+            spec = Some(a.clone());
+            break;
+        }
+    }
+    let spec = spec?;
+    // la version suit le DERNIER « @ » qui n'est pas en tête (portée @scope)
+    let nom = match spec.rfind('@').filter(|&i| i > 0) {
+        Some(i) => spec[..i].to_string(),
+        None => spec,
+    };
+    (!nom.is_empty()).then_some(nom)
+}
+
+/// Dossiers `_npx` candidats (variable npm_config_cache, sinon défaut OS).
+fn npx_cache_dirs() -> Vec<std::path::PathBuf> {
+    let mut v = Vec::new();
+    if let Ok(c) = std::env::var("npm_config_cache") {
+        v.push(std::path::PathBuf::from(c).join("_npx"));
+    }
+    if let Ok(l) = std::env::var("LOCALAPPDATA") {
+        v.push(std::path::PathBuf::from(l).join("npm-cache").join("_npx"));
+    }
+    if let Some(h) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        v.push(std::path::PathBuf::from(h).join(".npm").join("_npx"));
+    }
+    v
+}
+
+/// Le paquet est-il déjà installé dans un des caches npx ?
+pub(super) fn npx_package_cached(dirs: &[std::path::PathBuf], pkg: &str) -> bool {
+    let rel: std::path::PathBuf = pkg.split('/').collect();
+    dirs.iter().any(|d| {
+        std::fs::read_dir(d)
+            .map(|rd| {
+                rd.flatten().any(|e| {
+                    e.path()
+                        .join("node_modules")
+                        .join(&rel)
+                        .join("package.json")
+                        .is_file()
+                })
+            })
+            .unwrap_or(false)
+    })
+}
+
 pub fn local_discovery_disabled() -> bool {
     std::env::var("MCC_NO_LOCAL_DISCOVERY")
         .map(|v| v.trim() == "1")
@@ -1447,6 +1525,61 @@ mod tests {
     }
 
     /// Commande qui meurt aussitôt (code de sortie 1) — cross-platform.
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn npx_package_name_retire_options_et_version() {
+        assert_eq!(
+            npx_package_name(&v(&["-y", "mcp-mermaid"])).as_deref(),
+            Some("mcp-mermaid")
+        );
+        assert_eq!(
+            npx_package_name(&v(&["-y", "@modelcontextprotocol/server-gdrive@0.6.2"])).as_deref(),
+            Some("@modelcontextprotocol/server-gdrive")
+        );
+        assert_eq!(
+            npx_package_name(&v(&["--yes", "pkg@latest", "--flag"])).as_deref(),
+            Some("pkg")
+        );
+        assert_eq!(
+            npx_package_name(&v(&["-p", "@s/a@1", "bin"])).as_deref(),
+            Some("@s/a")
+        );
+        assert_eq!(
+            npx_package_name(&v(&["--package=x@2"])).as_deref(),
+            Some("x")
+        );
+        assert_eq!(npx_package_name(&v(&["-y"])), None);
+        assert_eq!(npx_package_name(&v(&[""])), None);
+    }
+
+    #[test]
+    fn delai_demarrage_long_si_paquet_npx_absent_du_cache() {
+        let tmp = std::env::temp_dir().join(format!("mcc-npx-{}", std::process::id()));
+        let pkg = tmp
+            .join("abc123")
+            .join("node_modules")
+            .join("@s")
+            .join("ok");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("package.json"), "{}").unwrap();
+        let dirs = vec![tmp.clone()];
+        assert!(npx_package_cached(&dirs, "@s/ok"));
+        assert!(!npx_package_cached(&dirs, "@s/absent"));
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(stdio_start_timeout_ms("node", &v(&["x.js"])), 15_000);
+        assert_eq!(
+            stdio_start_timeout_ms(r"C:\x\uvx.exe", &v(&["mcp-x"])),
+            120_000
+        );
+        assert_eq!(
+            stdio_start_timeout_ms("npx", &v(&["-y", "paquet-inexistant-mcc-zz9"])),
+            300_000
+        );
+    }
+
     fn commande_exit_immediat() -> (String, Vec<String>) {
         #[cfg(windows)]
         {

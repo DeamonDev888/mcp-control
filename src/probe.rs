@@ -2830,6 +2830,37 @@ fn read_bounded_line<R: std::io::BufRead>(
     Ok(n)
 }
 
+/// Lignes stderr conservées par process stdio (diagnostic de démarrage).
+const STDERR_TAIL_LINES: usize = 8;
+/// Longueur max du résumé stderr ajouté à un message d'erreur.
+const STDERR_SUMMARY_MAX: usize = 300;
+
+/// Résumé lisible des dernières lignes stderr : ignore le bruit npm
+/// (« npm warn … ») et garde les 2 dernières lignes utiles, tronquées.
+fn stderr_summary(tail: &std::collections::VecDeque<String>) -> String {
+    let utiles: Vec<&str> = tail
+        .iter()
+        .map(|l| l.as_str())
+        .filter(|l| {
+            let b = l.to_ascii_lowercase();
+            !(b.starts_with("npm warn") || b.starts_with("npm notice"))
+        })
+        .collect();
+    // Crash Node/Python : la ligne « …Error: … » est la seule parlante (la
+    // pile et « Node.js vXX » qui suivent n'apprennent rien).
+    let s = match utiles.iter().rev().find(|l| l.contains("Error:")) {
+        Some(l) => l.to_string(),
+        None => utiles[utiles.len().saturating_sub(2)..].join(" | "),
+    };
+    if s.chars().count() > STDERR_SUMMARY_MAX {
+        let mut t: String = s.chars().take(STDERR_SUMMARY_MAX).collect();
+        t.push('…');
+        t
+    } else {
+        s
+    }
+}
+
 /// Probe/handshake MCP stdio (JSON délimité par nouvelles lignes sur stdin/stdout).
 /// keep_alive=true → ne tue pas le process, renvoie un StdioHandle.
 pub fn probe_stdio(
@@ -2846,7 +2877,7 @@ pub fn probe_stdio(
     cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     // env additionnel du transport stdio (import mcpServers, lot 3) : les
     // valeurs ne vivent que dans le process enfant — jamais journalisées.
     cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
@@ -2864,6 +2895,35 @@ pub fn probe_stdio(
     let pid = child.id();
     let mut stdin = child.stdin.take().ok_or("stdin indisponible")?;
     let stdout = child.stdout.take().ok_or("stdout indisponible")?;
+    // stderr : vidé en continu (sinon un enfant bavard bloquerait sur un pipe
+    // plein) et seules les dernières lignes sont gardées, bornées, pour
+    // expliquer un échec de démarrage (« Credentials not found… ») au lieu
+    // d'un faux « timeout ».
+    let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<
+        String,
+    >::new()));
+    if let Some(se) = child.stderr.take() {
+        let tail = stderr_tail.clone();
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(se);
+            let mut buf: Vec<u8> = Vec::new();
+            while let Ok(n) = read_bounded_line(&mut reader, &mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let l = String::from_utf8_lossy(&buf).trim().to_string();
+                if l.is_empty() {
+                    continue;
+                }
+                if let Ok(mut t) = tail.lock() {
+                    if t.len() >= STDERR_TAIL_LINES {
+                        t.pop_front();
+                    }
+                    t.push_back(l);
+                }
+            }
+        });
+    }
 
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -2908,6 +2968,8 @@ pub fn probe_stdio(
     let mut protocol: Option<String> = None;
     let mut tools: Vec<ToolInfo> = Vec::new();
     let mut init_err: Option<String> = None;
+    // stdout fermé avant la réponse : le process s'est arrêté (pas un timeout)
+    let mut stdout_closed = false;
 
     loop {
         let now = Instant::now();
@@ -2963,19 +3025,56 @@ pub fn probe_stdio(
                     break;
                 }
             }
-            Err(_) => break, // timeout
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                stdout_closed = true;
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
         }
     }
 
     let latency = t0.elapsed().as_millis() as u64;
     if init_err.is_some() || !got_init {
+        // code de sortie si le process est déjà mort (laisser au lecteur
+        // stderr quelques ms pour vider les dernières lignes)
+        let mut exit = None;
+        if stdout_closed {
+            let fin = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < fin {
+                if let Ok(Some(st)) = child.try_wait() {
+                    exit = Some(st);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         kill_tree(pid);
         let _ = child.wait();
+        let detail = stderr_tail
+            .lock()
+            .map(|t| stderr_summary(&t))
+            .unwrap_or_default();
         let msg = init_err.unwrap_or_else(|| {
-            format!(
-                "timeout {}: pas de réponse initialize en {} ms",
-                program, timeout_ms
-            )
+            let base = if stdout_closed {
+                match exit.and_then(|st| st.code()) {
+                    Some(c) => format!(
+                        "{} s'est arrêté (code {}) avant de répondre à initialize",
+                        program, c
+                    ),
+                    None => format!("{} s'est arrêté avant de répondre à initialize", program),
+                }
+            } else {
+                format!(
+                    "timeout {}: pas de réponse initialize en {} ms",
+                    program, timeout_ms
+                )
+            };
+            if detail.is_empty() {
+                base
+            } else {
+                format!("{} — {}", base, detail)
+            }
         });
         return Err(msg);
     }
@@ -3711,6 +3810,55 @@ pub fn control_ui_at_hosts(port: u16, hosts: &[&str]) -> Option<String> {
 mod tests {
     use super::*;
     use std::thread;
+
+    /// Un serveur stdio qui meurt au démarrage (ex. server-gdrive sans
+    /// identifiants) doit remonter son stderr et son code de sortie, vite,
+    /// au lieu d'un faux « timeout … 45000 ms ».
+    #[cfg(windows)]
+    #[test]
+    fn probe_stdio_mort_au_demarrage_remonte_stderr_et_code() {
+        let args: Vec<String> = [
+            "/c",
+            "echo npm warn bruit 1>&2 & echo Credentials not found. Please run with 'auth' argument first. 1>&2 & exit 3",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let t0 = Instant::now();
+        let err = probe_stdio("cmd", &args, None, 20_000, false, &[])
+            .err()
+            .expect("doit échouer");
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "pas d'attente du timeout"
+        );
+        assert!(err.contains("s'est arrêté (code 3)"), "{err}");
+        assert!(err.contains("Credentials not found"), "{err}");
+        assert!(!err.contains("npm warn"), "{err}");
+        assert!(!err.contains("timeout"), "{err}");
+    }
+
+    #[test]
+    fn stderr_summary_garde_les_deux_dernieres_lignes_utiles() {
+        let t: std::collections::VecDeque<String> = ["a", "npm warn x", "b", "c", "npm notice y"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(stderr_summary(&t), "b | c");
+        let crash: std::collections::VecDeque<String> = [
+            "Error: Cannot find package 'playwright-core'",
+            "    at legacyMainResolve (node:internal)",
+            "}",
+            "Node.js v26.12.1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            stderr_summary(&crash),
+            "Error: Cannot find package 'playwright-core'"
+        );
+    }
 
     /// Lit la requête HTTP COMPLÈTE (en-têtes + corps annoncé par
     /// `Content-Length`) au lieu d'un `read` unique. Sous charge, un seul
