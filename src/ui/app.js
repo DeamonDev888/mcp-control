@@ -503,6 +503,44 @@ function groupKeys() {
   (state.settings.ssh_hosts || []).forEach(h => { if (!keys.includes(h.ip)) keys.push(h.ip); });
   return keys;
 }
+function hybridUrl(s) {
+  if (!s || !s.hybrid_path) return '';
+  return window.location.origin + s.hybrid_path;
+}
+function srvStoreLogo(s, lg) {
+  if (!s || !s.id || !s.id.startsWith('store-')) return '';
+  let inner = PKG_GLYPH;
+  if (storeLogos) {
+    const raw = s.id.slice(6);
+    const stripped = raw.replace(/^(at|gl|gh)-/, '');
+    const noNum = raw.replace(/-\d+$/, '');
+    const found = storeLogos[raw] || storeLogos[stripped] || storeLogos[noNum];
+    if (found) {
+      inner = found;
+    } else {
+      const sc = s.start_cmd || s.transport_info || {};
+      const cmd = ((sc.program || '') + ' ' + (sc.args || []).join(' ')).toLowerCase();
+      for (const [needle, lid] of PKG_LOGOS) {
+        if (storeLogos[lid] && cmd.includes(needle)) { inner = storeLogos[lid]; break; }
+      }
+    }
+  }
+  return `<span class="srv-logo${lg ? ' lg' : ''}" title="Serveur install&eacute; depuis la Boutique MCP Control"><svg viewBox="0 0 24 24" aria-hidden="true">${inner}</svg></span>`;
+}
+function loadStoreLogos() {
+  if (storeLogos) return;
+  fetch('/api/store-logos').then(r => r.ok ? r.json() : null).then(j => {
+    if (!j) return;
+    storeLogos = j;
+    _sigServers = '';
+    _sigDetail = '';
+    if (state) {
+      renderServers();
+      if (selectedId && detailCache) renderDetail();
+    }
+  }).catch(() => {});
+}
+
 function srvRow(s) {
   const endpoint = s.transport === 'http'
     ? (s.transport_info.host && !isLoopbackHost(s.transport_info.host)
@@ -520,14 +558,14 @@ function srvRow(s) {
     : '';
   const toolsTip = `${s.tools_count} outil${s.tools_count > 1 ? 's' : ''}`
     + (s.tools_disabled.length ? ` (${s.tools_disabled.length} coup\u00e9s)` : '');
-  /* Ligne 1 : état + nom + compteur d'outils + switch ON/OFF.
+  /* Ligne 1 : état + logo boutique éventuel + nom + compteur d'outils + switch ON/OFF.
      Ligne 2 : métadonnées (état si hors-ligne, port/programme, latence, badges)
      à gauche, actions rapides (favori, autoboot, play/stop) séparées à droite. */
   return `<div class="srow ${selectedId===s.id?'sel':''} ${s.enabled?'':'off'}" draggable="true"
     role="listitem" tabindex="0" aria-label="Serveur ${esc(s.label)} (${esc(s.state)})"
     data-act="select" data-id="${esc(s.id)}">
     <div class="l1">
-      <span class="dot ${esc(s.state)}"></span>
+      <span class="dot ${esc(s.state)}"></span>${srvStoreLogo(s, false)}
       <span class="nm" title="${esc(s.label)}">${esc(s.label)}</span>
       <div class="l1-right">
         <span class="cnt" title="${esc(toolsTip)}">${s.tools_count}</span>${offPill}${rowToggle(s)}
@@ -535,7 +573,7 @@ function srvRow(s) {
     </div>
     <div class="l2">
       <div class="srow-meta">
-        ${stPill}<span class="srow-pill">${endpoint}</span>${latPill}${langChip(s)}${frameworkBadge(s)}${lockBadge(s)}${s.transport==='stdio'?'<span class="legacy" title="Legacy : serveur stdio uniquement (pas de transport HTTP)">stdio</span>':''}
+        ${stPill}<span class="srow-pill">${endpoint}</span>${latPill}${langChip(s)}${frameworkBadge(s)}${lockBadge(s)}${s.transport==='stdio'?'<span class="tag hybrid" title="Pont hybride natif : Streamable HTTP (/mcp/s/...) + auth Ed25519 LiteMCP">HTTP+AUTH</span>':''}
       </div>
       <div class="srow-acts">${rowFav(s)}${rowAuto(s)}${rowCtl(s)}</div>
     </div>
@@ -1188,8 +1226,26 @@ function confAgent(s) {
   const blk = (t, lang, html) =>
     '<div class="conf-block"><div class="conf-head"><span class="conf-lang">' + esc(lang) + '</span><span>' + t +
     '</span><button class="copy-btn" data-act="copy-conf">' + ic('copy') + '<span>Copier</span></button></div><pre>' + html + '</pre></div>';
+  let hybridBlk = '';
+  const hUrl = hybridUrl(s);
+  if (hUrl) {
+    const hJson = JSON.stringify({
+      mcpServers: {
+        [s.id]: {
+          command: 'mcp-control',
+          args: ['bridge', '--url', hUrl],
+        },
+      },
+    }, null, 2);
+    hybridBlk = blk(
+      'Pont hybride Streamable HTTP + Auth LiteMCP Ed25519 (' + esc(hUrl) + ')',
+      'JSON',
+      hlJson(hJson)
+    );
+  }
   return '<h4 class="sec">Connecter ce serveur &agrave; un agent</h4>' +
     '<div class="conf-note">Copie le bloc de ton agent &mdash; Hermes : colle sous <b>mcp_servers:</b> dans <b>~/.hermes/config.yaml</b>. Cl&eacute;s API : bloc <b>env:</b> (Hermes) ou <b>"env"</b> (JSON) &mdash; voir la desc du serveur.</div>' +
+    hybridBlk +
     blk('Hermes &mdash; config.yaml', 'YAML', hlYaml(hermesYaml(s))) +
     blk('JSON mcpServers (Claude, Cursor, VS Code&hellip;)', 'JSON', hlJson(mcpJson(s))) +
     blk('claude mcp add', 'CLI', hlCli(claudeCmd(s)));
@@ -1262,7 +1318,7 @@ function renderToolParamsHtml(schema) {
 function renderToolPanelHtml(s, t, expKey) {
   const schema = t.input_schema || null;
   const schemaJson = schema ? JSON.stringify(schema, null, 2) : null;
-  const canRun = s.state === 'UP' && s.transport === 'http' && !s.via_ssh && (!s.locked || s.paired) && !t.disabled;
+  const canRun = s.state === 'UP' && (s.transport === 'http' || s.transport === 'stdio') && !s.via_ssh && (!s.locked || s.paired) && !t.disabled;
   const draft = toolArgsDraft.has(expKey)
     ? toolArgsDraft.get(expKey)
     : JSON.stringify(buildArgsTemplate(schema), null, 2);
@@ -1501,13 +1557,13 @@ function renderDetail() {
     <div id="toolsRowsBox">${renderToolsRowsHtml(s)}</div>`;
   const endpointLabel = s.transport === 'http'
     ? ((s.transport_info.host || '127.0.0.1') + ':' + s.transport_info.port + (s.transport_info.path || '/mcp'))
-    : ('stdio · ' + (s.transport_info.program || ''));
+    : (hybridUrl(s) || ('stdio · ' + (s.transport_info.program || '')));
   const needsPair = s.transport === 'http' && s.locked && !s.paired;
   contentEl.innerHTML = `
     <div class="crumb">serveurs / <b>${esc(s.label)}</b></div>
     <div class="d-head st-${esc(dispState)}">
       <div class="d-head-top">
-        <span class="dot dot-lg ${esc(dispState)}"></span>
+        <span class="dot dot-lg ${esc(dispState)}"></span>${srvStoreLogo(s, true)}
         <h1>${esc(s.label)}</h1>
         <span class="pill ${esc(dispState)}" ${starting ? 'title="Process lanc&eacute;, MCP pas encore r&eacute;pondu"' : ''}>${starting ? 'AU D&Eacute;MARRAGE' : esc(s.state)}</span>
         <span class="d-head-endpoint" title="${esc(endpointLabel)}">${esc(endpointLabel)}</span>
@@ -1517,7 +1573,7 @@ function renderDetail() {
         ${typeBadge(s)}
         ${frameworkBadge(s)}
         ${lockBadge(s, true)}
-        ${s.transport === 'stdio' ? '<span class="legacy" title="Legacy : serveur stdio uniquement (pas de transport HTTP)">legacy</span>' : ''}
+        ${s.transport === 'stdio' ? '<span class="tag hybrid" title="Pont hybride natif MCP Control : Streamable HTTP POST ' + esc(s.hybrid_path || '') + ' prot&eacute;g&eacute; par signature Ed25519 LiteMCP">HYBRIDE &middot; HTTP + AUTH</span>' : ''}
         ${s.protocol ? `<span class="d-meta-pill">MCP ${esc(s.protocol)}</span>` : ''}
         ${s.server_name ? `<span class="d-meta-pill">${esc(s.server_name)}${s.version ? ' v' + esc(s.version) : ''}</span>` : ''}
         ${s.latency_ms != null ? `<span class="d-meta-pill">${esc(String(s.latency_ms))} ms</span>` : ''}
@@ -1702,6 +1758,7 @@ function srvPaths(s) {
 // URL d'un serveur HTTP — variante gardée (la constante srvUrl plus haut ne
 // vérifie pas le transport et sert au bloc « Conf agent »).
 function ctxUrl(s) {
+  if (s.transport === 'stdio') return hybridUrl(s);
   if (s.transport !== 'http') return '';
   const ti = s.transport_info || {};
   return 'http://' + hostForUrl(ti.host || '127.0.0.1') + ':' + ti.port + (ti.path || '/mcp');
@@ -3765,6 +3822,7 @@ function runAction(ev) {
 }
 
 loadFrameworks();
+loadStoreLogos();
 updateLogoutBtn();
 load();
 armPolling();

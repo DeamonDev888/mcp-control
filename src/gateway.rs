@@ -1666,6 +1666,292 @@ fn respond_auth(
     reply
 }
 
+/// Pont hybride Streamable HTTP + auth LiteMCP Ed25519 (`POST /mcp/s/<id>`)
+/// pour tout serveur `stdio` supervisé par MCP Control (notamment les serveurs
+/// installés depuis la Boutique).
+///
+/// Applique exactement les mêmes garanties de transport et d'authentification
+/// RFC 9421 + RFC 9530 que `POST /mcp` :
+/// - `POST` + `Content-Type: application/json` stricts,
+/// - signature Ed25519 vérifiée contre le registre local (`verifier_for`) et `BOOT_TS`,
+/// - droits minimaux (`lecture` pour `initialize`/`ping`/`tools/list`, `execution` pour `tools/call`),
+/// - filtrage strict des outils désactivés (`tools_disabled`),
+/// - relais JSON-RPC 2.0 sur le process stdio vivant (`StdioHandle.rpc`).
+#[allow(clippy::too_many_arguments)]
+pub fn serve_hybrid_stdio(
+    state: &Arc<AppState>,
+    server_id: &str,
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    legacy: bool,
+    peer: Option<std::net::IpAddr>,
+) -> Reply {
+    crate::auth::confirm::set_request_peer(peer);
+    if method != "POST" {
+        return Reply::new(
+            405,
+            "application/json",
+            br#"{"ok":false,"error":"method not allowed: POST /mcp/s/<id> only (stateless streamable HTTP)"}"#
+                .to_vec(),
+        );
+    }
+    let mut ct_json = false;
+    let mut ct_seen = false;
+    for (name, value) in headers {
+        if name == "content-type" {
+            if ct_seen {
+                return err_json(
+                    400,
+                    json!({"ok": false, "error": "duplicate Content-Type header"}),
+                );
+            }
+            ct_seen = true;
+            ct_json = is_json_content_type(value);
+        }
+    }
+    if !ct_json {
+        return err_json(
+            415,
+            json!({"ok": false, "error": "expected Content-Type: application/json"}),
+        );
+    }
+    let mut accept_json = false;
+    let mut accept_sse = false;
+    let mut accept_seen = false;
+    for (name, value) in headers {
+        if name == "accept" {
+            accept_seen = true;
+            let (j, s) = accept_media(value);
+            accept_json |= j;
+            accept_sse |= s;
+        }
+    }
+    if accept_seen && !accept_json && !accept_sse {
+        return err_json(
+            406,
+            json!({"ok": false, "error": "not acceptable: serve application/json or text/event-stream"}),
+        );
+    }
+    let signed = headers
+        .iter()
+        .any(|(n, _)| n == "signature" || n == "signature-input");
+    let unauth = || {
+        Reply::new(
+            401,
+            "application/json",
+            br#"{"error":{"code":-32600,"message":"unauthorized"},"id":null,"jsonrpc":"2.0"}"#
+                .to_vec(),
+        )
+        .with_header(
+            "WWW-Authenticate",
+            r#"Signature realm="litemcp", tag="litemcp-auth-v1""#.to_string(),
+        )
+    };
+    let auth_ctx = if legacy && !signed {
+        AuthContext::new(
+            "mcc-legacy",
+            ProofMethod::Token {
+                issuer: "mcc-access".to_string(),
+            },
+        )
+        .with_right("lecture")
+    } else {
+        if signature_created(headers).is_some_and(|c| c < boot_ts()) {
+            return unauth();
+        }
+        let refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .collect();
+        let authority = headers
+            .iter()
+            .find(|(n, _)| n == "host")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        let req = VerifiedRequest::new(method, path, authority, &refs, body);
+        match verifier_for(state).verify(&req) {
+            Ok(ctx) => ctx,
+            Err(_) => return unauth(),
+        }
+    };
+    let Ok(rpc_req) = serde_json::from_slice::<Value>(body) else {
+        return Reply::json(
+            400,
+            json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}),
+        );
+    };
+    let rpc_id = rpc_req.get("id").cloned().unwrap_or(Value::Null);
+    let rpc_method = rpc_req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    if rpc_method.starts_with("notifications/") || (rpc_id.is_null() && rpc_method == "initialized")
+    {
+        return Reply::new(202, "application/json", Vec::new());
+    }
+    let is_exec = rpc_method == "tools/call";
+    let has_right = if is_exec {
+        auth_ctx.has_right("execution")
+    } else {
+        auth_ctx.has_right("lecture")
+            || auth_ctx.has_right("pilotage")
+            || auth_ctx.has_right("execution")
+    };
+    if !has_right {
+        return Reply::json(
+            403,
+            json!({
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "error": {
+                    "code": -32023,
+                    "message": if is_exec { "forbidden: execution right required" } else { "forbidden: lecture right required" }
+                }
+            }),
+        );
+    }
+    let srv_snap = {
+        let servers = lockv(&state.servers);
+        servers.iter().find(|s| s.id == server_id).map(|s| {
+            (
+                matches!(s.transport, Transport::Stdio { .. }),
+                s.state,
+                s.label.clone(),
+                s.server_name.clone(),
+                s.version.clone(),
+                s.protocol.clone(),
+                s.tools.clone(),
+                s.tools_disabled.clone(),
+            )
+        })
+    };
+    let Some((is_stdio, st, label, server_name, version, protocol, tools, disabled)) = srv_snap
+    else {
+        return Reply::json(
+            404,
+            json!({
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "error": { "code": -32004, "message": format!("serveur inconnu : {server_id}") }
+            }),
+        );
+    };
+    if !is_stdio {
+        return Reply::json(
+            400,
+            json!({
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "error": { "code": -32600, "message": "le pont hybride /mcp/s/<id> est réservé aux serveurs stdio" }
+            }),
+        );
+    }
+    let resp_val = match rpc_method {
+        "initialize" => json!({
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "result": {
+                "protocolVersion": protocol.unwrap_or_else(|| "2024-11-05".to_string()),
+                "capabilities": { "tools": { "listChanged": false } },
+                "serverInfo": {
+                    "name": server_name.unwrap_or(label),
+                    "version": version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
+                }
+            }
+        }),
+        "ping" => json!({ "jsonrpc": "2.0", "id": rpc_id, "result": {} }),
+        "tools/list" => {
+            let list: Vec<Value> = tools
+                .iter()
+                .filter(|t| !disabled.iter().any(|d| d == &t.name))
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.desc,
+                        "inputSchema": t.input_schema.clone().unwrap_or_else(|| json!({"type":"object","properties":{}})),
+                    })
+                })
+                .collect();
+            json!({ "jsonrpc": "2.0", "id": rpc_id, "result": { "tools": list } })
+        }
+        "tools/call" => {
+            let params = rpc_req.get("params").cloned().unwrap_or_else(|| json!({}));
+            let tool_name = params.get("name").and_then(|x| x.as_str()).unwrap_or("");
+            if tool_name.is_empty() {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "error": { "code": -32602, "message": "params.name requis" }
+                })
+            } else if disabled.iter().any(|d| d == tool_name) {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "error": { "code": -32023, "message": format!("outil désactivé : {tool_name}") }
+                })
+            } else if st != SState::Up {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "error": { "code": -32000, "message": format!("serveur stdio hors ligne ({})", st.as_str()) }
+                })
+            } else {
+                let rpc = lockv(&state.children)
+                    .get(server_id)
+                    .and_then(|h| h.rpc.clone());
+                let arguments = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                match rpc {
+                    Some(rpc) => {
+                        match crate::probe::call_stdio_tool(&rpc, tool_name, arguments, 30_000) {
+                            Ok((res, _ms)) => {
+                                json!({ "jsonrpc": "2.0", "id": rpc_id, "result": res })
+                            }
+                            Err(e) => json!({
+                                "jsonrpc": "2.0",
+                                "id": rpc_id,
+                                "error": { "code": -32000, "message": e }
+                            }),
+                        }
+                    }
+                    None => json!({
+                        "jsonrpc": "2.0",
+                        "id": rpc_id,
+                        "error": { "code": -32000, "message": "canal stdio non prêt — démarrez ou sondez le serveur" }
+                    }),
+                }
+            }
+        }
+        other => {
+            let rpc = lockv(&state.children)
+                .get(server_id)
+                .and_then(|h| h.rpc.clone());
+            let params = rpc_req.get("params").cloned().unwrap_or_else(|| json!({}));
+            match rpc {
+                Some(rpc) => match crate::probe::call_stdio_rpc(&rpc, other, params, 30_000) {
+                    Ok((res, _ms)) => json!({ "jsonrpc": "2.0", "id": rpc_id, "result": res }),
+                    Err(e) => json!({
+                        "jsonrpc": "2.0",
+                        "id": rpc_id,
+                        "error": { "code": -32000, "message": e }
+                    }),
+                },
+                None => json!({
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "error": { "code": -32000, "message": "serveur stdio hors ligne" }
+                }),
+            }
+        }
+    };
+    let reply = Reply::json(200, resp_val);
+    if accept_sse && !accept_json && !reply.body.is_empty() {
+        return Reply::new(200, "text/event-stream", sse_event(&reply.body));
+    }
+    reply
+}
+
 // ---------- tests ----------
 
 #[cfg(test)]

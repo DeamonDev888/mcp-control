@@ -68,6 +68,11 @@ pub(super) fn server_json(s: &Server, managed: bool) -> Value {
         "auth_keyid": auth.keyid,
         "auth_public_key": auth.public_key,
         "auth_fingerprint": auth.fingerprint,
+        "hybrid_path": if matches!(s.transport, Transport::Stdio { .. }) {
+            Some(format!("/mcp/s/{}", s.id))
+        } else {
+            None
+        },
         "via_ssh": s.via_ssh,
         // contrôle du process : maintenu par CE moteur MCP Control (children) ?
         "managed": managed,

@@ -463,11 +463,22 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                         .and_then(|s| s.start_cmd.clone())
                 };
                 if let Some(cmd) = cmd {
+                    let prog_low = std::path::Path::new(&cmd.program)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&cmd.program)
+                        .to_ascii_lowercase();
+                    let timeout_ms =
+                        if matches!(prog_low.as_str(), "npx" | "uvx" | "bunx" | "pnpx" | "dlx") {
+                            45_000
+                        } else {
+                            15_000
+                        };
                     match probe::probe_stdio(
                         &cmd.program,
                         &cmd.args,
                         cmd.workdir.as_deref(),
-                        15000,
+                        timeout_ms,
                         true,
                         &cmd.env,
                     ) {

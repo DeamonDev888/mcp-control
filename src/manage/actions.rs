@@ -1659,25 +1659,33 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                             .or(host.as_deref())
                             .unwrap_or("127.0.0.1")
                             .to_string();
-                        (h, *port, path.clone(), s.protocol.clone())
+                        (Some((h, *port, path.clone(), s.protocol.clone())), false)
                     }
-                    Transport::Stdio { .. } => {
-                        return json!({"ok": false, "error": "serveur stdio : exécution directe non supportée (HTTP uniquement)"});
+                    Transport::Stdio { .. } => (None, true),
+                }
+            };
+            let timeout_ms: u64 = 15_000;
+            add_log(state, "info", &format!("[ui] call_tool {sid}.{tool}"));
+            let res = if let Some((host, port, path, proto)) = target.0 {
+                probe::call_http_tool(
+                    &host,
+                    port,
+                    &path,
+                    proto.as_deref(),
+                    &tool,
+                    arguments,
+                    timeout_ms,
+                )
+            } else {
+                let rpc = lockv(&state.children).get(&sid).and_then(|h| h.rpc.clone());
+                match rpc {
+                    Some(rpc) => probe::call_stdio_tool(&rpc, &tool, arguments, timeout_ms),
+                    None => {
+                        Err("pont stdio hybride non prêt — redémarrez ou sondez le serveur".into())
                     }
                 }
             };
-            let (host, port, path, proto) = target;
-            let timeout_ms: u64 = 15_000;
-            add_log(state, "info", &format!("[ui] call_tool {sid}.{tool}"));
-            match probe::call_http_tool(
-                &host,
-                port,
-                &path,
-                proto.as_deref(),
-                &tool,
-                arguments,
-                timeout_ms,
-            ) {
+            match res {
                 Ok((res, elapsed_ms)) => {
                     json!({"ok": true, "result": res, "elapsed_ms": elapsed_ms})
                 }

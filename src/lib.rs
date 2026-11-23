@@ -1715,11 +1715,12 @@ fn handle_conn_stream(
     // - sur /mcp, la session n'ouvre rien : un code hérité sans signature est un
     //   usage, avec signature c'est la signature qui décide.
     let bare_route = path.split('?').next().unwrap_or(&path);
+    let is_mcp_route = bare_route == "/mcp" || bare_route.starts_with("/mcp/s/");
     let signature_presente = headers
         .iter()
         .any(|(n, _)| n == "signature-input" || n == "signature");
     let usage_legacy = match legacy_reason {
-        Some(_) if bare_route == "/mcp" => !signature_presente,
+        Some(_) if is_mcp_route => !signature_presente,
         Some(_) => !session_ok,
         None => false,
     };
@@ -1779,8 +1780,8 @@ fn handle_conn_stream(
         autre => autre,
     };
     // R-1 : le port de `Host` doit correspondre au `ui_port` de cette instance
-    // (ferme le rejeu inter-ports / inter-instances sur `/mcp`).
-    let gated = gated.and_then(|()| check_host_port(&headers, ui_port, bare_route == "/mcp"));
+    // (ferme le rejeu inter-ports / inter-instances sur `/mcp` et `/mcp/s/*`).
+    let gated = gated.and_then(|()| check_host_port(&headers, ui_port, is_mcp_route));
     // limiteur de débit /api/hello (audit 05 #6) : hors loopback, une adresse
     // ne peut plus remplir la table de nonces à outrance. Le loopback est
     // exempté : la fenêtre locale et le harnais e2e sondent /api/hello en rafale.
@@ -1807,7 +1808,7 @@ fn handle_conn_stream(
         // (émule le transport Streamable HTTP stateless de LiteMCP sur notre
         // socket déjà durci ; cf. gateway::serve). `legacy_ok` n'ouvre que la
         // LECTURE (code hérité, §10) — la signature, elle, est obligatoire.
-        Ok(()) if path.split('?').next() == Some("/mcp") => {
+        Ok(()) if is_mcp_route => {
             // Anti-force brute (lot M5, docs/auth.md §1.4) : le `keyid`
             // revendiqué est une donnée PUBLIQUE (jamais une autorisation) ;
             // la décision est prise AVANT toute cryptographie, et le loopback
@@ -1831,7 +1832,13 @@ fn handle_conn_stream(
                     // du hook C4 est posée sur ce fil, le transport y ajoute
                     // l'adresse source et le keyid revendiqué.
                     crate::audit::begin_mcp_request();
-                    let reply = gateway::serve(&method, &path, &headers, &body, legacy_ok, peer_ip);
+                    let reply = if let Some(sid) = bare_route.strip_prefix("/mcp/s/") {
+                        gateway::serve_hybrid_stdio(
+                            &state, sid, &method, &path, &headers, &body, legacy_ok, peer_ip,
+                        )
+                    } else {
+                        gateway::serve(&method, &path, &headers, &body, legacy_ok, peer_ip)
+                    };
                     crate::audit::note_http(
                         &state,
                         &headers,

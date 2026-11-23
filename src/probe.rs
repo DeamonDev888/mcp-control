@@ -128,6 +128,15 @@ impl McpProbe {
     }
 }
 
+/// Canal JSON-RPC 2.0 vivant vers un serveur MCP stdio déjà initialisé.
+/// Permet au pont hybride Streamable HTTP (`POST /mcp/s/<id>`) et au testeur
+/// d'outils de l'UI de relayer des requêtes sans relancer le process.
+pub struct StdioRpc {
+    stdin: ChildStdin,
+    rx: std::sync::mpsc::Receiver<String>,
+    next_id: u64,
+}
+
 /// Handle d'un serveur lancé (mode "start"). Le process est surveillé par un
 /// watcher — un thread dédié au wait() bloquant, hors du cycle de supervision :
 /// `exit` passe à Some(code) dès que le process est sorti, déterministe sur
@@ -142,12 +151,12 @@ pub struct StdioHandle {
     /// Code de sortie ; None tant que le process est en cours. Récolté par le
     /// watcher (signal non exprimable → -1).
     pub exit: std::sync::Arc<std::sync::Mutex<Option<i32>>>,
-    #[allow(dead_code)] // réservé : tools/call sur stdio dans une future version
-    pub stdin: Option<ChildStdin>,
+    /// Canal JSON-RPC stdio persistant (pont hybride HTTP + `call_tool`).
+    pub rpc: Option<std::sync::Arc<std::sync::Mutex<StdioRpc>>>,
 }
 
 /// Construit le handle et démarre le watcher qui récolte la sortie du process.
-fn handle_de_child(mut child: Child, stdin: Option<ChildStdin>) -> StdioHandle {
+fn handle_de_child(mut child: Child, rpc: Option<StdioRpc>) -> StdioHandle {
     let pid = child.id();
     let started = process_creation(pid);
     let exit = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -162,8 +171,84 @@ fn handle_de_child(mut child: Child, stdin: Option<ChildStdin>) -> StdioHandle {
         pid,
         started,
         exit,
-        stdin,
+        rpc: rpc.map(|r| std::sync::Arc::new(std::sync::Mutex::new(r))),
     }
+}
+
+/// Exécute une requête JSON-RPC 2.0 synchrone sur un canal stdio vivant.
+pub fn call_stdio_rpc(
+    rpc: &std::sync::Arc<std::sync::Mutex<StdioRpc>>,
+    method: &str,
+    params: Value,
+    timeout_ms: u64,
+) -> Result<(Value, u64), String> {
+    let t0 = Instant::now();
+    let mut guard = rpc.lock().unwrap_or_else(|p| p.into_inner());
+    let req_id = guard.next_id;
+    guard.next_id = guard.next_id.saturating_add(1);
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "method": method,
+        "params": params,
+    });
+    writeln!(guard.stdin, "{}", payload).map_err(|e| format!("écriture stdio : {e}"))?;
+    guard
+        .stdin
+        .flush()
+        .map_err(|e| format!("flush stdio : {e}"))?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(format!("timeout stdio sur {method} ({timeout_ms} ms)"));
+        }
+        match guard.rx.recv_timeout(deadline - now) {
+            Ok(line) => {
+                let t = line.trim();
+                if !t.starts_with('{') {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<Value>(t) else {
+                    continue;
+                };
+                if v.get("id").and_then(|x| x.as_u64()) != Some(req_id) {
+                    continue;
+                }
+                if let Some(err) = v.get("error") {
+                    let msg = err
+                        .get("message")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("erreur JSON-RPC");
+                    let code = err.get("code").and_then(|x| x.as_i64()).unwrap_or(-32000);
+                    return Err(format!("erreur MCP ({code}) : {msg}"));
+                }
+                let res = v.get("result").cloned().unwrap_or(Value::Null);
+                return Ok((res, t0.elapsed().as_millis() as u64));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(format!("timeout stdio sur {method} ({timeout_ms} ms)"));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("process stdio terminé (stdout fermé)".to_string());
+            }
+        }
+    }
+}
+
+/// Appelle un outil MCP (`tools/call`) sur un canal stdio vivant.
+pub fn call_stdio_tool(
+    rpc: &std::sync::Arc<std::sync::Mutex<StdioRpc>>,
+    tool: &str,
+    arguments: Value,
+    timeout_ms: u64,
+) -> Result<(Value, u64), String> {
+    call_stdio_rpc(
+        rpc,
+        "tools/call",
+        json!({ "name": tool, "arguments": arguments }),
+        timeout_ms,
+    )
 }
 
 fn resolve_windows_cmd(program: &str) -> String {
@@ -2929,7 +3014,14 @@ pub fn probe_stdio(
                 latency_ms: latency,
                 error: None,
             },
-            Some(handle_de_child(child, Some(stdin))),
+            Some(handle_de_child(
+                child,
+                Some(StdioRpc {
+                    stdin,
+                    rx,
+                    next_id: 100,
+                }),
+            )),
         ))
     } else {
         kill_tree(pid);

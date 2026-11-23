@@ -3326,7 +3326,7 @@ fn kill_et_toggle_ne_tuent_pas_un_pid_recycle_a_date_differente() {
             pid: pid_innocent,
             started: Some(vraie_date.saturating_sub(1)),
             exit: Arc::new(Mutex::new(None)),
-            stdin: None,
+            rpc: None,
         },
     );
     let _ = handle_action(&state, r#"{"action":"kill","id":"stdio-recycle"}"#);
@@ -3342,7 +3342,7 @@ fn kill_et_toggle_ne_tuent_pas_un_pid_recycle_a_date_differente() {
             pid: pid_innocent,
             started: Some(vraie_date.saturating_sub(1)),
             exit: Arc::new(Mutex::new(None)),
-            stdin: None,
+            rpc: None,
         },
     );
     let _ = handle_action(&state, r#"{"action":"toggle","id":"stdio-recycle"}"#);

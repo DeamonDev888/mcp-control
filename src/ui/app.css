@@ -1166,3 +1166,10 @@ input:focus-visible,select:focus-visible{outline:none;border-color:var(--accent)
 .tag.lock.unpaired{color:var(--warn);border-color:rgba(240,180,76,.55);background:rgba(240,180,76,.12)}
 .tag.lock.paired{color:var(--ok);border-color:rgba(78,201,148,.50);background:rgba(78,201,148,.10)}
 .tag.auth-env{color:var(--accent);border-color:rgba(123,147,255,.45);background:var(--active);font-weight:600}
+.tag.hybrid{color:#9eb2ff;border-color:rgba(123,147,255,.45);background:rgba(123,147,255,.12);font-weight:600;letter-spacing:.03em}
+:root[data-theme="light"] .tag.hybrid{color:#354194;border-color:rgba(67,85,214,.42);background:rgba(67,85,214,.09)}
+.srv-logo{display:inline-flex;align-items:center;justify-content:center;width:1.125rem;height:1.125rem;flex-shrink:0;
+  border-radius:var(--r1);background:var(--elevated);border:1px solid var(--border-soft);padding:2px}
+.srv-logo svg{width:100%;height:100%;display:block}
+.srv-logo.lg{width:1.75rem;height:1.75rem;border-radius:var(--r2);padding:3px}
+:root[data-theme="light"] .srv-logo{background:#ffffff;border-color:var(--border-soft)}
