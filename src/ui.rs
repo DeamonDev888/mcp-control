@@ -34,6 +34,8 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
           title="Oublier le code d'accès enregistré dans ce navigateur"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='4.5' y='10.5' width='15' height='10' rx='2'/><path d='M8 10.5V7a4 4 0 0 1 8 0v3.5'/></svg></button>
   <span class="tb-spacer"></span>
   <div class="tb-actions" role="toolbar" aria-label="Actions principales">
+    <button id="stUpdate" class="sb-upd" hidden data-act="update-download"
+      title="T&eacute;l&eacute;charge directement la mise &agrave; jour pour cette machine"></button>
     <div id="tbDiscoverWrap" class="tb-menu-wrap">
       <button id="tbDiscover" class="primary tb-menu-btn" data-act="discover-toggle"
               aria-haspopup="menu" aria-expanded="false" aria-controls="discoverMenu"
@@ -136,8 +138,6 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
       title="Lancer l'application au d&eacute;marrage de l'OS (tray silencieux)"></button>
     <span class="tb-badge">auto-d&eacute;tection : HTTP streamable &middot; stdio JSON-RPC</span>
     <span class="sb-ver" title="Version install&eacute;e">v__MCC_VERSION__</span>
-    <button id="stUpdate" class="sb-upd" hidden data-act="update-download"
-      title="T&eacute;l&eacute;charge directement la mise &agrave; jour pour cette machine"></button>
   </div>
   <div id="logbody"></div>
 </div>

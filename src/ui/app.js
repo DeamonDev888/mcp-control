@@ -400,9 +400,9 @@ function render() {
     setHidden(upd, false);
     if (upd.dataset.ver !== String(state.latest_version)) {
       upd.dataset.ver = String(state.latest_version);
-      upd.innerHTML = ic('download') + ' Mettre &agrave; jour';
+      upd.innerHTML = ic('download') + '<span class="tb-lbl">Mise &agrave; jour v' + esc(String(state.latest_version)) + '</span>';
       upd.title = 'Mettre à jour vers v' + state.latest_version + ' (installée : v' + MCC_VERSION
-        + ') — clic : téléchargement direct pour cette machine';
+        + ') — clic : téléchargement et installation directe';
     }
   } else setHidden(upd, true);
   renderServers();
