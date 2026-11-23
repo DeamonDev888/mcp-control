@@ -1,3 +1,8 @@
+## [0.8.6] — 2026-11-22
+
+### Correctifs
+- **Déplacement de fenêtre rétabli (cause racine)** : l'intercepteur `window.fetch` de `src/ui/app.js` recopiait les en-têtes via `Object.assign`, ce qui vidait les `Headers` de l'IPC Tauri (`Tauri-Invoke-Key` absent → `500`, plus de drag / réduire / agrandir / fermer). Les requêtes hors `/api/*` passent désormais telles quelles, et `/api/*` utilise `new Headers()` + `.set()`.
+
 ## [0.8.5] — 2026-11-22
 
 ### Refonte visuelle Studio Graphite & Platinum
@@ -6,7 +11,6 @@
 - **Explorateur, Dashboard, Détail & Inspecteur d'outils** : filet de sélection net de `2px` sans halo, séparateur `#grip` de précision `1px`, barre de révélation discrète sur les outils, coloration syntaxique JSON éditoriale adoucie et badges `HYBRIDE · HTTP + AUTH` / `AUTH ENV` raffinés.
 - **Modales, Boutique, Centre d'accès, Menu contextuel & Toasts** : harmonisation complète de `<dialog>`, des cartes Boutique, du code d'appairage `.acc-code`, de `#ctxmenu` et de `#toast` en stricte conformité CSP (`'self'`, zéro style en ligne).
 - **Filet de sécurité drag fenêtre (Windows / Tauri)** : écouteur `mousedown` en phase bulle sur `window` dans `src/ui/app.js` prenant le relais uniquement si `drag.js` natif n'a pas déjà intercepté le clic.
-- **Déplacement de fenêtre rétabli (cause racine)** : l'intercepteur `window.fetch` de `src/ui/app.js` recopiait les en-têtes via `Object.assign`, ce qui vidait les `Headers` de l'IPC Tauri (`Tauri-Invoke-Key` absent → `500`, plus de drag / réduire / agrandir / fermer). Les requêtes hors `/api/*` passent désormais telles quelles, et `/api/*` utilise `new Headers()` + `.set()`.
 
 ## [0.8.4] — 2026-11-22
 

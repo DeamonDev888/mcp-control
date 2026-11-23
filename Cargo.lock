@@ -2302,7 +2302,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-control"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "keyring",
  "litemcp",
@@ -2313,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-control-desktop"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "mcp-control",
  "serde_json",
