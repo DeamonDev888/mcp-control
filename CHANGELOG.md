@@ -1,3 +1,9 @@
+## [0.8.7] — 2026-11-22
+
+### Thème sombre par défaut & boutons obsidienne-graphite
+- **Mode sombre toujours par défaut** : suppression du basculement automatique sur `prefers-color-scheme: light` dans `src/ui/app-boot.js` ; MCP Control démarre désormais en mode sombre par défaut (le mode clair reste accessible via *⚙ Réglages*).
+- **Boutons primaires & contrôles actifs obsidienne-graphite** : remplacement des fonds blancs trop vifs en mode sombre (`.primary`, `.sb-upd`, `.scat.sel`, `#storeHideInst.sel`, cases cochées et interrupteurs) par une teinte graphite-obsidienne satinée (`#323744 → #262a34`, texte `#f0f2f6`, bordure fine lumineuse).
+
 ## [0.8.6] — 2026-11-22
 
 ### Correctifs
