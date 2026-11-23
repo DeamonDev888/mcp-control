@@ -60,7 +60,11 @@ fn main() {
     // passent par le moteur, action open_release_page → navigateur système).
     let ui_target: tauri::Url = ui_url.parse().expect("URL UI invalide");
     let ui_origin = ui_target.origin();
-    let ui_cap_origin = (ui_target.scheme() == "http" && ui_target.host_str() == Some("127.0.0.1"))
+    let is_loopback = matches!(
+        ui_target.host_str(),
+        Some("127.0.0.1" | "localhost" | "[::1]")
+    );
+    let ui_cap_origin = (matches!(ui_target.scheme(), "http" | "https") && is_loopback)
         .then(|| ui_origin.ascii_serialization());
 
     tauri::Builder::default()
@@ -75,14 +79,16 @@ fn main() {
         }))
         .setup(move |app| {
             // S-5 : capacité distante réduite à l'UNIQUE origine réellement
-            // servie par ce moteur (127.0.0.1:<port>) — aucune autre origine
+            // servie par ce moteur (loopback:<port>) — aucune autre origine
             // locale ou distante ne reçoit les contrôles de fenêtre.
             if let Some(ref cap_origin) = ui_cap_origin {
                 app.add_capability(
                     tauri::ipc::CapabilityBuilder::new("main-remote-ui-origin")
                         .local(false)
+                        .remote(cap_origin.clone())
                         .remote(format!("{cap_origin}/*"))
                         .window("main")
+                        .webview("main")
                         .permission("core:window:allow-start-dragging")
                         .permission("core:window:allow-minimize")
                         .permission("core:window:allow-toggle-maximize")
