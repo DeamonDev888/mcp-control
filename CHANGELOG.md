@@ -1,4 +1,4 @@
-## [0.8.8] — 2026-11-22
+## [0.8.8] — 2026-11-23
 
 ### Audit & optimisation complète de l'interface (WCAG 2.2 AA, Dark & Light)
 - **Bouton Accueil fonctionnel (`#tbHome`, juste à droite de `#tbExplToggle`)** : retour complet à l'état Dashboard initial (fermeture des modales/menus ouverts, réinitialisation sélection/filtres/pilules/scroll, `data-tauri-drag-region="false"` + `pointer-events:none` sur les éléments internes sous Tauri v2, protégé par `bouton_accueil_barre_titre_ramene_au_dashboard_initial`).
@@ -13,6 +13,10 @@
 
 ### Fiabilité `stdio` & premier lancement `npx`
 - **Démarrage `stdio` plus fiable (`3f2bd3f`)** : remontée des véritables erreurs de démarrage de processus, délai du handshake adapté (jusqu'à 5 min) pour les premières installations `npx`, et correction Clippy docstring dans `src/manage/scans.rs`.
+
+### Conteneurs Docker & guide d’appairage
+- **Indicateur conteneur Docker / Podman (`src/probe.rs`, `src/manage/*`, `src/ui/app.js`, `src/ui/app.css`)** : détection automatique des serveurs MCP exécutés en conteneur (`docker`/`podman`/`nerdctl` & wrappers, `docker ps`, proxys de conteneur, cgroups Linux, sondes SSH, cache & import pair) et affichage du logo baleine Docker dans la barre de l’explorateur et le panneau détail.
+- **Guide d’appairage `Accès` (`src/ui/app.js`)** : libellé mis à jour en `Hermes / Grokbot / Claude Code / Cursor`.
 
 ## [0.8.7] — 2026-11-22
 

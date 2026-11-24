@@ -1441,11 +1441,7 @@ fn extract_container_name(stem: &str, args: &[String]) -> Option<String> {
     }
 }
 
-fn detect_container_cmd_depth(
-    program: &str,
-    args: &[String],
-    depth: u8,
-) -> (bool, Option<String>) {
+fn detect_container_cmd_depth(program: &str, args: &[String], depth: u8) -> (bool, Option<String>) {
     if depth > 3 {
         return (false, None);
     }
@@ -5187,7 +5183,7 @@ pub fn probe_stdio(
         return Err(msg);
     }
     // Framework d'un serveur stdio : nom annoncé ou paquet lancé (npx/uvx).
-    let lang = detect_lang_stdio(&program, args);
+    let lang = detect_lang_stdio(program, args);
     let args_join = args.join(" ").to_ascii_lowercase();
     let fw = crate::frameworks::detect(
         name.as_deref(),
@@ -5631,8 +5627,13 @@ pub fn probe_http_host_with(
     // Transport WS : upgrade WebSocket acceptée (101) → badge « WS » dans l'UI.
     let ws = ws_upgrade_host(host, port, path, timeout_ms.clamp(300, 800));
     let is_loopback = crate::is_loopback_bind(host);
-    let lang_hint = detect_lang_http(&head, name.as_deref())
-        .or_else(|| if is_loopback { port_owner_lang(port) } else { None });
+    let lang_hint = detect_lang_http(&head, name.as_deref()).or_else(|| {
+        if is_loopback {
+            port_owner_lang(port)
+        } else {
+            None
+        }
+    });
     let health = protocol.as_deref() == Some(crate::LITEMCP_PROTOCOL)
         && health_ok_host(host, port, timeout_ms.clamp(400, 1200));
     let fw = crate::frameworks::detect(
@@ -7431,7 +7432,10 @@ mcp-range|0.0.0.0:9000-9002->9000-9002/tcp, 0.0.0.0:5353->5353/udp\n";
             "vpnkit.exe",
             "gvproxy.exe",
         ] {
-            assert!(is_container_proxy_image(img), "{img} attendu proxy conteneur");
+            assert!(
+                is_container_proxy_image(img),
+                "{img} attendu proxy conteneur"
+            );
         }
         for img in ["node.exe", "python.exe", "wslrelay.exe"] {
             assert!(
@@ -7460,7 +7464,8 @@ mcp-range|0.0.0.0:9000-9002->9000-9002/tcp, 0.0.0.0:5353->5353/udp\n";
             parse_ssh_container_probe("mcp-remote|0.0.0.0:3100->3100/tcp\n", "", 3100),
             (true, Some("mcp-remote".to_string()))
         );
-        let ss_proxy = "LISTEN 0 128 0.0.0.0:3100 0.0.0.0:* users:((\"docker-proxy\",pid=999,fd=4))\n";
+        let ss_proxy =
+            "LISTEN 0 128 0.0.0.0:3100 0.0.0.0:* users:((\"docker-proxy\",pid=999,fd=4))\n";
         assert_eq!(parse_ssh_container_probe("", ss_proxy, 3100), (true, None));
         let ss_cg = "LISTEN 0 128 127.0.0.1:3100 0.0.0.0:* users:((\"node\",pid=777,fd=8))\n0::/system.slice/docker-abc.scope\n";
         assert_eq!(parse_ssh_container_probe("", ss_cg, 3100), (true, None));

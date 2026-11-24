@@ -752,6 +752,7 @@ pub fn ssh_discover_host(state: &Arc<AppState>, host_cfg: &crate::types::SshHost
 
 /// Compatibilité : connexion SSH simple par `(ip, user)`, en reprenant les options
 /// éventuelles enregistrées dans `settings.ssh_hosts`.
+#[allow(dead_code)]
 pub fn ssh_discover(state: &Arc<AppState>, ip: &str, user: &str) -> Value {
     let cfg = {
         let st = lockv(&state.settings);

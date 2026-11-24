@@ -1121,9 +1121,23 @@ fn clear_readonly_recursive(path: &std::path::Path) {
             return;
         }
         let mut perms = meta.permissions();
-        if perms.readonly() {
-            perms.set_readonly(false);
-            let _ = std::fs::set_permissions(path, perms);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = perms.mode();
+            let add = if meta.is_dir() { 0o700 } else { 0o600 };
+            if mode & add != add {
+                perms.set_mode(mode | add);
+                let _ = std::fs::set_permissions(path, perms);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if perms.readonly() {
+                #[allow(clippy::permissions_set_readonly_false)]
+                perms.set_readonly(false);
+                let _ = std::fs::set_permissions(path, perms);
+            }
         }
         if meta.is_dir() {
             if let Ok(rd) = std::fs::read_dir(path) {
