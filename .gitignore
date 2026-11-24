@@ -31,6 +31,8 @@ TODO-AUTH-LITEMCP.md
 TODO-AUDIT.md
 TODO-CORRECTIFS.md
 TODO-RESTES.md
+TODO-BOUTIQUE.md
+boutique-agents/
 
 # parasites Windows (mauvais redirect `> nul` sous Git Bash)
 nul

@@ -32,15 +32,79 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const USAGE: &str = "mcp-control bridge [--url http://127.0.0.1:<port>]\n\
-  parle MCP sur stdin/stdout et relaie vers /mcp en signant avec l'identité\n\
-  du client local (appairé par `mcp-control auth pair <url>`).\n\
+pub const USAGE: &str = "mcp-control bridge [--url http://127.0.0.1:<port>[/mcp/s/<id>]]\n\
+  parle MCP sur stdin/stdout et relaie vers /mcp (ou /mcp/s/<id> en mode\n\
+  hybride stdio) en signant avec l'identité du client local (appairé par\n\
+  `mcp-control auth pair <url>`).\n\
   Sans --url : le port UI du config.json local.";
 
 /// Identité locale utilisable pour signer : `keyid` + clé privée + épinglage.
-struct Identite {
-    keyid: String,
-    signer: Signer,
+pub(crate) struct Identite {
+    pub(crate) keyid: String,
+    pub(crate) signer: Signer,
+}
+
+/// Analyse une URL de pont `http://host[:port][path]` :
+/// - `""`, `"/"`, `"/mcp"`, `"/mcp/"` → chemin `"/mcp"` ;
+/// - `"/mcp/s/<id>"` (slash final toléré, `<id>` ASCII `[A-Za-z0-9._-]+` sans `..`)
+///   → chemin `"/mcp/s/<id>"` ;
+/// - `https://` et tout autre chemin sont refusés explicitement.
+pub(crate) fn parse_bridge_url(url: &str) -> Result<(String, u16, String), String> {
+    let url = url.trim();
+    if url.starts_with("https://") {
+        return Err(
+            "https:// non pris en charge sur cette commande HTTP locale (lot M4 : utiliser auth pair pour TLS)"
+                .to_string(),
+        );
+    }
+    let Some(reste) = url.strip_prefix("http://") else {
+        return Err(format!(
+            "URL attendue en http://hôte[:port][/mcp/s/<id>] — reçu « {url} »"
+        ));
+    };
+    let (authority_part, path_part) = match reste.find('/') {
+        Some(idx) => (&reste[..idx], &reste[idx..]),
+        None => (reste, ""),
+    };
+    if authority_part.is_empty()
+        || authority_part.contains('?')
+        || authority_part.contains('#')
+        || path_part.contains('?')
+        || path_part.contains('#')
+    {
+        return Err(format!(
+            "URL bridge invalide (requête ou fragment interdit) : « {url} »"
+        ));
+    }
+    let (host, port) = crate::auth::cli::parse_url(&format!("http://{authority_part}"))?;
+    let target_path = if path_part.is_empty()
+        || path_part == "/"
+        || path_part == "/mcp"
+        || path_part == "/mcp/"
+    {
+        "/mcp".to_string()
+    } else if let Some(raw_id) = path_part.strip_prefix("/mcp/s/") {
+        let id = raw_id.trim_end_matches('/');
+        if id.is_empty()
+            || id.contains('/')
+            || id.contains('?')
+            || id.contains('#')
+            || id.contains("..")
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(format!(
+                "identifiant serveur invalide dans /mcp/s/<id> : « {url} »"
+            ));
+        }
+        format!("/mcp/s/{id}")
+    } else {
+        return Err(format!(
+            "chemin non pris en charge dans l'URL bridge (attendu /, /mcp ou /mcp/s/<id>) : « {url} »"
+        ));
+    };
+    Ok((host, port, target_path))
 }
 
 /// Point d'entrée du binaire. Rend le code de sortie du process.
@@ -64,7 +128,7 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let (host, port) = match crate::auth::cli::parse_url(&url) {
+    let (host, port, target_path) = match parse_bridge_url(&url) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("bridge : {e}");
@@ -72,6 +136,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
     let authority = format!("{host}:{port}");
+    let pair_url = format!("http://{authority}");
     let identite = match identite_locale(&host, port) {
         Ok(i) => i,
         Err(message) => {
@@ -80,7 +145,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
     eprintln!(
-        "bridge : stdio → http://{authority}/mcp (keyid {})",
+        "bridge : stdio → http://{authority}{target_path} (keyid {})",
         identite.keyid
     );
     let stdin = std::io::stdin();
@@ -93,7 +158,15 @@ pub fn run(args: &[String]) -> i32 {
         if ligne.trim().is_empty() {
             continue;
         }
-        let reponse = traiter_ligne(&ligne, &identite, &host, port, &authority, &url);
+        let reponse = traiter_ligne(
+            &ligne,
+            &identite,
+            &host,
+            port,
+            &authority,
+            &target_path,
+            &pair_url,
+        );
         if let Some(texte) = reponse {
             if writeln!(sortie, "{texte}").is_err() {
                 return 0;
@@ -269,9 +342,10 @@ fn trouver_pin(dir: &Path, url: &str) -> Option<Value> {
 
 // ---------- un message ----------
 
-fn construire_requete(
+pub(crate) fn construire_requete(
     identite: &Identite,
     authority: &str,
+    target_path: &str,
     v: &Value,
     methode: &str,
 ) -> Result<String, &'static str> {
@@ -298,12 +372,13 @@ fn construire_requete(
         .iter()
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
-    let a_signer = RequestToSign::new("POST", "/mcp", authority, &refs, corps.as_bytes());
+    let a_signer = RequestToSign::new("POST", target_path, authority, &refs, corps.as_bytes());
     let signes = identite.signer.headers(&a_signer);
     if !signes.is_complete() {
         return Err("invalid request: méthode MCP non signable");
     }
-    let mut requete = format!("POST /mcp HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n");
+    let mut requete =
+        format!("POST {target_path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n");
     for (n, valeur) in entetes
         .iter()
         .map(|(n, v)| (n.as_str(), v.as_str()))
@@ -322,6 +397,7 @@ fn traiter_ligne(
     host: &str,
     port: u16,
     authority: &str,
+    target_path: &str,
     url: &str,
 ) -> Option<String> {
     let v: Value = match serde_json::from_str(ligne) {
@@ -338,7 +414,7 @@ fn traiter_ligne(
         return (!est_notification)
             .then(|| erreur_json(&id, -32600, "invalid request: method", None));
     };
-    let requete = match construire_requete(identite, authority, &v, methode) {
+    let requete = match construire_requete(identite, authority, target_path, &v, methode) {
         Ok(r) => r,
         Err(msg) => {
             eprintln!("bridge : requête non signable ({msg})");
@@ -503,7 +579,7 @@ mod tests {
             "method": "tools/call",
             "params": { "name": "list_servers", "arguments": {} }
         });
-        let req = construire_requete(&ident, "127.0.0.1:5505", &v, "tools/call").unwrap();
+        let req = construire_requete(&ident, "127.0.0.1:5505", "/mcp", &v, "tools/call").unwrap();
         let (head, _) = req.split_once("\r\n\r\n").unwrap();
         let host_count = head
             .lines()
@@ -515,6 +591,120 @@ mod tests {
         assert!(head.contains("Signature: sig1=:"));
         assert!(head.contains("Mcp-Method: tools/call"));
         assert!(head.contains("Mcp-Name: list_servers"));
+    }
+
+    #[test]
+    fn parse_bridge_url_accepte_racine_mcp_et_hybride_boutique() {
+        assert_eq!(
+            parse_bridge_url("http://127.0.0.1:5090").unwrap(),
+            ("127.0.0.1".to_string(), 5090, "/mcp".to_string())
+        );
+        assert_eq!(
+            parse_bridge_url("http://127.0.0.1:5090/").unwrap(),
+            ("127.0.0.1".to_string(), 5090, "/mcp".to_string())
+        );
+        assert_eq!(
+            parse_bridge_url("http://127.0.0.1:5090/mcp").unwrap(),
+            ("127.0.0.1".to_string(), 5090, "/mcp".to_string())
+        );
+        assert_eq!(
+            parse_bridge_url("http://127.0.0.1:5090/mcp/").unwrap(),
+            ("127.0.0.1".to_string(), 5090, "/mcp".to_string())
+        );
+        assert_eq!(
+            parse_bridge_url("http://127.0.0.1:5090/mcp/s/store-github").unwrap(),
+            (
+                "127.0.0.1".to_string(),
+                5090,
+                "/mcp/s/store-github".to_string()
+            )
+        );
+        assert_eq!(
+            parse_bridge_url("http://127.0.0.1:5090/mcp/s/store-github/").unwrap(),
+            (
+                "127.0.0.1".to_string(),
+                5090,
+                "/mcp/s/store-github".to_string()
+            )
+        );
+        assert!(parse_bridge_url("https://127.0.0.1:5090/mcp/s/store-github").is_err());
+        assert!(parse_bridge_url("http://127.0.0.1:5090/mcp/s/").is_err());
+        assert!(parse_bridge_url("http://127.0.0.1:5090/mcp/s/a/b").is_err());
+        assert!(parse_bridge_url("http://127.0.0.1:5090/mcp/s/..").is_err());
+        assert!(parse_bridge_url("http://127.0.0.1:5090/mcp/s/store-github?x=1").is_err());
+        assert!(parse_bridge_url("http://127.0.0.1:5090/mcp/s/store-github#frag").is_err());
+        assert!(parse_bridge_url("http://127.0.0.1:5090/api/state").is_err());
+    }
+
+    #[test]
+    fn requete_signee_hybride_poste_et_signe_le_chemin_serveur() {
+        use litemcp::auth::sign::{ClientKey, NonceCache, SignatureVerifier, TestKeyStore};
+        use litemcp::auth::{VerifiedRequest, Verifier};
+        use std::sync::Arc;
+
+        let cle = SigningKey::generate();
+        let vk = cle.verifying_key();
+        let keyid = "mcc-hyb-0000000000000001";
+        let ident = Identite {
+            keyid: keyid.to_string(),
+            signer: Signer::new(cle).with_keyid(keyid),
+        };
+        let v = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": { "name": "search_repositories", "arguments": { "query": "mcp" } }
+        });
+        let req = construire_requete(
+            &ident,
+            "127.0.0.1:5090",
+            "/mcp/s/store-github",
+            &v,
+            "tools/call",
+        )
+        .unwrap();
+        let (head, body) = req.split_once("\r\n\r\n").unwrap();
+        assert!(
+            head.starts_with("POST /mcp/s/store-github HTTP/1.1\r\n"),
+            "ligne de requête inattendue :\n{head}"
+        );
+        let hdrs: Vec<(String, String)> = head
+            .lines()
+            .skip(1)
+            .filter_map(|l| {
+                let (n, val) = l.split_once(':')?;
+                Some((n.trim().to_ascii_lowercase(), val.trim().to_string()))
+            })
+            .collect();
+        let refs: Vec<(&str, &str)> = hdrs.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+
+        let store = Arc::new(TestKeyStore::new());
+        store.insert(
+            keyid,
+            ClientKey::new("bridge-test", vk.to_bytes()).with_right("execution"),
+        );
+        let verifier = SignatureVerifier::new(store, NonceCache::default());
+
+        let ok = verifier.verify(&VerifiedRequest::new(
+            "POST",
+            "/mcp/s/store-github",
+            "127.0.0.1:5090",
+            &refs,
+            body.as_bytes(),
+        ));
+        assert!(ok.is_ok(), "signature hybride valide attendue : {ok:?}");
+
+        let wrong_path = verifier.verify(&VerifiedRequest::new(
+            "POST",
+            "/mcp",
+            "127.0.0.1:5090",
+            &refs,
+            body.as_bytes(),
+        ));
+        assert!(
+            wrong_path.is_err(),
+            "la signature liée à /mcp/s/store-github ne doit pas passer sur /mcp"
+        );
     }
 
     #[test]

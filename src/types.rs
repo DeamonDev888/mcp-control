@@ -142,6 +142,12 @@ pub struct Server {
     /// 2026-07-28 sans négociation + sonde GET /health « ok »). Détecté au
     /// probe, jamais persisté dans config.json.
     pub framework: Option<String>,
+    /// Serveur exécuté dans un conteneur (Docker/Podman/containerd), détecté
+    /// dynamiquement via commande, `docker ps` / proxy port ou cgroup (jamais
+    /// persisté dans config.json, mis en cache dans state-cache.json).
+    pub in_container: bool,
+    /// Nom du conteneur si identifiable (`docker ps`, `--name`, `docker exec <nom>`).
+    pub container_name: Option<String>,
     /// Serveur sondé À TRAVERS la connexion SSH de sa machine (curl interne sur
     /// 127.0.0.1) — nécessaire quand le port est bindé localhost ou filtré ufw.
     /// L'utilisateur SSH vient de settings.ssh_hosts (clé = host du transport).
@@ -245,13 +251,31 @@ pub struct Peer {
     pub ui_port: u16,
     pub last_seen: u64,
     pub servers: Value,
+    pub via_ssh: bool,
 }
 
 /// Machine distante connue pour la découverte SSH (auth par clé, BatchMode).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SshHost {
     pub ip: String,
     pub user: String,
+    pub port: Option<u16>,
+    pub identity_file: Option<String>,
+    pub auto_install_cli: bool,
+}
+
+/// État runtime du bootstrap / CLI `mcp-control` sur une machine SSH distante.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SshHostStatus {
+    pub os: Option<String>,
+    pub arch: Option<String>,
+    pub cli_installed: bool,
+    pub cli_path: Option<String>,
+    pub cli_version: Option<String>,
+    pub cli_running: bool,
+    pub cli_port: Option<u16>,
+    pub last_check_ts: Option<u64>,
+    pub last_error: Option<String>,
 }
 
 pub struct AppState {

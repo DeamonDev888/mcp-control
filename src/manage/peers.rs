@@ -2,6 +2,41 @@
 // (split v0.7.20 : manage.rs reste la racine — API stable via réexport)
 use super::*;
 
+fn ssh_status_slot() -> &'static std::sync::Mutex<
+    std::collections::HashMap<(usize, String), crate::types::SshHostStatus>,
+> {
+    static SLOT: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(usize, String), crate::types::SshHostStatus>>,
+    > = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub fn get_ssh_status(state: &Arc<AppState>, ip: &str) -> Option<crate::types::SshHostStatus> {
+    let key = (Arc::as_ptr(state) as usize, ip.to_string());
+    lockv(ssh_status_slot()).get(&key).cloned()
+}
+
+pub fn set_ssh_status(state: &Arc<AppState>, ip: &str, status: crate::types::SshHostStatus) {
+    let key = (Arc::as_ptr(state) as usize, ip.to_string());
+    lockv(ssh_status_slot()).insert(key, status);
+}
+
+pub fn clear_ssh_status_one(state: &Arc<AppState>, ip: &str) {
+    let key = (Arc::as_ptr(state) as usize, ip.to_string());
+    lockv(ssh_status_slot()).remove(&key);
+}
+
+pub fn clear_ssh_status_all(state: &Arc<AppState>) {
+    let key_ptr = Arc::as_ptr(state) as usize;
+    lockv(ssh_status_slot()).retain(|(ptr, _), _| *ptr != key_ptr);
+}
+
+/// Ne saute notre propre port UI QUE sur les adresses loopback locales — jamais
+/// sur une IP distante du LAN (deux machines avec le même port 5090 par défaut).
+pub(crate) fn should_skip_peer_port(ip: &str, port: u16, own_port: u16) -> bool {
+    port == own_port && crate::is_loopback_bind(ip)
+}
+
 pub fn discover_peers(state: &Arc<AppState>) {
     if !lockv(&state.settings).network_enabled {
         return;
@@ -24,10 +59,12 @@ pub fn discover_peers(state: &Arc<AppState>) {
     // une cible qui est une de NOS ips sur NOTRE port UI = nous-mêmes -> skip
     hosts.retain(|h| !(my_ips.contains(h)));
     // Pairs déjà appairés (`auth/clients/*.pin.json`) : sondés même s'ils ne
-    // sont pas dans le cache ARP ou s'ils partagent l'IP locale sur un autre port.
-    for h in crate::auth::net::pinned_peer_hosts(&crate::auth::net::current_config_dir()) {
-        if !hosts.contains(&h) {
-            hosts.push(h);
+    // sont pas dans le cache ARP ou s'ils utilisent un port UI non standard.
+    let pinned_targets =
+        crate::auth::net::pinned_peer_targets(&crate::auth::net::current_config_dir());
+    for (h, _) in &pinned_targets {
+        if !hosts.contains(h) {
+            hosts.push(h.clone());
         }
     }
     add_log(
@@ -47,13 +84,21 @@ pub fn discover_peers(state: &Arc<AppState>) {
     let access = lockv(&state.settings).api_access.clone();
     let mut handles = Vec::new();
     for ip in hosts {
-        let ports = ports.clone();
+        let mut target_ports = ports.clone();
+        for (ph, pp) in &pinned_targets {
+            if ph == &ip && !target_ports.contains(pp) {
+                target_ports.push(*pp);
+            }
+        }
+        let my_ips = my_ips.clone();
         let state = state.clone();
         let new_peers = new_peers.clone();
         let access = access.clone();
         handles.push(std::thread::spawn(move || {
-            for port in &ports {
-                if *port == own_port {
+            for port in &target_ports {
+                if should_skip_peer_port(&ip, *port, own_port)
+                    || (*port == own_port && my_ips.contains(&ip))
+                {
                     continue;
                 } // ne jamais se sonder soi-même sur notre port
                 let pr = probe::probe_peer(&ip, *port, access.as_deref());
@@ -73,6 +118,7 @@ pub fn discover_peers(state: &Arc<AppState>) {
                                 ui_port: *port,
                                 last_seen: crate::types::now_ts(),
                                 servers,
+                                via_ssh: false,
                             },
                         );
                         drop(peers);
@@ -113,22 +159,25 @@ pub fn discover_peers(state: &Arc<AppState>) {
 pub fn import_peer(state: &Arc<AppState>, ip: &str) -> Value {
     let snapshot = {
         let peers = lockv(&state.peers);
-        peers.get(ip).map(|p| (p.ui_port, p.servers.clone()))
+        peers
+            .get(ip)
+            .map(|p| (p.ui_port, p.via_ssh, p.servers.clone()))
     };
-    let (ui_port, snapshot) = match snapshot {
+    let (ui_port, peer_via_ssh, snapshot) = match snapshot {
         Some(x) => x,
         None => return json!({"ok": false, "error": "pair inconnu"}),
     };
+    let in_ssh_hosts = lockv(&state.settings).ssh_hosts.iter().any(|h| h.ip == ip);
     let mut added = 0usize;
     if let Some(arr) = snapshot.get("servers").and_then(|x| x.as_array()) {
         for s in arr {
             if s.get("transport").and_then(|x| x.as_str()) != Some("http") {
                 continue;
             }
-            if s.get("enabled") != Some(&json!(true)) {
+            if s.get("enabled") == Some(&json!(false)) {
                 continue;
             }
-            let (host, port, path, name, version) = (
+            let (raw_host, port, path, name, version) = (
                 s.get("transport_info")
                     .and_then(|t| t.get("host"))
                     .and_then(|x| x.as_str())
@@ -147,12 +196,31 @@ pub fn import_peer(state: &Arc<AppState>, ip: &str) -> Value {
                     .map(String::from),
                 s.get("version").and_then(|x| x.as_str()).map(String::from),
             );
-            // host: null (localhost du pair) -> réécrire vers l'IP du pair si ce n'est pas notre machine
-            let host = match host {
-                Some(h) => h,
-                None if ip == "127.0.0.1" => continue, // même machine : localhost reste localhost
-                None => ip.to_string(),                // pair distant : pointer son IP
+            let in_container = s
+                .get("in_container")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
+            let container_name = s
+                .get("container_name")
+                .and_then(|x| x.as_str())
+                .map(String::from);
+            if port == 0 {
+                continue;
+            }
+            let is_local_on_peer = raw_host
+                .as_deref()
+                .map(crate::is_loopback_bind)
+                .unwrap_or(true);
+            // host local côté pair → réécrire vers l'IP du pair si ce n'est pas notre machine
+            let host = if is_local_on_peer {
+                if crate::is_loopback_bind(ip) {
+                    continue; // même machine : localhost reste localhost
+                }
+                ip.to_string()
+            } else {
+                raw_host.unwrap_or_else(|| ip.to_string())
             };
+            let import_via_ssh = peer_via_ssh || (is_local_on_peer && in_ssh_hosts);
             let mut servers = lockv(&state.servers);
             let already = servers.iter().any(|srv| {
                 matches!(&srv.transport,
@@ -188,7 +256,9 @@ pub fn import_peer(state: &Arc<AppState>, ip: &str) -> Value {
                 ws: false,
                 lang: None,
                 framework: None,
-                via_ssh: false,
+                in_container,
+                container_name,
+                via_ssh: import_via_ssh,
                 tools: vec![],
                 latency_ms: None,
                 last_seen_ts: None,
@@ -212,31 +282,278 @@ pub fn import_peer(state: &Arc<AppState>, ip: &str) -> Value {
     json!({"ok": true, "added": added})
 }
 
-// ---------- découverte SSH d'une machine distante ----------
+// ---------- découverte SSH et bootstrap CLI d'une machine distante ----------
 
-/// Connexion SSH à une machine (client ssh système, auth par clé), netstat
-/// distant, puis sonde des ports DEPUIS LA MACHINE (curl interne sur
-/// 127.0.0.1 via la connexion ssh — passe les binds localhost et ufw) →
-/// import des serveurs MCP trouvés en mode via_ssh (pollés par SSH ensuite).
-pub fn ssh_discover(state: &Arc<AppState>, ip: &str, user: &str) -> Value {
+/// Premier contact / bootstrap SSH avec une machine distante :
+/// 1. Inspecte OS, architecture, présence et état du CLI `mcp-control` ;
+/// 2. Si absent et `auto_install_cli` (ou `force_install`), télécharge et installe
+///    le binaire CLI officiel vérifié par SHA-256 ;
+/// 3. S'assure que le moteur CLI tourne sur la machine distante ;
+/// 4. Remonte son catalogue dans `state.peers` (`via_ssh: true`).
+pub fn ssh_bootstrap(
+    state: &Arc<AppState>,
+    host_cfg: &crate::types::SshHost,
+    force_install: bool,
+) -> Value {
+    let ip = host_cfg.ip.as_str();
+    let user = host_cfg.user.as_str();
+    let target = probe::SshTarget::from_host(host_cfg);
     add_log(
         state,
         "info",
-        &format!("[ssh] connexion à {user}@{ip} — vérification de la machine…"),
+        &format!("[ssh] connexion à {user}@{ip} — inspection de la machine et du CLI…"),
     );
-    // Health-check AVANT le scan : une machine éteinte ou une clé absente
-    // doit être dit immédiatement (au lieu d'attendre 30 s de scan futile).
-    if let Err(e) = probe::ssh_health(ip, user, 8) {
-        add_log(state, "warn", &e);
-        return json!({"ok": false, "error": e});
+    let env = match probe::ssh_inspect_remote(&target, 8) {
+        Ok(e) => e,
+        Err(e) => {
+            let st = crate::types::SshHostStatus {
+                last_check_ts: Some(crate::types::now_ts()),
+                last_error: Some(e.clone()),
+                ..Default::default()
+            };
+            set_ssh_status(state, ip, st);
+            add_log(state, "warn", &e);
+            return json!({"ok": false, "ssh_ok": false, "error": e});
+        }
+    };
+
+    let mut status = crate::types::SshHostStatus {
+        os: Some(env.os.clone()),
+        arch: Some(env.arch.clone()),
+        cli_installed: env.cli_path.is_some(),
+        cli_path: env.cli_path.clone(),
+        cli_version: env.cli_version.clone(),
+        cli_running: env.cli_running,
+        cli_port: env.cli_port,
+        last_check_ts: Some(crate::types::now_ts()),
+        last_error: None,
+    };
+    set_ssh_status(state, ip, status.clone());
+
+    if !status.cli_installed && (host_cfg.auto_install_cli || force_install) {
+        add_log(
+            state,
+            "info",
+            &format!(
+                "[ssh {ip}] CLI mcp-control absent ({}/{}) — recherche du binaire officiel…",
+                env.os, env.arch
+            ),
+        );
+        match latest_cli_download(&env.os, &env.arch) {
+            Ok((tag, url, sha256)) => {
+                add_log(
+                    state,
+                    "info",
+                    &format!(
+                        "[ssh {ip}] installation du CLI mcp-control {tag} ({}/{}) avec vérification SHA-256…",
+                        env.os, env.arch
+                    ),
+                );
+                match probe::ssh_install_cli(&target, &env.os, &url, &sha256) {
+                    Ok(installed_path) => {
+                        status.cli_installed = true;
+                        status.cli_path = Some(installed_path);
+                        status.cli_version =
+                            Some(tag.strip_prefix('v').unwrap_or(&tag).to_string());
+                        status.last_error = None;
+                        add_log(
+                            state,
+                            "info",
+                            &format!(
+                                "[ssh {ip}] CLI mcp-control {tag} installé et vérifié ({})",
+                                status.cli_path.as_deref().unwrap_or("")
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        status.last_error = Some(e.clone());
+                        add_log(
+                            state,
+                            "warn",
+                            &format!("[ssh {ip}] installation auto du CLI échouée : {e}"),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                status.last_error = Some(e.clone());
+                add_log(
+                    state,
+                    "info",
+                    &format!("[ssh {ip}] installation auto du CLI ignorée : {e}"),
+                );
+            }
+        }
+        status.last_check_ts = Some(crate::types::now_ts());
+        set_ssh_status(state, ip, status.clone());
     }
-    let ports = match probe::ssh_netstat(ip, user, 8) {
+
+    if let Some(ref cli_path) = status.cli_path.clone() {
+        if !status.cli_running {
+            match probe::ssh_ensure_cli_running(&target, &env.os, cli_path) {
+                Ok(port) => {
+                    status.cli_running = true;
+                    status.cli_port = Some(port);
+                    status.last_error = None;
+                    add_log(
+                        state,
+                        "info",
+                        &format!("[ssh {ip}] moteur CLI mcp-control démarré sur 127.0.0.1:{port}"),
+                    );
+                }
+                Err(e) => {
+                    status.last_error = Some(e.clone());
+                    add_log(
+                        state,
+                        "warn",
+                        &format!("[ssh {ip}] démarrage du CLI distant impossible : {e}"),
+                    );
+                }
+            }
+            status.last_check_ts = Some(crate::types::now_ts());
+            set_ssh_status(state, ip, status.clone());
+        }
+    }
+
+    let cfg_dir_fallback = env.cli_config_dir.clone().or_else(|| {
+        status
+            .cli_path
+            .as_deref()
+            .and_then(|p| p.rsplit_once(['/', '\\']).map(|(d, _)| d.to_string()))
+    });
+
+    if let Some(port) = status.cli_port.filter(|_| status.cli_running) {
+        if let Some(snap) = probe::ssh_read_remote_peer_state(
+            &target,
+            &env.os,
+            status.cli_path.as_deref(),
+            cfg_dir_fallback.as_deref(),
+            port,
+        ) {
+            let count = snap
+                .get("stats")
+                .and_then(|s| s.get("total"))
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
+            let mut peers = lockv(&state.peers);
+            peers.insert(
+                ip.to_string(),
+                crate::types::Peer {
+                    ip: ip.to_string(),
+                    ui_port: port,
+                    last_seen: crate::types::now_ts(),
+                    servers: snap,
+                    via_ssh: true,
+                },
+            );
+            drop(peers);
+            add_log(
+                state,
+                "info",
+                &format!(
+                    "[ssh {ip}] instance MCP Control distante détectée via SSH (:{port}, {count} serveur(s))"
+                ),
+            );
+        }
+    }
+
+    if force_install
+        && status.last_error.is_some()
+        && (!status.cli_installed || !status.cli_running)
+    {
+        return json!({
+            "ok": false,
+            "ssh_ok": true,
+            "os": status.os,
+            "arch": status.arch,
+            "cli_installed": status.cli_installed,
+            "cli_path": status.cli_path,
+            "cli_version": status.cli_version,
+            "cli_running": status.cli_running,
+            "cli_port": status.cli_port,
+            "error": status.last_error,
+        });
+    }
+
+    json!({
+        "ok": true,
+        "ssh_ok": true,
+        "os": status.os,
+        "arch": status.arch,
+        "cli_installed": status.cli_installed,
+        "cli_path": status.cli_path,
+        "cli_version": status.cli_version,
+        "cli_running": status.cli_running,
+        "cli_port": status.cli_port,
+        "error": status.last_error,
+    })
+}
+
+/// Découverte SSH complète d'une machine distante enregistrée (`SshHost`).
+pub fn ssh_discover_host(state: &Arc<AppState>, host_cfg: &crate::types::SshHost) -> Value {
+    let ip = host_cfg.ip.as_str();
+    let target = probe::SshTarget::from_host(host_cfg);
+
+    let boot = ssh_bootstrap(state, host_cfg, false);
+    if boot.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+        return boot;
+    }
+
+    let cli_port = get_ssh_status(state, ip).and_then(|s| s.cli_port);
+    let mut ports = match probe::ssh_netstat_target(&target, 8) {
         Ok(p) => p,
         Err(e) => {
             add_log(state, "warn", &e);
             return json!({"ok": false, "error": e});
         }
     };
+    if let Some(cp) = cli_port {
+        ports.retain(|&p| p != cp);
+    }
+
+    let mut candidate_paths: Vec<String> = vec!["/mcp".to_string()];
+    {
+        let peers = lockv(&state.peers);
+        if let Some(p) = peers.get(ip) {
+            if let Some(arr) = p.servers.get("servers").and_then(|x| x.as_array()) {
+                for s in arr {
+                    if let Some(path) = s
+                        .get("transport_info")
+                        .and_then(|t| t.get("path"))
+                        .and_then(|x| x.as_str())
+                        .map(str::trim)
+                        .filter(|x| !x.is_empty())
+                    {
+                        if !candidate_paths.iter().any(|c| c == path) {
+                            candidate_paths.push(path.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    {
+        let servers = lockv(&state.servers);
+        for s in servers.iter() {
+            if s.via_ssh {
+                if let Transport::Http {
+                    host: Some(ref h),
+                    ref path,
+                    ..
+                } = s.transport
+                {
+                    if h == ip
+                        && !path.trim().is_empty()
+                        && !candidate_paths.iter().any(|c| c == path)
+                    {
+                        candidate_paths.push(path.clone());
+                    }
+                }
+            }
+        }
+    }
+    let path_refs: Vec<&str> = candidate_paths.iter().map(String::as_str).collect();
+
     add_log(
         state,
         "info",
@@ -245,7 +562,7 @@ pub fn ssh_discover(state: &Arc<AppState>, ip: &str, user: &str) -> Value {
             ports.len()
         ),
     );
-    let found = match probe::ssh_probe_mcp_batch(ip, user, &ports, "/mcp", 4) {
+    let found = match probe::ssh_probe_mcp_batch_target(&target, &ports, &path_refs, 4) {
         Ok(f) => f,
         Err(e) => {
             add_log(state, "warn", &e);
@@ -254,7 +571,8 @@ pub fn ssh_discover(state: &Arc<AppState>, ip: &str, user: &str) -> Value {
     };
     let mut serveurs: Vec<Value> = Vec::new();
     let mut imported = 0usize;
-    for (port, v) in &found {
+    let mut to_poll: Vec<String> = Vec::new();
+    for (port, path, v) in &found {
         let res = v.get("result").cloned().unwrap_or(json!({}));
         let si = res.get("serverInfo").cloned().unwrap_or(json!({}));
         let raw_name = si.get("name").and_then(|x| x.as_str());
@@ -308,19 +626,25 @@ pub fn ssh_discover(state: &Arc<AppState>, ip: &str, user: &str) -> Value {
         };
         if let Some(idx) = existing_idx {
             let existing = &mut servers[idx];
+            let existing_id = existing.id.clone();
             // les entrées manuelles gardent leur mode de sonde : on ne force
             // pas via_ssh (audit 2026-10-26 — sinon elles échouent ensuite
             // « machine SSH non enregistrée » dès l'oubli de l'hôte)
             if existing.origin != Origin::Manual {
                 existing.via_ssh = true;
             }
-            // le port a pu changer : on suit le port réellement sondé
+            // le port et le chemin peuvent avoir changé : on suit le réel sondé
             if let Transport::Http {
-                port: ref mut sp, ..
+                port: ref mut sp,
+                path: ref mut spath,
+                ..
             } = existing.transport
             {
                 if *sp != *port {
                     *sp = *port;
+                }
+                if spath != path {
+                    *spath = path.clone();
                 }
             }
             existing.state = SState::Up;
@@ -347,7 +671,12 @@ pub fn ssh_discover(state: &Arc<AppState>, ip: &str, user: &str) -> Value {
                 existing.framework = framework.clone();
             }
             existing.last_seen_ts = Some(crate::types::now_ts());
-            serveurs.push(json!({"port": port, "name": name, "imported": false}));
+            let should_poll = existing.via_ssh && existing.tools.is_empty();
+            drop(servers);
+            if should_poll && !to_poll.contains(&existing_id) {
+                to_poll.push(existing_id);
+            }
+            serveurs.push(json!({"port": port, "path": path, "name": name, "imported": false}));
             continue;
         }
         servers.push(Server {
@@ -356,7 +685,7 @@ pub fn ssh_discover(state: &Arc<AppState>, ip: &str, user: &str) -> Value {
             transport: Transport::Http {
                 host: Some(ip.to_string()),
                 port: *port,
-                path: "/mcp".into(),
+                path: path.clone(),
             },
             origin: Origin::Discovered,
             enabled: true,
@@ -373,6 +702,8 @@ pub fn ssh_discover(state: &Arc<AppState>, ip: &str, user: &str) -> Value {
             ws: false,
             lang,
             framework,
+            in_container: false,
+            container_name: None,
             via_ssh: true,
             tools: vec![],
             latency_ms: None,
@@ -383,14 +714,16 @@ pub fn ssh_discover(state: &Arc<AppState>, ip: &str, user: &str) -> Value {
         });
         drop(servers);
         imported += 1;
-        serveurs.push(json!({"port": port, "name": name, "imported": true}));
+        to_poll.push(id.clone());
+        serveurs.push(json!({"port": port, "path": path, "name": name, "imported": true}));
         add_log(
             state,
             "info",
             &format!(
-                "[ssh {ip}] serveur MCP importé (via ssh) : {}:{} — {} {}",
+                "[ssh {ip}] serveur MCP importé (via ssh) : {}:{}{} — {} {}",
                 ip,
                 port,
+                path,
                 name,
                 version.as_deref().unwrap_or("")
             ),
@@ -402,6 +735,9 @@ pub fn ssh_discover(state: &Arc<AppState>, ip: &str, user: &str) -> Value {
     if !serveurs.is_empty() {
         save_config(state);
     }
+    for sid in &to_poll {
+        poll_one(state, sid);
+    }
     add_log(
         state,
         "info",
@@ -412,4 +748,32 @@ pub fn ssh_discover(state: &Arc<AppState>, ip: &str, user: &str) -> Value {
         ),
     );
     json!({"ok": true, "ports": ports.len(), "found": imported, "serveurs": serveurs})
+}
+
+/// Compatibilité : connexion SSH simple par `(ip, user)`, en reprenant les options
+/// éventuelles enregistrées dans `settings.ssh_hosts`.
+pub fn ssh_discover(state: &Arc<AppState>, ip: &str, user: &str) -> Value {
+    let cfg = {
+        let st = lockv(&state.settings);
+        st.ssh_hosts
+            .iter()
+            .find(|h| h.ip == ip)
+            .cloned()
+            .unwrap_or(crate::types::SshHost {
+                ip: ip.to_string(),
+                user: user.to_string(),
+                port: None,
+                identity_file: None,
+                auto_install_cli: true,
+            })
+    };
+    let cfg = crate::types::SshHost {
+        user: if user.trim().is_empty() {
+            cfg.user
+        } else {
+            user.to_string()
+        },
+        ..cfg
+    };
+    ssh_discover_host(state, &cfg)
 }

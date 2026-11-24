@@ -13,15 +13,17 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "python",
         program: "uvx",
         args: &["elevenlabs-mcp"],
+        env_vars: &["ELEVENLABS_API_KEY"],
     },
     StoreItem {
         id: "at-mysql",
         name: "Mysql",
-        desc: "Connect to MySQL databases for direct data access, queries, and database management within Claude Code workflows. — env : MYSQL_CONNECTION_STRING",
+        desc: "Connect to MySQL databases for direct data access, queries, and database management within Claude Code workflows. — env : MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE",
         cat: "Données",
         kind: "python",
         program: "uvx",
-        args: &["mcp-server-mysql"],
+        args: &["--with", "mcp>=1,<2", "mcp-server-mysql"],
+        env_vars: &["MYSQL_HOST", "MYSQL_PORT", "MYSQL_USER", "MYSQL_PASSWORD", "MYSQL_DATABASE"],
     },
     StoreItem {
         id: "at-neon",
@@ -31,6 +33,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "mcp-remote", "https://mcp.neon.tech/mcp"],
+        env_vars: &[],
     },
     StoreItem {
         id: "at-redis",
@@ -40,6 +43,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "python",
         program: "uvx",
         args: &["--from", "redis-mcp-server@latest", "redis-mcp-server"],
+        env_vars: &["REDIS_URL"],
     },
     StoreItem {
         id: "at-deepgraph-next-js-mcp",
@@ -49,6 +53,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "mcp-code-graph@latest", "vercel/next.js"],
+        env_vars: &[],
     },
     StoreItem {
         id: "at-android-mcp",
@@ -58,6 +63,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "python",
         program: "uvx",
         args: &["--python", "3.13", "android-mcp"],
+        env_vars: &[],
     },
     StoreItem {
         id: "at-chrome-devtools",
@@ -67,6 +73,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "chrome-devtools-mcp@latest"],
+        env_vars: &[],
     },
     StoreItem {
         id: "at-ios-simulator",
@@ -76,6 +83,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "ios-simulator-mcp"],
+        env_vars: &[],
     },
     StoreItem {
         id: "at-jupyter",
@@ -85,15 +93,17 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "python",
         program: "uvx",
         args: &["jupyter-mcp-server@latest"],
+        env_vars: &["JUPYTER_URL", "JUPYTER_TOKEN"],
     },
     StoreItem {
         id: "at-logfire",
         name: "Logfire",
-        desc: "Provides access to OpenTelemetry traces and metrics through Logfire.",
+        desc: "Provides access to OpenTelemetry traces and metrics through Logfire (serveur MCP distant officiel Pydantic Logfire US via OAuth, ou EU logfire-eu.pydantic.dev/mcp).",
         cat: "Dev",
-        kind: "python",
-        program: "uvx",
-        args: &["logfire-mcp@latest", "--read-token=YOUR-TOKEN"],
+        kind: "npm",
+        program: "npx",
+        args: &["-y", "mcp-remote", "https://logfire-us.pydantic.dev/mcp"],
+        env_vars: &[],
     },
     StoreItem {
         id: "at-mermaid",
@@ -103,6 +113,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "mcp-mermaid"],
+        env_vars: &[],
     },
     StoreItem {
         id: "at-nable",
@@ -112,6 +123,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "python",
         program: "uvx",
         args: &["nable"],
+        env_vars: &[],
     },
     StoreItem {
         id: "at-orcareplay",
@@ -121,6 +133,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "orcareplay", "mcp"],
+        env_vars: &[],
     },
     StoreItem {
         id: "at-trace-mcp",
@@ -130,6 +143,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "trace-mcp@latest"],
+        env_vars: &[],
     },
     StoreItem {
         id: "at-alpaca-trading",
@@ -139,6 +153,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "python",
         program: "uvx",
         args: &["alpaca-mcp-server"],
+        env_vars: &["ALPACA_API_KEY", "ALPACA_SECRET_KEY"],
     },
     StoreItem {
         id: "at-livetennisapi",
@@ -148,6 +163,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "livetennisapi-mcp"],
+        env_vars: &["LIVETENNISAPI_KEY"],
     },
     StoreItem {
         id: "at-memex",
@@ -157,6 +173,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "stifler-memex-mcp", "serve", "--repo", "."],
+        env_vars: &["NEO4J_URI", "NEO4J_USER", "NEO4J_PASSWORD", "GEMINI_API_KEY"],
     },
     StoreItem {
         id: "at-google-workspace",
@@ -166,6 +183,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "python",
         program: "uvx",
         args: &["workspace-mcp"],
+        env_vars: &["GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"],
     },
     StoreItem {
         id: "at-humanpen",
@@ -175,6 +193,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "humanpen-mcp"],
+        env_vars: &["HUMANPEN_API_KEY"],
     },
     StoreItem {
         id: "at-local-mcp",
@@ -184,6 +203,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "local-mcp@latest"],
+        env_vars: &[],
     },
     StoreItem {
         id: "at-arxiv-mcp-server",
@@ -193,6 +213,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "python",
         program: "uvx",
         args: &["arxiv-mcp-server"],
+        env_vars: &[],
     },
     StoreItem {
         id: "at-searxng",
@@ -202,15 +223,23 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "mcp-searxng"],
+        env_vars: &["SEARXNG_URL"],
     },
     StoreItem {
         id: "at-browseract",
         name: "Browseract",
-        desc: "BrowserAct cloud browser automation for structured data extraction from Amazon, YouTube, Google Maps, Google News, Reddit, WeChat, Zhihu and more — env : BROWSERACT_AP...",
+        desc: "BrowserAct cloud browser automation for structured data extraction from Amazon, YouTube, Google Maps, Google News, Reddit, WeChat, Zhihu and more — env : BROWSERACT_API_KEY",
         cat: "Web",
         kind: "npm",
         program: "npx",
-        args: &["-y", "browseract-mcp"],
+        args: &[
+            "-y",
+            "mcp-remote",
+            "https://mcp.browseract.com/mcp/",
+            "--header",
+            "Authorization:Bearer ${BROWSERACT_API_KEY}",
+        ],
+        env_vars: &["BROWSERACT_API_KEY"],
     },
     StoreItem {
         id: "at-hikerapi",
@@ -220,6 +249,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "hikerapi-mcp"],
+        env_vars: &["HIKERAPI_KEY"],
     },
     StoreItem {
         id: "at-lamatok",
@@ -229,5 +259,6 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "lamatok-mcp"],
+        env_vars: &["LAMATOK_KEY"],
     },
 ];

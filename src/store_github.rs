@@ -13,6 +13,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "codebase-memory-mcp"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-context-mode",
@@ -21,7 +22,8 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         cat: "Utilitaires",
         kind: "npm",
         program: "npx",
-        args: &["-y", "context-mode"],
+        args: &["-y", "context-mode", "server"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-serena",
@@ -38,6 +40,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
             "--context",
             "ide-assistant",
         ],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-ffmpeg-skill",
@@ -46,7 +49,8 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         cat: "Création",
         kind: "npm",
         program: "npx",
-        args: &["-y", "github:kajisho5/ffmpeg-skill"],
+        args: &["-y", "ffmpeg-skill", "mcp"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-stealth-browser",
@@ -60,6 +64,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
             "git+https://github.com/vibheksoni/stealth-browser-mcp",
             "stealth-browser-mcp",
         ],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-rea",
@@ -68,7 +73,8 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         cat: "Dev",
         kind: "npm",
         program: "npx",
-        args: &["-y", "github:morluto/rea"],
+        args: &["-y", "rea-agents", "mcp"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-world-intel",
@@ -82,6 +88,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
             "git+https://github.com/marc-shade/world-intel-mcp",
             "world-intel-mcp",
         ],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-gridex",
@@ -91,6 +98,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "github:gridex/gridex"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-tradingview",
@@ -104,6 +112,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
             "git+https://github.com/atilaahmettaner/tradingview-mcp",
             "tradingview-mcp",
         ],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-freecad",
@@ -113,6 +122,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         kind: "python",
         program: "uvx",
         args: &["freecad-mcp"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-opennews",
@@ -126,6 +136,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
             "git+https://github.com/6551Team/opennews-mcp",
             "opennews-mcp",
         ],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-cve-mcp",
@@ -135,10 +146,13 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         kind: "python",
         program: "uvx",
         args: &[
+            "--with",
+            "mcp>=1,<2",
             "--from",
             "git+https://github.com/mukul975/cve-mcp-server",
-            "cve-mcp-server",
+            "cve-mcp",
         ],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-tablepro",
@@ -148,6 +162,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "github:TableProApp/TablePro"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-tabularis",
@@ -157,6 +172,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "github:TabularisDB/tabularis"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-frontend-design-toolkit",
@@ -166,6 +182,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "github:wilwaldon/Claude-Code-Frontend-Design-Toolkit"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-markdownify",
@@ -174,7 +191,8 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         cat: "Fichiers",
         kind: "npm",
         program: "npx",
-        args: &["-y", "github:zcaceres/markdownify-mcp"],
+        args: &["-y", "mcp-markdownify-server"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-gortex",
@@ -184,15 +202,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "github:zzet/gortex"],
-    },
-    StoreItem {
-        id: "gh-metatrader",
-        name: "MetaTrader MCP",
-        desc: "Connecte Claude et ChatGPT à MetaTrader 5 pour consulter les marchés et piloter vos ordres en langage naturel (ariadng/metatrader-mcp-server)",
-        cat: "Données",
-        kind: "python",
-        program: "uvx",
-        args: &["metatrader-mcp-server"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-proxmox-plus",
@@ -206,6 +216,12 @@ pub const STORE_GITHUB: &[StoreItem] = &[
             "git+https://github.com/RekklesNA/ProxmoxMCP-Plus",
             "proxmox-mcp",
         ],
+        env_vars: &[
+            "PROXMOX_HOST",
+            "PROXMOX_USER",
+            "PROXMOX_TOKEN_NAME",
+            "PROXMOX_TOKEN_VALUE",
+        ],
     },
     StoreItem {
         id: "gh-hermes-control",
@@ -215,6 +231,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "github:xaspx/hermes-control-interface"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-codex-mcp",
@@ -224,6 +241,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "codex-mcp-server"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-financial-datasets",
@@ -231,12 +249,19 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         desc: "Bilans, comptes de résultat, flux de trésorerie et cours boursiers via Financial Datasets (FINANCIAL_DATASETS_API_KEY en env ; financial-datasets/mcp-server)",
         cat: "Données",
         kind: "python",
-        program: "uvx",
+        program: "uv",
         args: &[
-            "--from",
+            "run",
+            "--no-project",
+            "--with",
+            "mcp>=1,<2",
+            "--with",
             "git+https://github.com/financial-datasets/mcp-server",
-            "financial-datasets-mcp",
+            "python",
+            "-m",
+            "server",
         ],
+        env_vars: &["FINANCIAL_DATASETS_API_KEY"],
     },
     StoreItem {
         id: "gh-unity-mcp",
@@ -246,6 +271,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "github:IvanMurzak/Unity-MCP"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-n8n-skills",
@@ -255,6 +281,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "github:czlonkowski/n8n-skills"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-ssh-manager",
@@ -264,6 +291,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "mcp-ssh-manager"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-twenty-crm",
@@ -272,7 +300,8 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         cat: "Intégrations",
         kind: "npm",
         program: "npx",
-        args: &["-y", "github:mhenry3164/twenty-crm-mcp-server"],
+        args: &["-y", "twenty-crm-mcp-server"],
+        env_vars: &["TWENTY_API_KEY", "TWENTY_BASE_URL"],
     },
     StoreItem {
         id: "gh-pdf-mcp",
@@ -282,6 +311,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         kind: "python",
         program: "uvx",
         args: &["--from", "git+https://github.com/I-CAN-hack/pdf-mcp", "pdf-mcp"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-ai-trader",
@@ -289,12 +319,19 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         desc: "Backtesting de stratégies de trading multi-marchés (actions, crypto, forex) avec serveur MCP intégré (whchien/ai-trader)",
         cat: "Données",
         kind: "python",
-        program: "uvx",
+        program: "uv",
         args: &[
-            "--from",
+            "run",
+            "--no-project",
+            "--python",
+            "3.12",
+            "--with",
             "git+https://github.com/whchien/ai-trader",
-            "ai-trader",
+            "python",
+            "-m",
+            "ai_trader.mcp",
         ],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-whatsapp-multidevice",
@@ -304,6 +341,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "github:aldinokemal/go-whatsapp-web-multidevice"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gh-awesome-finance",
@@ -313,5 +351,6 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "github:BlockRunAI/awesome-finance-mcp"],
+        env_vars: &[],
     },
 ];

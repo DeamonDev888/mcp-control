@@ -197,8 +197,13 @@ pub fn refresh(state: &Arc<AppState>) {
 /// Le `KeyStore` est le registre `auth.clients[]` relu **à chaque requête**
 /// (contrat C6) : une révocation prend effet à la requête suivante.
 fn verifier_for(state: &Arc<AppState>) -> Arc<dyn litemcp::auth::Verifier> {
-    static VERIFIER: OnceLock<Arc<dyn litemcp::auth::Verifier>> = OnceLock::new();
-    Arc::clone(VERIFIER.get_or_init(|| {
+    static VERIFIERS: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, Arc<dyn litemcp::auth::Verifier>>>,
+    > = OnceLock::new();
+    let map = VERIFIERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = Arc::as_ptr(state) as usize;
+    let mut guard = lockv(map);
+    Arc::clone(guard.entry(key).or_insert_with(|| {
         Arc::new(SignatureVerifier::new(
             Arc::new(crate::auth::RegistryStore {
                 state: Arc::clone(state),
@@ -785,6 +790,13 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                     zod::describe("chemin MCP (défaut /mcp)", zod::string()),
                 )
                 .opt(
+                    "via_ssh",
+                    zod::describe(
+                        "true pour sonder et piloter ce serveur HTTP via SSH",
+                        zod::boolean(),
+                    ),
+                )
+                .opt(
                     "program",
                     zod::describe(
                         "programme stdio (requis pour stdio, ex. node)",
@@ -811,6 +823,7 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                                 "port",
                                 "host",
                                 "path",
+                                "via_ssh",
                                 "program",
                                 "args",
                                 "workdir",
@@ -997,14 +1010,26 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
         .tool_typed(
             "ssh_save",
             "Enregistre une machine distante (IP + utilisateur SSH, auth par clé) \
-             pour la découverte de ses serveurs.",
+             pour la découverte de ses serveurs et l'amorçage CLI.",
             zod::object()
                 .field("ip", zod::string().min(1))
                 .field("user", zod::string().min(1))
+                .opt("port", zod::integer().min(1).max(65535))
+                .opt("identity_file", zod::string())
+                .opt("auto_install_cli", zod::boolean())
                 .strict(),
             {
                 let st = Arc::clone(state);
-                move |args| do_action(&st, action_req("ssh_save", args, &["ip", "user"]))
+                move |args| {
+                    do_action(
+                        &st,
+                        action_req(
+                            "ssh_save",
+                            args,
+                            &["ip", "user", "port", "identity_file", "auto_install_cli"],
+                        ),
+                    )
+                }
             },
         )
         .annotate("ssh_forget", modifies("Oublier une machine"))
@@ -1037,9 +1062,24 @@ fn action_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
 
 // ---------- gateway : proxy vers les serveurs détectés ----------
 
+#[derive(Debug, PartialEq, Eq)]
+enum ProxyTarget {
+    Http {
+        host: String,
+        port: u16,
+        path: String,
+    },
+    Ssh {
+        host: String,
+        port: u16,
+        path: String,
+    },
+    Stdio,
+}
+
 /// Résout la cible proxy d'un serveur — pur et testé. `Err` = motif clair
 /// pour le client MCP.
-fn proxy_target(s: &crate::types::Server) -> Result<(String, u16, String), ToolError> {
+fn proxy_target(s: &crate::types::Server) -> Result<ProxyTarget, ToolError> {
     if !s.enabled {
         return Err(ToolError::invalid_input(format!(
             "serveur '{}' en pause (DISABLED) — toggle_server pour le réactiver",
@@ -1062,15 +1102,31 @@ fn proxy_target(s: &crate::types::Server) -> Result<(String, u16, String), ToolE
         )));
     }
     if s.via_ssh {
-        return Err(ToolError::invalid_input(
-            "serveur sondé via SSH : le proxy ne délivre que les serveurs \
-             directement joignables (HTTP)",
-        ));
+        return match &s.transport {
+            Transport::Http { host, port, path } => {
+                let Some(h) = host
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty())
+                    .map(str::to_string)
+                else {
+                    return Err(ToolError::invalid_input(
+                        "serveur SSH sans hôte distant configuré",
+                    ));
+                };
+                Ok(ProxyTarget::Ssh {
+                    host: h,
+                    port: *port,
+                    path: path.clone(),
+                })
+            }
+            Transport::Stdio { .. } => Err(ToolError::invalid_input(
+                "serveur stdio distant : passer par un hôte HTTP via SSH",
+            )),
+        };
     }
     match &s.transport {
-        Transport::Stdio { .. } => Err(ToolError::invalid_input(
-            "serveur stdio : le proxy tools/call ne couvre que les serveurs HTTP",
-        )),
+        Transport::Stdio { .. } => Ok(ProxyTarget::Stdio),
         Transport::Http { host, port, path } => {
             // bound_host = le host qui a réellement répondu à la dernière sonde
             // (::1 vs 127.0.0.1, IP LAN) : on appelle ce qui marche, pas ce
@@ -1080,7 +1136,11 @@ fn proxy_target(s: &crate::types::Server) -> Result<(String, u16, String), ToolE
                 .clone()
                 .or_else(|| host.clone())
                 .unwrap_or_else(|| "127.0.0.1".to_string());
-            Ok((h, *port, path.clone()))
+            Ok(ProxyTarget::Http {
+                host: h,
+                port: *port,
+                path: path.clone(),
+            })
         }
     }
 }
@@ -1091,8 +1151,8 @@ fn proxy_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
         .tool_typed(
             "call_server_tool",
             "Gateway : appelle un outil (tools/call) sur un serveur MCP détecté \
-             par la console et renvoie sa réponse complète (content + \
-             structuredContent de l'upstream). HTTP uniquement ; un outil coupé \
+             par la console (HTTP ou stdio en mode hybride) et renvoie sa réponse \
+             complète (content + structuredContent de l'upstream). Un outil coupé \
              dans l'UI (toggle_tool) est refusé.",
             zod::object()
                 .field(
@@ -1118,7 +1178,7 @@ fn proxy_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                     let tool = args["tool"].as_str().unwrap_or_default();
                     let arguments = args.get("arguments").cloned().unwrap_or(json!({}));
                     crate::auth::net::set_config_path(&st.config_path);
-                    let (host, port, path, protocol) = {
+                    let (target, protocol) = {
                         let servers = lockv(&st.servers);
                         let Some(s) = servers.iter().find(|s| s.id == id) else {
                             return Err(ToolError::invalid_input(format!(
@@ -1131,8 +1191,8 @@ fn proxy_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                                  (toggle_tool pour le rétablir)"
                             )));
                         }
-                        let (h, p, pth) = proxy_target(s)?;
-                        (h, p, pth, s.protocol.clone())
+                        let target = proxy_target(s)?;
+                        (target, s.protocol.clone())
                     };
                     // Contrat C1 (`docs/auth.md` §8.2) : journaliser le vrai client
                     // appelant et non le proxy.
@@ -1144,43 +1204,102 @@ fn proxy_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                         "info",
                         &format!("[proxy] call_server_tool {id}.{tool} (client {appelant})"),
                     );
-                    let rpc_id = PROXY_RPC_ID.fetch_add(1, Ordering::Relaxed);
-                    let stateless = protocol.as_deref() == Some(crate::LITEMCP_PROTOCOL);
-                    let params = if stateless {
-                        json!({
-                            "name": tool,
-                            "arguments": arguments,
-                            "_meta": {
-                                "io.modelcontextprotocol/protocolVersion": crate::LITEMCP_PROTOCOL
+                    match target {
+                        ProxyTarget::Stdio => {
+                            let rpc = {
+                                let children = lockv(&st.children);
+                                match children.get(id) {
+                                    Some(h) => {
+                                        let alive = h.exit.lock().is_ok_and(|g| g.is_none());
+                                        if !alive {
+                                            return Err(ToolError::upstream(format!(
+                                                "serveur stdio '{id}' arrêté — relancez ou sondez le serveur"
+                                            )));
+                                        }
+                                        h.rpc.clone()
+                                    }
+                                    None => None,
+                                }
+                            };
+                            let Some(rpc) = rpc else {
+                                return Err(ToolError::upstream(format!(
+                                    "canal stdio non prêt pour '{id}' — démarrez ou sondez le serveur"
+                                )));
+                            };
+                            match probe::call_stdio_tool(&rpc, tool, arguments, PROXY_TIMEOUT_MS) {
+                                Ok((result, _ms)) => Ok(result),
+                                Err(e) => Err(ToolError::upstream(format!(
+                                    "appel stdio de '{tool}' sur '{id}' : {e}"
+                                ))),
                             }
-                        })
-                    } else {
-                        json!({ "name": tool, "arguments": arguments })
-                    };
-                    let mut extra: Vec<(&str, &str)> =
-                        vec![("Mcp-Method", "tools/call"), ("Mcp-Name", tool)];
-                    if stateless {
-                        extra.push(("MCP-Protocol-Version", crate::LITEMCP_PROTOCOL));
-                    }
-                    match probe::rpc_call_host_headers(
-                        &host,
-                        port,
-                        &path,
-                        "tools/call",
-                        params,
-                        rpc_id,
-                        PROXY_TIMEOUT_MS,
-                        &extra,
-                    ) {
-                        Ok((result, _head)) => {
-                            // transparence : le résultat du serveur distant
-                            // (CallToolResult upstream) est rendu tel quel —
-                            // un isError distant reste visible par le client
-                            Ok(result)
                         }
-                        Err(e) => Err(ToolError::upstream(format!(
-                            "appel de '{tool}' sur '{id}' ({host}:{port}{path}) : {e}"
-                        ))),
+                        ProxyTarget::Http { host, port, path } => {
+                            let rpc_id = PROXY_RPC_ID.fetch_add(1, Ordering::Relaxed);
+                            let stateless = protocol.as_deref() == Some(crate::LITEMCP_PROTOCOL);
+                            let params = if stateless {
+                                json!({
+                                    "name": tool,
+                                    "arguments": arguments,
+                                    "_meta": {
+                                        "io.modelcontextprotocol/protocolVersion": crate::LITEMCP_PROTOCOL
+                                    }
+                                })
+                            } else {
+                                json!({ "name": tool, "arguments": arguments })
+                            };
+                            let mut extra: Vec<(&str, &str)> =
+                                vec![("Mcp-Method", "tools/call"), ("Mcp-Name", tool)];
+                            if stateless {
+                                extra.push(("MCP-Protocol-Version", crate::LITEMCP_PROTOCOL));
+                            }
+                            match probe::rpc_call_host_headers(
+                                &host,
+                                port,
+                                &path,
+                                "tools/call",
+                                params,
+                                rpc_id,
+                                PROXY_TIMEOUT_MS,
+                                &extra,
+                            ) {
+                                Ok((result, _head)) => {
+                                    // transparence : le résultat du serveur distant
+                                    // (CallToolResult upstream) est rendu tel quel —
+                                    // un isError distant reste visible par le client
+                                    Ok(result)
+                                }
+                                Err(e) => Err(ToolError::upstream(format!(
+                                    "appel de '{tool}' sur '{id}' ({host}:{port}{path}) : {e}"
+                                ))),
+                            }
+                        }
+                        ProxyTarget::Ssh { host, port, path } => {
+                            let sh_opt = lockv(&st.settings)
+                                .ssh_hosts
+                                .iter()
+                                .find(|h| h.ip == host)
+                                .cloned();
+                            let Some(sh) = sh_opt else {
+                                return Err(ToolError::invalid_input(format!(
+                                    "machine SSH '{host}' non enregistrée — utiliser ssh_save"
+                                )));
+                            };
+                            let target = probe::SshTarget::from_host(&sh);
+                            match probe::ssh_call_tool(
+                                &target,
+                                port,
+                                &path,
+                                protocol.as_deref(),
+                                tool,
+                                arguments,
+                                (PROXY_TIMEOUT_MS / 1000).max(5),
+                            ) {
+                                Ok((result, _ms)) => Ok(result),
+                                Err(e) => Err(ToolError::upstream(format!(
+                                    "appel SSH de '{tool}' sur '{id}' ({host}:{port}{path}) : {e}"
+                                ))),
+                            }
+                        }
                     }
                 }
             },
@@ -1812,9 +1931,21 @@ pub fn serve_hybrid_stdio(
     let srv_snap = {
         let servers = lockv(&state.servers);
         servers.iter().find(|s| s.id == server_id).map(|s| {
+            let http_target = match &s.transport {
+                Transport::Http { host, port, path } => host
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty())
+                    .map(|h| (h.to_string(), *port, path.clone())),
+                Transport::Stdio { .. } => None,
+            };
             (
                 matches!(s.transport, Transport::Stdio { .. }),
+                s.via_ssh,
+                http_target,
+                s.enabled,
                 s.state,
+                s.last_error.clone(),
                 s.label.clone(),
                 s.server_name.clone(),
                 s.version.clone(),
@@ -1824,7 +1955,20 @@ pub fn serve_hybrid_stdio(
             )
         })
     };
-    let Some((is_stdio, st, label, server_name, version, protocol, tools, disabled)) = srv_snap
+    let Some((
+        is_stdio,
+        via_ssh,
+        http_target,
+        enabled,
+        st,
+        last_error,
+        label,
+        server_name,
+        version,
+        protocol,
+        mut tools,
+        disabled,
+    )) = srv_snap
     else {
         return Reply::json(
             404,
@@ -1835,22 +1979,47 @@ pub fn serve_hybrid_stdio(
             }),
         );
     };
-    if !is_stdio {
+    if !is_stdio && !(via_ssh && http_target.is_some()) {
         return Reply::json(
             400,
             json!({
                 "jsonrpc": "2.0",
                 "id": rpc_id,
-                "error": { "code": -32600, "message": "le pont hybride /mcp/s/<id> est réservé aux serveurs stdio" }
+                "error": { "code": -32600, "message": "le pont hybride /mcp/s/<id> est réservé aux serveurs stdio (ou HTTP via SSH)" }
             }),
         );
     }
+    let live_rpc = |state: &Arc<AppState>| {
+        let children = lockv(&state.children);
+        match children.get(server_id) {
+            Some(h) => {
+                if !h.exit.lock().is_ok_and(|g| g.is_none()) {
+                    Err("serveur stdio arrêté — relancez ou sondez le serveur")
+                } else {
+                    h.rpc
+                        .clone()
+                        .ok_or("canal stdio non prêt — démarrez ou sondez le serveur")
+                }
+            }
+            None => Err("canal stdio non prêt — démarrez ou sondez le serveur"),
+        }
+    };
+    let disabled_msg = if is_stdio {
+        "serveur stdio en pause (DISABLED)"
+    } else {
+        "serveur SSH en pause (DISABLED)"
+    };
+    let offline_prefix = if is_stdio {
+        "serveur stdio hors ligne"
+    } else {
+        "serveur SSH hors ligne"
+    };
     let resp_val = match rpc_method {
         "initialize" => json!({
             "jsonrpc": "2.0",
             "id": rpc_id,
             "result": {
-                "protocolVersion": protocol.unwrap_or_else(|| "2024-11-05".to_string()),
+                "protocolVersion": protocol.as_deref().unwrap_or("2024-11-05"),
                 "capabilities": { "tools": { "listChanged": false } },
                 "serverInfo": {
                     "name": server_name.unwrap_or(label),
@@ -1860,23 +2029,71 @@ pub fn serve_hybrid_stdio(
         }),
         "ping" => json!({ "jsonrpc": "2.0", "id": rpc_id, "result": {} }),
         "tools/list" => {
-            let list: Vec<Value> = tools
-                .iter()
-                .filter(|t| !disabled.iter().any(|d| d == &t.name))
-                .map(|t| {
-                    json!({
-                        "name": t.name,
-                        "description": t.desc,
-                        "inputSchema": t.input_schema.clone().unwrap_or_else(|| json!({"type":"object","properties":{}})),
-                    })
+            if !enabled {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "error": { "code": -32023, "message": disabled_msg }
                 })
-                .collect();
-            json!({ "jsonrpc": "2.0", "id": rpc_id, "result": { "tools": list } })
+            } else {
+                if st == SState::Up && tools.is_empty() {
+                    if is_stdio {
+                        if let Ok(rpc) = live_rpc(state) {
+                            if let Ok((fresh, _ms)) = crate::probe::list_stdio_tools(&rpc, 15_000) {
+                                if !fresh.is_empty() {
+                                    let mut servers = lockv(&state.servers);
+                                    if let Some(s) = servers.iter_mut().find(|s| s.id == server_id)
+                                    {
+                                        s.tools = fresh.clone();
+                                    }
+                                    tools = fresh;
+                                }
+                            }
+                        }
+                    } else if let Some((host, port, path)) = &http_target {
+                        let sh_opt = lockv(&state.settings)
+                            .ssh_hosts
+                            .iter()
+                            .find(|h| h.ip == *host)
+                            .cloned();
+                        if let Some(sh) = sh_opt {
+                            let target = crate::probe::SshTarget::from_host(&sh);
+                            let probe_res =
+                                crate::probe::ssh_probe_server_target(&target, *port, path, 6);
+                            if !probe_res.tools.is_empty() {
+                                let mut servers = lockv(&state.servers);
+                                if let Some(s) = servers.iter_mut().find(|s| s.id == server_id) {
+                                    s.tools = probe_res.tools.clone();
+                                }
+                                tools = probe_res.tools;
+                            }
+                        }
+                    }
+                }
+                let list: Vec<Value> = tools
+                    .iter()
+                    .filter(|t| !disabled.iter().any(|d| d == &t.name))
+                    .map(|t| {
+                        json!({
+                            "name": t.name,
+                            "description": t.desc,
+                            "inputSchema": t.input_schema.clone().unwrap_or_else(|| json!({"type":"object","properties":{}})),
+                        })
+                    })
+                    .collect();
+                json!({ "jsonrpc": "2.0", "id": rpc_id, "result": { "tools": list } })
+            }
         }
         "tools/call" => {
             let params = rpc_req.get("params").cloned().unwrap_or_else(|| json!({}));
             let tool_name = params.get("name").and_then(|x| x.as_str()).unwrap_or("");
-            if tool_name.is_empty() {
+            if !enabled {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "error": { "code": -32023, "message": disabled_msg }
+                })
+            } else if tool_name.is_empty() {
                 json!({
                     "jsonrpc": "2.0",
                     "id": rpc_id,
@@ -1889,59 +2106,124 @@ pub fn serve_hybrid_stdio(
                     "error": { "code": -32023, "message": format!("outil désactivé : {tool_name}") }
                 })
             } else if st != SState::Up {
+                let msg = match last_error {
+                    Some(e) if !e.trim().is_empty() => {
+                        format!("{offline_prefix} ({}) — {e}", st.as_str())
+                    }
+                    _ => format!("{offline_prefix} ({})", st.as_str()),
+                };
                 json!({
                     "jsonrpc": "2.0",
                     "id": rpc_id,
-                    "error": { "code": -32000, "message": format!("serveur stdio hors ligne ({})", st.as_str()) }
+                    "error": { "code": -32000, "message": msg }
                 })
             } else {
-                let rpc = lockv(&state.children)
-                    .get(server_id)
-                    .and_then(|h| h.rpc.clone());
+                manage::add_log(
+                    state,
+                    "info",
+                    &format!(
+                        "[hybrid] {server_id}.{tool_name} (client {})",
+                        auth_ctx.client()
+                    ),
+                );
                 let arguments = params
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                match rpc {
-                    Some(rpc) => {
-                        match crate::probe::call_stdio_tool(&rpc, tool_name, arguments, 30_000) {
-                            Ok((res, _ms)) => {
-                                json!({ "jsonrpc": "2.0", "id": rpc_id, "result": res })
+                if is_stdio {
+                    match live_rpc(state) {
+                        Ok(rpc) => {
+                            match crate::probe::call_stdio_tool(&rpc, tool_name, arguments, 60_000)
+                            {
+                                Ok((res, _ms)) => {
+                                    json!({ "jsonrpc": "2.0", "id": rpc_id, "result": res })
+                                }
+                                Err(e) => json!({
+                                    "jsonrpc": "2.0",
+                                    "id": rpc_id,
+                                    "error": { "code": -32000, "message": e }
+                                }),
                             }
-                            Err(e) => json!({
-                                "jsonrpc": "2.0",
-                                "id": rpc_id,
-                                "error": { "code": -32000, "message": e }
-                            }),
                         }
+                        Err(msg) => json!({
+                            "jsonrpc": "2.0",
+                            "id": rpc_id,
+                            "error": { "code": -32000, "message": msg }
+                        }),
                     }
-                    None => json!({
+                } else if let Some((host, port, path)) = &http_target {
+                    let sh_opt = lockv(&state.settings)
+                        .ssh_hosts
+                        .iter()
+                        .find(|h| h.ip == *host)
+                        .cloned();
+                    match sh_opt {
+                        Some(sh) => {
+                            let target = crate::probe::SshTarget::from_host(&sh);
+                            match crate::probe::ssh_call_tool(
+                                &target,
+                                *port,
+                                path,
+                                protocol.as_deref(),
+                                tool_name,
+                                arguments,
+                                60,
+                            ) {
+                                Ok((res, _ms)) => {
+                                    json!({ "jsonrpc": "2.0", "id": rpc_id, "result": res })
+                                }
+                                Err(e) => json!({
+                                    "jsonrpc": "2.0",
+                                    "id": rpc_id,
+                                    "error": { "code": -32000, "message": e }
+                                }),
+                            }
+                        }
+                        None => json!({
+                            "jsonrpc": "2.0",
+                            "id": rpc_id,
+                            "error": { "code": -32000, "message": "machine SSH non enregistrée" }
+                        }),
+                    }
+                } else {
+                    json!({
                         "jsonrpc": "2.0",
                         "id": rpc_id,
-                        "error": { "code": -32000, "message": "canal stdio non prêt — démarrez ou sondez le serveur" }
-                    }),
+                        "error": { "code": -32000, "message": "cible SSH invalide" }
+                    })
                 }
             }
         }
         other => {
-            let rpc = lockv(&state.children)
-                .get(server_id)
-                .and_then(|h| h.rpc.clone());
-            let params = rpc_req.get("params").cloned().unwrap_or_else(|| json!({}));
-            match rpc {
-                Some(rpc) => match crate::probe::call_stdio_rpc(&rpc, other, params, 30_000) {
-                    Ok((res, _ms)) => json!({ "jsonrpc": "2.0", "id": rpc_id, "result": res }),
-                    Err(e) => json!({
-                        "jsonrpc": "2.0",
-                        "id": rpc_id,
-                        "error": { "code": -32000, "message": e }
-                    }),
-                },
-                None => json!({
+            if !enabled {
+                json!({
                     "jsonrpc": "2.0",
                     "id": rpc_id,
-                    "error": { "code": -32000, "message": "serveur stdio hors ligne" }
-                }),
+                    "error": { "code": -32023, "message": disabled_msg }
+                })
+            } else if is_stdio {
+                let params = rpc_req.get("params").cloned().unwrap_or_else(|| json!({}));
+                match live_rpc(state) {
+                    Ok(rpc) => match crate::probe::call_stdio_rpc(&rpc, other, params, 60_000) {
+                        Ok((res, _ms)) => json!({ "jsonrpc": "2.0", "id": rpc_id, "result": res }),
+                        Err(e) => json!({
+                            "jsonrpc": "2.0",
+                            "id": rpc_id,
+                            "error": { "code": -32000, "message": e }
+                        }),
+                    },
+                    Err(msg) => json!({
+                        "jsonrpc": "2.0",
+                        "id": rpc_id,
+                        "error": { "code": -32000, "message": msg }
+                    }),
+                }
+            } else {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "error": { "code": -32601, "message": format!("méthode '{other}' non prise en charge sur le pont hybride SSH") }
+                })
             }
         }
     };
@@ -2000,6 +2282,8 @@ mod tests {
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![],
             latency_ms: None,
@@ -2958,13 +3242,16 @@ mod tests {
     }
 
     #[test]
-    fn proxy_target_refuse_les_etats_non_up_et_stdio() {
+    fn proxy_target_refuse_les_etats_non_up_et_accepte_http_et_stdio() {
         let mut s = http_server("p", 30_401);
-        // UP + HTTP → cible
-        let (host, port, path) = proxy_target(&s).unwrap();
+        // UP + HTTP → cible Http
         assert_eq!(
-            (host.as_str(), port, path.as_str()),
-            ("127.0.0.1", 30_401, "/mcp")
+            proxy_target(&s).unwrap(),
+            ProxyTarget::Http {
+                host: "127.0.0.1".to_string(),
+                port: 30_401,
+                path: "/mcp".to_string(),
+            }
         );
         // DISABLED → refus
         s.enabled = false;
@@ -2974,29 +3261,66 @@ mod tests {
         s.state = SState::Down;
         assert!(proxy_target(&s).is_err());
         s.state = SState::Up;
-        // via_ssh → refus
+        // via_ssh : refus si host absent ; accepté si host présent
         s.via_ssh = true;
         assert!(proxy_target(&s).is_err());
-        s.via_ssh = false;
-        // stdio → refus
+        s.transport = Transport::Http {
+            host: Some("192.0.2.50".to_string()),
+            port: 30_401,
+            path: "/mcp".to_string(),
+        };
+        assert_eq!(
+            proxy_target(&s).unwrap(),
+            ProxyTarget::Ssh {
+                host: "192.0.2.50".to_string(),
+                port: 30_401,
+                path: "/mcp".to_string(),
+            }
+        );
+        s = http_server("p", 30_401);
+        // UP + stdio → cible Stdio
         s.transport = Transport::Stdio {
             program: "node".to_string(),
             args: vec![],
             workdir: None,
             env: Vec::new(),
         };
+        assert_eq!(proxy_target(&s).unwrap(), ProxyTarget::Stdio);
+        // stdio DISABLED / DOWN / via_ssh → refus
+        s.enabled = false;
         assert!(proxy_target(&s).is_err());
+        s.enabled = true;
+        s.state = SState::Down;
+        assert!(proxy_target(&s).is_err());
+        s.state = SState::Up;
+        s.via_ssh = true;
+        assert!(proxy_target(&s).is_err());
+        s.via_ssh = false;
         // bound_host prioritaire sur le host de config
         s.transport = Transport::Http {
             host: Some("192.0.2.99".to_string()),
             port: 30_402,
             path: "/mcp".to_string(),
         };
-        let (host, _, _) = proxy_target(&s).unwrap();
-        assert_eq!(host, "127.0.0.1", "bound_host gagne");
+        assert_eq!(
+            proxy_target(&s).unwrap(),
+            ProxyTarget::Http {
+                host: "127.0.0.1".to_string(),
+                port: 30_402,
+                path: "/mcp".to_string(),
+            },
+            "bound_host gagne"
+        );
         s.bound_host = None;
-        let (host, _, _) = proxy_target(&s).unwrap();
-        assert_eq!(host, "192.0.2.99", "retour au host de config");
+        assert_eq!(
+            proxy_target(&s).unwrap(),
+            ProxyTarget::Http {
+                host: "192.0.2.99".to_string(),
+                port: 30_402,
+                path: "/mcp".to_string(),
+            },
+            "retour au host de config"
+        );
     }
 
     #[test]
@@ -3307,5 +3631,622 @@ mod tests {
         let egal = sign_at(boot, [0x22u8; 16]);
         let rep_egal = respond_auth(&core, "/mcp", "POST", &egal, body, false, Some(boot));
         assert_eq!(rep_egal.status, 200, "created == boot_ts doit passer");
+    }
+
+    fn parse_signed_http(raw: &str) -> (Vec<(String, String)>, Vec<u8>) {
+        let (head, body) = raw.split_once("\r\n\r\n").expect("requête HTTP valide");
+        let headers = head
+            .lines()
+            .skip(1)
+            .filter_map(|l| {
+                let (n, v) = l.split_once(':')?;
+                Some((n.trim().to_ascii_lowercase(), v.trim().to_string()))
+            })
+            .collect();
+        (headers, body.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn serve_hybrid_stdio_couvre_tous_les_serveurs_de_la_boutique() {
+        use litemcp::auth::sign::{Signer, SigningKey};
+
+        let state = test_state();
+        let sk_read = SigningKey::generate();
+        let keyid_read = "mcc-st01-0000000000000001";
+        let sk_exec = SigningKey::generate();
+        let keyid_exec = "mcc-st02-0000000000000002";
+        {
+            let mut st = lockv(&state.settings);
+            st.auth
+                .insert(crate::auth::registry::ClientRecord::new(
+                    keyid_read.to_string(),
+                    "boutique-read".to_string(),
+                    crate::crypto::hex(&sk_read.verifying_key().to_bytes()),
+                    vec!["lecture".to_string()],
+                    "127.0.0.1".to_string(),
+                ))
+                .expect("client lecture inséré");
+            st.auth
+                .insert(crate::auth::registry::ClientRecord::new(
+                    keyid_exec.to_string(),
+                    "boutique-exec".to_string(),
+                    crate::crypto::hex(&sk_exec.verifying_key().to_bytes()),
+                    vec!["lecture".to_string(), "execution".to_string()],
+                    "127.0.0.1".to_string(),
+                ))
+                .expect("client execution inséré");
+        }
+        let ident_read = crate::bridge::Identite {
+            keyid: keyid_read.to_string(),
+            signer: Signer::new(sk_read).with_keyid(keyid_read),
+        };
+        let ident_exec = crate::bridge::Identite {
+            keyid: keyid_exec.to_string(),
+            signer: Signer::new(sk_exec).with_keyid(keyid_exec),
+        };
+
+        let items: Vec<&crate::manage::StoreItem> = crate::manage::STORE
+            .iter()
+            .chain(crate::store_aitmpl::STORE_AITMPL.iter())
+            .chain(crate::store_glama::STORE_GLAMA.iter())
+            .chain(crate::store_github::STORE_GITHUB.iter())
+            .collect();
+        assert_eq!(items.len(), 89, "la boutique doit contenir 89 serveurs");
+        {
+            let mut servers = lockv(&state.servers);
+            for it in &items {
+                servers.push(Server {
+                    id: format!("store-{}", it.id),
+                    label: it.name.to_string(),
+                    transport: Transport::Stdio {
+                        program: it.program.to_string(),
+                        args: it.args.iter().map(|a| a.to_string()).collect(),
+                        workdir: None,
+                        env: Vec::new(),
+                    },
+                    origin: Origin::Manual,
+                    enabled: true,
+                    auto_restart: true,
+                    favorite: false,
+                    state: SState::Up,
+                    pid: Some(4242),
+                    bound_host: None,
+                    server_name: Some(it.name.to_string()),
+                    version: Some("1.0.0".to_string()),
+                    protocol: Some("2024-11-05".to_string()),
+                    sse: false,
+                    sse_endpoint: false,
+                    ws: false,
+                    lang: None,
+                    framework: None,
+                    in_container: false,
+                    container_name: None,
+                    via_ssh: false,
+                    tools: vec![
+                        crate::types::ToolInfo {
+                            name: "tool_ok".to_string(),
+                            desc: "outil actif".to_string(),
+                            input_schema: Some(json!({"type": "object", "properties": {}})),
+                        },
+                        crate::types::ToolInfo {
+                            name: "tool_off".to_string(),
+                            desc: "outil désactivé".to_string(),
+                            input_schema: None,
+                        },
+                    ],
+                    latency_ms: Some(5),
+                    last_seen_ts: Some(crate::types::now_ts()),
+                    last_error: None,
+                    start_cmd: None,
+                    tools_disabled: vec!["tool_off".to_string()],
+                });
+            }
+        }
+
+        let authority = "127.0.0.1:5090";
+        for it in &items {
+            let sid = format!("store-{}", it.id);
+            let path = format!("/mcp/s/{sid}");
+
+            // 1. Sans signature → 401
+            let unsigned_hdrs = vec![
+                ("host".to_string(), authority.to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+                ("accept".to_string(), "application/json".to_string()),
+            ];
+            let rep_unauth = serve_hybrid_stdio(
+                &state,
+                &sid,
+                "POST",
+                &path,
+                &unsigned_hdrs,
+                br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+                false,
+                None,
+            );
+            assert_eq!(
+                rep_unauth.status, 401,
+                "{sid} sans signature doit rendre 401"
+            );
+
+            // 2. initialize → 200
+            let init_rpc = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+            let raw = crate::bridge::construire_requete(
+                &ident_read,
+                authority,
+                &path,
+                &init_rpc,
+                "initialize",
+            )
+            .unwrap();
+            let (hdrs, body) = parse_signed_http(&raw);
+            let rep = serve_hybrid_stdio(&state, &sid, "POST", &path, &hdrs, &body, false, None);
+            assert_eq!(rep.status, 200, "{sid} initialize");
+            let v: Value = serde_json::from_slice(&rep.body).unwrap();
+            assert_eq!(v["result"]["serverInfo"]["name"], json!(it.name));
+
+            // 3. ping → 200
+            let ping_rpc = json!({"jsonrpc": "2.0", "id": 2, "method": "ping"});
+            let raw =
+                crate::bridge::construire_requete(&ident_read, authority, &path, &ping_rpc, "ping")
+                    .unwrap();
+            let (hdrs, body) = parse_signed_http(&raw);
+            let rep = serve_hybrid_stdio(&state, &sid, "POST", &path, &hdrs, &body, false, None);
+            assert_eq!(rep.status, 200, "{sid} ping");
+
+            // 4. notifications/initialized → 202
+            let notif_rpc = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+            let raw = crate::bridge::construire_requete(
+                &ident_read,
+                authority,
+                &path,
+                &notif_rpc,
+                "notifications/initialized",
+            )
+            .unwrap();
+            let (hdrs, body) = parse_signed_http(&raw);
+            let rep = serve_hybrid_stdio(&state, &sid, "POST", &path, &hdrs, &body, false, None);
+            assert_eq!(rep.status, 202, "{sid} notifications/initialized");
+            assert!(rep.body.is_empty(), "{sid} 202 sans corps");
+
+            // 5. tools/list → 200 avec filtrage tools_disabled
+            let list_rpc = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}});
+            let raw = crate::bridge::construire_requete(
+                &ident_read,
+                authority,
+                &path,
+                &list_rpc,
+                "tools/list",
+            )
+            .unwrap();
+            let (hdrs, body) = parse_signed_http(&raw);
+            let rep = serve_hybrid_stdio(&state, &sid, "POST", &path, &hdrs, &body, false, None);
+            assert_eq!(rep.status, 200, "{sid} tools/list");
+            let v: Value = serde_json::from_slice(&rep.body).unwrap();
+            let names: Vec<&str> = v["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|t| t["name"].as_str())
+                .collect();
+            assert_eq!(names, vec!["tool_ok"], "{sid} doit filtrer tool_off");
+
+            // 6. tools/call avec droit lecture seul → 403
+            let call_rpc = json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": { "name": "tool_ok", "arguments": {} }
+            });
+            let raw = crate::bridge::construire_requete(
+                &ident_read,
+                authority,
+                &path,
+                &call_rpc,
+                "tools/call",
+            )
+            .unwrap();
+            let (hdrs, body) = parse_signed_http(&raw);
+            let rep = serve_hybrid_stdio(&state, &sid, "POST", &path, &hdrs, &body, false, None);
+            assert_eq!(rep.status, 403, "{sid} tools/call sans execution → 403");
+
+            // 7. Serveur DISABLED → refus -32023 sur tools/list et tools/call
+            {
+                let mut servers = lockv(&state.servers);
+                if let Some(s) = servers.iter_mut().find(|s| s.id == sid) {
+                    s.enabled = false;
+                }
+            }
+            let raw = crate::bridge::construire_requete(
+                &ident_read,
+                authority,
+                &path,
+                &list_rpc,
+                "tools/list",
+            )
+            .unwrap();
+            let (hdrs, body) = parse_signed_http(&raw);
+            let rep = serve_hybrid_stdio(&state, &sid, "POST", &path, &hdrs, &body, false, None);
+            assert_eq!(rep.status, 200, "{sid} DISABLED tools/list");
+            let v: Value = serde_json::from_slice(&rep.body).unwrap();
+            assert_eq!(v["error"]["code"], json!(-32023), "{sid} DISABLED : {v}");
+
+            let raw = crate::bridge::construire_requete(
+                &ident_exec,
+                authority,
+                &path,
+                &call_rpc,
+                "tools/call",
+            )
+            .unwrap();
+            let (hdrs, body) = parse_signed_http(&raw);
+            let rep = serve_hybrid_stdio(&state, &sid, "POST", &path, &hdrs, &body, false, None);
+            assert_eq!(rep.status, 200, "{sid} DISABLED tools/call");
+            let v: Value = serde_json::from_slice(&rep.body).unwrap();
+            assert_eq!(v["error"]["code"], json!(-32023), "{sid} DISABLED : {v}");
+
+            {
+                let mut servers = lockv(&state.servers);
+                if let Some(s) = servers.iter_mut().find(|s| s.id == sid) {
+                    s.enabled = true;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hybride_stdio_et_call_server_tool_executent_un_outil_reel() {
+        use litemcp::auth::sign::{Signer, SigningKey};
+
+        let state = test_state();
+        let sk = SigningKey::generate();
+        let keyid = "mcc-run1-0000000000000001";
+        {
+            let mut st = lockv(&state.settings);
+            st.auth
+                .insert(crate::auth::registry::ClientRecord::new(
+                    keyid.to_string(),
+                    "hybrid-runner".to_string(),
+                    crate::crypto::hex(&sk.verifying_key().to_bytes()),
+                    vec!["lecture".to_string(), "execution".to_string()],
+                    "127.0.0.1".to_string(),
+                ))
+                .expect("client inséré");
+        }
+        let ident = crate::bridge::Identite {
+            keyid: keyid.to_string(),
+            signer: Signer::new(sk).with_keyid(keyid),
+        };
+
+        {
+            let mut servers = lockv(&state.servers);
+            servers.push(Server {
+                id: "store-github".to_string(),
+                label: "GitHub".to_string(),
+                transport: Transport::Stdio {
+                    program: "npx".to_string(),
+                    args: vec![
+                        "-y".to_string(),
+                        "@modelcontextprotocol/server-github".to_string(),
+                    ],
+                    workdir: None,
+                    env: Vec::new(),
+                },
+                origin: Origin::Manual,
+                enabled: true,
+                auto_restart: true,
+                favorite: false,
+                state: SState::Up,
+                pid: Some(9001),
+                bound_host: None,
+                server_name: Some("github-mcp".to_string()),
+                version: Some("1.0.0".to_string()),
+                protocol: Some("2024-11-05".to_string()),
+                sse: false,
+                sse_endpoint: false,
+                ws: false,
+                lang: None,
+                framework: None,
+                in_container: false,
+                container_name: None,
+                via_ssh: false,
+                tools: vec![
+                    crate::types::ToolInfo {
+                        name: "search_repositories".to_string(),
+                        desc: "chercher des dépôts".to_string(),
+                        input_schema: None,
+                    },
+                    crate::types::ToolInfo {
+                        name: "delete_repo".to_string(),
+                        desc: "supprimer un dépôt".to_string(),
+                        input_schema: None,
+                    },
+                ],
+                latency_ms: Some(3),
+                last_seen_ts: Some(crate::types::now_ts()),
+                last_error: None,
+                start_cmd: None,
+                tools_disabled: vec!["delete_repo".to_string()],
+            });
+        }
+
+        let handle = crate::probe::test_stdio_handle_with_mock(|req| {
+            let id = req.get("id")?.clone();
+            let name = req
+                .pointer("/params/name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let query = req
+                .pointer("/params/arguments/query")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{ "type": "text", "text": format!("ok:{name}:{query}") }]
+                }
+            }))
+        });
+        lockv(&state.children).insert("store-github".to_string(), handle);
+
+        // 1. Exécution via POST /mcp/s/store-github (pont hybride signé Ed25519)
+        let call_ok = json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": { "name": "search_repositories", "arguments": { "query": "litemcp" } }
+        });
+        let raw = crate::bridge::construire_requete(
+            &ident,
+            "127.0.0.1:5090",
+            "/mcp/s/store-github",
+            &call_ok,
+            "tools/call",
+        )
+        .unwrap();
+        let (hdrs, body) = parse_signed_http(&raw);
+        let rep = serve_hybrid_stdio(
+            &state,
+            "store-github",
+            "POST",
+            "/mcp/s/store-github",
+            &hdrs,
+            &body,
+            false,
+            None,
+        );
+        assert_eq!(rep.status, 200);
+        let v: Value = serde_json::from_slice(&rep.body).unwrap();
+        assert_eq!(
+            v["result"]["content"][0]["text"],
+            json!("ok:search_repositories:litemcp"),
+            "{v}"
+        );
+
+        // Outil désactivé refusé via /mcp/s/store-github
+        let call_off = json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": { "name": "delete_repo", "arguments": {} }
+        });
+        let raw = crate::bridge::construire_requete(
+            &ident,
+            "127.0.0.1:5090",
+            "/mcp/s/store-github",
+            &call_off,
+            "tools/call",
+        )
+        .unwrap();
+        let (hdrs, body) = parse_signed_http(&raw);
+        let rep = serve_hybrid_stdio(
+            &state,
+            "store-github",
+            "POST",
+            "/mcp/s/store-github",
+            &hdrs,
+            &body,
+            false,
+            None,
+        );
+        assert_eq!(rep.status, 200);
+        let v: Value = serde_json::from_slice(&rep.body).unwrap();
+        assert_eq!(v["error"]["code"], json!(-32023), "{v}");
+
+        // 2. Exécution via call_server_tool sur POST /mcp
+        let core = build_builder(&state).core();
+        let req_ok = json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "call_server_tool",
+                "arguments": {
+                    "server": "store-github",
+                    "tool": "search_repositories",
+                    "arguments": { "query": "gateway" }
+                }
+            }
+        })
+        .to_string();
+        let rep_gw = core.dispatch(req_ok.as_bytes()).unwrap();
+        let v_gw: Value = serde_json::from_slice(&rep_gw).unwrap();
+        assert_ne!(v_gw["result"]["isError"], json!(true), "{v_gw}");
+        assert!(
+            v_gw.to_string().contains("ok:search_repositories:gateway"),
+            "résultat outil stdio attendu via call_server_tool : {v_gw}"
+        );
+
+        // Outil désactivé refusé via call_server_tool
+        let req_off = json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "call_server_tool",
+                "arguments": {
+                    "server": "store-github",
+                    "tool": "delete_repo"
+                }
+            }
+        })
+        .to_string();
+        let rep_off = core.dispatch(req_off.as_bytes()).unwrap();
+        let v_off: Value = serde_json::from_slice(&rep_off).unwrap();
+        assert_eq!(v_off["result"]["isError"], json!(true), "{v_off}");
+        assert!(
+            v_off["result"]["structuredContent"]["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("coupé pour ce serveur"),
+            "{v_off}"
+        );
+    }
+
+    #[test]
+    fn pont_hybride_accepte_serveur_via_ssh() {
+        use litemcp::auth::sign::{Signer, SigningKey};
+
+        let state = test_state();
+        let sk_exec = SigningKey::generate();
+        let keyid_exec = "mcc-ssh1-0000000000000001";
+        {
+            let mut st = lockv(&state.settings);
+            st.auth
+                .insert(crate::auth::registry::ClientRecord::new(
+                    keyid_exec.to_string(),
+                    "ssh-client".to_string(),
+                    crate::crypto::hex(&sk_exec.verifying_key().to_bytes()),
+                    vec!["lecture".to_string(), "execution".to_string()],
+                    "127.0.0.1".to_string(),
+                ))
+                .expect("client execution inséré");
+        }
+        let ident = crate::bridge::Identite {
+            keyid: keyid_exec.to_string(),
+            signer: Signer::new(sk_exec).with_keyid(keyid_exec),
+        };
+        {
+            let mut servers = lockv(&state.servers);
+            servers.push(Server {
+                id: "ssh-srv-1".to_string(),
+                label: "Remote Echo".to_string(),
+                transport: Transport::Http {
+                    host: Some("192.0.2.50".to_string()),
+                    port: 30_500,
+                    path: "/mcp".to_string(),
+                },
+                origin: Origin::Discovered,
+                enabled: true,
+                auto_restart: false,
+                favorite: false,
+                state: SState::Up,
+                pid: None,
+                bound_host: None,
+                server_name: Some("Remote Echo".to_string()),
+                version: Some("1.0.0".to_string()),
+                protocol: Some("2024-11-05".to_string()),
+                sse: false,
+                sse_endpoint: false,
+                ws: false,
+                lang: None,
+                framework: None,
+                in_container: false,
+                container_name: None,
+                via_ssh: true,
+                tools: vec![
+                    crate::types::ToolInfo {
+                        name: "echo".to_string(),
+                        desc: "echo distant".to_string(),
+                        input_schema: Some(json!({"type": "object", "properties": {}})),
+                    },
+                    crate::types::ToolInfo {
+                        name: "secret".to_string(),
+                        desc: "outil coupé".to_string(),
+                        input_schema: None,
+                    },
+                ],
+                latency_ms: Some(12),
+                last_seen_ts: Some(crate::types::now_ts()),
+                last_error: None,
+                start_cmd: None,
+                tools_disabled: vec!["secret".to_string()],
+            });
+        }
+
+        let authority = "127.0.0.1:5090";
+        let path = "/mcp/s/ssh-srv-1";
+
+        let init_rpc = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+        let raw =
+            crate::bridge::construire_requete(&ident, authority, path, &init_rpc, "initialize")
+                .unwrap();
+        let (hdrs, body) = parse_signed_http(&raw);
+        let rep = serve_hybrid_stdio(&state, "ssh-srv-1", "POST", path, &hdrs, &body, false, None);
+        assert_eq!(rep.status, 200);
+        let v: Value = serde_json::from_slice(&rep.body).unwrap();
+        assert_eq!(v["result"]["serverInfo"]["name"], json!("Remote Echo"));
+
+        let ping_rpc = json!({"jsonrpc": "2.0", "id": 2, "method": "ping"});
+        let raw =
+            crate::bridge::construire_requete(&ident, authority, path, &ping_rpc, "ping").unwrap();
+        let (hdrs, body) = parse_signed_http(&raw);
+        let rep = serve_hybrid_stdio(&state, "ssh-srv-1", "POST", path, &hdrs, &body, false, None);
+        assert_eq!(rep.status, 200);
+
+        let list_rpc = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}});
+        let raw =
+            crate::bridge::construire_requete(&ident, authority, path, &list_rpc, "tools/list")
+                .unwrap();
+        let (hdrs, body) = parse_signed_http(&raw);
+        let rep = serve_hybrid_stdio(&state, "ssh-srv-1", "POST", path, &hdrs, &body, false, None);
+        assert_eq!(rep.status, 200);
+        let v: Value = serde_json::from_slice(&rep.body).unwrap();
+        let names: Vec<&str> = v["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["echo"], "secret doit être filtré : {v}");
+
+        let call_off = json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": { "name": "secret", "arguments": {} }
+        });
+        let raw =
+            crate::bridge::construire_requete(&ident, authority, path, &call_off, "tools/call")
+                .unwrap();
+        let (hdrs, body) = parse_signed_http(&raw);
+        let rep = serve_hybrid_stdio(&state, "ssh-srv-1", "POST", path, &hdrs, &body, false, None);
+        assert_eq!(rep.status, 200);
+        let v: Value = serde_json::from_slice(&rep.body).unwrap();
+        assert_eq!(v["error"]["code"], json!(-32023), "{v}");
+
+        // machine SSH non enregistrée → erreur explicite -32000 sans lancer ssh
+        let call_on = json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": { "name": "echo", "arguments": {"msg": "hi"} }
+        });
+        let raw =
+            crate::bridge::construire_requete(&ident, authority, path, &call_on, "tools/call")
+                .unwrap();
+        let (hdrs, body) = parse_signed_http(&raw);
+        let rep = serve_hybrid_stdio(&state, "ssh-srv-1", "POST", path, &hdrs, &body, false, None);
+        assert_eq!(rep.status, 200);
+        let v: Value = serde_json::from_slice(&rep.body).unwrap();
+        assert_eq!(v["error"]["code"], json!(-32000), "{v}");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("machine SSH non enregistrée"),
+            "{v}"
+        );
     }
 }

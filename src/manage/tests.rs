@@ -31,12 +31,38 @@ fn store_catalogue_sain() {
             it.kind
         );
         assert!(
-            it.program == "npx" || it.program == "uvx",
+            it.program == "npx" || it.program == "uvx" || it.program == "uv",
             "{}: programme inconnu {}",
             it.id,
             it.program
         );
         assert!(!it.args.is_empty(), "{}: args vides", it.id);
+        for var in it.env_vars {
+            assert!(
+                !var.is_empty() && !var.chars().any(char::is_whitespace),
+                "{}: env_var invalide {:?}",
+                it.id,
+                var
+            );
+        }
+    }
+    let catalog = store_json();
+    let arr = catalog
+        .as_array()
+        .expect("store_json doit renvoyer un tableau");
+    for entry in arr {
+        let env_vars = entry["env_vars"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{}: env_vars manquant dans store_json", entry["id"]));
+        for v in env_vars {
+            let s = v.as_str().expect("env_var doit être une chaîne");
+            assert!(
+                !s.is_empty() && !s.chars().any(char::is_whitespace),
+                "{}: env_var invalide dans store_json : {:?}",
+                entry["id"],
+                s
+            );
+        }
     }
     assert!(
         STORE.len() >= 29,
@@ -54,8 +80,16 @@ fn store_github_logos_valides_et_complets() {
         serde_json::from_str(crate::logos::LOGOS_JSON)
             .expect("LOGOS_JSON doit être un objet JSON valide");
     assert!(
-        crate::store_github::STORE_GITHUB.len() >= 30,
-        "STORE_GITHUB doit contenir les 3 originaux + les 27 nouveaux MCP"
+        crate::store_github::STORE_GITHUB.len() >= 29,
+        "STORE_GITHUB doit contenir au moins 29 serveurs"
+    );
+    assert!(
+        find_store_item("gh-metatrader").is_none(),
+        "gh-metatrader doit être retiré de la boutique"
+    );
+    assert!(
+        !logos.contains_key("gh-metatrader"),
+        "le logo gh-metatrader doit être retiré de LOGOS_JSON"
     );
     for it in crate::store_github::STORE_GITHUB {
         let svg = logos
@@ -68,6 +102,180 @@ fn store_github_logos_valides_et_complets() {
             !low.contains("<script") && !low.contains("onload=") && !low.contains("onerror="),
             "logo non sûr pour {}",
             it.id
+        );
+    }
+}
+
+#[test]
+fn store_principal_logos_et_drawio_nominaux() {
+    let logos: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(crate::logos::LOGOS_JSON)
+            .expect("LOGOS_JSON doit être un objet JSON valide");
+    for it in STORE {
+        let svg = logos
+            .get(it.id)
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("logo manquant dans LOGOS_JSON pour {}", it.id));
+        assert!(!svg.trim().is_empty(), "logo vide pour {}", it.id);
+        let low = svg.to_ascii_lowercase();
+        assert!(
+            !low.contains("<script") && !low.contains("onload=") && !low.contains("onerror="),
+            "logo non sûr pour {}",
+            it.id
+        );
+    }
+    let drawio = find_store_item("drawio").expect("drawio présent dans la boutique");
+    assert!(
+        find_store_item("filesystem").is_none(),
+        "filesystem doit être retiré de la boutique"
+    );
+    assert!(
+        !logos.contains_key("filesystem"),
+        "le logo filesystem doit être retiré de LOGOS_JSON"
+    );
+    assert_eq!(drawio.name, "draw.io");
+    assert_eq!(drawio.cat, "Design");
+    assert_eq!(drawio.kind, "npm");
+    assert_eq!(drawio.program, "npx");
+    assert_eq!(drawio.args, &["-y", "@drawio/mcp"]);
+    let has_upper_snake = drawio
+        .desc
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|tok| {
+            tok.len() >= 4
+                && tok.contains('_')
+                && tok.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                && tok
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        });
+    assert!(
+        !has_upper_snake,
+        "drawio.desc ne doit pas exposer de faux token env UPPER_SNAKE_CASE : {}",
+        drawio.desc
+    );
+}
+
+#[test]
+fn store_tous_les_serveurs_eligibles_mode_hybride_et_persistants() {
+    let path = tmp_config("cfg_store_89_hybrid.json", Some("{\"servers\":[]}"));
+    let state = Arc::new(AppState {
+        servers: Mutex::new(Vec::new()),
+        log: Mutex::new(VecDeque::new()),
+        settings: Mutex::new(Settings::default()),
+        children: Mutex::new(std::collections::HashMap::new()),
+        config_path: path.clone(),
+        peers: Mutex::new(std::collections::HashMap::new()),
+        allowed_origins: Mutex::new(Vec::new()),
+        allowed_hosts: Mutex::new(Vec::new()),
+        spawn_fails: Mutex::new(std::collections::HashMap::new()),
+        runtime: Mutex::new(crate::runtime::RuntimeLog::new()),
+        spawning: Mutex::new(std::collections::HashSet::new()),
+        update_latest: Mutex::new(None),
+        lan_ok: Mutex::new(None),
+    });
+
+    let items: Vec<&StoreItem> = all_store_items().collect();
+    assert_eq!(items.len(), 89, "la boutique doit exposer 89 serveurs");
+    let secret_val = "secret-boutique-ne-doit-jamais-fuiter";
+    {
+        let mut servers = lockv(&state.servers);
+        for it in &items {
+            assert!(
+                !it.id.is_empty()
+                    && it
+                        .id
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "id boutique invalide : {}",
+                it.id
+            );
+            let url = format!("http://127.0.0.1:5090/mcp/s/store-{}", it.id);
+            assert!(
+                crate::bridge::parse_bridge_url(&url).is_ok(),
+                "parse_bridge_url doit accepter {url}"
+            );
+            let args: Vec<String> = it.args.iter().map(|a| a.to_string()).collect();
+            let env = vec![("STORE_SECRET".to_string(), secret_val.to_string())];
+            servers.push(Server {
+                id: format!("store-{}", it.id),
+                label: it.name.to_string(),
+                transport: Transport::Stdio {
+                    program: it.program.to_string(),
+                    args: args.clone(),
+                    workdir: None,
+                    env: env.clone(),
+                },
+                origin: Origin::Manual,
+                enabled: true,
+                state: SState::Down,
+                auto_restart: true,
+                favorite: false,
+                pid: None,
+                bound_host: None,
+                server_name: None,
+                version: None,
+                protocol: None,
+                sse: false,
+                sse_endpoint: false,
+                ws: false,
+                lang: None,
+                framework: None,
+                in_container: false,
+                container_name: None,
+                via_ssh: false,
+                tools: vec![],
+                latency_ms: None,
+                last_seen_ts: None,
+                last_error: None,
+                start_cmd: Some(StartCmd {
+                    program: it.program.to_string(),
+                    args,
+                    workdir: None,
+                    env,
+                }),
+                tools_disabled: vec![],
+            });
+        }
+    }
+
+    save_config(&state);
+    let (reloaded, _) = load_config(&path);
+    assert_eq!(reloaded.len(), items.len());
+
+    let state_dump = state_json(&state).to_string();
+    assert!(
+        !state_dump.contains(secret_val),
+        "state_json ne doit jamais exposer les valeurs env"
+    );
+
+    for it in &items {
+        let sid = format!("store-{}", it.id);
+        let srv = reloaded
+            .iter()
+            .find(|s| s.id == sid)
+            .unwrap_or_else(|| panic!("{sid} absent après save/load"));
+        assert!(
+            matches!(srv.transport, Transport::Stdio { .. }),
+            "{sid} doit rester en Transport::Stdio"
+        );
+        assert!(srv.start_cmd.is_some(), "{sid} doit garder start_cmd");
+        assert!(srv.auto_restart, "{sid} doit garder auto_restart == true");
+
+        let detail = detail_json(&state, &sid);
+        assert_eq!(
+            detail["hybrid_path"],
+            serde_json::json!(format!("/mcp/s/{sid}")),
+            "{sid} hybrid_path attendu"
+        );
+        assert_eq!(
+            detail["direct_stdio_blocked"],
+            serde_json::json!(true),
+            "{sid} direct_stdio_blocked attendu"
+        );
+        assert!(
+            !detail.to_string().contains(secret_val),
+            "detail_json({sid}) ne doit jamais exposer les valeurs env"
         );
     }
 }
@@ -256,6 +464,8 @@ fn reorder_fixe_l_ordre_d_affichage_et_de_sondage() {
                         ws: false,
                         lang: None,
                         framework: None,
+                        in_container: false,
+                        container_name: None,
                         via_ssh: false,
                         tools: vec![],
                         latency_ms: None,
@@ -354,6 +564,8 @@ fn cache_roundtrip_restaure_le_dernier_etat() {
                 ws: false,
                 lang: Some("node".into()),
                 framework: None,
+                in_container: false,
+                container_name: None,
                 via_ssh: false,
                 tools: if tools {
                     vec![
@@ -529,6 +741,8 @@ fn save_puis_load_roundtrip_stdio() {
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![],
             latency_ms: Some(3),
@@ -600,6 +814,8 @@ fn toggle_tool_desactive_et_reactive() {
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![
                 crate::types::ToolInfo {
@@ -672,6 +888,8 @@ fn tools_actifs_exclut_les_desactives() {
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![
                 crate::types::ToolInfo {
@@ -740,6 +958,8 @@ fn state_json_compte_bon_les_stats() {
                 ws: false,
                 lang: None,
                 framework: None,
+                in_container: false,
+                container_name: None,
                 via_ssh: false,
                 tools: vec![crate::types::ToolInfo {
                     name: "t".into(),
@@ -775,6 +995,8 @@ fn state_json_compte_bon_les_stats() {
                 ws: false,
                 lang: None,
                 framework: None,
+                in_container: false,
+                container_name: None,
                 via_ssh: false,
                 tools: vec![],
                 latency_ms: None,
@@ -806,6 +1028,8 @@ fn state_json_compte_bon_les_stats() {
                 ws: false,
                 lang: None,
                 framework: None,
+                in_container: false,
+                container_name: None,
                 via_ssh: false,
                 // tools en cache d'un poll précédent alors que le serveur est PORT-ONLY :
                 // ne doivent PAS gonfler stats.tools
@@ -914,6 +1138,8 @@ fn srv_http(
         ws: false,
         lang: None,
         framework: None,
+        in_container: false,
+        container_name: None,
         via_ssh: false,
         tools: vec![],
         latency_ms: None,
@@ -1112,6 +1338,8 @@ fn auto_restart_par_serveur_action_et_persistance() {
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![],
             latency_ms: None,
@@ -1206,6 +1434,8 @@ fn set_host_refuse_seed_et_rehost_manuel() {
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![],
             latency_ms: None,
@@ -1238,6 +1468,8 @@ fn set_host_refuse_seed_et_rehost_manuel() {
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: true,
             tools: vec![],
             latency_ms: None,
@@ -1271,6 +1503,8 @@ fn set_host_refuse_seed_et_rehost_manuel() {
             ws: false,
             lang: Some("node".into()),
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![],
             latency_ms: None,
@@ -1381,6 +1615,8 @@ fn set_start_cmd_refuse_seed_et_distant_persiste_le_local() {
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![],
             latency_ms: None,
@@ -1413,6 +1649,8 @@ fn set_start_cmd_refuse_seed_et_distant_persiste_le_local() {
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: true,
             tools: vec![],
             latency_ms: None,
@@ -1445,6 +1683,8 @@ fn set_start_cmd_refuse_seed_et_distant_persiste_le_local() {
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![],
             latency_ms: None,
@@ -1653,6 +1893,99 @@ fn annonces_litemcp_listees_sans_adoption_ni_ecriture() {
         .map(|a| a.len())
         .unwrap_or(0);
     assert!(n <= 32, "32 fichiers examinés au plus, obtenu {n}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn annonces_litemcp_ignorent_les_pid_morts_et_zombies() {
+    let _env_garde = litemp_env_guard();
+
+    assert!(probe::process_alive(std::process::id()));
+    assert!(!probe::process_alive(0));
+    assert!(!probe::process_alive(4_294_967_294));
+
+    #[cfg(windows)]
+    let mut child = {
+        let mut c = probe::system_command("cmd");
+        probe::hidden(&mut c).args(["/C", "exit", "0"]);
+        c.spawn().expect("spawn cmd exit 0")
+    };
+    #[cfg(not(windows))]
+    let mut child = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn true");
+    let dead_pid = child.id();
+    let _ = child.wait().expect("wait child");
+    assert!(
+        !probe::process_alive(dead_pid),
+        "processus terminé dont le handle est encore tenu ne doit pas être vu vivant"
+    );
+    drop(child);
+    assert!(!probe::process_alive(dead_pid));
+
+    let dir = dossier_annonces("zombies");
+    for i in 0..40 {
+        std::fs::write(
+            dir.join(format!("ztest-antizombie-{i:02}.json")),
+            format!(
+                r#"{{"name":"ztest-antizombie-{i:02}","port":23103,"pid":4294967294,"ts":0,"version":"1.0.0"}}"#
+            ),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        dir.join("pid-zero.json"),
+        r#"{"name":"pid-zero","port":23104,"pid":0,"version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("pid-invalide.json"),
+        r#"{"name":"pid-invalide","port":23105,"pid":"abc","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("zzz-vivant.json"),
+        format!(
+            r#"{{"name":"zzz-vivant","port":19876,"pid":{},"version":"1.0.0"}}"#,
+            std::process::id()
+        ),
+    )
+    .unwrap();
+
+    let state = test_state();
+    std::env::set_var("MCC_LITEMP_REGISTRY", &dir);
+    let v = litemcp_announcements(&state);
+    std::env::remove_var("MCC_LITEMP_REGISTRY");
+
+    let arr = v
+        .get("announcements")
+        .and_then(|a| a.as_array())
+        .expect("tableau announcements");
+    assert_eq!(arr.len(), 1, "seule l'annonce vivante doit subsister : {v}");
+    assert_eq!(arr[0].get("name"), Some(&serde_json::json!("zzz-vivant")));
+    assert_eq!(arr[0].get("port"), Some(&serde_json::json!(19876)));
+
+    let skipped = v
+        .get("skipped")
+        .and_then(|a| a.as_array())
+        .expect("tableau skipped");
+    assert!(
+        skipped
+            .iter()
+            .any(|s| s.to_string().contains("processus inactif")),
+        "les annonces au PID mort doivent être signalées dans skipped : {skipped:?}"
+    );
+    assert!(
+        skipped
+            .iter()
+            .any(|s| s.to_string().contains("pid invalide")),
+        "les annonces au PID invalide (0 / chaîne) doivent être signalées dans skipped : {skipped:?}"
+    );
+    assert!(
+        dir.join("ztest-antizombie-00.json").exists(),
+        "litemcp_announcements doit rester strictement en lecture seule"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 #[test]
@@ -2173,6 +2506,7 @@ fn surface_actions_sans_doublon_et_dispatch_connu() {
         "reset_runtime",
         "reorder",
         "install_store",
+        "uninstall_store",
     ] {
         let j = handle_action(&state, &format!("{{\"action\":\"{a}\"}}"));
         let err = j["error"].as_str().unwrap_or("");
@@ -2224,6 +2558,8 @@ fn set_favorite_epingle_persiste_et_se_relit() {
         ws: false,
         lang: None,
         framework: None,
+        in_container: false,
+        container_name: None,
         via_ssh: false,
         tools: vec![],
         latency_ms: None,
@@ -2290,6 +2626,9 @@ fn reset_state_placements_detection_et_oublis() {
         st.ssh_hosts.push(crate::types::SshHost {
             ip: "192.168.40.9".into(),
             user: "demon".into(),
+            port: None,
+            identity_file: None,
+            auto_install_cli: true,
         });
         // un identifiant de seed retiré durablement (les seeds par défaut
         // n'existent plus : le réglage reste lu, rien n'est réinjecté)
@@ -2318,6 +2657,8 @@ fn reset_state_placements_detection_et_oublis() {
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![],
             latency_ms: None,
@@ -2349,6 +2690,8 @@ fn reset_state_placements_detection_et_oublis() {
             ws: false,
             lang: None,
             framework: Some("litemcp".into()),
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![],
             latency_ms: None,
@@ -2380,6 +2723,8 @@ fn reset_state_placements_detection_et_oublis() {
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![],
             latency_ms: None,
@@ -2398,6 +2743,7 @@ fn reset_state_placements_detection_et_oublis() {
             ui_port: 5090,
             last_seen: 1,
             servers: serde_json::json!([]),
+            via_ssh: false,
         },
     );
 
@@ -2538,27 +2884,208 @@ fn import_https_est_refuse_avec_message_clair() {
 }
 
 #[test]
-fn install_store_filesystem_exige_un_dossier_explicite() {
-    // Régression audit : le catalogue embarquait C:/Users/<user> en dur (profil entier exposé)
+fn install_store_filesystem_retire_du_catalogue() {
     let state = test_state();
-    // sans args → refus AVANT tout spawn (poll_one jamais atteint)
     let j = handle_action(&state, r#"{"action":"install_store","id":"filesystem"}"#);
     assert_eq!(j["ok"], json!(false));
+    assert_eq!(j["error"], json!("item inconnu"));
     assert!(lockv(&state.servers).is_empty());
-    // critère pur : le nom du package contient un « / » — seule la LONGUEUR protège
-    let pkg = "-y".to_string();
-    let nm = "@modelcontextprotocol/server-filesystem".to_string();
-    assert!(filesystem_dossier_manquant(&[pkg.clone(), nm.clone()]));
-    assert!(!filesystem_dossier_manquant(&[
-        pkg,
-        nm,
-        "C:/data".to_string()
-    ]));
-    assert!(filesystem_dossier_manquant(&[
-        "-y".to_string(),
-        "@modelcontextprotocol/server-filesystem".to_string(),
-        "relatif-sans-separateur".to_string()
-    ]));
+}
+
+#[test]
+fn purge_store_package_files_supprime_caches_npx_et_uv_isoles() {
+    let base = std::env::temp_dir().join(format!(
+        "mcpcc_purge_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let npx_dir = base.join("_npx");
+    let uv_dir = base.join("uv_cache");
+
+    // 1. _npx/hash_match : seul @drawio/mcp
+    let h_match = npx_dir.join("hash_drawio");
+    std::fs::create_dir_all(h_match.join("node_modules").join("@drawio").join("mcp")).unwrap();
+    std::fs::write(
+        h_match.join("package.json"),
+        r#"{"dependencies":{"@drawio/mcp":"^1.0.0"},"_npx":{"packages":["@drawio/mcp"]}}"#,
+    )
+    .unwrap();
+
+    // 2. _npx/hash_multi : multi-paquets → NE DOIT PAS être supprimé
+    let h_multi = npx_dir.join("hash_multi");
+    std::fs::create_dir_all(h_multi.join("node_modules").join("@drawio").join("mcp")).unwrap();
+    std::fs::write(
+        h_multi.join("package.json"),
+        r#"{"dependencies":{"@drawio/mcp":"^1.0.0","other-tool":"^2.0.0"}}"#,
+    )
+    .unwrap();
+
+    // 3. _npx/hash_other : autre paquet → NE DOIT PAS être supprimé
+    let h_other = npx_dir.join("hash_other");
+    std::fs::create_dir_all(h_other.join("node_modules").join("other-tool")).unwrap();
+    std::fs::write(
+        h_other.join("package.json"),
+        r#"{"dependencies":{"other-tool":"^2.0.0"},"_npx":{"packages":["other-tool"]}}"#,
+    )
+    .unwrap();
+
+    let npx_args = vec!["-y".to_string(), "@drawio/mcp".to_string()];
+    let rep_npx = purge_store_package_files_in_dirs(
+        "npx",
+        &npx_args,
+        std::slice::from_ref(&npx_dir),
+        std::slice::from_ref(&uv_dir),
+        false,
+    );
+    assert!(rep_npx.warnings.is_empty(), "{:?}", rep_npx.warnings);
+    assert_eq!(
+        rep_npx.removed_paths.len(),
+        1,
+        "{:?}",
+        rep_npx.removed_paths
+    );
+    assert!(!h_match.exists(), "hash_drawio doit être supprimé");
+    assert!(h_multi.exists(), "hash_multi ne doit jamais être supprimé");
+    assert!(h_other.exists(), "hash_other ne doit jamais être supprimé");
+
+    // 4. uv cache : wheels, sdists et simple pour mcp-server-time + autre paquet préservé
+    let uv_wheels = uv_dir
+        .join("wheels-v6")
+        .join("pypi")
+        .join("mcp-server-time");
+    let uv_sdists = uv_dir
+        .join("sdists-v9")
+        .join("pypi")
+        .join("mcp-server-time");
+    let uv_simple_dir = uv_dir.join("simple-v24").join("pypi");
+    let uv_simple_file = uv_simple_dir.join("mcp-server-time.rkyv");
+    let uv_other = uv_dir.join("wheels-v6").join("pypi").join("other-pkg");
+    std::fs::create_dir_all(&uv_wheels).unwrap();
+    std::fs::write(uv_wheels.join("dummy.whl"), b"whl").unwrap();
+    std::fs::create_dir_all(&uv_sdists).unwrap();
+    std::fs::write(uv_sdists.join("dummy.tar.gz"), b"tgz").unwrap();
+    std::fs::create_dir_all(&uv_simple_dir).unwrap();
+    std::fs::write(&uv_simple_file, b"rkyv").unwrap();
+    std::fs::create_dir_all(&uv_other).unwrap();
+    std::fs::write(uv_other.join("keep.whl"), b"keep").unwrap();
+
+    let uv_args = vec!["mcp-server-time".to_string()];
+    let rep_uv = purge_store_package_files_in_dirs(
+        "uvx",
+        &uv_args,
+        std::slice::from_ref(&npx_dir),
+        std::slice::from_ref(&uv_dir),
+        false,
+    );
+    assert!(rep_uv.warnings.is_empty(), "{:?}", rep_uv.warnings);
+    assert_eq!(rep_uv.removed_paths.len(), 3, "{:?}", rep_uv.removed_paths);
+    assert!(
+        !uv_wheels.exists(),
+        "wheels mcp-server-time doit être supprimé"
+    );
+    assert!(
+        !uv_sdists.exists(),
+        "sdists mcp-server-time doit être supprimé"
+    );
+    assert!(
+        !uv_simple_file.exists(),
+        "simple rkyv mcp-server-time doit être supprimé"
+    );
+    assert!(uv_other.exists(), "other-pkg doit être préservé");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn uninstall_store_supprime_config_cache_etat_et_refuse_inconnu() {
+    let base = std::env::temp_dir().join(format!(
+        "mcpcc_uninstall_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&base).unwrap();
+    let cfg = base.join("config.json");
+    std::fs::write(&cfg, "{\"servers\":[]}").unwrap();
+    let cfg_str = cfg.to_string_lossy().to_string();
+    let state = state_lot3(&cfg_str);
+
+    // 1. Validation id manquant & serveur inconnu
+    let r_missing = handle_action(&state, r#"{"action":"uninstall_store"}"#);
+    assert_eq!(r_missing["ok"], json!(false));
+    assert_eq!(r_missing["error"], json!("id manquant"));
+
+    let r_unknown = handle_action(&state, r#"{"action":"uninstall_store","id":"inexistant"}"#);
+    assert_eq!(r_unknown["ok"], json!(false));
+    assert_eq!(r_unknown["error"], json!("serveur inconnu"));
+
+    // 2. Ajout en mémoire d'un serveur boutique simulé + écriture config & cache d'état
+    let sid = "store-drawio".to_string();
+    {
+        let mut servers = lockv(&state.servers);
+        servers.push(Server {
+            id: sid.clone(),
+            label: "draw.io".into(),
+            transport: Transport::Stdio {
+                program: "npx".into(),
+                args: vec!["-y".into(), "@mcpcc-unit-test-only/never-cached".into()],
+                workdir: None,
+                env: vec![],
+            },
+            origin: Origin::Manual,
+            enabled: true,
+            state: SState::Up,
+            pid: None,
+            bound_host: None,
+            server_name: Some("drawio".into()),
+            version: Some("1.0.0".into()),
+            protocol: Some("2024-11-05".into()),
+            sse: false,
+            sse_endpoint: false,
+            ws: false,
+            lang: Some("Node.js".into()),
+            framework: None,
+            in_container: false,
+            container_name: None,
+            via_ssh: false,
+            tools: vec![],
+            latency_ms: Some(10),
+            last_seen_ts: Some(100),
+            last_error: None,
+            start_cmd: Some(StartCmd {
+                program: "npx".into(),
+                args: vec!["-y".into(), "@mcpcc-unit-test-only/never-cached".into()],
+                workdir: None,
+                env: vec![],
+            }),
+            auto_restart: true,
+            favorite: false,
+            tools_disabled: vec![],
+        });
+    }
+    lockv(&state.settings).server_order.push(sid.clone());
+    lockv(&state.runtime).insert(sid.clone(), crate::runtime::RuntimeState::default());
+    save_config(&state);
+    save_cache(&state);
+
+    let cache_path = base.join("state-cache.json");
+    assert!(std::fs::read_to_string(&cfg).unwrap().contains(&sid));
+    assert!(std::fs::read_to_string(&cache_path).unwrap().contains(&sid));
+
+    // 3. uninstall_store avec id court ("drawio")
+    let res = handle_action(&state, r#"{"action":"uninstall_store","id":"drawio"}"#);
+    assert_eq!(res["ok"], json!(true), "{res}");
+    assert_eq!(res["id"], json!("store-drawio"));
+    assert!(lockv(&state.servers).is_empty());
+    assert!(lockv(&state.settings).server_order.is_empty());
+    assert!(!lockv(&state.runtime).contains_key(&sid));
+    assert!(!std::fs::read_to_string(&cfg).unwrap().contains(&sid));
+    assert!(!std::fs::read_to_string(&cache_path).unwrap().contains(&sid));
+
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]
@@ -2906,6 +3433,8 @@ fn save_config_concurrent_50_adds_tous_persistes() {
                     ws: false,
                     lang: None,
                     framework: None,
+                    in_container: false,
+                    container_name: None,
                     via_ssh: false,
                     tools: vec![],
                     latency_ms: None,
@@ -3310,6 +3839,8 @@ fn kill_et_toggle_ne_tuent_pas_un_pid_recycle_a_date_differente() {
         ws: false,
         lang: None,
         framework: None,
+        in_container: false,
+        container_name: None,
         via_ssh: false,
         tools: vec![],
         latency_ms: None,
@@ -3423,6 +3954,8 @@ fn set_start_cmd_program_null_retire_commande_et_autoboot() {
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![],
             latency_ms: None,
@@ -4090,6 +4623,8 @@ fn ui_api_aucun_secret_ni_fuite_gateway() {
         ws: false,
         lang: None,
         framework: None,
+        in_container: false,
+        container_name: None,
         via_ssh: false,
         tools: vec![],
         latency_ms: None,
@@ -4190,6 +4725,8 @@ fn p1_save_cache_ne_reecrit_pas_si_contenu_utile_inchange() {
             ws: false,
             lang: Some("node".into()),
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![crate::types::ToolInfo {
                 name: "ping".into(),
@@ -4340,6 +4877,8 @@ fn p1_tools_list_mis_en_cache_sur_serveur_up_et_invalide_sur_changement_version(
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![],
             latency_ms: None,
@@ -4439,6 +4978,8 @@ fn p1_refresh_lan_state_saute_sans_distant_ni_network_enabled() {
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![],
             latency_ms: None,
@@ -4497,6 +5038,8 @@ fn p1_servers_summary_json_filtre_et_stats_coherents() {
                 ws: false,
                 lang: None,
                 framework: None,
+                in_container: false,
+                container_name: None,
                 via_ssh: false,
                 tools: vec![crate::types::ToolInfo {
                     name: "t1".into(),
@@ -4532,6 +5075,8 @@ fn p1_servers_summary_json_filtre_et_stats_coherents() {
                 ws: false,
                 lang: None,
                 framework: None,
+                in_container: false,
+                container_name: None,
                 via_ssh: false,
                 tools: vec![],
                 latency_ms: None,
@@ -4622,4 +5167,324 @@ fn auto_update_url_whitelist_et_action_locale_seulement() {
     assert!(release_download_url("v0.8.1", "evil.exe").is_none());
     assert!(ACTIONS.contains(&"install_update"));
     assert!(crate::auth::action_reservee_admin("install_update"));
+}
+
+#[test]
+fn ssh_host_config_persistence_compat_et_champs_complets() {
+    // 1. Chargement rétrocompatible d'une entrée minimale {"ip","user"}
+    let path = tmp_config(
+        "cfg_ssh_hosts.json",
+        Some(r#"{"servers":[],"settings":{"ssh_hosts":[{"ip":"192.0.2.10","user":"ubuntu"}]}}"#),
+    );
+    let mut base = match Arc::try_unwrap(test_state()) {
+        Ok(s) => s,
+        Err(_) => panic!("test_state doit être unique"),
+    };
+    base.config_path = path.clone();
+    let state = Arc::new(base);
+    let (_srvs, loaded_def) = load_config(&path);
+    assert_eq!(loaded_def.ssh_hosts.len(), 1);
+    assert_eq!(loaded_def.ssh_hosts[0].ip, "192.0.2.10");
+    assert_eq!(loaded_def.ssh_hosts[0].user, "ubuntu");
+    assert_eq!(loaded_def.ssh_hosts[0].port, None);
+    assert_eq!(loaded_def.ssh_hosts[0].identity_file, None);
+    assert!(loaded_def.ssh_hosts[0].auto_install_cli);
+    lockv(&state.settings).ssh_hosts = loaded_def.ssh_hosts;
+
+    // 2. Sauvegarde par défaut : aucun champ optionnel ajouté
+    save_config_checked(&state).unwrap();
+    let raw_def: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        raw_def["settings"]["ssh_hosts"][0],
+        serde_json::json!({"ip": "192.0.2.10", "user": "ubuntu"})
+    );
+
+    // 3. Sauvegarde avec port personnalisé, clé SSH et auto_install_cli=false
+    let j = handle_action(
+        &state,
+        r#"{"action":"ssh_save","ip":"192.0.2.20","user":"ops","port":2222,"identity_file":"~/.ssh/id_ed25519","auto_install_cli":false}"#,
+    );
+    assert_eq!(j["ok"], serde_json::json!(true), "{j}");
+    let raw_full: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        raw_full["settings"]["ssh_hosts"][1],
+        serde_json::json!({
+            "ip": "192.0.2.20",
+            "user": "ops",
+            "port": 2222,
+            "identity_file": "~/.ssh/id_ed25519",
+            "auto_install_cli": false,
+        })
+    );
+
+    // Rechargement : les champs avancés sont fidèlement restaurés
+    let (_srvs2, reloaded) = load_config(&path);
+    let custom = reloaded
+        .ssh_hosts
+        .iter()
+        .find(|h| h.ip == "192.0.2.20")
+        .unwrap();
+    assert_eq!(custom.port, Some(2222));
+    assert_eq!(custom.identity_file.as_deref(), Some("~/.ssh/id_ed25519"));
+    assert!(!custom.auto_install_cli);
+}
+
+#[test]
+fn set_start_cmd_accepte_via_ssh_si_machine_enregistree() {
+    let path = tmp_config("cfg_ssh_start_cmd.json", Some(r#"{"servers":[]}"#));
+    let mut base = match Arc::try_unwrap(test_state()) {
+        Ok(s) => s,
+        Err(_) => panic!("test_state doit être unique"),
+    };
+    base.config_path = path.clone();
+    let state = Arc::new(base);
+    lockv(&state.servers).push(Server {
+        id: "ssh-srv-cmd".into(),
+        label: "Remote Node".into(),
+        transport: Transport::Http {
+            host: Some("192.0.2.30".into()),
+            port: 3001,
+            path: "/mcp".into(),
+        },
+        origin: Origin::Discovered,
+        enabled: true,
+        state: SState::Down,
+        pid: None,
+        bound_host: None,
+        server_name: None,
+        version: None,
+        protocol: None,
+        sse: false,
+        sse_endpoint: false,
+        ws: false,
+        lang: None,
+        framework: None,
+        in_container: false,
+        container_name: None,
+        via_ssh: true,
+        tools: Vec::new(),
+        latency_ms: None,
+        last_seen_ts: None,
+        last_error: None,
+        auto_restart: false,
+        favorite: false,
+        start_cmd: None,
+        tools_disabled: Vec::new(),
+    });
+
+    // Sans machine SSH enregistrée → refus canonique
+    let j_refus = handle_action(
+        &state,
+        r#"{"action":"set_start_cmd","id":"ssh-srv-cmd","program":"node","args":["srv.js"]}"#,
+    );
+    assert_eq!(j_refus["ok"], serde_json::json!(false));
+    assert!(j_refus["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("appartient à sa machine hôte"));
+
+    // Avec la machine SSH enregistrée → accepté et persisté
+    lockv(&state.settings)
+        .ssh_hosts
+        .push(crate::types::SshHost {
+            ip: "192.0.2.30".into(),
+            user: "ubuntu".into(),
+            port: None,
+            identity_file: None,
+            auto_install_cli: true,
+        });
+    let j_ok = handle_action(
+        &state,
+        r#"{"action":"set_start_cmd","id":"ssh-srv-cmd","program":"node","args":["srv.js","--port","3001"],"workdir":"/srv/mcp"}"#,
+    );
+    assert_eq!(j_ok["ok"], serde_json::json!(true), "{j_ok}");
+    let servers = lockv(&state.servers);
+    let cmd = servers[0].start_cmd.as_ref().expect("start_cmd enregistré");
+    assert_eq!(cmd.program, "node");
+    assert_eq!(cmd.workdir.as_deref(), Some("/srv/mcp"));
+    assert_eq!(servers[0].origin, Origin::Manual);
+}
+
+#[test]
+fn should_skip_peer_port_saute_loopback_mais_sonde_ip_distante() {
+    assert!(peers::should_skip_peer_port("127.0.0.1", 5090, 5090));
+    assert!(peers::should_skip_peer_port("::1", 5090, 5090));
+    assert!(!peers::should_skip_peer_port("192.168.1.42", 5090, 5090));
+    assert!(!peers::should_skip_peer_port("127.0.0.1", 5091, 5090));
+}
+
+#[test]
+fn import_peer_via_ssh_reecrit_loopback_et_marque_ssh() {
+    let path = tmp_config("cfg_import_peer_ssh.json", Some(r#"{"servers":[]}"#));
+    let mut base = match Arc::try_unwrap(test_state()) {
+        Ok(s) => s,
+        Err(_) => panic!("test_state doit être unique"),
+    };
+    base.config_path = path;
+    let state = Arc::new(base);
+    lockv(&state.peers).insert(
+        "192.0.2.55".into(),
+        crate::types::Peer {
+            ip: "192.0.2.55".into(),
+            ui_port: 5090,
+            last_seen: 1_700_000_000,
+            via_ssh: true,
+            servers: serde_json::json!({
+                "servers": [{
+                    "transport": "http",
+                    "enabled": true,
+                    "server_name": "Ubuntu Echo",
+                    "version": "1.2.3",
+                    "transport_info": {
+                        "host": "127.0.0.1",
+                        "port": 4100,
+                        "path": "/mcp"
+                    }
+                }]
+            }),
+        },
+    );
+    let j = import_peer(&state, "192.0.2.55");
+    assert_eq!(j["ok"], serde_json::json!(true), "{j}");
+    assert_eq!(j["added"], serde_json::json!(1), "{j}");
+    let servers = lockv(&state.servers);
+    assert_eq!(servers.len(), 1);
+    assert!(servers[0].via_ssh);
+    match &servers[0].transport {
+        Transport::Http { host, port, path } => {
+            assert_eq!(host.as_deref(), Some("192.0.2.55"));
+            assert_eq!(*port, 4100);
+            assert_eq!(path, "/mcp");
+        }
+        other => panic!("transport HTTP attendu, reçu {other:?}"),
+    }
+}
+
+#[test]
+fn container_json_etag_et_cache_roundtrip() {
+    let dir = std::env::temp_dir().join(format!(
+        "mcc-container-test-{}-{}",
+        std::process::id(),
+        crate::types::now_ts()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg_path = dir.join("config.json").to_string_lossy().to_string();
+
+    let mk_srv = |id: &str, prog: &str, args: Vec<&str>, in_c: bool, cname: Option<&str>| Server {
+        id: id.into(),
+        label: id.into(),
+        transport: Transport::Stdio {
+            program: prog.into(),
+            args: args.into_iter().map(String::from).collect(),
+            workdir: None,
+            env: Vec::new(),
+        },
+        origin: Origin::Manual,
+        enabled: true,
+        state: SState::Down,
+        pid: None,
+        bound_host: None,
+        server_name: None,
+        version: None,
+        protocol: None,
+        sse: false,
+        sse_endpoint: false,
+        ws: false,
+        lang: None,
+        framework: None,
+        in_container: in_c,
+        container_name: cname.map(String::from),
+        via_ssh: false,
+        tools: vec![],
+        latency_ms: None,
+        last_seen_ts: None,
+        last_error: None,
+        start_cmd: None,
+        auto_restart: true,
+        favorite: false,
+        tools_disabled: vec![],
+    };
+
+    // 1. server_json expose in_container=true + container_name même DOWN pour docker run,
+    //    et false pour npx @modelcontextprotocol/server-docker.
+    let docker_srv = mk_srv(
+        "ctr-1",
+        "docker",
+        vec!["run", "--name", "gh-mcp", "-i", "mcp/github"],
+        false,
+        None,
+    );
+    let j_docker = server_json(&docker_srv, false);
+    assert_eq!(j_docker["in_container"], serde_json::json!(true));
+    assert_eq!(j_docker["container_name"], serde_json::json!("gh-mcp"));
+
+    let host_srv = mk_srv(
+        "host-1",
+        "npx",
+        vec!["-y", "@modelcontextprotocol/server-docker"],
+        false,
+        None,
+    );
+    let j_host = server_json(&host_srv, false);
+    assert_eq!(j_host["in_container"], serde_json::json!(false));
+    assert!(j_host["container_name"].is_null());
+
+    // 2. state_etag s'invalide si in_container ou container_name change.
+    let mk_state = |srvs: Vec<Server>| {
+        Arc::new(AppState {
+            servers: Mutex::new(srvs),
+            log: Mutex::new(VecDeque::new()),
+            settings: Mutex::new(Settings::default()),
+            children: Mutex::new(std::collections::HashMap::new()),
+            config_path: cfg_path.clone(),
+            peers: Mutex::new(std::collections::HashMap::new()),
+            allowed_origins: Mutex::new(Vec::new()),
+            allowed_hosts: Mutex::new(Vec::new()),
+            spawn_fails: Mutex::new(std::collections::HashMap::new()),
+            runtime: Mutex::new(crate::runtime::RuntimeLog::new()),
+            spawning: Mutex::new(std::collections::HashSet::new()),
+            update_latest: Mutex::new(None),
+            lan_ok: Mutex::new(None),
+        })
+    };
+
+    let mut http_srv = mk_srv("http-1", "node", vec!["index.js"], false, None);
+    http_srv.transport = Transport::Http {
+        host: None,
+        port: 4444,
+        path: "/mcp".into(),
+    };
+    let st = mk_state(vec![http_srv.clone()]);
+    let etag_plain = state_etag(&st);
+    {
+        let mut s = lockv(&st.servers);
+        s[0].in_container = true;
+    }
+    let etag_ctr = state_etag(&st);
+    assert_ne!(
+        etag_plain, etag_ctr,
+        "state_etag doit changer sur in_container"
+    );
+    {
+        let mut s = lockv(&st.servers);
+        s[0].container_name = Some("mcp-pg".into());
+    }
+    let etag_named = state_etag(&st);
+    assert_ne!(
+        etag_ctr, etag_named,
+        "state_etag doit changer sur container_name"
+    );
+
+    // 3. save_cache + load_cache préservent in_container et container_name.
+    save_cache(&st);
+    let fresh = mk_state(vec![http_srv]);
+    load_cache(&fresh);
+    let restored = lockv(&fresh.servers);
+    assert!(restored[0].in_container);
+    assert_eq!(restored[0].container_name.as_deref(), Some("mcp-pg"));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

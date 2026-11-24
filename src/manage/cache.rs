@@ -37,6 +37,8 @@ fn useful_cache_signature(servers: &[Server]) -> String {
                 "ws": s.ws,
                 "lang": s.lang,
                 "framework": s.framework,
+                "in_container": s.in_container,
+                "container_name": s.container_name,
                 "via_ssh": s.via_ssh,
                 "last_error": s.last_error,
                 "tools": s.tools.iter()
@@ -72,7 +74,8 @@ pub fn save_cache(state: &Arc<AppState>) {
                     "id": s.id, "state": s.state.as_str(),
                     "server_name": s.server_name, "version": s.version, "protocol": s.protocol,
                     "sse": s.sse, "sse_endpoint": s.sse_endpoint, "ws": s.ws, "lang": s.lang,
-                    "framework": s.framework, "via_ssh": s.via_ssh,
+                    "framework": s.framework, "in_container": s.in_container,
+                    "container_name": s.container_name, "via_ssh": s.via_ssh,
                     "latency_ms": s.latency_ms, "last_seen": s.last_seen_ts,
                     "last_error": s.last_error,
                     "tools": s.tools.iter()
@@ -147,6 +150,11 @@ pub fn load_cache(state: &Arc<AppState>) {
         srv.ws = e.get("ws").and_then(|x| x.as_bool()).unwrap_or(srv.ws);
         srv.lang = get_str("lang").or(srv.lang.take());
         srv.framework = get_str("framework").or(srv.framework.take());
+        srv.in_container = e
+            .get("in_container")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(srv.in_container);
+        srv.container_name = get_str("container_name").or(srv.container_name.take());
         srv.via_ssh = e
             .get("via_ssh")
             .and_then(|x| x.as_bool())

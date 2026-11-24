@@ -35,9 +35,11 @@ pub const ACTIONS: &[&str] = &[
     "reorder",
     "import_mcp",
     "install_store",
+    "uninstall_store",
     "ssh_save",
     "ssh_forget",
     "ssh_discover",
+    "ssh_bootstrap",
     "set_settings",
     "set_notify",
     "set_autostart",
@@ -120,6 +122,128 @@ fn decrire_processus(v: &[(u32, String)]) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
+
+fn is_via_ssh_http(state: &Arc<AppState>, id: &str) -> bool {
+    lockv(&state.servers)
+        .iter()
+        .find(|s| s.id == id)
+        .is_some_and(|s| s.via_ssh && matches!(s.transport, Transport::Http { .. }))
+}
+
+fn ssh_server_context(
+    state: &Arc<AppState>,
+    id: &str,
+) -> Option<(crate::types::SshHost, u16, Option<u32>, Option<String>)> {
+    let info = {
+        let servers = lockv(&state.servers);
+        let s = servers.iter().find(|s| s.id == id)?;
+        if !s.via_ssh {
+            return None;
+        }
+        let Transport::Http { host, port, .. } = &s.transport else {
+            return None;
+        };
+        let h = host.as_deref().or(s.bound_host.as_deref())?.to_string();
+        (h, *port, s.pid)
+    };
+    let sh = lockv(&state.settings)
+        .ssh_hosts
+        .iter()
+        .find(|x| x.ip == info.0)
+        .cloned()?;
+    let os_hint = get_ssh_status(state, &sh.ip).and_then(|st| st.os);
+    Some((sh, info.1, info.2, os_hint))
+}
+
+fn parse_optional_ssh_port(req: &Value) -> Result<Option<Option<u16>>, String> {
+    let Some(val) = req.get("port") else {
+        return Ok(None);
+    };
+    if val.is_null() {
+        return Ok(Some(None));
+    }
+    let Some(p) = val.as_u64() else {
+        return Err("port SSH invalide (1..=65535)".to_string());
+    };
+    if !(1..=65535).contains(&p) {
+        return Err("port SSH invalide (1..=65535)".to_string());
+    }
+    let p = p as u16;
+    Ok(Some(if p == 22 { None } else { Some(p) }))
+}
+
+fn parse_optional_ssh_key(req: &Value) -> Result<Option<Option<String>>, String> {
+    let Some(val) = req.get("identity_file") else {
+        return Ok(None);
+    };
+    if val.is_null() {
+        return Ok(Some(None));
+    }
+    let Some(raw) = val.as_str() else {
+        return Err("chemin de clé SSH invalide".to_string());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Some(None));
+    }
+    let safe =
+        probe::ssh_path_safe(trimmed).ok_or_else(|| "chemin de clé SSH invalide".to_string())?;
+    Ok(Some(Some(safe)))
+}
+
+fn resolve_ssh_host_from_req(
+    state: &Arc<AppState>,
+    req: &Value,
+    ip: String,
+    force_auto_install: bool,
+) -> Result<crate::types::SshHost, Value> {
+    let existing = lockv(&state.settings)
+        .ssh_hosts
+        .iter()
+        .find(|h| h.ip == ip)
+        .cloned();
+    let user = req
+        .get("user")
+        .and_then(|x| x.as_str())
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .or_else(|| existing.as_ref().map(|h| h.user.clone()))
+        .ok_or_else(
+            || json!({"ok": false, "error": "utilisateur SSH requis (ou enregistre la machine)"}),
+        )?;
+    let port_opt = parse_optional_ssh_port(req).map_err(|e| json!({"ok": false, "error": e}))?;
+    let key_opt = parse_optional_ssh_key(req).map_err(|e| json!({"ok": false, "error": e}))?;
+    let auto_opt = req.get("auto_install_cli").and_then(|x| x.as_bool());
+    Ok(crate::types::SshHost {
+        ip,
+        user,
+        port: port_opt.unwrap_or_else(|| existing.as_ref().and_then(|h| h.port)),
+        identity_file: key_opt
+            .unwrap_or_else(|| existing.as_ref().and_then(|h| h.identity_file.clone())),
+        auto_install_cli: if force_auto_install {
+            true
+        } else {
+            auto_opt.unwrap_or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|h| h.auto_install_cli)
+                    .unwrap_or(true)
+            })
+        },
+    })
+}
+/// Réinitialise le compteur d'échecs et le backoff avant un démarrage manuel
+/// (« Démarrer » ou réactivation) pour garantir un essai immédiat.
+fn reset_spawn_retry(state: &AppState, id: &str) {
+    lockv(&state.spawn_fails).remove(id);
+    let mut rt = lockv(&state.runtime);
+    if let Some(entry) = rt.get_mut(id) {
+        entry.fails = 0;
+        entry.last_attempt_ts = 0;
+        entry.starting_until = 0;
+    }
+}
+
 /// Asset de la release correspondant à (type de binaire, OS) — table blanche
 /// pure et testée. `None` = plateforme inconnue (jamais d'URL fabriquée hors
 /// de cette table). Les assets n'embarquent pas la version : l'URL
@@ -157,6 +281,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                                 if s.enabled {
                                     s.start_cmd = start_cmd_for(s);
                                     s.auto_restart = true;
+                                    if s.start_cmd.is_some() {
+                                        s.last_error = Some("démarrage en cours…".to_string());
+                                    }
                                 } else {
                                     s.auto_restart = false;
                                 }
@@ -172,7 +299,13 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                         // OFF réel : tuer le SEUL process lancé par MCP Control
                         // (identité vérifiée — jamais un process tiers qui
                         // aurait pris le port).
-                        if let Some((pid, true)) = processus_lance(state, &id) {
+                        if let Some((sh, _port, Some(pid), os_hint)) =
+                            ssh_server_context(state, &id)
+                        {
+                            let target = probe::SshTarget::from_host(&sh);
+                            let _ =
+                                probe::ssh_kill_pids(&target, os_hint.as_deref(), &[pid], false);
+                        } else if let Some((pid, true)) = processus_lance(state, &id) {
                             probe::kill_tree(pid);
                         }
                         lockv(&state.children).remove(&id);
@@ -195,7 +328,8 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                         ),
                     );
                     if now_enabled {
-                        // ON réel : démarrer/sonder immédiatement si une commande de lancement existe
+                        // ON réel : démarrer/sonder immédiatement sans attendre le backoff précédent
+                        reset_spawn_retry(state, &id);
                         poll_one(state, &id);
                     }
                     json!({"ok": true, "enabled": now_enabled})
@@ -219,10 +353,12 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                                     s.start_cmd = start_cmd_for(s);
                                 }
                                 s.auto_restart = true;
+                                s.last_error = Some("démarrage en cours…".to_string());
                             }
                             None => return json!({"ok": false, "error": "serveur inconnu"}),
                         }
                     }
+                    reset_spawn_retry(state, &id);
                     if let Err(e) = save_config_checked(state) {
                         return json!({"ok": false, "error": format!("config non écrite : {e}")});
                     }
@@ -233,6 +369,92 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     // Lot F point 5 : id inconnu = refus EXPLICITE.
                     if !lockv(&state.servers).iter().any(|s| s.id == id) {
                         return json!({"ok": false, "error": "serveur inconnu"});
+                    }
+                    if is_via_ssh_http(state, &id) {
+                        let Some((sh, port, pid_opt, os_hint)) = ssh_server_context(state, &id)
+                        else {
+                            return json!({
+                                "ok": false,
+                                "error": "machine SSH non enregistrée — réenregistre-la dans Machines"
+                            });
+                        };
+                        let target = probe::SshTarget::from_host(&sh);
+                        let listeners =
+                            probe::ssh_port_listeners(&target, os_hint.as_deref(), port);
+                        let pid_lance = pid_opt.unwrap_or(0);
+                        let vivant = pid_opt.is_some();
+                        let etrangers: Vec<(u32, String)> = listeners
+                            .into_iter()
+                            .filter(|(p, _)| !(vivant && *p == pid_lance))
+                            .collect();
+                        if !etrangers.is_empty() {
+                            let desc = decrire_processus(&etrangers);
+                            add_log(
+                                state,
+                                "warn",
+                                &format!(
+                                    "[{id}] arrêt SSH refusé : port {port} tenu par {desc} — ce process n'a pas été lancé par l'application (action « arrêter quand même » pour forcer)"
+                                ),
+                            );
+                            return json!({
+                                "ok": false,
+                                "error": format!(
+                                    "port {port} tenu par {desc} — process non lancé par l'application ; utilisez stop_server_force pour l'arrêter quand même"
+                                ),
+                                "needs_force": true,
+                                "occupants": etrangers
+                                    .iter()
+                                    .map(|(p, i)| json!({"pid": p, "process": i}))
+                                    .collect::<Vec<_>>(),
+                            });
+                        }
+                        if vivant {
+                            let _ = probe::ssh_kill_pids(
+                                &target,
+                                os_hint.as_deref(),
+                                &[pid_lance],
+                                false,
+                            );
+                        }
+                        let mut restants: Vec<(u32, String)> = Vec::new();
+                        for _ in 0..4 {
+                            restants = probe::ssh_port_listeners(&target, os_hint.as_deref(), port);
+                            if restants.is_empty() {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        }
+                        {
+                            let mut servers = lockv(&state.servers);
+                            if let Some(s) = servers.iter_mut().find(|s| s.id == id) {
+                                s.auto_restart = false;
+                                s.pid = None;
+                                s.state = SState::Down;
+                            }
+                        }
+                        if !restants.is_empty() {
+                            let desc = decrire_processus(&restants);
+                            add_log(
+                                state,
+                                "warn",
+                                &format!(
+                                    "[{id}] port distant {port} toujours tenu par {desc} — non tué"
+                                ),
+                            );
+                            return json!({
+                                "ok": false,
+                                "error": format!(
+                                    "le process est arrêté, mais le port {port} reste tenu par {desc} (non tué) ; utilisez stop_server_force pour l'arrêter quand même"
+                                ),
+                                "needs_force": true,
+                                "occupants": restants
+                                    .iter()
+                                    .map(|(p, i)| json!({"pid": p, "process": i}))
+                                    .collect::<Vec<_>>(),
+                            });
+                        }
+                        add_log(state, "info", &format!("[{id}] arrêté (SSH)"));
+                        return json!({"ok": true});
                     }
                     let local_port = local_port_of(state, &id);
                     // AUDIT S4, point 1 : on ne tue QUE le process lancé par
@@ -325,6 +547,51 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             };
             if !lockv(&state.servers).iter().any(|s| s.id == id) {
                 return json!({"ok": false, "error": "serveur inconnu"});
+            }
+            if is_via_ssh_http(state, &id) {
+                let Some((sh, port, pid_opt, os_hint)) = ssh_server_context(state, &id) else {
+                    return json!({
+                        "ok": false,
+                        "error": "machine SSH non enregistrée — réenregistre-la dans Machines"
+                    });
+                };
+                let target = probe::SshTarget::from_host(&sh);
+                let mut occupants = probe::ssh_port_listeners(&target, os_hint.as_deref(), port);
+                if let Some(pid) = pid_opt {
+                    if !occupants.iter().any(|(p, _)| *p == pid) {
+                        occupants.push((pid, "remote".to_string()));
+                    }
+                }
+                let pids: Vec<u32> = occupants.iter().map(|(p, _)| *p).collect();
+                if let Err(e) = probe::ssh_kill_pids(&target, os_hint.as_deref(), &pids, true) {
+                    return json!({"ok": false, "error": e});
+                }
+                {
+                    let mut servers = lockv(&state.servers);
+                    if let Some(s) = servers.iter_mut().find(|s| s.id == id) {
+                        s.auto_restart = false;
+                        s.pid = None;
+                        s.state = SState::Down;
+                    }
+                }
+                add_log(
+                    state,
+                    "warn",
+                    &format!(
+                        "[{id}] arrêt FORCÉ (SSH) : port {port} — {} process tué(s) : {}",
+                        pids.len(),
+                        decrire_processus(&occupants)
+                    ),
+                );
+                return json!({
+                    "ok": true,
+                    "forced": true,
+                    "port": port,
+                    "killed": occupants
+                        .iter()
+                        .map(|(p, i)| json!({"pid": p, "process": i}))
+                        .collect::<Vec<_>>(),
+                });
             }
             let Some(port) = local_port_of(state, &id) else {
                 return json!({
@@ -429,6 +696,8 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     ws: false,
                     lang: None,
                     framework: None,
+                    in_container: false,
+                    container_name: None,
                     via_ssh: false,
                     tools: vec![],
                     latency_ms: None,
@@ -478,6 +747,17 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                         })
                     }
                 };
+                let host_val = req
+                    .get("host")
+                    .and_then(|x| x.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
+                let via_ssh = host_val.is_some()
+                    && req
+                        .get("via_ssh")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false);
                 Server {
                     id: format!("manual-http-{}", now_compact()),
                     label: req
@@ -486,7 +766,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                         .unwrap_or("")
                         .to_string(),
                     transport: Transport::Http {
-                        host: req.get("host").and_then(|x| x.as_str()).map(String::from),
+                        host: host_val,
                         port,
                         path: req
                             .get("path")
@@ -507,7 +787,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     ws: false,
                     lang: None,
                     framework: None,
-                    via_ssh: false,
+                    in_container: false,
+                    container_name: None,
+                    via_ssh,
                     tools: vec![],
                     latency_ms: None,
                     last_seen_ts: None,
@@ -549,6 +831,10 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             // il n'est PAS tué — supprimer une entrée ne doit jamais tuer un
             // tiers, même pour libérer le port (action explicite
             // stop_server_force).
+            if let Some((sh, _port, Some(pid), os_hint)) = ssh_server_context(state, &id) {
+                let target = probe::SshTarget::from_host(&sh);
+                let _ = probe::ssh_kill_pids(&target, os_hint.as_deref(), &[pid], false);
+            }
             let (pid_lance, vivant) = processus_lance(state, &id).unwrap_or((0, false));
             let local_port = local_port_of(state, &id);
             if vivant {
@@ -594,6 +880,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             if let Err(e) = save_config_checked(state) {
                 return json!({"ok": false, "error": format!("config non écrite : {e}")});
             }
+            save_cache(state);
             add_log(
                 state,
                 "info",
@@ -681,11 +968,35 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 }
                 _ => return json!({"ok": false, "error": "ip et user requis"}),
             };
+            let port_opt = match parse_optional_ssh_port(&req) {
+                Ok(v) => v,
+                Err(e) => return json!({"ok": false, "error": e}),
+            };
+            let key_opt = match parse_optional_ssh_key(&req) {
+                Ok(v) => v,
+                Err(e) => return json!({"ok": false, "error": e}),
+            };
+            let auto_opt = req.get("auto_install_cli").and_then(|x| x.as_bool());
             let mut st = lockv(&state.settings);
             if let Some(h) = st.ssh_hosts.iter_mut().find(|h| h.ip == ip) {
                 h.user = user;
+                if let Some(p) = port_opt {
+                    h.port = p;
+                }
+                if let Some(k) = key_opt {
+                    h.identity_file = k;
+                }
+                if let Some(a) = auto_opt {
+                    h.auto_install_cli = a;
+                }
             } else {
-                st.ssh_hosts.push(crate::types::SshHost { ip, user });
+                st.ssh_hosts.push(crate::types::SshHost {
+                    ip,
+                    user,
+                    port: port_opt.flatten(),
+                    identity_file: key_opt.flatten(),
+                    auto_install_cli: auto_opt.unwrap_or(true),
+                });
             }
             drop(st);
             if let Err(e) = save_config_checked(state) {
@@ -698,8 +1009,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             // Un serveur local sans commande de lancement (découvert par scan de
             // ports) n'a ni Start/Stop ni autoboot : l'utilisateur peut poser la
             // commande à la main ici. Seeds refusés (la config par défaut
-            // réécraserait) et serveurs distants refusés (le process appartient
-            // à sa machine hôte, pas au moteur local).
+            // réécraserait) et serveurs distants non-SSH refusés (le process appartient
+            // à sa machine hôte, pas au moteur local). Les serveurs via_ssh dont
+            // la machine est enregistrée dans ssh_hosts sont autorisés.
             // `program` null/absent/chaîne vide = RETRAIT de la commande (lot A :
             // le schéma gateway est nullable depuis le lot 1 — le dispatcher
             // répondait « program manquant » au lieu de retirer) ; l'autoboot
@@ -727,6 +1039,11 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 .and_then(|x| x.as_str())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
+            let ssh_ips: Vec<String> = lockv(&state.settings)
+                .ssh_hosts
+                .iter()
+                .map(|sh| sh.ip.clone())
+                .collect();
             let mut servers = lockv(&state.servers);
             let Some(srv) = servers.iter_mut().find(|s| s.id == id) else {
                 return json!({"ok": false, "error": "serveur inconnu"});
@@ -734,8 +1051,10 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             if srv.origin == Origin::Seed {
                 return json!({"ok": false, "error": "serveur seed : commande non modifiable (retire-le durablement puis réajoute-le)"});
             }
-            if matches!(&srv.transport, Transport::Http { host: Some(_), .. }) {
-                return json!({"ok": false, "error": "serveur distant : la commande de lancement appartient à sa machine hôte"});
+            if let Transport::Http { host: Some(h), .. } = &srv.transport {
+                if !(srv.via_ssh && ssh_ips.iter().any(|ip| ip == h)) {
+                    return json!({"ok": false, "error": "serveur distant : la commande de lancement appartient à sa machine hôte"});
+                }
             }
             let Some(program) = program else {
                 // RETRAIT : plus de commande → plus d'autoboot (un
@@ -861,6 +1180,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 st.ssh_hosts.retain(|h| h.ip != ip);
                 before != st.ssh_hosts.len()
             };
+            if removed {
+                clear_ssh_status_one(state, &ip);
+            }
             if let Err(e) = save_config_checked(state) {
                 return json!({"ok": false, "error": format!("config non écrite : {e}")});
             }
@@ -1363,6 +1685,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     st.removed_seeds.clear();
                     removed
                 };
+                clear_ssh_status_all(state);
                 // réinjection immédiate (même logique que le boot) : les
                 // seeds retirés durablement redeviennent visibles sans
                 // attendre un redémarrage
@@ -1515,34 +1838,57 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            // user : fourni par la requête, sinon la machine enregistrée
-            let user = req
-                .get("user")
-                .and_then(|x| x.as_str())
-                .map(|u| u.trim().to_string())
-                .filter(|u| !u.is_empty())
-                .or_else(|| {
-                    lockv(&state.settings)
-                        .ssh_hosts
-                        .iter()
-                        .find(|h| h.ip == ip)
-                        .map(|h| h.user.clone())
-                });
-            let Some(user) = user else {
-                return json!({"ok": false, "error": "utilisateur SSH requis (ou enregistre la machine)"});
-            };
             if ip.is_empty() {
-                return json!({"ok": false, "error": "ip requise"});
+                let hosts = lockv(&state.settings).ssh_hosts.clone();
+                if hosts.is_empty() {
+                    return json!({"ok": false, "error": "utilisateur SSH requis (ou enregistre la machine)"});
+                }
+                let st = state.clone();
+                let count = hosts.len();
+                std::thread::spawn(move || {
+                    for h in hosts {
+                        ssh_discover_host(&st, &h);
+                    }
+                });
+                return json!({
+                    "ok": true,
+                    "started": true,
+                    "count": count,
+                    "note": "découverte SSH lancée sur toutes les machines — vois le journal, l'état se recharge"
+                });
             }
+            let host_cfg = match resolve_ssh_host_from_req(state, &req, ip, false) {
+                Ok(c) => c,
+                Err(err_json) => return err_json,
+            };
             // l'action peut prendre ~30 s (netstat distant + sonde des ports) :
             // on la détache pour ne pas bloquer le serveur HTTP, l'UI suit via
             // le journal et un rechargement d'état.
             let st = state.clone();
-            let ip2 = ip.clone();
             std::thread::spawn(move || {
-                ssh_discover(&st, &ip2, &user);
+                ssh_discover_host(&st, &host_cfg);
             });
             json!({"ok": true, "started": true, "note": "découverte SSH lancée — vois le journal, l'état se recharge"})
+        }
+        "ssh_bootstrap" => {
+            let ip = req
+                .get("ip")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if ip.is_empty() {
+                return json!({"ok": false, "error": "ip requise"});
+            }
+            let host_cfg = match resolve_ssh_host_from_req(state, &req, ip, true) {
+                Ok(c) => c,
+                Err(err_json) => return err_json,
+            };
+            let st = state.clone();
+            std::thread::spawn(move || {
+                ssh_bootstrap(&st, &host_cfg, true);
+            });
+            json!({"ok": true, "started": true, "note": "bootstrap CLI SSH lancé — vois le journal, l'état se recharge"})
         }
         "import_peer" => {
             let ip = req.get("ip").and_then(|x| x.as_str()).unwrap_or("");
@@ -1648,9 +1994,6 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 if s.tools_disabled.iter().any(|t| t == &tool) {
                     return json!({"ok": false, "error": "outil désactivé"});
                 }
-                if s.via_ssh {
-                    return json!({"ok": false, "error": "serveur SSH : exécution directe non supportée"});
-                }
                 match &s.transport {
                     Transport::Http { host, port, path } => {
                         let h = s
@@ -1659,23 +2002,54 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                             .or(host.as_deref())
                             .unwrap_or("127.0.0.1")
                             .to_string();
-                        (Some((h, *port, path.clone(), s.protocol.clone())), false)
+                        (
+                            Some((h, *port, path.clone(), s.protocol.clone(), s.via_ssh)),
+                            false,
+                        )
                     }
-                    Transport::Stdio { .. } => (None, true),
+                    Transport::Stdio { .. } => {
+                        if s.via_ssh {
+                            return json!({"ok": false, "error": "serveur stdio SSH non supporté"});
+                        }
+                        (None, true)
+                    }
                 }
             };
             let timeout_ms: u64 = 15_000;
             add_log(state, "info", &format!("[ui] call_tool {sid}.{tool}"));
-            let res = if let Some((host, port, path, proto)) = target.0 {
-                probe::call_http_tool(
-                    &host,
-                    port,
-                    &path,
-                    proto.as_deref(),
-                    &tool,
-                    arguments,
-                    timeout_ms,
-                )
+            let res = if let Some((host, port, path, proto, via_ssh)) = target.0 {
+                if via_ssh {
+                    let sh = lockv(&state.settings)
+                        .ssh_hosts
+                        .iter()
+                        .find(|x| x.ip == host)
+                        .cloned();
+                    match sh {
+                        Some(cfg) => probe::ssh_call_tool(
+                            &probe::SshTarget::from_host(&cfg),
+                            port,
+                            &path,
+                            proto.as_deref(),
+                            &tool,
+                            arguments,
+                            15,
+                        ),
+                        None => Err(
+                            "machine SSH non enregistrée — réenregistre-la dans Machines"
+                                .to_string(),
+                        ),
+                    }
+                } else {
+                    probe::call_http_tool(
+                        &host,
+                        port,
+                        &path,
+                        proto.as_deref(),
+                        &tool,
+                        arguments,
+                        timeout_ms,
+                    )
+                }
             } else {
                 let rpc = lockv(&state.children).get(&sid).and_then(|h| h.rpc.clone());
                 match rpc {
@@ -1751,11 +2125,6 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     if args.is_empty() {
                         args = it.args.iter().map(|a| a.to_string()).collect();
                     }
-                    // Filesystem : le dossier exposé doit être choisi EXPLICITEMENT —
-                    // jamais un chemin personnel par défaut dans un binaire distribué.
-                    if it.id == "filesystem" && filesystem_dossier_manquant(&args) {
-                        return json!({"ok": false, "error": "précisez le dossier à exposer : {\"action\":\"install_store\",\"id\":\"filesystem\",\"args\":[\"-y\",\"@modelcontextprotocol/server-filesystem\",\"C:/chemin/autorisé\"]}"});
-                    }
                     // env additionnel optionnel {"CLÉ": "valeur"} (lot A) : des
                     // items du catalogue ont besoin d'un jeton (GITHUB_TOKEN…).
                     // Mêmes garanties que l'import (lot 3) : les valeurs
@@ -1792,6 +2161,8 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                                 ws: false,
                                 lang: None,
                                 framework: None,
+                                in_container: false,
+                                container_name: None,
                                 via_ssh: false,
                                 tools: vec![],
                                 latency_ms: None,
@@ -1828,6 +2199,109 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 }
                 None => json!({"ok": false, "error": "item inconnu"}),
             }
+        }
+        "uninstall_store" => {
+            let raw_id = req
+                .get("id")
+                .and_then(|x| x.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            if raw_id.is_empty() {
+                return json!({"ok": false, "error": "id manquant"});
+            }
+            let sid = if raw_id.starts_with("store-") {
+                raw_id.to_string()
+            } else {
+                format!("store-{raw_id}")
+            };
+            let cmd_info: Option<(String, Vec<String>)> = {
+                let servers = lockv(&state.servers);
+                let Some(s) = servers.iter().find(|s| s.id == sid) else {
+                    return json!({"ok": false, "error": "serveur inconnu"});
+                };
+                match &s.transport {
+                    Transport::Stdio { program, args, .. } => Some((program.clone(), args.clone())),
+                    _ => s
+                        .start_cmd
+                        .as_ref()
+                        .map(|c| (c.program.clone(), c.args.clone())),
+                }
+            };
+            if let Some((pid_lance, vivant)) = processus_lance(state, &sid) {
+                if vivant {
+                    probe::kill_tree(pid_lance);
+                    for _ in 0..15 {
+                        let exited = lockv(&state.children)
+                            .get(&sid)
+                            .map(|h| lockv(&h.exit).is_some())
+                            .unwrap_or(true);
+                        if exited {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            }
+            lockv(&state.children).remove(&sid);
+            lockv(&state.spawn_fails).remove(&sid);
+            lockv(&state.spawning).remove(&sid);
+            lockv(&state.runtime).remove(&sid);
+            {
+                let mut servers = lockv(&state.servers);
+                servers.retain(|s| s.id != sid);
+            }
+            lockv(&state.settings).server_order.retain(|x| x != &sid);
+            let pkg_key = cmd_info.as_ref().and_then(|(p, a)| store_package_key(p, a));
+            let cache_shared = if let Some(ref key) = pkg_key {
+                let servers = lockv(&state.servers);
+                servers.iter().any(|s| {
+                    let other_cmd = match &s.transport {
+                        Transport::Stdio { program, args, .. } => {
+                            Some((program.as_str(), args.as_slice()))
+                        }
+                        _ => s
+                            .start_cmd
+                            .as_ref()
+                            .map(|c| (c.program.as_str(), c.args.as_slice())),
+                    };
+                    other_cmd
+                        .and_then(|(p, a)| store_package_key(p, a))
+                        .as_ref()
+                        == Some(key)
+                })
+            } else {
+                false
+            };
+            if let Err(e) = save_config_checked(state) {
+                return json!({"ok": false, "error": format!("config non écrite : {e}")});
+            }
+            save_cache(state);
+            let report = match (cache_shared, cmd_info) {
+                (false, Some((prog, args))) => purge_store_package_files(&prog, &args),
+                _ => PurgeReport::default(),
+            };
+            add_log(
+                state,
+                "info",
+                &format!(
+                    "[-] boutique désinstallée : {sid} ({} élément(s) disque supprimé(s){})",
+                    report.removed_paths.len(),
+                    if report.uv_cache_cleaned {
+                        ", cache uv nettoyé"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+            json!({
+                "ok": true,
+                "id": sid,
+                "removed_paths": report.removed_paths,
+                "removed_count": report.removed_paths.len(),
+                "uv_cache_cleaned": report.uv_cache_cleaned,
+                "cache_shared": cache_shared,
+                "warnings": report.warnings,
+            })
         }
         "import_mcp" => {
             let raw = req.get("text").and_then(|x| x.as_str()).unwrap_or("");

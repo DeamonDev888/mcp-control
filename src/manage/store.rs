@@ -13,18 +13,10 @@ pub struct StoreItem {
     pub kind: &'static str, // npm | python
     pub program: &'static str,
     pub args: &'static [&'static str],
+    pub env_vars: &'static [&'static str],
 }
 
 pub const STORE: &[StoreItem] = &[
-    StoreItem {
-        id: "filesystem",
-        name: "Filesystem",
-        desc: "Lecture/écriture de fichiers dans un dossier autorisé (dossier demandé à l'installation)",
-        cat: "Fichiers",
-        kind: "npm",
-        program: "npx",
-        args: &["-y", "@modelcontextprotocol/server-filesystem"],
-    },
     StoreItem {
         id: "gdrive",
         name: "Google Drive",
@@ -33,6 +25,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-gdrive"],
+        env_vars: &["GDRIVE_OAUTH_PATH", "GDRIVE_CREDENTIALS_PATH"],
     },
     StoreItem {
         id: "git",
@@ -42,6 +35,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "python",
         program: "uvx",
         args: &["mcp-server-git"],
+        env_vars: &[],
     },
     StoreItem {
         id: "github",
@@ -51,6 +45,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-github"],
+        env_vars: &["GITHUB_PERSONAL_ACCESS_TOKEN"],
     },
     StoreItem {
         id: "memory",
@@ -60,6 +55,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-memory"],
+        env_vars: &[],
     },
     StoreItem {
         id: "seqthink",
@@ -69,6 +65,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-sequential-thinking"],
+        env_vars: &[],
     },
     StoreItem {
         id: "everything",
@@ -78,6 +75,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-everything"],
+        env_vars: &[],
     },
     StoreItem {
         id: "time",
@@ -87,6 +85,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "python",
         program: "uvx",
         args: &["mcp-server-time"],
+        env_vars: &[],
     },
     StoreItem {
         id: "fetch",
@@ -96,6 +95,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "python",
         program: "uvx",
         args: &["mcp-server-fetch"],
+        env_vars: &[],
     },
     StoreItem {
         id: "puppeteer",
@@ -105,6 +105,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-puppeteer"],
+        env_vars: &[],
     },
     StoreItem {
         id: "brave",
@@ -114,6 +115,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-brave-search"],
+        env_vars: &["BRAVE_API_KEY"],
     },
     StoreItem {
         id: "postgres",
@@ -123,6 +125,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-postgres"],
+        env_vars: &[],
     },
     StoreItem {
         id: "sqlite",
@@ -131,7 +134,8 @@ pub const STORE: &[StoreItem] = &[
         cat: "Données",
         kind: "python",
         program: "uvx",
-        args: &["mcp-server-sqlite", "--db-path", "test.db"],
+        args: &["--with", "mcp>=1,<2", "mcp-server-sqlite", "--db-path", "test.db"],
+        env_vars: &[],
     },
     StoreItem {
         id: "slack",
@@ -141,6 +145,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-slack"],
+        env_vars: &["SLACK_BOT_TOKEN", "SLACK_TEAM_ID"],
     },
     StoreItem {
         id: "playwright",
@@ -150,6 +155,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "@playwright/mcp@latest"],
+        env_vars: &[],
     },
     StoreItem {
         id: "context7",
@@ -159,6 +165,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "@upstash/context7-mcp"],
+        env_vars: &[],
     },
     StoreItem {
         id: "duckduckgo",
@@ -168,6 +175,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "python",
         program: "uvx",
         args: &["duckduckgo-mcp-server"],
+        env_vars: &[],
     },
     StoreItem {
         id: "kubernetes",
@@ -177,15 +185,17 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "mcp-server-kubernetes"],
+        env_vars: &[],
     },
     StoreItem {
         id: "supabase",
         name: "Supabase",
-        desc: "Bases, tables et edge functions Supabase (OAuth navigateur au premier probe, ou SUPABASE_ACCESS_TOKEN en env)",
+        desc: "Bases, tables et edge functions Supabase (SUPABASE_ACCESS_TOKEN requis en env, ou OAuth navigateur)",
         cat: "Données",
         kind: "npm",
         program: "npx",
         args: &["-y", "@supabase/mcp-server-supabase@latest"],
+        env_vars: &["SUPABASE_ACCESS_TOKEN"],
     },
     StoreItem {
         id: "mongodb",
@@ -195,6 +205,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "mongodb-mcp-server"],
+        env_vars: &["MDB_MCP_CONNECTION_STRING"],
     },
     StoreItem {
         id: "stripe",
@@ -204,15 +215,17 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "@stripe/mcp", "--tools=all"],
+        env_vars: &["STRIPE_SECRET_KEY"],
     },
     StoreItem {
         id: "notion",
         name: "Notion",
-        desc: "API Notion officielle (env OPENAPI_MCP_HEADERS = JSON avec Authorization Bearer + Notion-Version)",
+        desc: "API Notion officielle (NOTION_TOKEN en env, ou OPENAPI_MCP_HEADERS)",
         cat: "Données",
         kind: "npm",
         program: "npx",
-        args: &["-y", "@notionhq/mcp-server"],
+        args: &["-y", "@notionhq/notion-mcp-server"],
+        env_vars: &["NOTION_TOKEN"],
     },
     StoreItem {
         id: "firecrawl",
@@ -222,6 +235,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "firecrawl-mcp"],
+        env_vars: &["FIRECRAWL_API_KEY"],
     },
     StoreItem {
         id: "exa",
@@ -231,6 +245,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "exa-mcp-server"],
+        env_vars: &["EXA_API_KEY"],
     },
     StoreItem {
         id: "blender",
@@ -239,7 +254,8 @@ pub const STORE: &[StoreItem] = &[
         cat: "Création",
         kind: "python",
         program: "uvx",
-        args: &["blender-mcp==1.6.4"],
+        args: &["--with", "mcp>=1,<2", "blender-mcp==1.6.4"],
+        env_vars: &[],
     },
     StoreItem {
         id: "figma",
@@ -249,6 +265,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "figma-developer-mcp", "--stdio"],
+        env_vars: &["FIGMA_API_KEY"],
     },
     StoreItem {
         id: "n8n",
@@ -258,6 +275,7 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "n8n-mcp"],
+        env_vars: &["N8N_API_URL", "N8N_API_KEY"],
     },
     StoreItem {
         id: "todoist",
@@ -266,7 +284,8 @@ pub const STORE: &[StoreItem] = &[
         cat: "Productivité",
         kind: "npm",
         program: "npx",
-        args: &["-y", "@doist/todoist-mcp"],
+        args: &["-y", "-p", "@todoist/mcp", "todoist-mcp"],
+        env_vars: &["TODOIST_API_KEY"],
     },
     StoreItem {
         id: "taskmaster",
@@ -276,6 +295,17 @@ pub const STORE: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "--package=task-master-ai", "task-master-ai"],
+        env_vars: &["ANTHROPIC_API_KEY"],
+    },
+    StoreItem {
+        id: "drawio",
+        name: "draw.io",
+        desc: "Serveur MCP officiel draw.io (jgraph/drawio-mcp) : génère et ouvre des diagrammes éditables (XML, Mermaid, CSV) directement dans draw.io",
+        cat: "Design",
+        kind: "npm",
+        program: "npx",
+        args: &["-y", "@drawio/mcp"],
+        env_vars: &[],
     },
 ];
 
@@ -312,6 +342,7 @@ pub fn store_json() -> Value {
             "id": s.id, "name": s.name, "desc": s.desc,
             "cat": s.cat, "kind": s.kind,
             "program": s.program, "args": s.args,
+            "env_vars": s.env_vars,
         }))
         .collect::<Vec<_>>())
 }

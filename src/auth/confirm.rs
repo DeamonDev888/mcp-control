@@ -386,13 +386,33 @@ pub fn effect_of(state: &Arc<AppState>, tool: &str, args: &Value) -> Value {
             "arguments": masked_arguments(args.get("arguments").unwrap_or(&Value::Null)),
             "note": "un outil distant peut exécuter n'importe quoi",
         }),
-        "ssh_save" | "ssh_discover" => json!({
-            "kind": "ssh",
-            "target": format!("{}@{}", s("user"), s("ip")),
-            "resume": format!("SSH {}@{}", s("user"), s("ip")),
-            "note": if tool == "ssh_save" { "enregistre la cible que ssh_discover contactera" }
-                    else { "exécute ssh vers la machine" },
-        }),
+        "ssh_save" | "ssh_discover" => {
+            let port_sfx = args
+                .get("port")
+                .and_then(|x| x.as_u64())
+                .filter(|&p| (1..=65535).contains(&p) && p != 22)
+                .map(|p| format!(":{p}"))
+                .unwrap_or_default();
+            let auto_cli = args
+                .get("auto_install_cli")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true);
+            let target = format!("{}@{}{}", s("user"), s("ip"), port_sfx);
+            let note = match (tool, auto_cli) {
+                ("ssh_save", true) => {
+                    "enregistre la cible SSH (avec auto-installation du CLI mcp-control si absent)"
+                }
+                ("ssh_save", false) => "enregistre la cible que ssh_discover contactera",
+                (_, true) => "exécute ssh vers la machine et prépare le CLI mcp-control",
+                (_, false) => "exécute ssh vers la machine",
+            };
+            json!({
+                "kind": "ssh",
+                "target": target,
+                "resume": format!("SSH {}@{}{}", s("user"), s("ip"), port_sfx),
+                "note": note,
+            })
+        }
         _ => json!({
             "kind": "autre",
             "resume": format!("appel de {tool}"),

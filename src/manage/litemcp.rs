@@ -27,9 +27,12 @@ fn registry_dir() -> std::path::PathBuf {
     base.join("litemcp-registry")
 }
 
-/// Bornes de lecture : 64 Kio par fichier, 32 fichiers examinés au plus.
+/// Bornes de lecture : 64 Kio par fichier, 32 annonces retenues au plus,
+/// 512 fichiers `.json` examinés au maximum par appel (évite qu'un amas de
+/// fichiers zombies morts n'éclipse des annonces vivantes tout en restant borné).
 const ANNONCE_MAX_BYTES: u64 = 64 * 1024;
 const ANNONCES_MAX: usize = 32;
+const ANNONCES_SCAN_MAX: usize = 512;
 
 /// Une annonce lue sur le disque. Champs d'AFFICHAGE seulement : `exe`, `args`,
 /// `cwd` ne sont ni lus ni rendus (rien d'une annonce n'est exécuté).
@@ -90,7 +93,7 @@ pub fn litemcp_announcements(state: &Arc<AppState>) -> Value {
     };
     let mut examines = 0usize;
     for entry in entries.flatten() {
-        if examines >= ANNONCES_MAX {
+        if annonces.len() >= ANNONCES_MAX || examines >= ANNONCES_SCAN_MAX {
             break;
         }
         let path = entry.path();
@@ -111,6 +114,23 @@ pub fn litemcp_announcements(state: &Arc<AppState>) -> Value {
             skipped.push(json!({"name": name, "reason": "JSON invalide"}));
             continue;
         };
+        if let Some(raw_pid) = v.get("pid").filter(|x| !x.is_null()) {
+            let Some(pid) = raw_pid
+                .as_u64()
+                .and_then(|p| u32::try_from(p).ok())
+                .filter(|&p| p > 0)
+            else {
+                skipped.push(json!({"name": name, "reason": "pid invalide"}));
+                continue;
+            };
+            if !probe::process_alive(pid) {
+                skipped.push(json!({
+                    "name": name,
+                    "reason": format!("processus inactif (pid {pid})"),
+                }));
+                continue;
+            }
+        }
         let nom = v
             .get("name")
             .and_then(|x| x.as_str())

@@ -51,17 +51,6 @@ pub(crate) use litemcp::*;
 mod autostart;
 pub(crate) use autostart::*;
 
-/// Filesystem : le dossier exposé doit être présent — il faut au moins les
-/// options + le package + UN chemin (le nom du package contient un « / », la
-/// longueur est donc le critère fiable), et le dernier arg doit ressembler à un chemin.
-fn filesystem_dossier_manquant(args: &[String]) -> bool {
-    args.len() < 3
-        || args
-            .last()
-            .map(|a| !a.contains('/') && !a.contains('\\'))
-            .unwrap_or(true)
-}
-
 // events : déplacé vers manage/events.rs (v0.7.20) — réexport pour API stable.
 mod events;
 pub(crate) use events::*;

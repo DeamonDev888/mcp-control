@@ -82,6 +82,12 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
             // serveurs via_ssh : la sonde tourne DEPUIS la machine (curl interne
             // sur 127.0.0.1 via la connexion ssh) — l'extérieur est souvent
             // bloqué (bind localhost, ufw)
+            if force_full
+                && !via_ssh
+                && host.as_deref().map(crate::is_loopback_bind).unwrap_or(true)
+            {
+                probe::begin_port_owner_cycle();
+            }
             let can_reuse = !force_full
                 && was_up
                 && has_tools
@@ -92,24 +98,32 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                 prev_name: prev_name.as_deref(),
                 prev_version: prev_version.as_deref(),
             };
+            let ssh_host_cfg = if via_ssh {
+                host.as_deref().and_then(|h| {
+                    lockv(&state.settings)
+                        .ssh_hosts
+                        .iter()
+                        .find(|x| x.ip == h)
+                        .cloned()
+                })
+            } else {
+                None
+            };
             let mut res = if via_ssh {
-                match &host {
-                    Some(h) => {
-                        let user = lockv(&state.settings)
-                            .ssh_hosts
-                            .iter()
-                            .find(|x| x.ip == *h)
-                            .map(|x| x.user.clone());
-                        match user {
-                            Some(u) => probe::ssh_probe_server(h, &u, port, &path, 6),
-                            None => probe::McpProbe::fail(
-                                "machine SSH non enregistrée — réenregistre-la dans Machines"
-                                    .to_string(),
-                                true,
-                            ),
-                        }
+                match (&host, &ssh_host_cfg) {
+                    (Some(_), Some(sh)) => probe::ssh_probe_server_target(
+                        &probe::SshTarget::from_host(sh),
+                        port,
+                        &path,
+                        6,
+                    ),
+                    (Some(_), None) => probe::McpProbe::fail(
+                        "machine SSH non enregistrée — réenregistre-la dans Machines".to_string(),
+                        true,
+                    ),
+                    (None, _) => {
+                        probe::McpProbe::fail("serveur via SSH sans hôte".to_string(), true)
                     }
-                    None => probe::McpProbe::fail("serveur via SSH sans hôte".to_string(), true),
                 }
             } else {
                 match &host {
@@ -121,11 +135,15 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                     None => probe::probe_http_with(port, &path, 8000, &hint),
                 }
             };
-            // Auto-start : serveur HTTP LOCAL éteint + commande de lancement configurée
-            // (jamais pour un serveur distant, ni pour un serveur déjà en écoute mais verrouillé 401)
-            if !res.mcp_up && !res.locked && host.is_none() {
+            // Auto-start : serveur HTTP LOCAL éteint OU serveur via_ssh enregistré
+            // avec commande de lancement configurée (jamais pour un serveur LAN non-SSH,
+            // ni pour un serveur déjà en écoute mais verrouillé 401).
+            let auto_start_eligible = host.is_none() || (via_ssh && ssh_host_cfg.is_some());
+            if !res.mcp_up && !res.locked && auto_start_eligible {
                 // État du process lancé par nous, s'il existe : vivant ? code de sortie ?
-                let (child_alive, exit_code) = {
+                let (child_alive, exit_code) = if via_ssh {
+                    (false, None)
+                } else {
                     let children = lockv(&state.children);
                     match children.get(id) {
                         Some(h) => {
@@ -145,19 +163,26 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                 // (compteur persisté, backoff croissant, abandon à MAX_ATTEMPTS) :
                 // la relance n'est plus infinie.
                 let now = crate::types::now_ts();
-                let echec_demarrage = {
+                let (echec_demarrage, ssh_still_starting) = {
                     let mut rt = lockv(&state.runtime);
                     let entry = rt.entry(id.to_string()).or_default();
                     let echeance = entry.starting_until;
-                    if echeance != 0 && (!child_alive || now >= echeance) {
+                    if via_ssh {
+                        if echeance != 0 && now >= echeance {
+                            entry.starting_until = 0;
+                            (true, false)
+                        } else {
+                            (false, echeance > now)
+                        }
+                    } else if echeance != 0 && (!child_alive || now >= echeance) {
                         entry.starting_until = 0;
-                        true
+                        (true, false)
                     } else {
-                        false
+                        (false, false)
                     }
                 };
                 if echec_demarrage {
-                    let motif = if child_alive {
+                    let motif = if child_alive || via_ssh {
                         format!(
                             "échéance de démarrage ({} s) dépassée sans réponse MCP",
                             START_WINDOW_SECS
@@ -191,6 +216,7 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                 };
                 if can_auto
                     && !child_alive
+                    && !ssh_still_starting
                     && backoff_ok
                     && lockv(&state.spawning).insert(id.to_string())
                 {
@@ -204,54 +230,101 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                             .and_then(|s| s.start_cmd.clone())
                     };
                     if let Some(cmd) = cmd {
-                        match probe::spawn_process(
-                            &cmd.program,
-                            &cmd.args,
-                            cmd.workdir.as_deref(),
-                            &cmd.env,
-                        ) {
-                            Ok(h) => {
-                                let pid = h.pid;
-                                lockv(&state.children).insert(id.to_string(), h);
-                                lockv(&state.spawn_fails).remove(id);
-                                {
-                                    let mut servers = lockv(&state.servers);
-                                    if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
-                                        srv.pid = Some(pid);
+                        if let Some(ref sh) = ssh_host_cfg {
+                            let os_hint = get_ssh_status(state, &sh.ip).and_then(|st| st.os);
+                            let target = probe::SshTarget::from_host(sh);
+                            match probe::ssh_spawn_remote(&target, os_hint.as_deref(), &cmd) {
+                                Ok(pid_opt) => {
+                                    lockv(&state.spawn_fails).remove(id);
+                                    if let Some(pid) = pid_opt {
+                                        let mut servers = lockv(&state.servers);
+                                        if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
+                                            srv.pid = Some(pid);
+                                        }
                                     }
+                                    add_log(
+                                        state,
+                                        "info",
+                                        &format!(
+                                            "[{}] ssh démarré ({} — re-sonde)",
+                                            id,
+                                            pid_opt
+                                                .map(|p| format!("pid {p}"))
+                                                .unwrap_or_else(|| "détaché".to_string())
+                                        ),
+                                    );
+                                    {
+                                        let mut rt = lockv(&state.runtime);
+                                        rt.entry(id.to_string()).or_default().starting_until =
+                                            crate::types::now_ts() + START_WINDOW_SECS;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(400));
+                                    let mut res2 =
+                                        probe::ssh_probe_server_target(&target, port, &path, 3);
+                                    if res2.mcp_up && res2.pid.is_none() {
+                                        res2.pid = pid_opt;
+                                    }
+                                    res = res2;
                                 }
-                                add_log(
-                                    state,
-                                    "info",
-                                    &format!("[{}] http démarré (pid {}) — re-sonde", id, pid),
-                                );
-                                // Marqueur « démarrage en cours » avec échéance :
-                                // les cycles suivants re-vérifient l'état du serveur
-                                // (UP réel → start-ok ; process sorti ou échéance
-                                // dépassée → échec) au lieu de bloquer ici.
-                                {
-                                    let mut rt = lockv(&state.runtime);
-                                    rt.entry(id.to_string()).or_default().starting_until =
-                                        crate::types::now_ts() + START_WINDOW_SECS;
+                                Err(e) => {
+                                    note_spawn_failure(state, id);
+                                    add_log(
+                                        state,
+                                        "warn",
+                                        &format!("[{}] démarrage SSH KO : {}", id, e),
+                                    );
                                 }
-                                // Re-sonde UNIQUE et courte : un lanceur qui
-                                // construit avant d'écouter est revérifié aux
-                                // cycles suivants — le cycle n'attend plus 30 s
-                                // (audit 03, constat 2 : c'était la cause principale
-                                // des périodes mesurées à 48-90 s).
-                                let mut res2 = probe::probe_http(port, &path, 2000);
-                                if res2.mcp_up && res2.pid.is_none() {
-                                    res2.pid = Some(pid);
-                                }
-                                res = res2;
                             }
-                            Err(e) => {
-                                note_spawn_failure(state, id);
-                                add_log(
-                                    state,
-                                    "warn",
-                                    &format!("[{}] démarrage HTTP KO : {}", id, e),
-                                )
+                        } else {
+                            match probe::spawn_process(
+                                &cmd.program,
+                                &cmd.args,
+                                cmd.workdir.as_deref(),
+                                &cmd.env,
+                            ) {
+                                Ok(h) => {
+                                    let pid = h.pid;
+                                    lockv(&state.children).insert(id.to_string(), h);
+                                    lockv(&state.spawn_fails).remove(id);
+                                    {
+                                        let mut servers = lockv(&state.servers);
+                                        if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
+                                            srv.pid = Some(pid);
+                                        }
+                                    }
+                                    add_log(
+                                        state,
+                                        "info",
+                                        &format!("[{}] http démarré (pid {}) — re-sonde", id, pid),
+                                    );
+                                    // Marqueur « démarrage en cours » avec échéance :
+                                    // les cycles suivants re-vérifient l'état du serveur
+                                    // (UP réel → start-ok ; process sorti ou échéance
+                                    // dépassée → échec) au lieu de bloquer ici.
+                                    {
+                                        let mut rt = lockv(&state.runtime);
+                                        rt.entry(id.to_string()).or_default().starting_until =
+                                            crate::types::now_ts() + START_WINDOW_SECS;
+                                    }
+                                    // Re-sonde UNIQUE et courte : un lanceur qui
+                                    // construit avant d'écouter est revérifié aux
+                                    // cycles suivants — le cycle n'attend plus 30 s
+                                    // (audit 03, constat 2 : c'était la cause principale
+                                    // des périodes mesurées à 48-90 s).
+                                    let mut res2 = probe::probe_http(port, &path, 2000);
+                                    if res2.mcp_up && res2.pid.is_none() {
+                                        res2.pid = Some(pid);
+                                    }
+                                    res = res2;
+                                }
+                                Err(e) => {
+                                    note_spawn_failure(state, id);
+                                    add_log(
+                                        state,
+                                        "warn",
+                                        &format!("[{}] démarrage HTTP KO : {}", id, e),
+                                    )
+                                }
                             }
                         }
                     }
@@ -301,6 +374,8 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                             srv.ws = res.ws;
                             srv.lang = res.lang.clone();
                             srv.framework = res.framework.clone();
+                            srv.in_container = res.in_container;
+                            srv.container_name = res.container_name.clone();
                             srv.tools = res.tools.clone();
                         }
                         srv.latency_ms = Some(res.latency_ms);
@@ -350,10 +425,16 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                                 if res.lang.is_some() {
                                     srv.lang = res.lang.clone();
                                 }
+                                if res.in_container {
+                                    srv.in_container = true;
+                                    if res.container_name.is_some() {
+                                        srv.container_name = res.container_name.clone();
+                                    }
+                                }
                             }
                             srv.last_error = res.error.clone();
                             srv.latency_ms = None;
-                            if !res.port_open && host.is_none() {
+                            if !res.port_open && (host.is_none() || via_ssh) {
                                 srv.pid = None;
                             }
                             if was_up {
@@ -436,6 +517,23 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                 };
                 add_log(state, "warn", &format!("[{id}] {detail}"));
                 runtime_event(state, id, "crash", &detail);
+                let mut gw_changed = false;
+                {
+                    let mut servers = lockv(&state.servers);
+                    if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
+                        if srv.state == SState::Up {
+                            gw_changed = true;
+                        }
+                        srv.state = SState::Down;
+                        srv.pid = None;
+                        if srv.last_error.is_none() {
+                            srv.last_error = Some(detail.clone());
+                        }
+                    }
+                }
+                if gw_changed {
+                    crate::gateway::notify_change();
+                }
             }
             let (enabled, has_cmd) = {
                 let servers = lockv(&state.servers);
@@ -445,22 +543,104 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                 }
             };
             if alive {
-                let mut servers = lockv(&state.servers);
-                if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
-                    srv.state = SState::Up;
-                    srv.last_seen_ts = Some(crate::types::now_ts());
+                let rpc_opt = if force_full {
+                    lockv(&state.children).get(id).and_then(|h| h.rpc.clone())
+                } else {
+                    None
+                };
+                if let Some(rpc) = rpc_opt {
+                    match probe::list_stdio_tools(&rpc, 10_000) {
+                        Ok((tools, ms)) => {
+                            let mut gw_changed = false;
+                            {
+                                let mut servers = lockv(&state.servers);
+                                if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
+                                    if srv.state != SState::Up || srv.tools.len() != tools.len() {
+                                        gw_changed = true;
+                                    }
+                                    srv.state = SState::Up;
+                                    if !tools.is_empty() || srv.tools.is_empty() {
+                                        srv.tools = tools;
+                                    }
+                                    srv.latency_ms = Some(ms);
+                                    srv.last_seen_ts = Some(crate::types::now_ts());
+                                    srv.last_error = None;
+                                }
+                            }
+                            if gw_changed {
+                                crate::gateway::notify_change();
+                            }
+                        }
+                        Err(e) => {
+                            let pipe_dead = e.contains("stdout fermé")
+                                || e.contains("écriture stdio")
+                                || e.contains("flush stdio");
+                            let mut gw_changed = false;
+                            if pipe_dead {
+                                lockv(&state.children).remove(id);
+                                let mut servers = lockv(&state.servers);
+                                if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
+                                    if srv.state == SState::Up {
+                                        gw_changed = true;
+                                    }
+                                    srv.state = SState::Down;
+                                    srv.pid = None;
+                                    srv.last_error = Some(e.clone());
+                                }
+                            } else {
+                                let mut servers = lockv(&state.servers);
+                                if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
+                                    if srv.state != SState::Up {
+                                        gw_changed = true;
+                                    }
+                                    srv.state = SState::Up;
+                                    srv.last_seen_ts = Some(crate::types::now_ts());
+                                }
+                            }
+                            if gw_changed {
+                                crate::gateway::notify_change();
+                            }
+                        }
+                    }
+                } else {
+                    let mut gw_changed = false;
+                    {
+                        let mut servers = lockv(&state.servers);
+                        if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
+                            if srv.state != SState::Up {
+                                gw_changed = true;
+                            }
+                            srv.state = SState::Up;
+                            srv.last_seen_ts = Some(crate::types::now_ts());
+                        }
+                    }
+                    if gw_changed {
+                        crate::gateway::notify_change();
+                    }
                 }
             } else if enabled && has_cmd {
+                let now = crate::types::now_ts();
+                let backoff_ok = if force_full {
+                    true
+                } else {
+                    let mut rt = lockv(&state.runtime);
+                    rt.entry(id.to_string()).or_default().can_attempt(now)
+                };
+                if !backoff_ok {
+                    return;
+                }
                 // (re)démarrage auto avec handshake complet — même garde anti-doublon
                 if !lockv(&state.spawning).insert(id.to_string()) {
                     return;
                 }
                 let cmd = {
                     let mut servers = lockv(&state.servers);
-                    servers
-                        .iter_mut()
-                        .find(|s| s.id == id)
-                        .and_then(|s| s.start_cmd.clone())
+                    if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
+                        srv.last_error = Some("démarrage en cours…".to_string());
+                        srv.start_cmd.clone()
+                    } else {
+                        None
+                    }
                 };
                 if let Some(cmd) = cmd {
                     let timeout_ms = stdio_start_timeout_ms(&cmd.program, &cmd.args);
@@ -477,23 +657,33 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                                 lockv(&state.children).insert(id.to_string(), h);
                             }
                             lockv(&state.spawn_fails).remove(id);
-                            let mut servers = lockv(&state.servers);
-                            if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
-                                srv.state = SState::Up;
-                                srv.pid = p.pid;
-                                srv.server_name = p.name.clone();
-                                srv.version = p.version.clone();
-                                srv.protocol = p.protocol.clone();
-                                srv.sse = p.sse;
-                                srv.sse_endpoint = p.sse_endpoint;
-                                srv.lang = p.lang.clone();
-                                srv.framework = p.framework.clone();
-                                srv.tools = p.tools.clone();
-                                srv.latency_ms = Some(p.latency_ms);
-                                srv.last_seen_ts = Some(crate::types::now_ts());
-                                srv.last_error = None;
+                            let mut gw_changed = false;
+                            {
+                                let mut servers = lockv(&state.servers);
+                                if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
+                                    if srv.state != SState::Up || srv.tools.len() != p.tools.len() {
+                                        gw_changed = true;
+                                    }
+                                    srv.state = SState::Up;
+                                    srv.pid = p.pid;
+                                    srv.server_name = p.name.clone();
+                                    srv.version = p.version.clone();
+                                    srv.protocol = p.protocol.clone();
+                                    srv.sse = p.sse;
+                                    srv.sse_endpoint = p.sse_endpoint;
+                                    srv.lang = p.lang.clone();
+                                    srv.framework = p.framework.clone();
+                                    srv.in_container = p.in_container;
+                                    srv.container_name = p.container_name.clone();
+                                    srv.tools = p.tools.clone();
+                                    srv.latency_ms = Some(p.latency_ms);
+                                    srv.last_seen_ts = Some(crate::types::now_ts());
+                                    srv.last_error = None;
+                                }
                             }
-                            drop(servers);
+                            if gw_changed {
+                                crate::gateway::notify_change();
+                            }
                             add_log(
                                 state,
                                 "info",
@@ -508,13 +698,21 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                             runtime_event(state, id, "start-ok", "stdio");
                         }
                         Err(e) => {
-                            let mut servers = lockv(&state.servers);
-                            if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
-                                srv.state = SState::Down;
-                                srv.last_error = Some(e.clone());
-                                srv.pid = None;
+                            let mut gw_changed = false;
+                            {
+                                let mut servers = lockv(&state.servers);
+                                if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
+                                    if srv.state == SState::Up {
+                                        gw_changed = true;
+                                    }
+                                    srv.state = SState::Down;
+                                    srv.last_error = Some(e.clone());
+                                    srv.pid = None;
+                                }
                             }
-                            drop(servers);
+                            if gw_changed {
+                                crate::gateway::notify_change();
+                            }
                             note_spawn_failure(state, id);
                             add_log(state, "warn", &format!("[{}] stdio KO : {}", id, e));
                         }
@@ -523,9 +721,18 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                 // libère la garde anti-doublon quoi qu'il arrive
                 lockv(&state.spawning).remove(id);
             } else {
-                let mut servers = lockv(&state.servers);
-                if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
-                    srv.state = SState::Down;
+                let mut gw_changed = false;
+                {
+                    let mut servers = lockv(&state.servers);
+                    if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
+                        if srv.state == SState::Up {
+                            gw_changed = true;
+                        }
+                        srv.state = SState::Down;
+                    }
+                }
+                if gw_changed {
+                    crate::gateway::notify_change();
                 }
             }
         }
@@ -548,10 +755,12 @@ pub const SCAN_MAX_PORTS: usize = 512;
 /// lancement : couper ce téléchargement à 45 s laissait un cache npx à moitié
 /// installé (ex. mcp-mermaid → playwright-core sans index.js), et chaque
 /// démarrage suivant plantait. D'où :
-/// - npx avec paquet déjà en cache → 45 s (démarrage normal) ;
-/// - npx sans cache → 5 min (installation complète) ;
-/// - autres lanceurs (cache non détecté) → 2 min ;
-/// - binaire direct → 15 s.
+/// - npx avec paquet déjà en cache → 60 s (démarrage normal) ;
+/// - uvx avec paquet déjà en cache → 90 s (environnement uv prêt) ;
+/// - npx/uvx sans cache ou depuis git → 5 min (installation complète) ;
+/// - bunx/pnpx/dlx → 3 min ;
+/// - binaire direct → 30 s.
+///
 /// Un process qui meurt est signalé tout de suite (probe_stdio), donc un long
 /// délai ne fait attendre que les serveurs réellement bloqués.
 pub(super) fn stdio_start_timeout_ms(program: &str, args: &[String]) -> u64 {
@@ -562,12 +771,140 @@ pub(super) fn stdio_start_timeout_ms(program: &str, args: &[String]) -> u64 {
         .to_ascii_lowercase();
     match stem.as_str() {
         "npx" => match npx_package_name(args) {
-            Some(pkg) if npx_package_cached(&npx_cache_dirs(), &pkg) => 45_000,
+            Some(pkg)
+                if !pkg.starts_with("github:")
+                    && !pkg.starts_with("git+")
+                    && !pkg.starts_with("http://")
+                    && !pkg.starts_with("https://")
+                    && npx_package_cached(&npx_cache_dirs(), &pkg) =>
+            {
+                60_000
+            }
             _ => 300_000,
         },
-        "uvx" | "bunx" | "pnpx" | "dlx" => 120_000,
-        _ => 15_000,
+        "uvx" | "uv" => {
+            if args.iter().any(|a| a.contains("git+")) {
+                300_000
+            } else {
+                match uv_package_name(args) {
+                    Some(pkg) if uv_package_cached(&uv_cache_dirs(), &pkg) => 90_000,
+                    _ => 300_000,
+                }
+            }
+        }
+        "bunx" | "pnpx" | "dlx" => 180_000,
+        _ => 30_000,
     }
+}
+
+/// Normalise un nom de paquet Python selon PEP 503 (`_` / `.` / `-` -> `-`, minuscules).
+fn normalize_pep503(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_dash = false;
+    for ch in name.chars() {
+        if matches!(ch, '-' | '_' | '.') {
+            if !prev_dash && !out.is_empty() {
+                out.push('-');
+                prev_dash = true;
+            }
+        } else {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// Nom du paquet PyPI lancé par uvx (`--from pkg@latest bin` → `Some("pkg")`).
+pub(super) fn uv_package_name(args: &[String]) -> Option<String> {
+    let mut it = args.iter();
+    let mut spec = None;
+    while let Some(a) = it.next() {
+        if a == "--from" {
+            spec = it.next().cloned();
+            break;
+        }
+        if let Some(v) = a.strip_prefix("--from=") {
+            spec = Some(v.to_string());
+            break;
+        }
+        if matches!(
+            a.as_str(),
+            "--python"
+                | "-p"
+                | "--with"
+                | "--with-editable"
+                | "--with-requirements"
+                | "--index-url"
+                | "--default-index"
+                | "--extra-index-url"
+                | "--find-links"
+                | "--python-preference"
+                | "--cache-dir"
+                | "-C"
+                | "--directory"
+        ) {
+            let _ = it.next();
+            continue;
+        }
+        if !a.starts_with('-') {
+            spec = Some(a.clone());
+            break;
+        }
+    }
+    let spec = spec?;
+    if spec.contains("git+") || spec.contains("://") {
+        return None;
+    }
+    let base = spec
+        .split(['@', '=', '<', '>', '!', '~', '['])
+        .next()
+        .unwrap_or("")
+        .trim();
+    let norm = normalize_pep503(base);
+    (!norm.is_empty()).then_some(norm)
+}
+
+/// Dossiers de cache uv candidats (`UV_CACHE_DIR`, `LOCALAPPDATA/uv/cache`, `.cache/uv`).
+fn uv_cache_dirs() -> Vec<std::path::PathBuf> {
+    let mut v = Vec::new();
+    if let Ok(c) = std::env::var("UV_CACHE_DIR") {
+        if !c.trim().is_empty() {
+            v.push(std::path::PathBuf::from(c));
+        }
+    }
+    if let Ok(l) = std::env::var("LOCALAPPDATA") {
+        v.push(std::path::PathBuf::from(l).join("uv").join("cache"));
+    }
+    if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
+        v.push(std::path::PathBuf::from(x).join("uv"));
+    }
+    if let Some(h) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        v.push(std::path::PathBuf::from(h).join(".cache").join("uv"));
+    }
+    v
+}
+
+/// Le paquet PyPI est-il déjà présent dans un des caches `wheels-v*/pypi/<pkg>` d'uv ?
+pub(super) fn uv_package_cached(dirs: &[std::path::PathBuf], pkg: &str) -> bool {
+    let norm = normalize_pep503(pkg);
+    if norm.is_empty() {
+        return false;
+    }
+    dirs.iter().any(|d| {
+        std::fs::read_dir(d)
+            .map(|rd| {
+                rd.flatten().any(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with("wheels-") && e.path().join("pypi").join(&norm).is_dir()
+                })
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// Nom du paquet lancé par npx, sans version (`@scope/nom@1.2` → `@scope/nom`).
@@ -628,6 +965,317 @@ pub(super) fn npx_package_cached(dirs: &[std::path::PathBuf], pkg: &str) -> bool
             })
             .unwrap_or(false)
     })
+}
+
+/// Résultat de la purge des fichiers téléchargés pour un paquet de la Boutique.
+#[derive(Default, Debug, Clone)]
+pub(super) struct PurgeReport {
+    pub removed_paths: Vec<String>,
+    pub uv_cache_cleaned: bool,
+    pub warnings: Vec<String>,
+}
+
+/// Clé canonique `(lanceur, paquet)` pour éviter de purger un cache partagé
+/// avec un autre serveur configuré.
+pub(super) fn store_package_key(program: &str, args: &[String]) -> Option<(String, String)> {
+    let stem = std::path::Path::new(program)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    match stem.as_str() {
+        "npx" => npx_package_name(args).map(|p| ("npx".to_string(), p)),
+        "uvx" => uv_purge_targets(args)
+            .into_iter()
+            .next()
+            .map(|p| ("uvx".to_string(), p)),
+        _ => None,
+    }
+}
+
+/// Cibles normalisées (PEP 503) pour nettoyer les caches `uv` d'un serveur `uvx`.
+pub(super) fn uv_purge_targets(args: &[String]) -> Vec<String> {
+    if let Some(norm) = uv_package_name(args) {
+        return vec![norm];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut it = args.iter();
+    let mut from_spec: Option<String> = None;
+    let mut bin_name: Option<String> = None;
+    while let Some(a) = it.next() {
+        if a == "--from" {
+            from_spec = it.next().cloned();
+            continue;
+        }
+        if let Some(v) = a.strip_prefix("--from=") {
+            from_spec = Some(v.to_string());
+            continue;
+        }
+        if matches!(
+            a.as_str(),
+            "--python"
+                | "-p"
+                | "--with"
+                | "--with-editable"
+                | "--with-requirements"
+                | "--index-url"
+                | "--default-index"
+                | "--extra-index-url"
+                | "--find-links"
+                | "--python-preference"
+                | "--cache-dir"
+                | "-C"
+                | "--directory"
+        ) {
+            let _ = it.next();
+            continue;
+        }
+        if !a.starts_with('-') && bin_name.is_none() {
+            bin_name = Some(a.clone());
+        }
+    }
+    if let Some(spec) = from_spec {
+        let trimmed = spec.split(['#', '?']).next().unwrap_or(&spec);
+        let seg = trimmed.rsplit('/').next().unwrap_or(trimmed);
+        let seg = seg.strip_suffix(".git").unwrap_or(seg);
+        let seg = seg.split('@').next().unwrap_or(seg).trim();
+        let norm = normalize_pep503(seg);
+        if !norm.is_empty() && !out.contains(&norm) {
+            out.push(norm);
+        }
+    }
+    if let Some(b) = bin_name {
+        let base = b
+            .split(['@', '=', '<', '>', '!', '~', '['])
+            .next()
+            .unwrap_or("")
+            .trim();
+        let norm = normalize_pep503(base);
+        if !norm.is_empty() && !out.contains(&norm) {
+            out.push(norm);
+        }
+    }
+    out
+}
+
+fn npx_spec_pkg_name(spec: &str) -> String {
+    if spec.starts_with("github:") || spec.contains("://") {
+        return spec.to_string();
+    }
+    match spec.rfind('@').filter(|&i| i > 0) {
+        Some(i) => spec[..i].to_string(),
+        None => spec.to_string(),
+    }
+}
+
+fn npx_hash_dir_matches_pkg(hash_dir: &std::path::Path, pkg: &str) -> bool {
+    let pkg_json_path = hash_dir.join("package.json");
+    let parsed: Option<Value> = std::fs::read_to_string(&pkg_json_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let mut deps_len = 0usize;
+    if let Some(ref v) = parsed {
+        if let Some(deps) = v.get("dependencies").and_then(|d| d.as_object()) {
+            deps_len = deps.len();
+            if deps_len > 1 {
+                return false;
+            }
+            if deps.contains_key(pkg) {
+                return true;
+            }
+            if pkg.starts_with("github:") {
+                let gh_slug = pkg
+                    .trim_start_matches("github:")
+                    .split('#')
+                    .next()
+                    .unwrap_or("");
+                if deps.values().any(|val| {
+                    val.as_str().is_some_and(|s| {
+                        s == pkg
+                            || s.starts_with(pkg)
+                            || (!gh_slug.is_empty() && s.contains(gh_slug))
+                    })
+                }) {
+                    return true;
+                }
+            }
+        }
+        if let Some(arr) = v.pointer("/_npx/packages").and_then(|a| a.as_array()) {
+            if arr.len() == 1 && arr[0].as_str().map(npx_spec_pkg_name).as_deref() == Some(pkg) {
+                return true;
+            }
+        }
+    }
+    if !pkg.starts_with("github:") && !pkg.contains("://") && (parsed.is_none() || deps_len == 0) {
+        let rel: std::path::PathBuf = pkg.split('/').collect();
+        if hash_dir.join("node_modules").join(rel).is_dir() {
+            return true;
+        }
+    }
+    false
+}
+
+fn clear_readonly_recursive(path: &std::path::Path) {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return;
+        }
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+        if meta.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(path) {
+                for entry in rd.flatten() {
+                    clear_readonly_recursive(&entry.path());
+                }
+            }
+        }
+    }
+}
+
+fn remove_dir_all_retry(path: &std::path::Path) -> std::io::Result<()> {
+    for attempt in 0..5 {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    clear_readonly_recursive(path);
+                }
+                if attempt == 4 {
+                    return Err(e);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Purge les caches `npx`/`uvx` d'un paquet sur disque dans les répertoires fournis.
+pub(super) fn purge_store_package_files_in_dirs(
+    program: &str,
+    args: &[String],
+    npx_dirs: &[std::path::PathBuf],
+    uv_dirs: &[std::path::PathBuf],
+    run_uv_cli: bool,
+) -> PurgeReport {
+    let mut report = PurgeReport::default();
+    let stem = std::path::Path::new(program)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    match stem.as_str() {
+        "npx" => {
+            if let Some(pkg) = npx_package_name(args) {
+                for d in npx_dirs {
+                    let Ok(rd) = std::fs::read_dir(d) else {
+                        continue;
+                    };
+                    for entry in rd.flatten() {
+                        let p = entry.path();
+                        let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                            continue;
+                        };
+                        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                            continue;
+                        }
+                        if npx_hash_dir_matches_pkg(&p, &pkg) {
+                            match remove_dir_all_retry(&p) {
+                                Ok(()) => {
+                                    report.removed_paths.push(p.to_string_lossy().to_string())
+                                }
+                                Err(e) => report.warnings.push(format!("{}: {e}", p.display())),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "uvx" => {
+            let targets = uv_purge_targets(args);
+            if run_uv_cli && !targets.is_empty() {
+                let mut cmd = Command::new("uv");
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x0800_0000);
+                }
+                cmd.args(["cache", "clean", "--force"])
+                    .args(&targets)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                if let Ok(st) = cmd.status() {
+                    if st.success() {
+                        report.uv_cache_cleaned = true;
+                    }
+                }
+            }
+            if !targets.is_empty() {
+                for d in uv_dirs {
+                    let Ok(rd) = std::fs::read_dir(d) else {
+                        continue;
+                    };
+                    for entry in rd.flatten() {
+                        let bucket = entry.path();
+                        let Ok(meta) = std::fs::symlink_metadata(&bucket) else {
+                            continue;
+                        };
+                        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                            continue;
+                        }
+                        let bname = entry.file_name();
+                        let bname = bname.to_string_lossy();
+                        let pypi = bucket.join("pypi");
+                        if bname.starts_with("wheels-") || bname.starts_with("sdists-") {
+                            for norm in &targets {
+                                let pkg_dir = pypi.join(norm);
+                                if std::fs::symlink_metadata(&pkg_dir)
+                                    .map(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+                                    .unwrap_or(false)
+                                {
+                                    match remove_dir_all_retry(&pkg_dir) {
+                                        Ok(()) => report
+                                            .removed_paths
+                                            .push(pkg_dir.to_string_lossy().to_string()),
+                                        Err(e) => report
+                                            .warnings
+                                            .push(format!("{}: {e}", pkg_dir.display())),
+                                    }
+                                }
+                            }
+                        } else if bname.starts_with("simple-") {
+                            for norm in &targets {
+                                let rkyv = pypi.join(format!("{norm}.rkyv"));
+                                if std::fs::symlink_metadata(&rkyv)
+                                    .map(|m| !m.file_type().is_symlink() && m.file_type().is_file())
+                                    .unwrap_or(false)
+                                {
+                                    match std::fs::remove_file(&rkyv) {
+                                        Ok(()) => report
+                                            .removed_paths
+                                            .push(rkyv.to_string_lossy().to_string()),
+                                        Err(e) => {
+                                            report.warnings.push(format!("{}: {e}", rkyv.display()))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    report
+}
+
+/// Purge les fichiers locaux du paquet lancé par un item de la Boutique.
+pub(super) fn purge_store_package_files(program: &str, args: &[String]) -> PurgeReport {
+    purge_store_package_files_in_dirs(program, args, &npx_cache_dirs(), &uv_cache_dirs(), true)
 }
 
 pub fn local_discovery_disabled() -> bool {
@@ -785,6 +1433,7 @@ pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) -> u32 {
         .collect();
     let (mtx, mrx) = std::sync::mpsc::channel::<(u16, String, &'static str, probe::McpProbe)>();
     if !candidats.is_empty() {
+        probe::begin_port_owner_cycle();
         let workers = SCAN_WORKERS.min(candidats.len()).max(1);
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
@@ -847,6 +1496,8 @@ pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) -> u32 {
                 ws: p.ws,
                 lang: p.lang.clone(),
                 framework: p.framework.clone(),
+                in_container: p.in_container,
+                container_name: p.container_name.clone(),
                 via_ssh: false,
                 tools: p.tools,
                 latency_ms: if p.mcp_up { Some(p.latency_ms) } else { None },
@@ -939,6 +1590,7 @@ pub fn scan_listening(state: &Arc<AppState>) {
     let results: Vec<(u16, Option<(&'static str, probe::McpProbe)>)> = if candidates.is_empty() {
         Vec::new()
     } else {
+        probe::begin_port_owner_cycle();
         let workers = SCAN_LISTENING_WORKERS.min(candidates.len()).max(1);
         let next = std::sync::atomic::AtomicUsize::new(0);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1004,6 +1656,8 @@ pub fn scan_listening(state: &Arc<AppState>) {
             ws: p.ws,
             lang: p.lang.clone(),
             framework: p.framework.clone(),
+            in_container: p.in_container,
+            container_name: p.container_name.clone(),
             via_ssh: false,
             tools: p.tools,
             latency_ms: if p.mcp_up { Some(p.latency_ms) } else { None },
@@ -1366,6 +2020,8 @@ pub fn scan_network_range(
                                     s.version = p.version.clone();
                                     s.framework = p.framework.clone();
                                     s.lang = p.lang.clone();
+                                    s.in_container = p.in_container;
+                                    s.container_name = p.container_name.clone();
                                     s.tools = p.tools;
                                     s.latency_ms = Some(p.latency_ms);
                                     s.last_seen_ts = Some(crate::types::now_ts());
@@ -1418,6 +2074,8 @@ pub fn scan_network_range(
                                 ws: p.ws,
                                 lang: p.lang.clone(),
                                 framework: p.framework.clone(),
+                                in_container: p.in_container,
+                                container_name: p.container_name.clone(),
                                 via_ssh: false,
                                 tools: p.tools,
                                 latency_ms: Some(p.latency_ms),
@@ -1487,6 +2145,8 @@ mod tests {
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![],
             latency_ms: None,
@@ -1569,13 +2229,76 @@ mod tests {
         assert!(npx_package_cached(&dirs, "@s/ok"));
         assert!(!npx_package_cached(&dirs, "@s/absent"));
         let _ = std::fs::remove_dir_all(&tmp);
-        assert_eq!(stdio_start_timeout_ms("node", &v(&["x.js"])), 15_000);
+        assert_eq!(stdio_start_timeout_ms("node", &v(&["x.js"])), 30_000);
+        assert_eq!(stdio_start_timeout_ms("bunx", &v(&["mcp-x"])), 180_000);
         assert_eq!(
-            stdio_start_timeout_ms(r"C:\x\uvx.exe", &v(&["mcp-x"])),
-            120_000
+            stdio_start_timeout_ms(r"C:\x\uvx.exe", &v(&["paquet-uv-inexistant-mcc-zz9"])),
+            300_000
         );
         assert_eq!(
             stdio_start_timeout_ms("npx", &v(&["-y", "paquet-inexistant-mcc-zz9"])),
+            300_000
+        );
+        assert_eq!(
+            stdio_start_timeout_ms("npx", &v(&["-y", "github:org/repo"])),
+            300_000
+        );
+    }
+
+    #[test]
+    fn delai_demarrage_long_pour_uvx_git() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let tmp_uv = std::env::temp_dir().join(format!("mcc-uv-{}", std::process::id()));
+        let wheel_dir = tmp_uv.join("wheels-v6").join("pypi").join("mcp-simple");
+        std::fs::create_dir_all(&wheel_dir).unwrap();
+        let uv_dirs = vec![tmp_uv.clone()];
+        assert!(uv_package_cached(&uv_dirs, "mcp_simple"));
+        assert!(!uv_package_cached(&uv_dirs, "absent-pkg"));
+        let _ = std::fs::remove_dir_all(&tmp_uv);
+
+        assert_eq!(
+            uv_package_name(&v(&[
+                "--from",
+                "redis-mcp-server@latest",
+                "redis-mcp-server"
+            ])),
+            Some("redis-mcp-server".to_string())
+        );
+        assert_eq!(
+            uv_package_name(&v(&["--python", "3.13", "android_mcp"])),
+            Some("android-mcp".to_string())
+        );
+        assert_eq!(
+            stdio_start_timeout_ms(
+                "uvx",
+                &v(&["--from", "git+https://github.com/org/repo.git", "mcp-repo"])
+            ),
+            300_000
+        );
+        assert_eq!(
+            stdio_start_timeout_ms(
+                r"C:\tools\uvx.exe",
+                &v(&["--from", "git+https://github.com/org/repo.git", "mcp-repo"])
+            ),
+            300_000
+        );
+        assert_eq!(
+            stdio_start_timeout_ms("uvx", &v(&["paquet-uv-absent-mcc-zz9"])),
+            300_000
+        );
+        assert_eq!(
+            stdio_start_timeout_ms(
+                "uv",
+                &v(&[
+                    "run",
+                    "--no-project",
+                    "--with",
+                    "git+https://example.com/r",
+                    "python",
+                    "-m",
+                    "m"
+                ])
+            ),
             300_000
         );
     }

@@ -14,37 +14,40 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 <script src="/app.js?v=__MCC_VERSION__" defer></script>
 </head>
 <body>
+<a href='#content' class="skip-link">Aller au contenu principal</a>
 
 <header id="titlebar" data-tauri-drag-region="deep">
-  <button id="tbExplToggle" class="tb-icon-btn" data-act="toggle-explorer" aria-label="Replier ou d&eacute;plier l'explorateur (Ctrl+B)" aria-expanded="true" aria-controls="explorer" title="Replier / d&eacute;plier l'explorateur (Ctrl+B)">
+  <button type="button" id="tbExplToggle" class="tb-icon-btn" data-act="toggle-explorer" data-tauri-drag-region="false" aria-label="Replier ou d&eacute;plier l'explorateur (Ctrl+B)" aria-expanded="true" aria-controls="explorer" title="Replier / d&eacute;plier l'explorateur (Ctrl+B)">
     <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='3' y='4' width='18' height='16' rx='2'/><path d='M9 4v16'/></svg>
   </button>
-  <span class="logo">
+  <button type="button" class="logo" data-act="go-home" id="tbHome" data-tauri-drag-region="false" aria-label="MCP Control — Retour à l'accueil (tableau de bord)" title="Retour à l'accueil — Tableau de bord MCP Control">
     <svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
       <rect x="2.5" y="4.5" width="19" height="15" rx="3.2" fill="none" stroke="currentColor" stroke-width="1.5"/>
       <circle cx="8" cy="10" r="1.7" fill="currentColor"/>
       <path d="M5.5 16.2c1.6-1.5 3.1-2.2 4.6-2.2s3 .7 4.6 2.2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
     </svg>
     <span class="wordmark">MCP<span class="wm-dim"> Control</span></span>
-  </span>
+  </button>
   <span class="tb-badge ok" title="Serveurs MCP qui répondent, sur le total suivi">UP <b id="stUp">0</b>/<b id="stTotal">0</b></span>
   <span class="tb-badge" title="Outils MCP exposés par les serveurs UP">outils <b id="stTools">0</b></span>
-  <button id="tbLogout" class="tb-logout" hidden data-act="logout"
+  <button type="button" id="tbLogout" class="tb-logout" hidden data-act="logout"
           aria-label="Oublier le code d'acc&egrave;s enregistr&eacute; dans ce navigateur"
           title="Oublier le code d'accès enregistré dans ce navigateur"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='4.5' y='10.5' width='15' height='10' rx='2'/><path d='M8 10.5V7a4 4 0 0 1 8 0v3.5'/></svg></button>
   <span class="tb-spacer"></span>
   <div class="tb-actions" role="toolbar" aria-label="Actions principales">
-    <button id="stUpdate" class="sb-upd" hidden data-act="update-download"
+    <button type="button" id="stUpdate" class="sb-upd" hidden data-act="update-download"
+      aria-label="Mettre &agrave; jour l'application"
       title="T&eacute;l&eacute;charge directement la mise &agrave; jour pour cette machine"></button>
     <div id="tbDiscoverWrap" class="tb-menu-wrap">
-      <button id="tbDiscover" class="primary tb-menu-btn" data-act="discover-toggle"
+      <button type="button" id="tbDiscover" class="primary tb-menu-btn" data-act="discover-toggle"
+              aria-label="D&eacute;couverte — scanner les ports, le r&eacute;seau ou les machines"
               aria-haspopup="menu" aria-expanded="false" aria-controls="discoverMenu"
               title="D&eacute;couverte : scanner les ports locaux, le r&eacute;seau ou g&eacute;rer les machines distantes">
         <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='8.5'/><circle cx='12' cy='12' r='3.5'/><path d='M12 3.5V7M12 17v3.5M3.5 12H7M17 12h3.5'/></svg>
         <span class="tb-lbl">D&eacute;couverte</span>
         <svg class="ic tb-caret" viewBox="0 0 24 24" aria-hidden="true"><path d='m6 9 6 6 6-6'/></svg>
       </button>
-      <div id="discoverMenu" class="tb-menu" role="menu" aria-labelledby="tbDiscover" hidden>
+      <div id="discoverMenu" class="tb-menu" role="menu" aria-labelledby="tbDiscover" data-tauri-drag-region="false" hidden>
         <button type="button" class="tb-menu-item" role="menuitem" data-act="scan" title="Balayer les ports locaux pour d&eacute;couvrir les serveurs MCP">
           <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='11' cy='11' r='7'/><path d='m21 21-4.3-4.3'/></svg>
           <span class="tb-menu-txt"><span class="tb-menu-t">Scanner les ports</span><span class="tb-menu-sub">Ports locaux de cette machine</span></span>
@@ -59,22 +62,21 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
         </button>
       </div>
     </div>
-    <button data-act="store" title="Catalogue de serveurs MCP pr&ecirc;ts &agrave; installer"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='9' cy='20' r='1.4'/><circle cx='17' cy='20' r='1.4'/><path d='M2.5 3.5h2.2l2.5 11.5h10.3l2-8H6'/></svg><span class="tb-lbl">Boutique</span></button>
-    <button id="tbAccess" data-act="access-open" title="Acc&egrave;s &mdash; clients appair&eacute;s, demandes d'appairage et confirmations avant ex&eacute;cution"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 3 4.5 6v5.5c0 4.4 3.1 8.3 7.5 9.5 4.4-1.2 7.5-5.1 7.5-9.5V6L12 3Z'/><path d='m8.8 11.8 2.2 2.2 4.2-4.4'/></svg><span class="tb-lbl">Acc&egrave;s</span><span id="tbAccessN" class="tb-count" hidden>0</span></button>
-    <button data-act="settings-open" title="R&eacute;glages du client"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='3.1'/><path d='M12 2.8v2.6M12 18.6v2.6M2.8 12h2.6M18.6 12h2.6M5.5 5.5l1.9 1.9M16.6 16.6l1.9 1.9M18.5 5.5l-1.9 1.9M7.4 16.6l-1.9 1.9'/></svg><span class="tb-lbl">R&eacute;glages</span></button>
-    <button data-act="refresh-all" aria-label="Re-sonder tous les serveurs connus et d&eacute;couvrir les nouveaux" title="Re-sonder tous les serveurs connus et d&eacute;couvrir les nouveaux (tous ports en &eacute;coute)"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M21 12a9 9 0 1 1-2.6-6.4L21 8'/><path d='M21 3v5h-5'/></svg></button>
+    <button type="button" data-act="store" aria-label="Boutique de serveurs MCP" title="Catalogue de serveurs MCP pr&ecirc;ts &agrave; installer"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='9' cy='20' r='1.4'/><circle cx='17' cy='20' r='1.4'/><path d='M2.5 3.5h2.2l2.5 11.5h10.3l2-8H6'/></svg><span class="tb-lbl">Boutique</span></button>
+    <button type="button" id="tbAccess" data-act="access-open" aria-label="Acc&egrave;s et s&eacute;curit&eacute;" title="Acc&egrave;s &mdash; clients appair&eacute;s, demandes d'appairage et confirmations avant ex&eacute;cution"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 3 4.5 6v5.5c0 4.4 3.1 8.3 7.5 9.5 4.4-1.2 7.5-5.1 7.5-9.5V6L12 3Z'/><path d='m8.8 11.8 2.2 2.2 4.2-4.4'/></svg><span class="tb-lbl">Acc&egrave;s</span><span id="tbAccessN" class="tb-count" hidden>0</span></button>
+    <button type="button" data-act="settings-open" aria-label="R&eacute;glages du client" title="R&eacute;glages du client"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='3.1'/><path d='M12 2.8v2.6M12 18.6v2.6M2.8 12h2.6M18.6 12h2.6M5.5 5.5l1.9 1.9M16.6 16.6l1.9 1.9M18.5 5.5l-1.9 1.9M7.4 16.6l-1.9 1.9'/></svg><span class="tb-lbl">R&eacute;glages</span></button>
+    <button type="button" data-act="refresh-all" aria-label="Re-sonder tous les serveurs connus et d&eacute;couvrir les nouveaux" title="Re-sonder tous les serveurs connus et d&eacute;couvrir les nouveaux (tous ports en &eacute;coute)"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M21 12a9 9 0 1 1-2.6-6.4L21 8'/><path d='M21 3v5h-5'/></svg></button>
   </div>
   <div id="winCtrls">
-    <button class="wbtn" id="wMin" data-act="win-min" aria-label="R&eacute;duire la fen&ecirc;tre" title="R&eacute;duire">&#x2500;</button>
-    <button class="wbtn" id="wMax" data-act="win-max" aria-label="Agrandir ou restaurer la fen&ecirc;tre" title="Agrandir / restaurer">&#x25A1;</button>
-    <button class="wbtn wclose" id="wClose" data-act="win-close" aria-label="Fermer la fen&ecirc;tre" title="Fermer">&#x2715;</button>
+    <button type="button" class="wbtn" id="wMin" data-act="win-min" aria-label="R&eacute;duire la fen&ecirc;tre" title="R&eacute;duire">&#x2500;</button>
+    <button type="button" class="wbtn" id="wMax" data-act="win-max" aria-label="Agrandir ou restaurer la fen&ecirc;tre" title="Agrandir / restaurer">&#x25A1;</button>
+    <button type="button" class="wbtn wclose" id="wClose" data-act="win-close" aria-label="Fermer la fen&ecirc;tre" title="Fermer">&#x2715;</button>
   </div>
 </header>
 
 <div id="deadBanner" hidden aria-live="polite" role="status"></div>
 
-<div id="accessBanner" hidden data-act="access-open" data-pending="1" aria-live="polite" role="status"
-  title="Une demande attend une d&eacute;cision locale &mdash; cliquer pour ouvrir l'&eacute;cran Acc&egrave;s"></div>
+<div id="accessBanner" hidden aria-live="polite" role="status"><button type="button" id="accessBannerBtn" class="access-banner-btn" data-act="access-open" data-pending="1" title="Une demande attend une d&eacute;cision locale &mdash; cliquer pour ouvrir l'&eacute;cran Acc&egrave;s"></button></div>
 
 <div id="main">
   <aside id="explorer" aria-label="Explorateur de serveurs MCP">
@@ -97,22 +99,19 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
         aria-label="Filtrer les serveurs par nom, port, framework ou &eacute;tat"
         title="Filtre par nom, port, framework ou &eacute;tat &mdash; raccourcis : / ou Ctrl+K, &Eacute;chap efface"
         data-act="srv-filter">
-      <button id="srvFilterClear" hidden data-act="clear-filter" aria-label="Effacer le filtre" title="Effacer le filtre">&times;</button>
+      <button type="button" id="srvFilterClear" hidden data-act="clear-filter" aria-label="Effacer le filtre" title="Effacer le filtre">&times;</button>
     </div>
     <div class="exp-pills" id="expStatePills" role="group" aria-label="Filtres rapides par &eacute;tat">
-      <button class="exp-pill sel" data-act="exp-state" data-mode="all">Tous</button>
-      <button class="exp-pill" data-act="exp-state" data-mode="up">UP</button>
-      <button class="exp-pill" data-act="exp-state" data-mode="down">Panne</button>
-      <button class="exp-pill" data-act="exp-state" data-mode="locked">Verrouill&eacute;s</button>
-      <button class="exp-pill" data-act="exp-state" data-mode="paused">Pause</button>
+      <button type="button" class="exp-pill sel" data-act="exp-state" data-mode="all" aria-pressed="true">Tous</button>
+      <button type="button" class="exp-pill" data-act="exp-state" data-mode="up" aria-pressed="false">UP</button>
+      <button type="button" class="exp-pill" data-act="exp-state" data-mode="down" aria-pressed="false">Panne</button>
+      <button type="button" class="exp-pill" data-act="exp-state" data-mode="locked" aria-pressed="false">Verrouill&eacute;s</button>
+      <button type="button" class="exp-pill" data-act="exp-state" data-mode="paused" aria-pressed="false">Pause</button>
     </div>
-    <div id="hiddenBar" hidden data-act="show-hidden"
-      title="Les serveurs masqu&eacute;s ne le restent que pour cette session : ils reviennent &agrave; la r&eacute;ouverture de l'application (ou d'un rechargement de la page)"></div>
+    <button type="button" id="hiddenBar" hidden data-act="show-hidden"
+      title="Les serveurs masqu&eacute;s ne le restent que pour cette session : ils reviennent &agrave; la r&eacute;ouverture de l'application (ou d'un rechargement de la page)"></button>
     <div id="localSec">
-      <div class="grphead" id="localHead" data-act="group-toggle" data-key="local"
-        title="Serveurs MCP locaux &agrave; cette machine (loopback) — cliquer pour replier/d&eacute;plier">
-        <span class="gchev">&#9662;</span><span class="gname">Serveurs locaux</span><span class="gcount" id="localCount"></span>
-      </div>
+      <div class="grphead" id="localHead"><button type="button" class="grp-toggle" data-act="group-toggle" data-key="local" aria-expanded="true" aria-controls="srvList" title="Serveurs MCP locaux &agrave; cette machine (loopback) — cliquer pour replier/d&eacute;plier"><span class="gchev" aria-hidden="true">&#9662;</span><span class="gname">Serveurs locaux</span><span class="gcount" id="localCount"></span></button></div>
       <div class="grpbody" id="srvList" role="list" aria-label="Serveurs locaux"></div>
     </div>
     <div class="sec-label" id="remoteLabel" hidden>Machines distantes</div>
@@ -123,29 +122,39 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
       <div class="sec-label">D&eacute;tect&eacute;s, non suivis</div>
       <div id="annList"></div>
     </div>
-    <div id="addWrap"><button data-act="add-server">+ Ajouter un serveur</button></div>
+    <div id="addWrap"><button type="button" data-act="add-server">+ Ajouter un serveur</button></div>
   </aside>
-  <div id="grip" role="separator" aria-orientation="vertical" aria-label="Ajuster la largeur de l'explorateur" title="Glisser pour ajuster la largeur"></div>
+  <div id="grip" role="separator" aria-orientation="vertical" tabindex="0" aria-valuemin="180" aria-valuemax="520" aria-valuenow="320" aria-label="Ajuster la largeur de l'explorateur" title="Glisser ou utiliser les fl&egrave;ches pour ajuster la largeur"></div>
   <main id="content" tabindex="-1"><h1 class="sr-only">MCP Control</h1></main>
 </div>
 
 <div id="logpanel" role="region" aria-label="Journal d'&eacute;v&eacute;nements">
-  <div id="loghead" data-act="log-toggle">
-    <span class="arrow">&#9662;</span><span class="lbl">Journal</span>
-    <button id="netWarn" class="tb-badge netwarn" hidden data-act="net-detail"
+  <div id="loghead">
+    <button type="button" id="logToggleBtn" class="log-toggle" data-act="log-toggle" aria-expanded="false" aria-controls="logbody" title="Afficher ou replier le journal"><span class="arrow" aria-hidden="true">&#9662;</span><span class="lbl">Journal</span><span id="logCountBadge" class="log-badge" hidden>0</span><span id="logErrBadge" class="log-badge err" hidden>0</span></button>
+    <div id="logFilters" class="log-filters" role="group" aria-label="Filtrer le journal par niveau">
+      <button type="button" class="log-fbtn sel" data-act="log-filter" data-level="all" aria-pressed="true">Tous</button>
+      <button type="button" class="log-fbtn" data-act="log-filter" data-level="warn" aria-pressed="false">Alertes</button>
+      <button type="button" class="log-fbtn" data-act="log-filter" data-level="error" aria-pressed="false">Erreurs</button>
+    </div>
+    <div class="log-tools">
+      <button type="button" class="log-tbtn" data-act="log-copy" aria-label="Copier le journal visible" title="Copier le journal visible">Copier</button>
+      <button type="button" class="log-tbtn" data-act="log-clear" aria-label="Effacer la vue du journal" title="Masquer les entr&eacute;es pr&eacute;c&eacute;dentes dans cette vue">Effacer</button>
+      <button type="button" id="logExpandBtn" class="log-tbtn" data-act="log-expand" aria-pressed="false" aria-label="Agrandir ou r&eacute;duire la hauteur du journal" title="Agrandir / r&eacute;duire le journal">Hauteur</button>
+    </div>
+    <button type="button" id="netWarn" class="tb-badge netwarn" hidden data-act="net-detail"
       title="Les serveurs distants ne peuvent pas &ecirc;tre sond&eacute;s &mdash; VPN actif ? (Proton VPN : activer &laquo;&nbsp;autoriser les connexions LAN&nbsp;&raquo;)"></button>
-    <button id="stAuto" class="sb-auto tb-push" role="switch" aria-checked="false" data-act="autostart"
+    <button type="button" id="stAuto" class="sb-auto tb-push" role="switch" aria-checked="false" aria-label="Lancer au d&eacute;marrage de l'OS" data-act="autostart"
       title="Lancer l'application au d&eacute;marrage de l'OS (tray silencieux)"></button>
-    <span class="tb-badge">auto-d&eacute;tection : HTTP streamable &middot; stdio JSON-RPC</span>
+    <span class="tb-badge tb-hint">auto-d&eacute;tection : HTTP streamable &middot; stdio JSON-RPC</span>
     <span class="sb-ver" title="Version install&eacute;e">v__MCC_VERSION__</span>
   </div>
-  <div id="logbody"></div>
+  <div id="logbody" aria-live="off"></div>
 </div>
 
 <dialog id="dlg" aria-labelledby="dlgAddTitle">
   <div class="dlg-head">
-    <h2 id="dlgAddTitle">Ajouter un serveur MCP</h2>
-    <button class="close" data-act="close-dialog" aria-label="Fermer">&times;</button>
+    <h2 id="dlgAddTitle"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 5v14M5 12h14'/></svg> Ajouter un serveur MCP</h2>
+    <button type="button" class="close" data-act="close-dialog" aria-label="Fermer">&times;</button>
   </div>
   <div class="dlg-body">
     <form data-act="add-submit">
@@ -161,6 +170,10 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
         <div class="row">
           <div><label for="fPort">Port</label><input id="fPort" type="number" placeholder="3099"></div>
           <div><label for="fPath">Chemin MCP</label><input id="fPath" value="/mcp"></div>
+        </div>
+        <div class="row">
+          <div><label for="fHttpHost">H&ocirc;te (optionnel)</label><input id="fHttpHost" placeholder="127.0.0.1 ou IP LAN/SSH"></div>
+          <div class="chk-field"><input id="fViaSsh" type="checkbox"><label for="fViaSsh">Passer par SSH (machine enregistr&eacute;e)</label></div>
         </div>
         <div class="stack">
           <label for="fHttpProgram">Commande de lancement (option — permet Start/Stop par MCP Control)</label>
@@ -188,7 +201,7 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
         <div class="row row-end">
           <button type="button" class="primary" data-act="import-mcp">Importer</button>
         </div>
-        <div id="importMsg" class="machine-msg"></div>
+        <div id="importMsg" class="machine-msg" aria-live="polite"></div>
       </div>
     </form>
   </div>
@@ -197,26 +210,27 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 <dialog id="storeDlg" aria-labelledby="dlgStoreTitle">
   <div class="dlg-head">
     <h2 id="dlgStoreTitle"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='9' cy='20' r='1.4'/><circle cx='17' cy='20' r='1.4'/><path d='M2.5 3.5h2.2l2.5 11.5h10.3l2-8H6'/></svg> Boutique &mdash; serveurs MCP <span id="storeCount" class="store-count"></span></h2>
-    <button class="close" data-act="close-dialog" aria-label="Fermer">&times;</button>
+    <button type="button" class="close" data-act="close-dialog" aria-label="Fermer">&times;</button>
   </div>
   <div class="dlg-body dlg-body-tight">
     <div class="store-head">
       <div class="store-bar">
-        <div class="store-search-wrap">
+        <div id="storeSearchWrap" class="store-search-wrap">
           <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='11' cy='11' r='7'/><path d='m21 21-4.3-4.3'/></svg>
           <label for="storeSearch" class="sr-only">Rechercher dans la boutique</label>
           <input id="storeSearch" placeholder="Rechercher un serveur MCP&hellip;" data-act="store-search">
+          <button type="button" id="storeSearchClear" class="search-clear" hidden data-act="store-clear-search" aria-label="Effacer la recherche">&times;</button>
         </div>
         <label for="storeSort" class="sr-only">Trier les r&eacute;sultats</label>
         <select id="storeSort" data-act="store-sort" title="Trier les r&eacute;sultats">
           <option value="cat">Ordre du catalogue</option>
           <option value="az">A→Z</option>
         </select>
-        <button id="storeHideInst" class="scat" role="switch" aria-checked="false" data-act="store-hide-inst"
+        <button type="button" id="storeHideInst" class="scat" role="switch" aria-checked="false" data-act="store-hide-inst"
           title="Masquer les serveurs d&eacute;j&agrave; pr&eacute;sents dans ta liste">Masquer les install&eacute;s</button>
       </div>
       <div id="storeCats" class="store-cats"></div>
-      <div id="storeResults" class="store-results"></div>
+      <div id="storeResults" class="store-results" aria-live="polite"></div>
     </div>
     <div id="storeGrid" class="store-grid"></div>
   </div>
@@ -225,23 +239,32 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 <dialog id="machineDlg" aria-labelledby="dlgMachineTitle">
   <div class="dlg-head">
     <h2 id="dlgMachineTitle"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='2.5' y='4' width='19' height='13' rx='2'/><path d='M8 21h8M12 17v4'/></svg> Machines distantes</h2>
-    <button class="close" data-act="close-dialog" aria-label="Fermer">&times;</button>
+    <button type="button" class="close" data-act="close-dialog" aria-label="Fermer">&times;</button>
   </div>
   <div class="dlg-body">
-    <div class="conf-note">Connexion SSH par cl&eacute; (BatchMode — aucun mot de passe possible) : la machine
-    doit accepter ta cl&eacute; publique. L'app liste ses ports en &eacute;coute via <b>netstat</b> distant,
-    y sonde les serveurs MCP et les importe ici automatiquement.</div>
+    <div class="conf-note">Connexion SSH par cl&eacute; (BatchMode &mdash; aucun mot de passe possible) : la machine
+    doit accepter ta cl&eacute; publique. L'app inspecte l'OS et l'architecture distants, peut installer et
+    d&eacute;marrer automatiquement le CLI officiel <b>mcp-control</b> (empreinte SHA-256 v&eacute;rifi&eacute;e),
+    liste les ports en &eacute;coute, y sonde les serveurs MCP et permet de piloter leurs outils &agrave; distance.</div>
     <div class="machine-form">
       <label for="mIp" class="sr-only">IP ou h&ocirc;te SSH</label>
       <input id="mIp" placeholder="IP ou h&ocirc;te (ex. 192.168.1.42)">
       <label for="mUser" class="sr-only">Utilisateur SSH</label>
       <input id="mUser" placeholder="Utilisateur SSH">
-      <button class="primary" data-act="ssh-discover"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7'/><path d='M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7'/></svg> SSH &amp; d&eacute;couvrir</button>
-      <button data-act="ssh-save"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M5 3.5h11L20.5 8v11a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 19V5A1.5 1.5 0 0 1 5 3.5Z'/><path d='M8 3.5V8h7V3.5M7.5 20.5v-6h9v6'/></svg> Enregistrer</button>
+      <label for="mPort" class="sr-only">Port SSH</label>
+      <input id="mPort" type="number" min="1" max="65535" placeholder="Port (22)">
+      <label for="mKey" class="sr-only">Cl&eacute; priv&eacute;e SSH (optionnel)</label>
+      <input id="mKey" placeholder="Cl&eacute; SSH optionnelle (ex. ~/.ssh/id_ed25519)">
+      <button type="button" class="primary" data-act="ssh-discover"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7'/><path d='M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7'/></svg> SSH &amp; d&eacute;couvrir</button>
+      <button type="button" data-act="ssh-save"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M5 3.5h11L20.5 8v11a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 19V5A1.5 1.5 0 0 1 5 3.5Z'/><path d='M8 3.5V8h7V3.5M7.5 20.5v-6h9v6'/></svg> Enregistrer</button>
     </div>
-    <div id="machineMsg" class="machine-msg"></div>
+    <div class="machine-opts">
+      <input id="mAutoCli" type="checkbox" checked>
+      <label for="mAutoCli">Auto-installer et d&eacute;marrer le CLI <b>mcp-control</b> si absent (v&eacute;rifi&eacute; SHA-256)</label>
+    </div>
+    <div id="machineMsg" class="machine-msg" aria-live="polite"></div>
     <div id="machineList"></div>
-    <div class="stack"><button data-act="peers-scan"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M21 12a9 9 0 1 1-2.6-6.4L21 8'/><path d='M21 3v5h-5'/></svg> D&eacute;tecter les moteurs MCP Control sur le LAN</button></div>
+    <div class="stack"><button type="button" data-act="peers-scan"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M21 12a9 9 0 1 1-2.6-6.4L21 8'/><path d='M21 3v5h-5'/></svg> D&eacute;tecter les moteurs MCP Control sur le LAN</button></div>
   </div>
 </dialog>
 
@@ -258,17 +281,17 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
         <p>Pr&eacute;f&eacute;rences du client MCP Control</p>
       </div>
     </div>
-    <button class="close" data-act="settings-close" aria-label="Fermer" title="Fermer">&times;</button>
+    <button type="button" class="close" data-act="settings-close" aria-label="Fermer" title="Fermer">&times;</button>
   </div>
   <div class="set-shell">
     <nav class="set-nav" id="setNav" role="tablist" aria-orientation="vertical" aria-label="Sections des r&eacute;glages">
-      <button class="set-nav-btn sel" role="tab" id="stab-general" aria-selected="true" aria-controls="spane-general" tabindex="0" data-pane="general" data-act="set-pane"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='3.1'/><path d='M12 2.8v2.6M12 18.6v2.6M2.8 12h2.6M18.6 12h2.6M5.5 5.5l1.9 1.9M16.6 16.6l1.9 1.9M18.5 5.5l-1.9 1.9M7.4 16.6l-1.9 1.9'/></svg>G&eacute;n&eacute;ral</button>
-      <button class="set-nav-btn" role="tab" id="stab-decouverte" aria-selected="false" aria-controls="spane-decouverte" tabindex="-1" data-pane="decouverte" data-act="set-pane"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='11' cy='11' r='7'/><path d='m21 21-4.3-4.3'/></svg>D&eacute;couverte</button>
-      <button class="set-nav-btn" role="tab" id="stab-interface" aria-selected="false" aria-controls="spane-interface" tabindex="-1" data-pane="interface" data-act="set-pane"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='2.5' y='4' width='19' height='13' rx='2'/><path d='M8 21h8M12 17v4'/></svg>Interface</button>
-      <button class="set-nav-btn" role="tab" id="stab-notifications" aria-selected="false" aria-controls="spane-notifications" tabindex="-1" data-pane="notifications" data-act="set-pane"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M6 9a6 6 0 0 1 12 0c0 5 2 6.5 2 6.5H4S6 14 6 9Z'/><path d='M10 19.5a2.2 2.2 0 0 0 4 0'/></svg>Notifications</button>
-      <button class="set-nav-btn" role="tab" id="stab-updates" aria-selected="false" aria-controls="spane-updates" tabindex="-1" data-pane="updates" data-act="set-pane"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 15.5V4m0 0L7.5 8.5M12 4l4.5 4.5'/><path d='M4 16.5V19a1.5 1.5 0 0 0 1.5 1.5h13A1.5 1.5 0 0 0 20 19v-2.5'/></svg>Mises &agrave; jour</button>
+      <button type="button" class="set-nav-btn sel" role="tab" id="stab-general" aria-selected="true" aria-controls="spane-general" tabindex="0" data-pane="general" data-act="set-pane"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='3.1'/><path d='M12 2.8v2.6M12 18.6v2.6M2.8 12h2.6M18.6 12h2.6M5.5 5.5l1.9 1.9M16.6 16.6l1.9 1.9M18.5 5.5l-1.9 1.9M7.4 16.6l-1.9 1.9'/></svg>G&eacute;n&eacute;ral</button>
+      <button type="button" class="set-nav-btn" role="tab" id="stab-decouverte" aria-selected="false" aria-controls="spane-decouverte" tabindex="-1" data-pane="decouverte" data-act="set-pane"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='11' cy='11' r='7'/><path d='m21 21-4.3-4.3'/></svg>D&eacute;couverte</button>
+      <button type="button" class="set-nav-btn" role="tab" id="stab-interface" aria-selected="false" aria-controls="spane-interface" tabindex="-1" data-pane="interface" data-act="set-pane"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='2.5' y='4' width='19' height='13' rx='2'/><path d='M8 21h8M12 17v4'/></svg>Interface</button>
+      <button type="button" class="set-nav-btn" role="tab" id="stab-notifications" aria-selected="false" aria-controls="spane-notifications" tabindex="-1" data-pane="notifications" data-act="set-pane"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M6 9a6 6 0 0 1 12 0c0 5 2 6.5 2 6.5H4S6 14 6 9Z'/><path d='M10 19.5a2.2 2.2 0 0 0 4 0'/></svg>Notifications</button>
+      <button type="button" class="set-nav-btn" role="tab" id="stab-updates" aria-selected="false" aria-controls="spane-updates" tabindex="-1" data-pane="updates" data-act="set-pane"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 15.5V4m0 0L7.5 8.5M12 4l4.5 4.5'/><path d='M4 16.5V19a1.5 1.5 0 0 0 1.5 1.5h13A1.5 1.5 0 0 0 20 19v-2.5'/></svg>Mises &agrave; jour</button>
       <div class="set-nav-sep" role="separator"></div>
-      <button class="set-nav-btn danger" role="tab" id="stab-reset" aria-selected="false" aria-controls="spane-reset" tabindex="-1" data-pane="reset" data-act="set-pane"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 3.5 2.5 20h19L12 3.5Z'/><path d='M12 10v4.5M12 17.1v.1'/></svg>R&eacute;initialiser</button>
+      <button type="button" class="set-nav-btn danger" role="tab" id="stab-reset" aria-selected="false" aria-controls="spane-reset" tabindex="-1" data-pane="reset" data-act="set-pane"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 3.5 2.5 20h19L12 3.5Z'/><path d='M12 10v4.5M12 17.1v.1'/></svg>R&eacute;initialiser</button>
     </nav>
     <div class="set-panes">
       <section class="set-pane sel" role="tabpanel" id="spane-general" aria-labelledby="stab-general" data-pane="general">
@@ -284,8 +307,8 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
             <div class="set-label"><span>Th&egrave;me</span>
               <em>Apparence de l'interface. Conserv&eacute; sur ce poste.</em></div>
             <div class="set-ctrl seg" role="group" aria-label="Th&egrave;me">
-              <button id="tDark" class="seg-btn" data-act="theme" data-theme="dark" title="Th&egrave;me sombre (d&eacute;faut)">Sombre</button>
-              <button id="tLight" class="seg-btn" data-act="theme" data-theme="light" title="Th&egrave;me clair">Clair</button>
+              <button type="button" id="tDark" class="seg-btn" data-act="theme" data-theme="dark" aria-pressed="true" title="Th&egrave;me sombre (d&eacute;faut)">Sombre</button>
+              <button type="button" id="tLight" class="seg-btn" data-act="theme" data-theme="light" aria-pressed="false" title="Th&egrave;me clair">Clair</button>
             </div>
           </div>
         </div>
@@ -302,10 +325,10 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
               <input id="sScanTo" type="number" min="1" max="65535" class="set-num" aria-label="Port de fin de scan" aria-describedby="desc_scan err_scan"></div>
           </div>
           <div class="set-row">
-            <div class="set-label"><label for="sNetEnabled">Pairs &amp; r&eacute;seau</label>
+            <div class="set-label"><span id="lbl_net_enabled">Pairs &amp; r&eacute;seau</span>
               <em id="desc_net">D&eacute;tecte les autres moteurs MCP Control du LAN et leurs serveurs distants.</em></div>
             <div class="set-ctrl">
-              <label class="switch"><input type="checkbox" id="sNetEnabled" role="switch" aria-describedby="desc_net"><span class="switch-track"></span></label>
+              <label class="switch"><input type="checkbox" id="sNetEnabled" role="switch" aria-labelledby="lbl_net_enabled" aria-describedby="desc_net"><span class="switch-track"></span></label>
             </div>
           </div>
           <div class="set-row">
@@ -352,10 +375,10 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
       <section class="set-pane" role="tabpanel" id="spane-notifications" aria-labelledby="stab-notifications" data-pane="notifications">
         <div class="set-list">
           <div class="set-row">
-            <div class="set-label"><label for="sNotifDesktop">Toast desktop</label>
+            <div class="set-label"><span id="lbl_notif_desktop">Toast desktop</span>
               <em id="desc_notif_desktop">Notification Windows quand un serveur surveill&eacute; tombe (UP &rarr; DOWN ou PORT-ONLY).</em></div>
             <div class="set-ctrl">
-              <label class="switch"><input type="checkbox" id="sNotifDesktop" role="switch" aria-describedby="desc_notif_desktop"><span class="switch-track"></span></label>
+              <label class="switch"><input type="checkbox" id="sNotifDesktop" role="switch" aria-labelledby="lbl_notif_desktop" aria-describedby="desc_notif_desktop"><span class="switch-track"></span></label>
             </div>
           </div>
           <div class="set-row col">
@@ -402,10 +425,10 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
           <div class="set-row">
             <div class="set-label"><span>Test</span>
               <em>Enregistre la section puis &eacute;met une notification sur chaque canal activ&eacute;.</em></div>
-            <div class="set-ctrl"><button data-act="test-notify"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M6 9a6 6 0 0 1 12 0c0 5 2 6.5 2 6.5H4S6 14 6 9Z'/><path d='M10 19.5a2.2 2.2 0 0 0 4 0'/></svg> Tester</button></div>
+            <div class="set-ctrl"><button type="button" data-act="test-notify"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M6 9a6 6 0 0 1 12 0c0 5 2 6.5 2 6.5H4S6 14 6 9Z'/><path d='M10 19.5a2.2 2.2 0 0 0 4 0'/></svg> Tester</button></div>
           </div>
           <div class="set-row" hidden id="notifyMsgRow">
-            <div class="set-ctrl set-ctrl-wide"><span id="notifyMsg" class="set-note"></span></div>
+            <div class="set-ctrl set-ctrl-wide"><span id="notifyMsg" class="set-note" aria-live="polite"></span></div>
           </div>
         </div>
       </section>
@@ -422,9 +445,9 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
               <em id="updMsg">&nbsp;</em></div>
             <div class="set-ctrl">
               <span class="set-static" id="sLatest">&ndash;</span>
-              <button data-act="check-update" title="Interroge l'API GitHub releases/latest maintenant"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M21 12a9 9 0 1 1-2.6-6.4L21 8'/><path d='M21 3v5h-5'/></svg> V&eacute;rifier</button>
-              <button class="primary" id="btnUpdInstall" data-act="update-download" title="T&eacute;l&eacute;charge, v&eacute;rifie (SHA-256), installe et relance automatiquement la nouvelle version"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 15.5V4m0 0L7.5 8.5M12 4l4.5 4.5'/><path d='M4 16.5V19a1.5 1.5 0 0 0 1.5 1.5h13A1.5 1.5 0 0 0 20 19v-2.5'/></svg> Mettre &agrave; jour &amp; relancer</button>
-              <button data-act="release-page" title="Toutes les versions et archives"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M14 4h6v6M20 4l-9 9'/><path d='M19 14v5a1.5 1.5 0 0 1-1.5 1.5h-12A1.5 1.5 0 0 1 4 19V7.5A1.5 1.5 0 0 1 5.5 6H10'/></svg> Releases</button>
+              <button type="button" data-act="check-update" title="Interroge l'API GitHub releases/latest maintenant"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M21 12a9 9 0 1 1-2.6-6.4L21 8'/><path d='M21 3v5h-5'/></svg> V&eacute;rifier</button>
+              <button type="button" class="primary" id="btnUpdInstall" data-act="update-download" title="T&eacute;l&eacute;charge, v&eacute;rifie (SHA-256), installe et relance automatiquement la nouvelle version"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 15.5V4m0 0L7.5 8.5M12 4l4.5 4.5'/><path d='M4 16.5V19a1.5 1.5 0 0 0 1.5 1.5h13A1.5 1.5 0 0 0 20 19v-2.5'/></svg> Mettre &agrave; jour &amp; relancer</button>
+              <button type="button" data-act="release-page" title="Toutes les versions et archives"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M14 4h6v6M20 4l-9 9'/><path d='M19 14v5a1.5 1.5 0 0 1-1.5 1.5h-12A1.5 1.5 0 0 1 4 19V7.5A1.5 1.5 0 0 1 5.5 6H10'/></svg> Releases</button>
             </div>
           </div>
           <div class="set-row col" id="sSha256Row" hidden>
@@ -432,7 +455,7 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
               <em id="sSha256Note">Publi&eacute;e dans SHA256SUMS.txt de la release GitHub pour v&eacute;rifier l'int&eacute;grit&eacute; de l'installateur.</em></div>
             <div class="set-ctrl set-ctrl-wide">
               <code id="sSha256Val" class="mono-inline">&ndash;</code>
-              <button id="sSha256Copy" data-act="copy-sha256" hidden title="Copier l'empreinte SHA-256">Copier SHA-256</button>
+              <button type="button" id="sSha256Copy" data-act="copy-sha256" hidden title="Copier l'empreinte SHA-256">Copier SHA-256</button>
             </div>
           </div>
         </div>
@@ -450,31 +473,31 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
                 <option value="oublis">Oublis (seeds + machines)</option>
                 <option value="tout">Tout</option>
               </select>
-              <button class="danger" data-act="reset-state">R&eacute;initialiser</button>
+              <button type="button" class="danger" data-act="reset-state">R&eacute;initialiser</button>
             </div>
           </div>
           <div class="set-row" id="resetMsgRow" hidden>
-            <div class="set-ctrl set-ctrl-wide"><span id="resetMsg" class="set-note"></span></div>
+            <div class="set-ctrl set-ctrl-wide"><span id="resetMsg" class="set-note" aria-live="polite"></span></div>
           </div>
           <div class="set-row">
             <div class="set-label"><span>Historique runtime</span>
               <em>Efface crashs, relances et compteurs d'&eacute;chec enregistr&eacute;s par serveur. Ne touche ni la liste ni les r&eacute;glages.</em></div>
-            <div class="set-ctrl"><button class="danger" data-act="reset-runtime">Effacer</button></div>
+            <div class="set-ctrl"><button type="button" class="danger" data-act="reset-runtime">Effacer</button></div>
           </div>
           <div class="set-row" hidden id="runtimeMsgRow">
-            <div class="set-ctrl set-ctrl-wide"><span id="runtimeMsg" class="set-note"></span></div>
+            <div class="set-ctrl set-ctrl-wide"><span id="runtimeMsg" class="set-note" aria-live="polite"></span></div>
           </div>
         </div>
       </section>
     </div>
   </div>
-  <div id="settingsMsg" class="machine-msg set-msgline"></div>
+  <div id="settingsMsg" class="machine-msg set-msgline" aria-live="polite"></div>
   <div class="dlg-foot">
     <span id="settingsDirty" class="set-dirty" hidden>&#9679; Modifications non enregistr&eacute;es</span>
     <span class="dlg-foot-note" id="settingsFootNote"></span>
     <div class="row">
-      <button data-act="settings-close">Annuler</button>
-      <button class="primary" data-act="save-settings">Enregistrer</button>
+      <button type="button" data-act="settings-close">Annuler</button>
+      <button type="button" class="primary" data-act="save-settings">Enregistrer</button>
     </div>
   </div>
 </dialog>
@@ -493,15 +516,15 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
         <p>Clients appair&eacute;s, demandes d'appairage, confirmations, identit&eacute; et journal d'audit</p>
       </div>
     </div>
-    <button class="close" data-act="access-close" aria-label="Fermer" title="Fermer">&times;</button>
+    <button type="button" class="close" data-act="access-close" aria-label="Fermer" title="Fermer">&times;</button>
   </div>
   <div class="set-shell">
     <nav class="set-nav" id="accessNav" role="tablist" aria-orientation="vertical" aria-label="Sections de l'&eacute;cran Acc&egrave;s">
-      <button class="set-nav-btn sel" role="tab" id="atab-confirmations" aria-selected="true" aria-controls="apane-confirmations" tabindex="0" data-atab="confirmations" data-act="access-tab"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 3 4.5 6v5.5c0 4.4 3.1 8.3 7.5 9.5 4.4-1.2 7.5-5.1 7.5-9.5V6L12 3Z'/><path d='m8.8 11.8 2.2 2.2 4.2-4.4'/></svg>Confirmations<span class="nav-count" id="accCountPending" hidden>0</span></button>
-      <button class="set-nav-btn" role="tab" id="atab-appairage" aria-selected="false" aria-controls="apane-appairage" tabindex="-1" data-atab="appairage" data-act="access-tab"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M9.5 14.5 14.5 9.5'/><path d='M8 11 5.8 13.2a3.6 3.6 0 0 0 5 5L13 16'/><path d='M16 13l2.2-2.2a3.6 3.6 0 0 0-5-5L11 8'/></svg>Appairage<span class="nav-count" id="accCountPairs" hidden>0</span></button>
-      <button class="set-nav-btn" role="tab" id="atab-clients" aria-selected="false" aria-controls="apane-clients" tabindex="-1" data-atab="clients" data-act="access-tab"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='8' r='3.4'/><path d='M5 20c0-3.6 3.1-6 7-6s7 2.4 7 6'/></svg>Clients</button>
-      <button class="set-nav-btn" role="tab" id="atab-identite" aria-selected="false" aria-controls="apane-identite" tabindex="-1" data-atab="identite" data-act="access-tab"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='4.5' y='10.5' width='15' height='10' rx='2'/><path d='M8 10.5V7a4 4 0 0 1 8 0v3.5'/></svg>Identit&eacute; &amp; Sessions</button>
-      <button class="set-nav-btn" role="tab" id="atab-journal" aria-selected="false" aria-controls="apane-journal" tabindex="-1" data-atab="journal" data-act="access-tab"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M5 4.5h14v15H5z'/><path d='M8.5 8.5h7M8.5 12h7M8.5 15.5h4'/></svg>Journal d'audit</button>
+      <button type="button" class="set-nav-btn sel" role="tab" id="atab-confirmations" aria-selected="true" aria-controls="apane-confirmations" tabindex="0" data-atab="confirmations" data-act="access-tab"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 3 4.5 6v5.5c0 4.4 3.1 8.3 7.5 9.5 4.4-1.2 7.5-5.1 7.5-9.5V6L12 3Z'/><path d='m8.8 11.8 2.2 2.2 4.2-4.4'/></svg>Confirmations<span class="nav-count" id="accCountPending" hidden>0</span></button>
+      <button type="button" class="set-nav-btn" role="tab" id="atab-appairage" aria-selected="false" aria-controls="apane-appairage" tabindex="-1" data-atab="appairage" data-act="access-tab"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M9.5 14.5 14.5 9.5'/><path d='M8 11 5.8 13.2a3.6 3.6 0 0 0 5 5L13 16'/><path d='M16 13l2.2-2.2a3.6 3.6 0 0 0-5-5L11 8'/></svg>Appairage<span class="nav-count" id="accCountPairs" hidden>0</span></button>
+      <button type="button" class="set-nav-btn" role="tab" id="atab-clients" aria-selected="false" aria-controls="apane-clients" tabindex="-1" data-atab="clients" data-act="access-tab"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='8' r='3.4'/><path d='M5 20c0-3.6 3.1-6 7-6s7 2.4 7 6'/></svg>Clients</button>
+      <button type="button" class="set-nav-btn" role="tab" id="atab-identite" aria-selected="false" aria-controls="apane-identite" tabindex="-1" data-atab="identite" data-act="access-tab"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='4.5' y='10.5' width='15' height='10' rx='2'/><path d='M8 10.5V7a4 4 0 0 1 8 0v3.5'/></svg>Identit&eacute; &amp; Sessions</button>
+      <button type="button" class="set-nav-btn" role="tab" id="atab-journal" aria-selected="false" aria-controls="apane-journal" tabindex="-1" data-atab="journal" data-act="access-tab"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M5 4.5h14v15H5z'/><path d='M8.5 8.5h7M8.5 12h7M8.5 15.5h4'/></svg>Journal d'audit</button>
     </nav>
     <div class="set-panes acc-panes">
       <section class="set-pane sel" role="tabpanel" id="apane-confirmations" aria-labelledby="atab-confirmations" data-atab="confirmations">
@@ -514,10 +537,10 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
       <section class="set-pane" role="tabpanel" id="apane-journal" aria-labelledby="atab-journal" data-atab="journal"><div id="accDecisions" class="acc-list"></div></section>
     </div>
   </div>
-  <div id="accessMsg" class="machine-msg set-msgline"></div>
+  <div id="accessMsg" class="machine-msg set-msgline" aria-live="polite"></div>
   <div class="dlg-foot">
     <span class="dlg-foot-note">Approbation r&eacute;serv&eacute;e &agrave; cette fen&ecirc;tre (session locale). Rien n'est persist&eacute; : un red&eacute;marrage redemande tout.</span>
-    <div class="row"><button data-act="access-refresh">Rafra&icirc;chir</button></div>
+    <div class="row"><button type="button" data-act="access-refresh">Rafra&icirc;chir</button></div>
   </div>
 </dialog>
 
@@ -530,7 +553,7 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     <form data-act="login-submit">
       <label for="loginCode">Code d'acc&egrave;s (mode legacy api_access)</label>
       <input id="loginCode" type="password" autocomplete="off" placeholder="code d'acc&egrave;s">
-      <div id="loginMsg" class="machine-msg"></div>
+      <div id="loginMsg" class="machine-msg" aria-live="polite"></div>
       <div class="row row-between">
         <button type="button" data-act="forget-code" title="Supprime le code enregistr&eacute; dans ce navigateur">Oublier le code enregistr&eacute;</button>
         <button type="submit" class="primary">D&eacute;verrouiller</button>
@@ -542,7 +565,7 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 <dialog id="confirmDlg" aria-labelledby="confirmDlgTitle" aria-describedby="confirmDlgMsg">
   <div class="dlg-head">
     <h2 id="confirmDlgTitle">Confirmation</h2>
-    <button class="close" data-act="confirm-dlg-cancel" aria-label="Fermer">&times;</button>
+    <button type="button" class="close" data-act="confirm-dlg-cancel" aria-label="Fermer">&times;</button>
   </div>
   <div class="dlg-body">
     <p id="confirmDlgMsg" class="confirm-msg"></p>
@@ -556,7 +579,7 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 </dialog>
 
 <div id="ctxmenu" class="ctxmenu" role="menu" hidden></div>
-<div id="toast" aria-live="polite" role="status"></div>
+<div id="toast" popover="manual" aria-live="polite" role="status"></div>
 </body>
 </html>
 "#;
@@ -1477,5 +1500,492 @@ mod tests {
             "le bandeau doit lire state.access"
         );
         assert!(APP_JS.contains("tbAccessN"), "pastille de compteur absente");
+    }
+
+    // ---------- Contrats Phase 3 : A11y, navigation & Top-Layer ----------
+
+    #[test]
+    fn coquille_a11y_et_navigation_clavier_verrouilles() {
+        let html = INDEX_HTML.replace("\r\n", "\n");
+
+        // 1. Lien d'évitement juste après <body>
+        assert!(
+            html.contains("<body>\n<a href='#content' class=\"skip-link\">"),
+            "skip-link vers #content manquant juste après <body>"
+        );
+
+        // 2. Barre de titre : logo en <button> go-home, #discoverMenu non-draggable,
+        //    aria-label sur chaque bouton interactif (hors items textuels du menu).
+        assert!(
+            html.contains(r#"<header id="titlebar" data-tauri-drag-region="deep">"#),
+            "#titlebar doit garder data-tauri-drag-region=\"deep\""
+        );
+        assert!(
+            html.contains(r#"<button type="button" class="logo" data-act="go-home""#),
+            "le logo doit être un <button type=\"button\" data-act=\"go-home\">"
+        );
+        assert!(
+            html.contains(r#"id="discoverMenu""#)
+                && html.contains(r#"data-tauri-drag-region="false""#),
+            "#discoverMenu doit porter data-tauri-drag-region=\"false\""
+        );
+        let tb_start = html.find("<header id=\"titlebar\"").unwrap();
+        let tb_end = html[tb_start..].find("</header>").unwrap() + tb_start;
+        let titlebar = &html[tb_start..tb_end];
+        let mut scan = titlebar;
+        while let Some(pos) = scan.find("<button") {
+            let close = scan[pos..].find('>').unwrap() + pos;
+            let tag = &scan[pos..=close];
+            if !tag.contains(r#"role="menuitem""#) {
+                assert!(
+                    tag.contains("aria-label=\""),
+                    "bouton de #titlebar sans aria-label (perdu au repli <= 1120 px) : {tag}"
+                );
+            }
+            scan = &scan[close + 1..];
+        }
+
+        // 3. #accessBanner encapsulé dans un vrai <button>
+        assert!(
+            html.contains(
+                r#"<div id="accessBanner" hidden aria-live="polite" role="status"><button type="button" id="accessBannerBtn" class="access-banner-btn" data-act="access-open""#
+            ),
+            "#accessBanner doit contenir #accessBannerBtn sans data-act sur le <div>"
+        );
+
+        // 4. Explorateur : aria-pressed, #hiddenBar en <button>, #localHead/.grp-toggle, #grip clavier
+        assert!(
+            html.contains(r#"data-act="exp-state" data-mode="all" aria-pressed="true""#),
+            "pilule Tous doit porter aria-pressed=\"true\""
+        );
+        for mode in ["up", "down", "locked", "paused"] {
+            assert!(
+                html.contains(&format!(
+                    r#"data-act="exp-state" data-mode="{mode}" aria-pressed="false""#
+                )),
+                "pilule {mode} doit porter aria-pressed=\"false\""
+            );
+        }
+        assert!(
+            html.contains(r#"<button type="button" id="hiddenBar" hidden data-act="show-hidden""#),
+            "#hiddenBar doit être un <button type=\"button\">"
+        );
+        assert!(
+            html.contains(
+                r#"<div class="grphead" id="localHead"><button type="button" class="grp-toggle" data-act="group-toggle" data-key="local" aria-expanded="true" aria-controls="srvList""#
+            ),
+            "#localHead doit contenir un bouton .grp-toggle accessible"
+        );
+        for attr in [
+            r#"id="grip""#,
+            r#"tabindex="0""#,
+            r#"aria-valuemin="180""#,
+            r#"aria-valuemax="520""#,
+            r#"aria-valuenow="320""#,
+        ] {
+            assert!(
+                html.contains(attr),
+                "attribut clavier manquant sur #grip : {attr}"
+            );
+        }
+
+        // 5. Journal : #loghead sans data-act, #logToggleBtn, filtres, outils, #logbody aria-live="off"
+        assert!(
+            html.contains("<div id=\"loghead\">"),
+            "#loghead ne doit plus porter data-act directement"
+        );
+        assert!(
+            html.contains(
+                r#"<button type="button" id="logToggleBtn" class="log-toggle" data-act="log-toggle" aria-expanded="false" aria-controls="logbody""#
+            ),
+            "#logToggleBtn manquant ou mal configuré"
+        );
+        for marker in [
+            r#"id="logCountBadge""#,
+            r#"id="logErrBadge""#,
+            r#"id="logFilters""#,
+            r#"data-act="log-filter" data-level="all" aria-pressed="true""#,
+            r#"data-act="log-filter" data-level="warn" aria-pressed="false""#,
+            r#"data-act="log-filter" data-level="error" aria-pressed="false""#,
+            r#"data-act="log-copy""#,
+            r#"data-act="log-clear""#,
+            r#"id="logExpandBtn" class="log-tbtn" data-act="log-expand" aria-pressed="false""#,
+            r#"<span class="tb-badge tb-hint">auto-d&eacute;tection : HTTP streamable &middot; stdio JSON-RPC</span>"#,
+            r#"<div id="logbody" aria-live="off"></div>"#,
+        ] {
+            assert!(
+                html.contains(marker),
+                "marqueur journal manquant : {marker}"
+            );
+        }
+        let st_auto_pos = html.find(r#"id="stAuto""#).unwrap();
+        let st_auto_end = html[st_auto_pos..].find('>').unwrap() + st_auto_pos;
+        assert!(
+            html[st_auto_pos..=st_auto_end].contains("aria-label=\""),
+            "#stAuto doit avoir un aria-label initial"
+        );
+
+        // 6. Dialogues, labels uniques, régions live et #toast popover="manual"
+        assert!(
+            html.contains(
+                r#"<h2 id="dlgAddTitle"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 5v14M5 12h14'/></svg> Ajouter un serveur MCP</h2>"#
+            ),
+            "icône SVG manquante dans #dlgAddTitle"
+        );
+        assert!(
+            html.contains(
+                r#"id="storeSearchClear" class="search-clear" hidden data-act="store-clear-search""#
+            ),
+            "bouton clear recherche boutique manquant"
+        );
+        assert!(
+            html.contains(r#"id="tDark" class="seg-btn" data-act="theme" data-theme="dark" aria-pressed="true""#)
+                && html.contains(r#"id="tLight" class="seg-btn" data-act="theme" data-theme="light" aria-pressed="false""#),
+            "aria-pressed initial manquant sur #tDark / #tLight"
+        );
+        assert!(
+            !html.contains(r#"for="sNetEnabled""#) && !html.contains(r#"for="sNotifDesktop""#),
+            "label dupliqué sur #sNetEnabled ou #sNotifDesktop"
+        );
+        assert!(
+            html.contains(r#"id="lbl_net_enabled""#)
+                && html.contains(
+                    r#"id="sNetEnabled" role="switch" aria-labelledby="lbl_net_enabled""#
+                )
+                && html.contains(r#"id="lbl_notif_desktop""#)
+                && html.contains(
+                    r#"id="sNotifDesktop" role="switch" aria-labelledby="lbl_notif_desktop""#
+                ),
+            "aria-labelledby manquant sur #sNetEnabled ou #sNotifDesktop"
+        );
+        for live_id in [
+            "importMsg",
+            "machineMsg",
+            "settingsMsg",
+            "notifyMsg",
+            "resetMsg",
+            "runtimeMsg",
+            "accessMsg",
+            "loginMsg",
+            "storeResults",
+        ] {
+            let p = html
+                .find(&format!("id=\"{live_id}\""))
+                .unwrap_or_else(|| panic!("élément live absent : {live_id}"));
+            let e = html[p..].find('>').unwrap() + p;
+            assert!(
+                html[p..=e].contains(r#"aria-live="polite""#),
+                "aria-live=\"polite\" manquant sur #{live_id}"
+            );
+        }
+        assert!(
+            html.contains(
+                r#"<div id="toast" popover="manual" aria-live="polite" role="status"></div>"#
+            ),
+            "#toast doit utiliser popover=\"manual\" (Top Layer)"
+        );
+    }
+
+    #[test]
+    fn coquille_ids_uniques_et_sans_boutons_imbriques() {
+        let mut ids = Vec::new();
+        let bytes = INDEX_HTML.as_bytes();
+        let mut i = 0usize;
+        while let Some(rel) = INDEX_HTML[i..].find("id=\"") {
+            let abs = i + rel;
+            let prev = abs.checked_sub(1).and_then(|k| bytes.get(k)).copied();
+            if matches!(prev, Some(b' ' | b'\n' | b'\r' | b'\t')) {
+                let s = abs + 4;
+                let e = INDEX_HTML[s..].find('"').map(|k| s + k).unwrap_or(s);
+                let id = &INDEX_HTML[s..e];
+                assert!(!ids.contains(&id), "id dupliqué dans INDEX_HTML : {id}");
+                ids.push(id);
+                i = e;
+            } else {
+                i = abs + 4;
+            }
+        }
+        // Aucun <button> imbriqué dans un autre <button>
+        let mut depth = 0usize;
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            if bytes[pos..].starts_with(b"<button") {
+                let next = bytes.get(pos + 7).copied().unwrap_or(b' ');
+                if next == b' ' || next == b'>' || next == b'\n' || next == b'\r' {
+                    assert_eq!(depth, 0, "bouton imbriqué détecté près de l'offset {pos}");
+                    depth += 1;
+                }
+            } else if bytes[pos..].starts_with(b"</button>") {
+                depth = depth.saturating_sub(1);
+            }
+            pos += 1;
+        }
+        assert_eq!(depth, 0, "balise <button> non fermée dans INDEX_HTML");
+    }
+
+    #[test]
+    fn contrats_phase3_js_et_css() {
+        assert!(
+            APP_JS.contains("escPre"),
+            "helper escPre() requis pour préserver les sauts de ligne JSON/args"
+        );
+        assert!(
+            APP_JS.contains("showPopover"),
+            "toast() doit promouvoir #toast via showPopover() en Top Layer"
+        );
+        assert!(
+            !APP_JS.contains("'--key'"),
+            "pairGuideHtml() ne doit plus générer '--key' (rejeté par bridge.rs)"
+        );
+        let table: Vec<String> = act_table().into_iter().map(|(k, _)| k).collect();
+        for key in [
+            "go-home",
+            "log-filter",
+            "log-copy",
+            "log-clear",
+            "log-expand",
+            "store-clear-search",
+            "store-reset-filters",
+            "tool-search-clear",
+            "tool-args-format",
+            "copy-tool-res",
+        ] {
+            assert!(
+                table.contains(&key.to_string()),
+                "action Phase 3 absente de ACT : {key}"
+            );
+        }
+        for sel in [
+            ".skip-link",
+            ".access-banner-btn",
+            "#explorer.resizing",
+            ".grp-toggle",
+            ".crumb-link",
+            ".d-head.st-DOWN",
+            ".d-head.st-DISABLED",
+            ".dash-link",
+            ".t3",
+            ".spin",
+            ".search-clear",
+            ".log-toggle",
+            ".log-badge",
+            ".log-filters",
+            ".log-fbtn",
+            ".log-tools",
+            ".log-tbtn",
+            ".tb-hint",
+            ".logo-on-dark",
+            ".logo-on-light",
+            "#toast[popover]",
+            r#".ctxmenu[data-x="2496"]"#,
+            r#".ctxmenu[data-y="1376"]"#,
+            ".acc-acts-sep",
+            ".acc-guide-card",
+            ".tile-neutral",
+            ".dot.IDLE",
+        ] {
+            assert!(
+                APP_CSS.contains(sel),
+                "sélecteur Phase 3 attendu absent de app.css : {sel}"
+            );
+        }
+    }
+
+    #[test]
+    fn boutique_bouton_supprimer_avec_confirmation() {
+        let table: Vec<String> = act_table().into_iter().map(|(k, _)| k).collect();
+        assert!(
+            table.contains(&"uninstall-store".to_string()),
+            "action uninstall-store absente de ACT"
+        );
+        assert!(
+            APP_JS.contains("async function uninstallStore(")
+                && APP_JS.contains("askConfirm(")
+                && APP_JS.contains("action: 'uninstall_store'"),
+            "uninstallStore() avec confirmation askConfirm et action uninstall_store requis"
+        );
+        assert!(
+            APP_CSS.contains(".scard-inst-badge") && APP_CSS.contains(".btn-uninst"),
+            "styles .scard-inst-badge et .btn-uninst requis dans app.css"
+        );
+    }
+
+    #[test]
+    fn bouton_accueil_barre_titre_ramene_au_dashboard_initial() {
+        let html = INDEX_HTML.replace("\r\n", "\n");
+
+        // 1. #tbExplToggle porte data-tauri-drag-region="false" et est suivi
+        //    immédiatement par le bouton logo/accueil #tbHome (aucun autre <button entre eux).
+        let expl_pos = html
+            .find(r#"id="tbExplToggle""#)
+            .expect("#tbExplToggle absent de INDEX_HTML");
+        let expl_start = html[..expl_pos]
+            .rfind("<button")
+            .expect("balise ouvrante de #tbExplToggle absente");
+        let expl_open_end = html[expl_start..]
+            .find('>')
+            .expect("fin de balise ouvrante #tbExplToggle absente")
+            + expl_start;
+        let expl_tag = &html[expl_start..=expl_open_end];
+        assert!(
+            expl_tag.contains(r#"data-tauri-drag-region="false""#),
+            "#tbExplToggle doit porter data-tauri-drag-region=\"false\" : {expl_tag}"
+        );
+
+        let expl_close = html[expl_open_end..]
+            .find("</button>")
+            .expect("fermeture de #tbExplToggle absente")
+            + expl_open_end
+            + "</button>".len();
+        let after_expl = &html[expl_close..];
+        let next_btn = after_expl
+            .find("<button")
+            .expect("aucun <button après #tbExplToggle");
+        let home_prefix = r#"<button type="button" class="logo" data-act="go-home" id="tbHome" data-tauri-drag-region="false""#;
+        assert!(
+            after_expl[next_btn..].starts_with(home_prefix),
+            "#tbExplToggle doit être immédiatement suivi par #tbHome : {}",
+            &after_expl[next_btn..after_expl.len().min(next_btn + 160)]
+        );
+
+        // 2. ACT mappe 'go-home' vers goHome(
+        let table = act_table();
+        let go_home_handler = table
+            .iter()
+            .find(|(k, _)| k == "go-home")
+            .map(|(_, v)| v.as_str())
+            .expect("action 'go-home' absente de ACT");
+        assert!(
+            go_home_handler.contains("goHome("),
+            "ACT['go-home'] doit appeler goHome( : {go_home_handler}"
+        );
+
+        // 3. goHome() réinitialise complètement l'état vers le tableau de bord initial
+        let go_home = fn_body(APP_JS, "goHome");
+        for needle in [
+            "selectedId = null",
+            "detailCache = null",
+            "detailTab = 'outils'",
+            "overviewFilter = null",
+            "expStateFilter = 'all'",
+            "srvFilter",
+            "expStatePills",
+            "toolSearchQuery = ''",
+            "closeDiscoverMenu(",
+            "ctxClose(",
+            "scrollTop = 0",
+            "delete contentEl.dataset.srvId",
+            "render()",
+        ] {
+            assert!(
+                go_home.contains(needle),
+                "goHome() doit contenir `{needle}`"
+            );
+        }
+
+        // 4. select() délègue à goHome() quand id est vide
+        let select_fn = fn_body(APP_JS, "select");
+        assert!(
+            select_fn.contains("goHome()"),
+            "select() doit déléguer à goHome()"
+        );
+
+        // 5. CSS : curseur pointeur sur le logo et pointer-events:none sur ses enfants / icône
+        assert!(
+            APP_CSS.contains("cursor:pointer"),
+            "app.css doit contenir cursor:pointer"
+        );
+        assert!(
+            APP_CSS.contains("pointer-events:none"),
+            "app.css doit contenir pointer-events:none"
+        );
+    }
+
+    #[test]
+    fn mode_hybride_bloque_config_stdio_directe_dans_conf_agent() {
+        for (fname, bridge_tok, url_tok) in [
+            ("hermesYaml", "'bridge'", "'--url'"),
+            ("mcpJson", "'bridge'", "'--url'"),
+            ("claudeCmd", "bridge", "--url"),
+        ] {
+            let body = fn_body(APP_JS, fname);
+            let h_pos = body
+                .find("hybridUrl(")
+                .unwrap_or_else(|| panic!("{fname}() doit tester hybridUrl(s)"));
+            let prog_pos = body.find("transport_info.program").unwrap_or_else(|| {
+                panic!("{fname}() doit conserver le repli transport_info.program")
+            });
+            assert!(
+                h_pos < prog_pos,
+                "{fname}() doit tester hybridUrl(s) AVANT transport_info.program"
+            );
+            assert!(
+                body.contains("mcp-control") && body.contains(bridge_tok) && body.contains(url_tok),
+                "{fname}() doit générer le pont signé mcp-control bridge --url"
+            );
+        }
+
+        let conf = fn_body(APP_JS, "confAgent");
+        assert!(
+            conf.contains("const hUrl = hybridUrl(s)"),
+            "confAgent() doit lire hybridUrl(s)"
+        );
+        assert!(
+            conf.contains("if (hUrl) {"),
+            "confAgent() doit avoir une branche hybride exclusive `if (hUrl)`"
+        );
+        assert!(
+            conf.contains("conf-hybrid-lock"),
+            "confAgent() doit afficher le bandeau de blocage `.conf-hybrid-lock`"
+        );
+        assert!(
+            conf.contains("Pont hybride Ed25519"),
+            "confAgent() doit titrer les 3 blocs hybrides signés Ed25519"
+        );
+        assert!(
+            !conf.contains("hybridBlk"),
+            "confAgent() ne doit plus dupliquer le bloc JSON via hybridBlk"
+        );
+        assert!(
+            APP_CSS.contains(".conf-note.conf-hybrid-lock"),
+            "app.css doit styler `.conf-note.conf-hybrid-lock`"
+        );
+    }
+
+    #[test]
+    fn badge_docker_explorateur_et_detail_respectent_csp_et_xss() {
+        let logo_line = APP_JS
+            .lines()
+            .find(|l| l.contains("const DOCKER_LOGO ="))
+            .expect("DOCKER_LOGO doit être défini dans app.js");
+        assert!(
+            !logo_line.contains("style="),
+            "DOCKER_LOGO ne doit contenir aucun style= (CSP stricte)"
+        );
+        let badge_fn = fn_body(APP_JS, "dockerBadge");
+        assert!(
+            !badge_fn.contains("style="),
+            "dockerBadge() ne doit contenir aucun style= (CSP stricte)"
+        );
+        assert!(
+            badge_fn.contains("esc(tip)") && badge_fn.contains("esc(lbl)"),
+            "dockerBadge() doit échapper tip et lbl via esc()"
+        );
+        let row_fn = fn_body(APP_JS, "srvRow");
+        assert!(
+            row_fn.contains("dockerBadge(s, false)"),
+            "srvRow() doit afficher dockerBadge(s, false) dans l'explorateur"
+        );
+        let det_fn = fn_body(APP_JS, "renderDetail");
+        assert!(
+            det_fn.contains("dockerBadge(s, true)"),
+            "renderDetail() doit afficher dockerBadge(s, true) dans l'en-tête"
+        );
+        for cls in [".dockerwrap", ".dockerlogo", ".tag.docker"] {
+            assert!(
+                APP_CSS.contains(cls),
+                "app.css doit définir la classe {cls}"
+            );
+        }
     }
 }

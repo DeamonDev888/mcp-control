@@ -30,7 +30,7 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
 /// ailleurs (audit 2026-10-24). `Ok(Some(tag))` = tag lu ; `Ok(None)` = réponse
 /// sans tag ; `Err` = réseau/API/outil indisponible — la distinction permet au
 /// bouton « Vérifier » de ne plus prétendre « à jour » quand le check a raté.
-fn github_latest_tag() -> Result<Option<String>, &'static str> {
+pub(crate) fn github_latest_tag() -> Result<Option<String>, &'static str> {
     let mut c = crate::probe::system_command("curl");
     probe::probe_hidden_cmd(&mut c);
     if let Ok(out) = c
@@ -167,6 +167,56 @@ pub fn release_asset(kind: &str, os: &str) -> Option<&'static str> {
         ("cli", "linux") => Some("mcp-control-cli-linux-x86_64"),
         _ => None,
     }
+}
+
+/// Actif CLI publié pour un OS + architecture distants (`ssh_install_cli`).
+/// Table blanche stricte : une architecture sans livrable CLI publié renvoie `None`.
+pub fn cli_release_asset(os: &str, arch: &str) -> Option<&'static str> {
+    let os_norm = os.trim().to_ascii_lowercase();
+    let arch_norm = arch.trim().to_ascii_lowercase();
+    match (os_norm.as_str(), arch_norm.as_str()) {
+        ("linux", "x86_64" | "amd64") => Some("mcp-control-cli-linux-x86_64"),
+        ("macos" | "darwin", "x86_64" | "arm64" | "aarch64") => {
+            Some("mcp-control-cli-macos-universal")
+        }
+        ("windows", "x86_64" | "amd64") => Some("mcp-control-cli-windows-x86_64.exe"),
+        _ => None,
+    }
+}
+
+/// Résout `(tag, url, expected_sha256)` pour le binaire CLI le plus récent d'un OS/arch.
+/// Refuse catégoriquement si le tag est hors gabarit ou si le SHA-256 est absent/malformé.
+pub fn latest_cli_download(os: &str, arch: &str) -> Result<(String, String, String), String> {
+    let asset = cli_release_asset(os, arch).ok_or_else(|| {
+        format!("aucun binaire CLI publié pour {os}/{arch} (installation auto impossible)")
+    })?;
+    let tag = github_latest_tag()
+        .map_err(|e| format!("release GitHub injoignable : {e}"))?
+        .ok_or_else(|| "aucune release GitHub publiée trouvée".to_string())?;
+    if !tag_url_safe(&tag) {
+        return Err("tag de release GitHub hors gabarit".to_string());
+    }
+    let sha256 = match expected_sha256(&tag, asset) {
+        Ok(Sha256Lookup::Found(s)) => s,
+        Ok(Sha256Lookup::Absent) => {
+            return Err(format!(
+                "empreinte SHA-256 absente de SHA256SUMS.txt pour {asset} ({tag}) — refus d'installer"
+            ));
+        }
+        Ok(Sha256Lookup::Malformed) => {
+            return Err(format!(
+                "empreinte SHA-256 malformée dans SHA256SUMS.txt pour {asset} ({tag}) — refus d'installer"
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "SHA256SUMS.txt illisible pour {tag} ({e}) — refus d'installer sans vérification"
+            ));
+        }
+    };
+    let url =
+        format!("https://github.com/DeamonDev888/mcp-control/releases/download/{tag}/{asset}");
+    Ok((tag, url, sha256))
 }
 
 /// L'OS du binaire qui tourne, tel que nommé dans la table ci-dessus.
@@ -640,4 +690,35 @@ pub fn perform_auto_update(state: &Arc<AppState>) -> Value {
         "asset": asset,
         "sha256": verified_sha,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cli_release_asset;
+
+    #[test]
+    fn cli_release_asset_table_blanche() {
+        assert_eq!(
+            cli_release_asset("linux", "x86_64"),
+            Some("mcp-control-cli-linux-x86_64")
+        );
+        assert_eq!(
+            cli_release_asset("Linux", "amd64"),
+            Some("mcp-control-cli-linux-x86_64")
+        );
+        assert_eq!(
+            cli_release_asset("macos", "arm64"),
+            Some("mcp-control-cli-macos-universal")
+        );
+        assert_eq!(
+            cli_release_asset("Darwin", "aarch64"),
+            Some("mcp-control-cli-macos-universal")
+        );
+        assert_eq!(
+            cli_release_asset("windows", "x86_64"),
+            Some("mcp-control-cli-windows-x86_64.exe")
+        );
+        assert_eq!(cli_release_asset("linux", "aarch64"), None);
+        assert_eq!(cli_release_asset("freebsd", "x86_64"), None);
+    }
 }

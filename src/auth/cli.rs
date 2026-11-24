@@ -22,6 +22,10 @@ use crate::auth::secret;
 
 pub const USAGE: &str = "mcp-control auth <commande>\n\
   pair <url>         appairer ce poste avec un moteur MCP Control (http://127.0.0.1:port ou https://hôte:port)\n\
+  pending            lister les demandes d'appairage en attente sur le moteur local\n\
+  approve <pair_id> [droits...]  approuver une demande (défaut : lecture)\n\
+  reject <pair_id>   refuser une demande d'appairage en attente\n\
+  state              afficher un état JSON assaini du moteur local\n\
   list               clients appairés du moteur local\n\
   revoke <keyid>     révoquer un client (effet à la requête suivante)\n\
   fingerprint        empreintes de l'identité du serveur local\n\
@@ -626,6 +630,165 @@ fn cmd_pair(url: &str) -> i32 {
     0
 }
 
+fn cmd_pending() -> i32 {
+    match action(json!({ "action": "pair_list" })) {
+        Ok(v) => {
+            let pending = v
+                .get("pending")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if pending.is_empty() {
+                println!("Aucune demande d'appairage en attente.");
+                return 0;
+            }
+            println!(
+                "{:<34} {:<18} {:<26} {:<8} SOURCE",
+                "PAIR_ID", "LIBELLÉ", "KEYID", "CODE"
+            );
+            for p in pending {
+                println!(
+                    "{:<34} {:<18} {:<26} {:<8} {}",
+                    p.get("pair_id").and_then(|x| x.as_str()).unwrap_or(""),
+                    p.get("label").and_then(|x| x.as_str()).unwrap_or(""),
+                    p.get("keyid").and_then(|x| x.as_str()).unwrap_or(""),
+                    p.get("code").and_then(|x| x.as_str()).unwrap_or(""),
+                    p.get("paired_from").and_then(|x| x.as_str()).unwrap_or(""),
+                );
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("auth pending : {e}");
+            1
+        }
+    }
+}
+
+pub(crate) fn parse_approve_rights(args: &[String]) -> Result<Vec<String>, String> {
+    if args.is_empty() {
+        return Ok(vec![crate::auth::RIGHT_LECTURE.to_string()]);
+    }
+    let mut out = Vec::new();
+    for raw in args {
+        let r = raw.trim();
+        if !crate::auth::registry::is_grantable(r) {
+            return Err(format!(
+                "droit refusé « {r} » (attendu : lecture, pilotage ou execution)"
+            ));
+        }
+        if !out.iter().any(|x| x == r) {
+            out.push(r.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn cmd_approve(pair_id: &str, right_args: &[String]) -> i32 {
+    let pair_id = pair_id.trim();
+    if pair_id.is_empty() {
+        eprintln!("auth approve : pair_id manquant");
+        return 2;
+    }
+    let rights = match parse_approve_rights(right_args) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("auth approve : {e}");
+            return 2;
+        }
+    };
+    match action(json!({
+        "action": "pair_approve",
+        "pair_id": pair_id,
+        "rights": rights,
+    })) {
+        Ok(v) => {
+            println!(
+                "Appairage approuvé : keyid={} — droits : {}",
+                v.get("keyid").and_then(|x| x.as_str()).unwrap_or("?"),
+                rights.join(", ")
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("auth approve : {e}");
+            1
+        }
+    }
+}
+
+fn cmd_reject(pair_id: &str) -> i32 {
+    let pair_id = pair_id.trim();
+    if pair_id.is_empty() {
+        eprintln!("auth reject : pair_id manquant");
+        return 2;
+    }
+    match action(json!({ "action": "pair_reject", "pair_id": pair_id })) {
+        Ok(_) => {
+            println!("Appairage {pair_id} refusé.");
+            0
+        }
+        Err(e) => {
+            eprintln!("auth reject : {e}");
+            1
+        }
+    }
+}
+
+pub(crate) fn sanitize_cli_state(v: &Value) -> Value {
+    json!({
+        "app": v.get("app").cloned().unwrap_or_else(|| json!("mcp-control")),
+        "version": v.get("version").cloned().unwrap_or_else(|| json!(env!("CARGO_PKG_VERSION"))),
+        "stats": v.get("stats").cloned().unwrap_or_else(|| json!({})),
+        "servers": v.get("servers").cloned().unwrap_or_else(|| json!([])),
+    })
+}
+
+fn cmd_state() -> i32 {
+    let port = match local_port() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("auth state : {e}");
+            return 1;
+        }
+    };
+    let (cookie, secret) = match local_session(port) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("auth state : {e}");
+            return 1;
+        }
+    };
+    let cookie_hdr = format!("{}={cookie}", crate::auth::session::COOKIE_NAME);
+    let (status, _, corps) = match http_with_headers(
+        "127.0.0.1",
+        port,
+        "GET",
+        "/api/state",
+        &[("Cookie", &cookie_hdr), ("X-MCC-Session", &secret)],
+        None,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("auth state : {e}");
+            return 1;
+        }
+    };
+    if status != 200 {
+        eprintln!("auth state : le moteur a répondu HTTP {status}");
+        return 1;
+    }
+    let v: Value = match serde_json::from_str(&corps) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("auth state : JSON illisible ({e})");
+            return 1;
+        }
+    };
+    println!("{}", sanitize_cli_state(&v));
+    0
+}
+
 fn cmd_list() -> i32 {
     match action(json!({ "action": "client_list" })) {
         Ok(v) => {
@@ -808,6 +971,24 @@ pub fn run(args: &[String]) -> i32 {
                 2
             }
         },
+        Some("pending") => cmd_pending(),
+        Some("approve") => match args.get(1) {
+            Some(pair_id) => cmd_approve(pair_id, &args[2..]),
+            None => {
+                eprintln!("auth approve : pair_id manquant");
+                eprintln!("{USAGE}");
+                2
+            }
+        },
+        Some("reject") => match args.get(1) {
+            Some(pair_id) => cmd_reject(pair_id),
+            None => {
+                eprintln!("auth reject : pair_id manquant");
+                eprintln!("{USAGE}");
+                2
+            }
+        },
+        Some("state") => cmd_state(),
         Some("list") => cmd_list(),
         Some("revoke") => match args.get(1) {
             Some(keyid) => cmd_revoke(keyid),
@@ -931,5 +1112,38 @@ mod tests {
             premier_secret_du_fichier("-----BEGIN LITEMCP ED25519 PRIVATE KEY-----"),
             Some("PRIVATE KEY")
         );
+    }
+
+    #[test]
+    fn approve_rights_valides_et_rejet_admin() {
+        assert_eq!(parse_approve_rights(&[]), Ok(vec!["lecture".to_string()]));
+        assert_eq!(
+            parse_approve_rights(&[
+                "lecture".to_string(),
+                "pilotage".to_string(),
+                "lecture".to_string()
+            ]),
+            Ok(vec!["lecture".to_string(), "pilotage".to_string()])
+        );
+        assert!(parse_approve_rights(&["admin".to_string()]).is_err());
+        assert!(parse_approve_rights(&["inconnu".to_string()]).is_err());
+    }
+
+    #[test]
+    fn sanitize_cli_state_ne_laisse_que_champs_publics() {
+        let raw = json!({
+            "app": "mcp-control",
+            "version": "0.8.8",
+            "stats": {"total": 1, "up": 1},
+            "servers": [{"id": "s1"}],
+            "settings": {"api_access": "secret", "notify": {"webhook_url": "http://x"}},
+            "log": [{"msg": "interne"}]
+        });
+        let out = sanitize_cli_state(&raw);
+        assert_eq!(out["app"], json!("mcp-control"));
+        assert_eq!(out["stats"]["total"], json!(1));
+        assert_eq!(out["servers"][0]["id"], json!("s1"));
+        assert!(out.get("settings").is_none());
+        assert!(out.get("log").is_none());
     }
 }

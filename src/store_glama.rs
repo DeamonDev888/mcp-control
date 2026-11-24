@@ -13,6 +13,7 @@ pub const STORE_GLAMA: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-gitlab"],
+        env_vars: &["GITLAB_PERSONAL_ACCESS_TOKEN", "GITLAB_API_URL"],
     },
     StoreItem {
         id: "gl-sentry",
@@ -22,6 +23,7 @@ pub const STORE_GLAMA: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "@sentry/mcp-server"],
+        env_vars: &["SENTRY_ACCESS_TOKEN"],
     },
     StoreItem {
         id: "gl-googlemaps",
@@ -31,6 +33,7 @@ pub const STORE_GLAMA: &[StoreItem] = &[
         kind: "npm",
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-google-maps"],
+        env_vars: &["GOOGLE_MAPS_API_KEY"],
     },
     StoreItem {
         id: "gl-paddleocr",
@@ -39,7 +42,14 @@ pub const STORE_GLAMA: &[StoreItem] = &[
         cat: "Utilitaires",
         kind: "python",
         program: "uvx",
-        args: &["paddleocr-mcp"],
+        args: &[
+            "--with",
+            "paddlepaddle",
+            "--from",
+            "paddleocr-mcp",
+            "paddleocr_mcp",
+        ],
+        env_vars: &[],
     },
     StoreItem {
         id: "gl-codegraph",
@@ -48,15 +58,17 @@ pub const STORE_GLAMA: &[StoreItem] = &[
         cat: "Dev",
         kind: "npm",
         program: "npx",
-        args: &["-y", "@colbymchenry/codegraph"],
+        args: &["-y", "@colbymchenry/codegraph", "serve", "--mcp"],
+        env_vars: &[],
     },
     StoreItem {
         id: "gl-worldmonitor",
         name: "World Monitor",
-        desc: "Intelligence globale en temps réel : agrégation d'actualités par IA, suivi géopolitique et d'infrastructures",
+        desc: "Intelligence globale en temps réel : agrégation d'actualités par IA, suivi géopolitique et d'infrastructures (WORLDMONITOR_API_KEY optionnel en env)",
         cat: "Recherche",
         kind: "npm",
         program: "npx",
-        args: &["-y", "worldmonitor"],
+        args: &["-y", "mcp-remote", "https://worldmonitor.app/mcp"],
+        env_vars: &["WORLDMONITOR_API_KEY"],
     },
 ];

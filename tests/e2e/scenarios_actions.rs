@@ -1030,11 +1030,11 @@ fn import_mcp_json_et_rejets() {
     );
 }
 
-/// Scénario A9 — install_store (boutique) : CHEMINS DE VALIDATION SEULEMENT.
+/// Scénario A9 — install_store / uninstall_store (boutique) : CHEMINS DE VALIDATION SEULEMENT.
 /// L'installation réelle lance npx/uvx (téléchargements réseau + process) —
 /// effet de bord interdit en e2e ; on verrouille donc le refus d'un item
-/// inconnu et le garde-fou « dossier filesystem explicite », en prouvant
-/// qu'AUCUNE entrée n'a été créée.
+/// inconnu (y compris filesystem retiré) et la validation de uninstall_store,
+/// en prouvant qu'AUCUNE entrée n'a été créée.
 #[test]
 fn install_store_validation_sans_installation() {
     let _garde = crate::harness::serial_guard();
@@ -1049,18 +1049,31 @@ fn install_store_validation_sans_installation() {
         "{rep}"
     );
 
-    // filesystem sans dossier explicite → refus (jamais un chemin personnel
-    // par défaut dans un binaire distribué).
+    // filesystem retiré du catalogue → refus canonique.
     let rep = eng.action(&json!({"action": "install_store", "id": "filesystem"}));
     assert!(
         !ok_de(&rep),
-        "install filesystem sans dossier doit refuser : {rep}"
+        "install filesystem retiré doit refuser : {rep}"
     );
-    assert!(
-        rep.get("error")
-            .and_then(|e| e.as_str())
-            .map(|e| e.starts_with("précisez le dossier à exposer"))
-            .unwrap_or(false),
+    assert_eq!(
+        rep.get("error").and_then(|e| e.as_str()),
+        Some("item inconnu"),
+        "{rep}"
+    );
+
+    // uninstall_store : id manquant et serveur inconnu → refus canoniques.
+    let rep = eng.action(&json!({"action": "uninstall_store"}));
+    assert!(!ok_de(&rep), "{rep}");
+    assert_eq!(
+        rep.get("error").and_then(|e| e.as_str()),
+        Some("id manquant"),
+        "{rep}"
+    );
+    let rep = eng.action(&json!({"action": "uninstall_store", "id": "item-inexistant-e2e"}));
+    assert!(!ok_de(&rep), "{rep}");
+    assert_eq!(
+        rep.get("error").and_then(|e| e.as_str()),
+        Some("serveur inconnu"),
         "{rep}"
     );
 

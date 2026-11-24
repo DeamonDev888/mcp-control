@@ -697,15 +697,15 @@ fn pin_matches_host_port(v: &Value, host: &str, port: u16) -> bool {
     false
 }
 
-/// Liste les hôtes déjà épinglés dans `auth/clients/*.pin.json` (pour la
-/// découverte de pairs appairés même hors cache ARP).
+/// Liste les cibles `(hôte, port)` déjà épinglées dans `auth/clients/*.pin.json`
+/// (pour la découverte de pairs appairés même hors cache ARP ou sur port non standard).
 #[must_use]
-pub fn pinned_peer_hosts(config_dir: &Path) -> Vec<String> {
+pub fn pinned_peer_targets(config_dir: &Path) -> Vec<(String, u16)> {
     let dir = clients_dir(config_dir);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let mut hosts = Vec::new();
+    let mut targets = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         if !name.ends_with(".pin.json") {
@@ -717,23 +717,62 @@ pub fn pinned_peer_hosts(config_dir: &Path) -> Vec<String> {
         let Ok(v) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
+        let url_str = v.get("url").and_then(|x| x.as_str()).unwrap_or("");
+        let (url_https, url_rest) = if let Some(r) = url_str.strip_prefix("https://") {
+            (true, Some(r.trim_end_matches('/')))
+        } else if let Some(r) = url_str.strip_prefix("http://") {
+            (false, Some(r.trim_end_matches('/')))
+        } else {
+            (false, None)
+        };
+        let url_parts = url_rest.and_then(|rest| {
+            if let Some(bracketed) = rest.strip_prefix('[') {
+                let (h, after) = bracketed.split_once(']')?;
+                let p = after
+                    .strip_prefix(':')
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .filter(|&p| p > 0)
+                    .unwrap_or(if url_https { 443 } else { 80 });
+                Some((h.to_string(), p))
+            } else if let Some((h, p_str)) = rest.rsplit_once(':') {
+                let p = p_str.parse::<u16>().ok().filter(|&p| p > 0)?;
+                Some((h.to_string(), p))
+            } else if !rest.is_empty() {
+                Some((rest.to_string(), if url_https { 443 } else { 80 }))
+            } else {
+                None
+            }
+        });
         let host = v
             .get("host")
             .and_then(|x| x.as_str())
-            .map(String::from)
-            .or_else(|| {
-                let url = v.get("url")?.as_str()?;
-                let rest = url
-                    .strip_prefix("https://")
-                    .or_else(|| url.strip_prefix("http://"))?
-                    .trim_end_matches('/');
-                rest.rsplit_once(':').map(|(h, _)| h.to_string())
-            });
-        if let Some(h) = host {
-            let h = h.trim().to_string();
-            if !h.is_empty() && !hosts.contains(&h) {
-                hosts.push(h);
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| url_parts.as_ref().map(|(h, _)| h.clone()));
+        let port = v
+            .get("port")
+            .and_then(|x| x.as_u64())
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|&p| p > 0)
+            .or_else(|| url_parts.as_ref().map(|(_, p)| *p));
+        if let (Some(h), Some(p)) = (host, port) {
+            let entry = (h, p);
+            if !targets.contains(&entry) {
+                targets.push(entry);
             }
+        }
+    }
+    targets
+}
+
+/// Liste les hôtes déjà épinglés dans `auth/clients/*.pin.json` (pour la
+/// découverte de pairs appairés même hors cache ARP).
+#[must_use]
+pub fn pinned_peer_hosts(config_dir: &Path) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for (h, _) in pinned_peer_targets(config_dir) {
+        if !hosts.contains(&h) {
+            hosts.push(h);
         }
     }
     hosts

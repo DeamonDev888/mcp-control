@@ -59,6 +59,8 @@ pub(super) fn entry_to_server(id: String, name: &str, entry: &Value) -> Option<S
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![],
             latency_ms: None,
@@ -93,6 +95,8 @@ pub(super) fn entry_to_server(id: String, name: &str, entry: &Value) -> Option<S
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![],
             latency_ms: None,
@@ -232,6 +236,8 @@ pub fn import_mcp_text(state: &Arc<AppState>, raw: &str) -> Value {
                     ws: false,
                     lang: None,
                     framework: None,
+                    in_container: false,
+                    container_name: None,
                     via_ssh: false,
                     tools: vec![],
                     latency_ms: None,
@@ -252,7 +258,7 @@ pub fn import_mcp_text(state: &Arc<AppState>, raw: &str) -> Value {
 
     // 4. Commande npx/uvx/docker → serveur stdio
     if let Some(first) = toks.first() {
-        if ["npx", "uvx", "docker", "node", "python", "python3"].contains(first) {
+        if ["npx", "uvx", "uv", "docker", "node", "python", "python3"].contains(first) {
             // premier token qui n'est pas une option (-y, --yes…) = le package
             let spec = toks
                 .iter()
@@ -314,6 +320,8 @@ pub(super) fn push_imported(
         ws: false,
         lang: None,
         framework: None,
+        in_container: false,
+        container_name: None,
         via_ssh: false,
         tools: vec![],
         latency_ms: None,

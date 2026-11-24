@@ -422,6 +422,8 @@ pub(super) fn from_json(s: &Value) -> Option<Server> {
         ws: false,
         lang: None,
         framework: None,
+        in_container: false,
+        container_name: None,
         via_ssh,
         tools: vec![],
         latency_ms: None,
@@ -511,9 +513,32 @@ pub(super) fn parse_settings(v: &Value, mut st: crate::types::Settings) -> crate
             st.ssh_hosts = arr
                 .iter()
                 .filter_map(|h| {
+                    let ip = h.get("ip")?.as_str()?.trim();
+                    let user = h.get("user")?.as_str()?.trim();
+                    if ip.is_empty() || user.is_empty() {
+                        return None;
+                    }
+                    let port = h
+                        .get("port")
+                        .and_then(|x| x.as_u64())
+                        .and_then(|p| u16::try_from(p).ok())
+                        .filter(|&p| p > 0 && p != 22);
+                    let identity_file = h
+                        .get("identity_file")
+                        .and_then(|x| x.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from);
+                    let auto_install_cli = h
+                        .get("auto_install_cli")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(true);
                     Some(crate::types::SshHost {
-                        ip: h.get("ip")?.as_str()?.to_string(),
-                        user: h.get("user")?.as_str()?.to_string(),
+                        ip: ip.to_string(),
+                        user: user.to_string(),
+                        port,
+                        identity_file,
+                        auto_install_cli,
                     })
                 })
                 .collect();
@@ -525,6 +550,22 @@ pub(super) fn parse_settings(v: &Value, mut st: crate::types::Settings) -> crate
         st.auth = crate::auth::AuthState::from_json(a);
     }
     st
+}
+
+pub(super) fn ssh_host_json(h: &crate::types::SshHost) -> Value {
+    let mut o = Map::new();
+    o.insert("ip".into(), json!(h.ip));
+    o.insert("user".into(), json!(h.user));
+    if let Some(p) = h.port {
+        o.insert("port".into(), json!(p));
+    }
+    if let Some(ref k) = h.identity_file {
+        o.insert("identity_file".into(), json!(k));
+    }
+    if !h.auto_install_cli {
+        o.insert("auto_install_cli".into(), json!(false));
+    }
+    Value::Object(o)
 }
 
 /// Verrou global d'écriture de config.json (lot 3, audit 03 constat 7) :
@@ -656,7 +697,7 @@ pub fn save_config_checked(state: &AppState) -> Result<(), String> {
             "ssh_hosts": settings
                 .ssh_hosts
                 .iter()
-                .map(|h| json!({"ip": h.ip, "user": h.user}))
+                .map(ssh_host_json)
                 .collect::<Vec<_>>(),
         },
         // runtime : backoff d'autoboot + historique des crashs (persiste)

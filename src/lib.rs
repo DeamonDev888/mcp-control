@@ -1832,10 +1832,25 @@ fn handle_conn_stream(
                     // du hook C4 est posée sur ce fil, le transport y ajoute
                     // l'adresse source et le keyid revendiqué.
                     crate::audit::begin_mcp_request();
-                    let reply = if let Some(sid) = bare_route.strip_prefix("/mcp/s/") {
-                        gateway::serve_hybrid_stdio(
-                            &state, sid, &method, &path, &headers, &body, legacy_ok, peer_ip,
-                        )
+                    let reply = if let Some(raw_sid) = bare_route.strip_prefix("/mcp/s/") {
+                        let sid = raw_sid.trim_end_matches('/');
+                        if sid.is_empty() || sid.contains('/') {
+                            Reply::json(
+                                400,
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": null,
+                                    "error": {
+                                        "code": -32600,
+                                        "message": "identifiant serveur invalide dans /mcp/s/<id>"
+                                    }
+                                }),
+                            )
+                        } else {
+                            gateway::serve_hybrid_stdio(
+                                &state, sid, &method, &path, &headers, &body, legacy_ok, peer_ip,
+                            )
+                        }
                     } else {
                         gateway::serve(&method, &path, &headers, &body, legacy_ok, peer_ip)
                     };
@@ -2834,6 +2849,8 @@ mod tests {
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![],
             latency_ms: None,
@@ -3166,6 +3183,8 @@ mod tests {
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             via_ssh: false,
             tools: vec![],
             latency_ms: Some(5),

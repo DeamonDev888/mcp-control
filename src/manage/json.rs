@@ -28,6 +28,17 @@ pub fn start_cmd_for(srv: &Server) -> Option<StartCmd> {
 
 // ---------- sérialisation UI ----------
 
+fn effective_container(s: &Server) -> (bool, Option<String>) {
+    let (cmd_in_c, cmd_name) = crate::probe::server_cmd_in_container(s);
+    let in_c = s.in_container || cmd_in_c;
+    let name = if in_c {
+        s.container_name.clone().or(cmd_name)
+    } else {
+        None
+    };
+    (in_c, name)
+}
+
 pub(super) fn server_json(s: &Server, managed: bool) -> Value {
     let (ttype, extra) = match &s.transport {
         Transport::Http { host, port, path } => {
@@ -50,7 +61,15 @@ pub(super) fn server_json(s: &Server, managed: bool) -> Value {
     };
     let origin = s.origin.as_str();
     let auth = crate::auth::net::server_auth_status(s);
-    json!({
+    let (in_container, container_name) = effective_container(s);
+    let start_cmd_val = s.start_cmd.as_ref().map(|c| {
+        json!({
+            "program": c.program, "args": c.args, "workdir": c.workdir,
+            // noms SEULS (lot 3) : les valeurs d'env ne sortent jamais par l'API.
+            "env": crate::types::env_names(&c.env),
+        })
+    });
+    let mut obj = match json!({
         "id": s.id, "label": s.label, "transport": ttype, "transport_info": extra,
         "origin": origin, "enabled": s.enabled, "state": s.state.as_str(),
         "pid": s.pid, "bound_host": s.bound_host,
@@ -68,21 +87,24 @@ pub(super) fn server_json(s: &Server, managed: bool) -> Value {
         "auth_keyid": auth.keyid,
         "auth_public_key": auth.public_key,
         "auth_fingerprint": auth.fingerprint,
-        "hybrid_path": if matches!(s.transport, Transport::Stdio { .. }) {
+        "hybrid_path": if matches!(s.transport, Transport::Stdio { .. }) || s.via_ssh {
             Some(format!("/mcp/s/{}", s.id))
         } else {
             None
         },
+        "direct_stdio_blocked": matches!(s.transport, Transport::Stdio { .. }),
         "via_ssh": s.via_ssh,
         // contrôle du process : maintenu par CE moteur MCP Control (children) ?
         "managed": managed,
         // commande de lancement (Start/Stop) — panneau Démarrage de l'UI
-        "start_cmd": s.start_cmd.as_ref().map(|c| json!({
-            "program": c.program, "args": c.args, "workdir": c.workdir,
-            // noms SEULS (lot 3) : les valeurs d'env ne sortent jamais par l'API.
-            "env": crate::types::env_names(&c.env),
-        })),
-    })
+        "start_cmd": start_cmd_val,
+    }) {
+        Value::Object(m) => m,
+        _ => Map::new(),
+    };
+    obj.insert("in_container".into(), json!(in_container));
+    obj.insert("container_name".into(), json!(container_name));
+    Value::Object(obj)
 }
 
 /// Ids des process actuellement maintenus par MCP Control (copie —
@@ -183,9 +205,23 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
                 "network_ports": settings.network_ports,
                 "discovery_ports_only": settings.discovery_ports_only,
                 "discovery_ports_excluded": settings.discovery_ports_excluded,
-                "ssh_hosts": settings.ssh_hosts.iter().map(|h| json!({
-                    "ip": h.ip, "user": h.user
-                })).collect::<Vec<_>>(),
+                "ssh_hosts": settings.ssh_hosts.iter().map(|h| {
+                    let mut v = ssh_host_json(h);
+                    if let (Value::Object(ref mut o), Some(st)) = (&mut v, get_ssh_status(state, &h.ip)) {
+                        o.insert("status".into(), json!({
+                            "os": st.os,
+                            "arch": st.arch,
+                            "cli_installed": st.cli_installed,
+                            "cli_path": st.cli_path,
+                            "cli_version": st.cli_version,
+                            "cli_running": st.cli_running,
+                            "cli_port": st.cli_port,
+                            "last_check_ts": st.last_check_ts,
+                            "last_error": st.last_error,
+                        }));
+                    }
+                    v
+                }).collect::<Vec<_>>(),
                 // config des notifications (toast/webhook) : l'UI locale en a
                 // besoin pour son panneau Réglages → Notifications. JAMAIS
                 // exposée au gateway MCP, et les en-têtes ne sortent JAMAIS
@@ -246,6 +282,7 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
             .map(|p| {
                 json!({
                     "ip": p.ip, "ui_port": p.ui_port, "last_seen": p.last_seen,
+                    "via_ssh": p.via_ssh,
                     "stats": p.servers.get("stats"),
                     "servers": p.servers.get("servers"),
                 })
@@ -422,6 +459,9 @@ fn hash_server_visible<H: std::hash::Hasher>(
     s.ws.hash(h);
     s.lang.hash(h);
     s.framework.hash(h);
+    let (in_container, container_name) = effective_container(s);
+    in_container.hash(h);
+    container_name.hash(h);
     let auth = crate::auth::net::server_auth_status(s);
     auth.locked.hash(h);
     auth.paired.hash(h);
@@ -462,7 +502,7 @@ pub fn state_etag(state: &Arc<AppState>) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let managed = managed_ids(state);
-    let order = {
+    let (order, ssh_ips) = {
         let settings = lockv(&state.settings);
         settings.refresh_secs.hash(&mut h);
         settings.ui_port.hash(&mut h);
@@ -474,9 +514,14 @@ pub fn state_etag(state: &Arc<AppState>) -> String {
         settings.discovery_ports_only.hash(&mut h);
         settings.discovery_ports_excluded.hash(&mut h);
         settings.ssh_hosts.len().hash(&mut h);
+        let mut ips = Vec::with_capacity(settings.ssh_hosts.len());
         for sh in &settings.ssh_hosts {
             sh.ip.hash(&mut h);
             sh.user.hash(&mut h);
+            sh.port.hash(&mut h);
+            sh.identity_file.hash(&mut h);
+            sh.auto_install_cli.hash(&mut h);
+            ips.push(sh.ip.clone());
         }
         settings.server_order.hash(&mut h);
         settings.autostart.hash(&mut h);
@@ -493,8 +538,23 @@ pub fn state_etag(state: &Arc<AppState>) -> String {
         settings.auth.tls_fp.hash(&mut h);
         settings.auth.tls_bind_refused.hash(&mut h);
         settings.auth.tls_notice.hash(&mut h);
-        settings.server_order.clone()
+        (settings.server_order.clone(), ips)
     };
+    for ip in &ssh_ips {
+        if let Some(st) = get_ssh_status(state, ip) {
+            true.hash(&mut h);
+            st.os.hash(&mut h);
+            st.arch.hash(&mut h);
+            st.cli_installed.hash(&mut h);
+            st.cli_path.hash(&mut h);
+            st.cli_version.hash(&mut h);
+            st.cli_running.hash(&mut h);
+            st.cli_port.hash(&mut h);
+            st.last_error.hash(&mut h);
+        } else {
+            false.hash(&mut h);
+        }
+    }
     {
         let servers = lockv(&state.servers);
         servers.len().hash(&mut h);
@@ -534,6 +594,7 @@ pub fn state_etag(state: &Arc<AppState>) -> String {
             if let Some(p) = peers.get(k) {
                 p.ip.hash(&mut h);
                 p.ui_port.hash(&mut h);
+                p.via_ssh.hash(&mut h);
                 if let Some(st) = p.servers.get("stats") {
                     st.to_string().hash(&mut h);
                 }

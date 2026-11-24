@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 #[cfg_attr(not(windows), allow(unused_imports))] // Stdio : chemins cfg(windows)
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// En-têtes utiles d'une réponse HTTP (inférence du langage serveur + session MCP).
@@ -52,6 +52,10 @@ pub struct McpProbe {
     /// 2024-11-05, litemcp ignore la version demandée) ET que sa sonde
     /// GET /health répond 200 « ok » (deux signatures documentées de litemcp).
     pub framework: Option<String>,
+    /// Vrai si le serveur tourne dans un conteneur (Docker/Podman/containerd).
+    pub in_container: bool,
+    /// Nom du conteneur si détecté (`docker ps`, `--name`, `docker exec`).
+    pub container_name: Option<String>,
     pub tools: Vec<ToolInfo>,
     /// Vrai quand une sonde légère sur serveur déjà UP (nom + version inchangés)
     /// a sauté `tools/list` et les sondes annexes (`/sse`, WS, `/health`).
@@ -87,6 +91,8 @@ impl McpProbe {
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             tools: vec![],
             metadata_reused: false,
             latency_ms: 0,
@@ -120,6 +126,8 @@ impl McpProbe {
             ws: false,
             lang: Some("rust".to_string()),
             framework: fw.map(|f| f.id.to_string()),
+            in_container: false,
+            container_name: None,
             tools: vec![],
             metadata_reused: false,
             latency_ms,
@@ -132,9 +140,86 @@ impl McpProbe {
 /// Permet au pont hybride Streamable HTTP (`POST /mcp/s/<id>`) et au testeur
 /// d'outils de l'UI de relayer des requêtes sans relancer le process.
 pub struct StdioRpc {
-    stdin: ChildStdin,
+    stdin: Box<dyn Write + Send>,
     rx: std::sync::mpsc::Receiver<String>,
     next_id: u64,
+}
+
+/// Compare un champ JSON-RPC `id` (entier ou chaîne numérique) à l'identifiant attendu.
+fn rpc_id_matches(v: Option<&Value>, expected: u64) -> bool {
+    match v {
+        Some(Value::Number(n)) => n.as_u64() == Some(expected),
+        Some(Value::String(s)) => s.parse::<u64>().ok() == Some(expected),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+struct LineChannelWriter {
+    tx: std::sync::mpsc::Sender<String>,
+    buf: Vec<u8>,
+}
+
+#[cfg(test)]
+impl Write for LineChannelWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=pos).collect();
+            let text = String::from_utf8_lossy(&line).to_string();
+            if self.tx.send(text).is_err() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "mock stdio receiver closed",
+                ));
+            }
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Construit un [`StdioHandle`] de test purement en mémoire (sans spawn externe)
+/// dont le canal JSON-RPC répond via la closure `responder`.
+#[cfg(test)]
+pub(crate) fn test_stdio_handle_with_mock<F>(mut responder: F) -> StdioHandle
+where
+    F: FnMut(Value) -> Option<Value> + Send + 'static,
+{
+    let (tx_in, rx_in) = std::sync::mpsc::channel::<String>();
+    let (tx_out, rx_out) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in rx_in {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(req) = serde_json::from_str::<Value>(trimmed) else {
+                continue;
+            };
+            if let Some(resp) = responder(req) {
+                if tx_out.send(resp.to_string()).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    StdioHandle {
+        pid: 0,
+        started: None,
+        exit: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        rpc: Some(std::sync::Arc::new(std::sync::Mutex::new(StdioRpc {
+            stdin: Box::new(LineChannelWriter {
+                tx: tx_in,
+                buf: Vec::new(),
+            }),
+            rx: rx_out,
+            next_id: 100,
+        }))),
+    }
 }
 
 /// Handle d'un serveur lancé (mode "start"). Le process est surveillé par un
@@ -205,14 +290,14 @@ pub fn call_stdio_rpc(
         }
         match guard.rx.recv_timeout(deadline - now) {
             Ok(line) => {
-                let t = line.trim();
+                let t = line.trim().trim_start_matches('\u{feff}');
                 if !t.starts_with('{') {
                     continue;
                 }
                 let Ok(v) = serde_json::from_str::<Value>(t) else {
                     continue;
                 };
-                if v.get("id").and_then(|x| x.as_u64()) != Some(req_id) {
+                if v.get("method").is_some() || !rpc_id_matches(v.get("id"), req_id) {
                     continue;
                 }
                 if let Some(err) = v.get("error") {
@@ -251,22 +336,131 @@ pub fn call_stdio_tool(
     )
 }
 
-fn resolve_windows_cmd(program: &str) -> String {
-    // Windows : CreateProcess ne résout que les .exe — npx/uvx sont des .cmd → introuvables.
-    // Retourne <prog>.cmd si présent dans le PATH, sinon le programme tel quel.
-    if !program.contains('.') {
-        let path_var = std::env::var("PATH").unwrap_or_default();
-        for dir in path_var.split(';') {
-            if dir.is_empty() {
-                continue;
-            }
-            let cand = std::path::Path::new(dir).join(format!("{}.cmd", program));
-            if cand.exists() {
-                return cand.to_string_lossy().to_string();
+/// Interroge `tools/list` (avec pagination `nextCursor`) sur un canal stdio vivant.
+pub fn list_stdio_tools(
+    rpc: &std::sync::Arc<std::sync::Mutex<StdioRpc>>,
+    timeout_ms: u64,
+) -> Result<(Vec<ToolInfo>, u64), String> {
+    let t0 = Instant::now();
+    let mut tools = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..10 {
+        let params = match &cursor {
+            Some(c) => json!({ "cursor": c }),
+            None => json!({}),
+        };
+        let (res, _) = call_stdio_rpc(rpc, "tools/list", params, timeout_ms)?;
+        if let Some(arr) = res.get("tools").and_then(|x| x.as_array()) {
+            for t in arr {
+                tools.push(parse_tool_info(t));
             }
         }
+        cursor = res
+            .get("nextCursor")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if cursor.is_none() {
+            break;
+        }
     }
-    program.to_string()
+    Ok((tools, t0.elapsed().as_millis() as u64))
+}
+
+fn resolve_windows_cmd(program: &str) -> String {
+    #[cfg(windows)]
+    {
+        // Windows : CreateProcess ne résout que les .exe — npx/uvx peuvent être
+        // des .cmd/.bat/.exe. On nettoie guillemets et espaces sur chaque entrée PATH.
+        let p = std::path::Path::new(program);
+        if p.extension().is_none() {
+            if program.contains('\\') || program.contains('/') {
+                for ext in ["cmd", "bat", "exe"] {
+                    let cand = std::path::PathBuf::from(format!("{program}.{ext}"));
+                    if cand.exists() {
+                        return cand.to_string_lossy().to_string();
+                    }
+                }
+            } else {
+                let path_var = std::env::var("PATH").unwrap_or_default();
+                for raw_dir in path_var.split(';') {
+                    let dir = raw_dir.trim().trim_matches('"').trim();
+                    if dir.is_empty() {
+                        continue;
+                    }
+                    for ext in ["cmd", "bat", "exe"] {
+                        let cand = std::path::Path::new(dir).join(format!("{program}.{ext}"));
+                        if cand.exists() {
+                            return cand.to_string_lossy().to_string();
+                        }
+                    }
+                }
+            }
+        }
+        program.to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        program.to_string()
+    }
+}
+
+/// Si `dir` contient `node.exe` et `node_modules/npm/bin/npx-cli.js`,
+/// renvoie `(node_exe, npx_cli_js)` pour contourner `cmd.exe` / `npx.cmd`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn resolve_npx_in_dir(dir: &std::path::Path) -> Option<(String, String)> {
+    let node_exe = dir.join("node.exe");
+    let npx_cli = dir
+        .join("node_modules")
+        .join("npm")
+        .join("bin")
+        .join("npx-cli.js");
+    if node_exe.is_file() && npx_cli.is_file() {
+        Some((
+            node_exe.to_string_lossy().to_string(),
+            npx_cli.to_string_lossy().to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Résout la commande réelle à spawner pour un serveur stdio :
+/// sous Windows, contourne `npx.cmd` (`cmd.exe`) en lançant `node.exe`
+/// directement sur `npx-cli.js` dès que possible.
+pub(crate) fn resolve_stdio_command(program: &str, args: &[String]) -> (String, Vec<String>) {
+    #[cfg(windows)]
+    {
+        let resolved = resolve_windows_cmd(program);
+        let p = std::path::Path::new(&resolved);
+        let stem = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let ext = p
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if stem == "npx" && matches!(ext.as_str(), "cmd" | "bat") {
+            if let Some(parent) = p.parent() {
+                if let Some((node_exe, npx_cli)) = resolve_npx_in_dir(parent) {
+                    let mut full_args = Vec::with_capacity(args.len() + 1);
+                    full_args.push(npx_cli);
+                    full_args.extend(args.iter().cloned());
+                    return (node_exe, full_args);
+                }
+            }
+        }
+        (resolved, args.to_vec())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (resolve_windows_cmd,);
+        (program.to_string(), args.to_vec())
+    }
 }
 
 /// Applique CREATE_NO_WINDOW : aucune fenêtre console ne s'ouvre, même quand le
@@ -378,6 +572,63 @@ pub fn process_creation(pid: u32) -> Option<u64> {
 #[cfg(not(windows))]
 pub fn process_creation(_pid: u32) -> Option<u64> {
     None
+}
+
+/// Indique si le processus `pid` est encore vivant (non terminé et non zombie).
+/// Retourne `false` pour `pid == 0`, pour un PID inexistant, ou (sous Windows)
+/// lorsque le handle est encore tenu mais que `GetExitCodeProcess` ne vaut plus
+/// `STILL_ACTIVE` (259).
+#[cfg(windows)]
+pub fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn GetExitCodeProcess(handle: isize, exit_code: *mut u32) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h == 0 {
+            return std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED);
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(h, &mut code);
+        CloseHandle(h);
+        ok != 0 && code == STILL_ACTIVE
+    }
+}
+
+/// Hors Windows : sonde par `kill(pid, 0)` (borné à `i32::MAX` pour éviter tout
+/// débordement négatif) et écarte les états zombie/mort (`Z`, `X`, `x`) dans
+/// `/proc/{pid}/stat` lorsqu'il est disponible.
+#[cfg(not(windows))]
+pub fn process_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    let rc = unsafe { kill(pid as i32, 0) };
+    if rc == 0 {
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            if let Some((_, rest)) = stat.rsplit_once(')') {
+                if let Some(state) = rest.trim_start().chars().next() {
+                    if matches!(state, 'Z' | 'X' | 'x') {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(1)
 }
 
 /// Nom d'image d'un PID (`tasklist` sous Windows, `ps` ailleurs) — pour NOMMER
@@ -924,9 +1175,732 @@ pub fn detect_lang_http(head: &RespHead, name: Option<&str>) -> Option<String> {
     Some(lang.to_string())
 }
 
+/// Normalise un nom d'exécutable (dernier segment, minuscules, sans .exe/.cmd/.bat).
+fn command_stem(program: &str) -> String {
+    let p = program
+        .trim()
+        .trim_matches('"')
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    p.trim_end_matches(".exe")
+        .trim_end_matches(".cmd")
+        .trim_end_matches(".bat")
+        .to_string()
+}
+
+fn is_direct_container_cli(stem: &str) -> bool {
+    matches!(
+        stem,
+        "docker" | "docker-compose" | "podman" | "podman-compose" | "nerdctl"
+    )
+}
+
+fn is_valid_env_assignment(tok: &str) -> bool {
+    let Some((k, _)) = tok.split_once('=') else {
+        return false;
+    };
+    let mut chars = k.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn split_shell_words_simple(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut has_tok = false;
+    let mut chars = cmd.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            } else {
+                cur.push(c);
+            }
+        } else if in_double {
+            if c == '"' {
+                in_double = false;
+            } else if c == '\\' && matches!(chars.peek(), Some('"' | '\\')) {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            } else {
+                cur.push(c);
+            }
+        } else if c.is_whitespace() {
+            if has_tok {
+                out.push(std::mem::take(&mut cur));
+                has_tok = false;
+            }
+        } else if c == '\'' {
+            in_single = true;
+            has_tok = true;
+        } else if c == '"' {
+            in_double = true;
+            has_tok = true;
+        } else {
+            cur.push(c);
+            has_tok = true;
+        }
+    }
+    if has_tok {
+        out.push(cur);
+    }
+    let mut i = 0usize;
+    while i < out.len() {
+        if out[i] == "env" || out[i] == "/usr/bin/env" {
+            i += 1;
+            while i < out.len() && (out[i].starts_with('-') || is_valid_env_assignment(&out[i])) {
+                i += 1;
+            }
+            continue;
+        }
+        if is_valid_env_assignment(&out[i]) {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    if i > 0 {
+        out.drain(..i);
+    }
+    out
+}
+
+fn valid_container_name(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() || s.len() > 128 {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+fn extract_container_name(stem: &str, args: &[String]) -> Option<String> {
+    let mut i = 0usize;
+    if !matches!(stem, "docker-compose" | "podman-compose") {
+        // Options globales docker/podman/nerdctl avant la sous-commande
+        while i < args.len() {
+            let a = args[i].as_str();
+            if !a.starts_with('-') {
+                break;
+            }
+            if matches!(
+                a,
+                "-H" | "--host"
+                    | "-c"
+                    | "--context"
+                    | "--config"
+                    | "-l"
+                    | "--log-level"
+                    | "--tlscacert"
+                    | "--tlscert"
+                    | "--tlskey"
+            ) {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    let mut subcmd = args.get(i).map(|s| s.to_ascii_lowercase())?;
+    i += 1;
+    if subcmd == "compose" || matches!(stem, "docker-compose" | "podman-compose") {
+        if subcmd != "compose" {
+            // Pour docker-compose, le premier non-flag lu après options globales est déjà subcmd ;
+            // on recule i d'un cran pour sauter d'éventuelles options compose (-f, -p, etc.)
+            i -= 1;
+        }
+        while i < args.len() {
+            let a = args[i].as_str();
+            if !a.starts_with('-') {
+                break;
+            }
+            if matches!(
+                a,
+                "-f" | "--file"
+                    | "-p"
+                    | "--project-name"
+                    | "--env-file"
+                    | "--profile"
+                    | "--project-directory"
+            ) {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        subcmd = args.get(i).map(|s| s.to_ascii_lowercase())?;
+        i += 1;
+    }
+    match subcmd.as_str() {
+        "run" | "create" => {
+            while i < args.len() {
+                let a = args[i].as_str();
+                if a == "--name" {
+                    return args.get(i + 1).and_then(|v| valid_container_name(v));
+                }
+                if let Some(val) = a.strip_prefix("--name=") {
+                    return valid_container_name(val);
+                }
+                if a == "--" || !a.starts_with('-') {
+                    break;
+                }
+                if matches!(
+                    a,
+                    "-e" | "--env"
+                        | "--env-file"
+                        | "-p"
+                        | "--publish"
+                        | "-v"
+                        | "--volume"
+                        | "--mount"
+                        | "-w"
+                        | "--workdir"
+                        | "-u"
+                        | "--user"
+                        | "--network"
+                        | "--net"
+                        | "--entrypoint"
+                        | "--label"
+                        | "-l"
+                        | "-h"
+                        | "--hostname"
+                        | "--add-host"
+                        | "--platform"
+                        | "--cpus"
+                        | "-m"
+                        | "--memory"
+                        | "--restart"
+                        | "--pid"
+                        | "--ipc"
+                        | "--cap-add"
+                        | "--cap-drop"
+                        | "--device"
+                        | "--dns"
+                        | "--gpus"
+                        | "--cidfile"
+                        | "--cgroup-parent"
+                        | "--expose"
+                        | "--ip"
+                        | "--log-driver"
+                        | "--log-opt"
+                        | "--pull"
+                        | "--runtime"
+                        | "--shm-size"
+                        | "--tmpfs"
+                        | "--ulimit"
+                        | "--volumes-from"
+                ) {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            None
+        }
+        "exec" => {
+            while i < args.len() {
+                let a = args[i].as_str();
+                if a == "--" {
+                    i += 1;
+                    break;
+                }
+                if !a.starts_with('-') {
+                    return valid_container_name(a);
+                }
+                if matches!(
+                    a,
+                    "-e" | "--env"
+                        | "--env-file"
+                        | "-u"
+                        | "--user"
+                        | "-w"
+                        | "--workdir"
+                        | "--detach-keys"
+                        | "-l"
+                        | "--label"
+                        | "--index"
+                ) {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            args.get(i)
+                .filter(|s| !s.starts_with('-'))
+                .and_then(|v| valid_container_name(v))
+        }
+        _ => None,
+    }
+}
+
+fn detect_container_cmd_depth(
+    program: &str,
+    args: &[String],
+    depth: u8,
+) -> (bool, Option<String>) {
+    if depth > 3 {
+        return (false, None);
+    }
+    let stem = command_stem(program);
+    if is_direct_container_cli(&stem) {
+        return (true, extract_container_name(&stem, args));
+    }
+    if stem == "wsl" {
+        let mut i = 0usize;
+        while i < args.len() {
+            let a = args[i].as_str();
+            if matches!(a, "--" | "-e" | "--exec") {
+                i += 1;
+                break;
+            }
+            if matches!(
+                a,
+                "-d" | "--distribution" | "-u" | "--user" | "--cd" | "--shell-type"
+            ) {
+                i += 2;
+                continue;
+            }
+            if a.starts_with('-') {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        if let Some(inner_prog) = args.get(i) {
+            return detect_container_cmd_depth(inner_prog, &args[i + 1..], depth + 1);
+        }
+        return (false, None);
+    }
+    if stem == "cmd" {
+        let mut i = 0usize;
+        while i < args.len() {
+            let low = args[i].to_ascii_lowercase();
+            if matches!(low.as_str(), "/c" | "/k" | "-c" | "-k") {
+                let rest = &args[i + 1..];
+                if rest.len() == 1 {
+                    let toks = split_shell_words_simple(&rest[0]);
+                    if let Some(first) = toks.first() {
+                        return detect_container_cmd_depth(first, &toks[1..], depth + 1);
+                    }
+                } else if let Some(first) = rest.first() {
+                    if first.contains(char::is_whitespace) || first.starts_with('"') {
+                        let toks = split_shell_words_simple(first);
+                        if let Some(head) = toks.first() {
+                            let mut combined = toks[1..].to_vec();
+                            combined.extend_from_slice(&rest[1..]);
+                            return detect_container_cmd_depth(head, &combined, depth + 1);
+                        }
+                    } else {
+                        return detect_container_cmd_depth(first, &rest[1..], depth + 1);
+                    }
+                }
+                return (false, None);
+            }
+            i += 1;
+        }
+        return (false, None);
+    }
+    if matches!(stem.as_str(), "sh" | "bash" | "zsh" | "ash" | "dash") {
+        for (i, a) in args.iter().enumerate() {
+            let is_c = a == "-c"
+                || (a.starts_with('-')
+                    && !a.starts_with("--")
+                    && a.ends_with('c')
+                    && a[1..].chars().all(|ch| ch.is_ascii_alphabetic()));
+            if is_c {
+                if let Some(script) = args.get(i + 1) {
+                    let toks = split_shell_words_simple(script);
+                    if let Some(first) = toks.first() {
+                        return detect_container_cmd_depth(first, &toks[1..], depth + 1);
+                    }
+                }
+                return (false, None);
+            }
+        }
+        return (false, None);
+    }
+    if matches!(stem.as_str(), "powershell" | "pwsh") {
+        for (i, a) in args.iter().enumerate() {
+            let low = a.to_ascii_lowercase();
+            if matches!(low.as_str(), "-c" | "-command" | "/c" | "/command") {
+                let rest = &args[i + 1..];
+                if rest.len() == 1 {
+                    let mut toks = split_shell_words_simple(&rest[0]);
+                    if toks.first().is_some_and(|t| t == "&") {
+                        toks.remove(0);
+                    }
+                    if let Some(first) = toks.first() {
+                        return detect_container_cmd_depth(first, &toks[1..], depth + 1);
+                    }
+                } else if !rest.is_empty() {
+                    let start = usize::from(rest[0] == "&");
+                    if let Some(first) = rest.get(start) {
+                        return detect_container_cmd_depth(first, &rest[start + 1..], depth + 1);
+                    }
+                }
+                return (false, None);
+            }
+        }
+        return (false, None);
+    }
+    (false, None)
+}
+
+/// Détecte si une commande de lancement exécute le serveur MCP dans un conteneur
+/// (`docker`, `docker-compose`, `podman`, `podman-compose`, `nerdctl`, ou via
+/// `wsl`/`cmd`/`sh`/`bash`/`powershell`).
+///
+/// Ne déclenche PAS de faux positif sur `npx @modelcontextprotocol/server-docker`
+/// ou `uvx docker-mcp` (qui pilotent Docker depuis l'hôte).
+pub fn detect_container_cmd(program: &str, args: &[String]) -> (bool, Option<String>) {
+    detect_container_cmd_depth(program, args, 0)
+}
+
+/// Détecte si un `Server` lance un conteneur via son transport stdio ou sa `start_cmd`.
+pub fn server_cmd_in_container(s: &crate::types::Server) -> (bool, Option<String>) {
+    if let crate::types::Transport::Stdio { program, args, .. } = &s.transport {
+        let res = detect_container_cmd(program, args);
+        if res.0 {
+            return res;
+        }
+    }
+    if let Some(ref cmd) = s.start_cmd {
+        return detect_container_cmd(&cmd.program, &cmd.args);
+    }
+    (false, None)
+}
+
+/// Vrai si le nom d'image de processus qui écoute un port local correspond à un
+/// proxy/runtime de conteneur (Docker Desktop, docker-proxy, Podman, containerd).
+/// N'inclut PAS `wslrelay` seul (utilisé aussi par WSL2 hors conteneur).
+pub fn is_container_proxy_image(image: &str) -> bool {
+    let i = image.trim().to_ascii_lowercase();
+    let i = i.trim_end_matches(".exe");
+    matches!(
+        i,
+        "com.docker.backend"
+            | "docker-proxy"
+            | "vpnkit"
+            | "com.docker.vpnkit"
+            | "gvproxy"
+            | "dockerd"
+            | "podman"
+            | "rootlesskit"
+            | "slirp4netns"
+            | "pasta"
+            | "conmon"
+            | "containerd-shim"
+            | "containerd-shim-runc-v2"
+            | "limactl"
+            | "lima-guestagent"
+    )
+}
+
+/// Vrai si le texte `/proc/<pid>/cgroup` indique un processus isolé dans un
+/// conteneur (Docker, Kubernetes/containerd, CRI-O, Podman/libpod, LXC),
+/// sans faux positif sur `docker.service` côté hôte.
+pub fn is_cgroup_in_container(cgroup_text: &str) -> bool {
+    for raw in cgroup_text.lines() {
+        let low = raw.trim().to_ascii_lowercase();
+        if low.is_empty() {
+            continue;
+        }
+        if low.contains("/docker/")
+            || (low.contains("/docker-") && low.contains(".scope"))
+            || low.contains("/kubepods")
+            || low.contains("/cri-containerd-")
+            || low.contains("/containerd/")
+            || low.contains("/crio-")
+            || low.contains("/libpod-")
+            || low.contains("/libpod/")
+            || low.contains("/lxc/")
+            || low.contains("/lxc.payload.")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse la sortie de `docker ps --format '{{.Names}}|{{.Ports}}'` (ou Podman)
+/// en table `port TCP hôte publié -> nom du conteneur`.
+/// Ignore les ports exposés sans mapping hôte (sans `->`) et les ports UDP/SCTP.
+pub fn parse_docker_ps_ports(output: &str) -> std::collections::HashMap<u16, String> {
+    let mut map = std::collections::HashMap::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((raw_name, raw_ports)) = line.split_once('|').or_else(|| line.split_once('\t'))
+        else {
+            continue;
+        };
+        let name = raw_name.trim();
+        if name.is_empty() || raw_ports.trim().is_empty() {
+            continue;
+        }
+        for entry in raw_ports.split(',') {
+            let entry = entry.trim();
+            let Some((host_part, container_part)) = entry.split_once("->") else {
+                continue;
+            };
+            let proto_low = container_part.trim().to_ascii_lowercase();
+            if proto_low.ends_with("/udp") || proto_low.ends_with("/sctp") {
+                continue;
+            }
+            let port_spec = host_part.rsplit(':').next().unwrap_or(host_part).trim();
+            if let Some((a_s, b_s)) = port_spec.split_once('-') {
+                if let (Ok(a), Ok(b)) = (a_s.trim().parse::<u16>(), b_s.trim().parse::<u16>()) {
+                    if a > 0 && a <= b && (b - a) < 64 {
+                        for p in a..=b {
+                            map.entry(p).or_insert_with(|| name.to_string());
+                        }
+                    }
+                }
+            } else if let Ok(p) = port_spec.parse::<u16>() {
+                if p > 0 {
+                    map.entry(p).or_insert_with(|| name.to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Parse `ss -tlnp` en table `port -> Vec<(Option<pid>, nom_process)>`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn parse_ss_port_owners(
+    text: &str,
+) -> std::collections::HashMap<u16, Vec<(Option<u32>, String)>> {
+    let mut map: std::collections::HashMap<u16, Vec<(Option<u32>, String)>> =
+        std::collections::HashMap::new();
+    for line in text.lines() {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        let Some(listen_idx) = toks.iter().position(|&t| t == "LISTEN") else {
+            continue;
+        };
+        let Some(local_addr) = toks.get(listen_idx + 3) else {
+            continue;
+        };
+        let Some(port) = local_addr
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let Some(users_pos) = line.find("users:(") else {
+            continue;
+        };
+        let mut rest = &line[users_pos + "users:(".len()..];
+        while let Some(q_start) = rest.find("(\"") {
+            let after_q = &rest[q_start + 2..];
+            let Some(q_end) = after_q.find('"') else {
+                break;
+            };
+            let comm = after_q[..q_end].trim().to_ascii_lowercase();
+            let after_comm = &after_q[q_end + 1..];
+            let seg_end = after_comm.find(')').unwrap_or(after_comm.len());
+            let seg = &after_comm[..seg_end];
+            let pid = seg.split(',').find_map(|part| {
+                part.trim()
+                    .strip_prefix("pid=")
+                    .and_then(|v| v.parse::<u32>().ok())
+            });
+            if !comm.is_empty() {
+                let entry = map.entry(port).or_default();
+                if !entry.iter().any(|(ep, ec)| *ep == pid && ec == &comm) {
+                    entry.push((pid, comm));
+                }
+            }
+            rest = &after_comm[seg_end..];
+        }
+    }
+    map
+}
+
+/// Analyse la sortie combinée `docker ps` + `ss -tlnp` + `/proc/<pid>/cgroup`
+/// collectée lors d'une sonde SSH.
+pub fn parse_ssh_container_probe(
+    docker_out: &str,
+    ss_out: &str,
+    port: u16,
+) -> (bool, Option<String>) {
+    if let Some(name) = parse_docker_ps_ports(docker_out).get(&port) {
+        return (true, Some(name.clone()));
+    }
+    let owners = parse_ss_port_owners(ss_out);
+    if owners
+        .get(&port)
+        .is_some_and(|list| list.iter().any(|(_, img)| is_container_proxy_image(img)))
+    {
+        return (true, None);
+    }
+    if is_cgroup_in_container(ss_out) {
+        return (true, None);
+    }
+    (false, None)
+}
+
+fn resolve_container_cli(name: &str) -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok();
+    let is_cwd = |dir: &std::path::Path| -> bool {
+        let Some(ref c) = cwd else {
+            return false;
+        };
+        #[cfg(windows)]
+        {
+            dir.to_string_lossy()
+                .eq_ignore_ascii_case(&c.to_string_lossy())
+        }
+        #[cfg(not(windows))]
+        {
+            dir == c
+        }
+    };
+    #[cfg(windows)]
+    {
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        for env_key in ["ProgramFiles", "ProgramW6432"] {
+            if let Ok(pf) = std::env::var(env_key) {
+                if name == "docker" {
+                    candidates.push(
+                        std::path::Path::new(&pf)
+                            .join("Docker")
+                            .join("Docker")
+                            .join("resources")
+                            .join("bin")
+                            .join("docker.exe"),
+                    );
+                } else if name == "podman" {
+                    candidates.push(
+                        std::path::Path::new(&pf)
+                            .join("RedHat")
+                            .join("Podman")
+                            .join("podman.exe"),
+                    );
+                }
+            }
+        }
+        if name == "docker" {
+            if let Ok(local_app) = std::env::var("LocalAppData") {
+                candidates.push(
+                    std::path::Path::new(&local_app)
+                        .join("Programs")
+                        .join("Docker")
+                        .join("Docker")
+                        .join("resources")
+                        .join("bin")
+                        .join("docker.exe"),
+                );
+            }
+        }
+        for c in candidates {
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        for raw_dir in path_var.split(';') {
+            let dir = raw_dir.trim().trim_matches('"').trim();
+            if dir.is_empty() {
+                continue;
+            }
+            let dir_path = std::path::Path::new(dir);
+            if !dir_path.is_absolute() || is_cwd(dir_path) {
+                continue;
+            }
+            let cand = dir_path.join(format!("{name}.exe"));
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        for prefix in ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"] {
+            let cand = std::path::Path::new(prefix).join(name);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        for raw_dir in path_var.split(':') {
+            let dir = raw_dir.trim();
+            if dir.is_empty() {
+                continue;
+            }
+            let dir_path = std::path::Path::new(dir);
+            if !dir_path.is_absolute() || is_cwd(dir_path) {
+                continue;
+            }
+            let cand = dir_path.join(name);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+        None
+    }
+}
+
+fn run_docker_ps_ports() -> Option<std::collections::HashMap<u16, String>> {
+    const MAX_DOCKER_PS_BYTES: usize = 256 * 1024;
+    for cli in ["docker", "podman"] {
+        let Some(bin) = resolve_container_cli(cli) else {
+            continue;
+        };
+        let mut cmd = Command::new(&bin);
+        cmd.args(["ps", "--format", "{{.Names}}|{{.Ports}}"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        probe_hidden_cmd(&mut cmd);
+        let Ok(mut child) = cmd.spawn() else {
+            continue;
+        };
+        let out_reader = child
+            .stdout
+            .take()
+            .map(|sout| std::thread::spawn(move || read_bounded_pipe(sout, MAX_DOCKER_PS_BYTES)));
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        let mut timed_out = false;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break Some(st),
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        timed_out = true;
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break None;
+                    }
+                    std::thread::sleep(Duration::from_millis(15));
+                }
+                Err(_) => break None,
+            }
+        };
+        let bytes = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+        if timed_out || !status.is_some_and(|s| s.success()) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        return Some(parse_docker_ps_ports(&text));
+    }
+    None
+}
+
 /// Génération du cycle de sondage pour mutualiser la table port → process
-/// (P-3 : une seule construction `netstat` + `tasklist` par cycle, partagée
-/// par tous les workers sans tempête de spawns concurrents).
+/// (P-3 : une seule construction `netstat` + `tasklist` + `docker ps` par cycle,
+/// partagée par tous les workers sans tempête de spawns concurrents).
 static PORT_OWNER_CYCLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Démarre un nouveau cycle de sondage : invalide la table port → process
@@ -935,50 +1909,100 @@ pub fn begin_port_owner_cycle() {
     PORT_OWNER_CYCLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Langage inféré du process qui écoute réellement un port local
-/// (Windows : netstat -ano → PID → tasklist → image).
-/// Mutualisé par cycle de sondage (verrou unique : 12 workers parallèles ne
-/// déclenchent qu'UN SEUL `netstat` + `tasklist`, plus repli TTL 10 s hors cycle).
-#[cfg(windows)]
-pub fn port_owner_lang(port: u16) -> Option<String> {
+struct PortOwnerCache {
+    cycle: u64,
+    built_at: Instant,
+    owners: std::collections::HashMap<u16, Vec<(Option<u32>, String)>>,
+    docker_ports: std::collections::HashMap<u16, String>,
+    docker_retry_after: Option<Instant>,
+}
+
+fn with_port_owner_cache<F, R>(f: F) -> R
+where
+    F: FnOnce(&PortOwnerCache) -> R,
+{
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
     use std::sync::{Mutex, OnceLock};
-    use std::time::{Duration, Instant};
-    struct PortOwnerCache {
-        cycle: u64,
-        built_at: Instant,
-        map: HashMap<u16, String>,
-    }
     static CACHE: OnceLock<Mutex<PortOwnerCache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| {
         Mutex::new(PortOwnerCache {
             cycle: 0,
             built_at: Instant::now() - Duration::from_secs(60),
-            map: HashMap::new(),
+            owners: HashMap::new(),
+            docker_ports: HashMap::new(),
+            docker_retry_after: None,
         })
     });
     let cur_cycle = PORT_OWNER_CYCLE.load(Ordering::Relaxed);
     let mut g = cache.lock().unwrap_or_else(|p| p.into_inner());
     let fresh = g.cycle == cur_cycle && g.built_at.elapsed() < Duration::from_secs(10);
     if !fresh {
-        g.map = build_port_owner_map();
+        g.owners = build_port_owner_map();
+        let can_docker = g
+            .docker_retry_after
+            .is_none_or(|until| Instant::now() >= until);
+        if can_docker {
+            match run_docker_ps_ports() {
+                Some(dp) => {
+                    g.docker_ports = dp;
+                    g.docker_retry_after = None;
+                }
+                None => {
+                    g.docker_ports.clear();
+                    g.docker_retry_after = Some(Instant::now() + Duration::from_secs(60));
+                }
+            }
+        }
         g.cycle = cur_cycle;
         g.built_at = Instant::now();
     }
-    g.map.get(&port).and_then(|img| detect_lang_from_image(img))
+    f(&g)
 }
 
-#[cfg(not(windows))]
-pub fn port_owner_lang(_port: u16) -> Option<String> {
-    None
+/// Langage inféré du process qui écoute réellement un port local
+/// (Windows : netstat -ano → PID → tasklist → image ; Linux : ss -tlnp).
+/// Mutualisé par cycle de sondage (verrou unique : 12 workers parallèles ne
+/// déclenchent qu'UN SEUL `netstat` + `tasklist`, plus repli TTL 10 s hors cycle).
+pub fn port_owner_lang(port: u16) -> Option<String> {
+    with_port_owner_cache(|g| {
+        g.owners
+            .get(&port)
+            .and_then(|list| list.iter().find_map(|(_, img)| detect_lang_from_image(img)))
+    })
 }
 
-/// port → nom d'image du process propriétaire (Windows).
+/// Détecte si un port TCP local est servi par un conteneur (Docker/Podman/containerd).
+/// Sources : `docker ps` / `podman ps`, nom d'image proxy de conteneur, et sous
+/// Linux `/proc/<pid>/cgroup`.
+pub fn port_owner_container(port: u16) -> (bool, Option<String>) {
+    with_port_owner_cache(|g| {
+        if let Some(name) = g.docker_ports.get(&port) {
+            return (true, Some(name.clone()));
+        }
+        if let Some(list) = g.owners.get(&port) {
+            if list.iter().any(|(_, img)| is_container_proxy_image(img)) {
+                return (true, None);
+            }
+            #[cfg(target_os = "linux")]
+            for (pid_opt, _) in list {
+                if let Some(pid) = pid_opt {
+                    if let Ok(cg) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")) {
+                        if is_cgroup_in_container(&cg) {
+                            return (true, None);
+                        }
+                    }
+                }
+            }
+        }
+        (false, None)
+    })
+}
+
+/// port → liste des `(pid, nom d'image)` des process propriétaires (Windows).
 #[cfg(windows)]
-fn build_port_owner_map() -> std::collections::HashMap<u16, String> {
+fn build_port_owner_map() -> std::collections::HashMap<u16, Vec<(Option<u32>, String)>> {
     use std::collections::HashMap;
-    use std::process::Command;
     let mut ports: Vec<(u16, u32)> = Vec::new();
     let mut c = Command::new(system_tool("netstat"));
     if let Ok(out) = hidden(&mut c).args(["-ano"]).output() {
@@ -1009,10 +2033,31 @@ fn build_port_owner_map() -> std::collections::HashMap<u16, String> {
             }
         }
     }
-    ports
-        .into_iter()
-        .filter_map(|(p, pid)| names.get(&pid).map(|n| (p, n.clone())))
-        .collect()
+    let mut map: HashMap<u16, Vec<(Option<u32>, String)>> = HashMap::new();
+    for (p, pid) in ports {
+        if let Some(n) = names.get(&pid) {
+            let entry = map.entry(p).or_default();
+            if !entry.iter().any(|(ep, en)| *ep == Some(pid) && en == n) {
+                entry.push((Some(pid), n.clone()));
+            }
+        }
+    }
+    map
+}
+
+#[cfg(target_os = "linux")]
+fn build_port_owner_map() -> std::collections::HashMap<u16, Vec<(Option<u32>, String)>> {
+    let mut c = Command::new("ss");
+    probe_hidden_cmd(&mut c);
+    match c.args(["-tlnp"]).output() {
+        Ok(out) => parse_ss_port_owners(&String::from_utf8_lossy(&out.stdout)),
+        Err(_) => std::collections::HashMap::new(),
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
+fn build_port_owner_map() -> std::collections::HashMap<u16, Vec<(Option<u32>, String)>> {
+    std::collections::HashMap::new()
 }
 
 /// Image de process → langage (node.exe, python.exe, java.exe…).
@@ -1491,29 +2536,135 @@ le mot de passe n'est pas possible en non-interactif)"
     }
 }
 
+/// Cible SSH complète (hôte, utilisateur, port optionnel, clé privée optionnelle).
+#[derive(Clone, Copy, Debug)]
+pub struct SshTarget<'a> {
+    pub host: &'a str,
+    pub user: &'a str,
+    pub port: Option<u16>,
+    pub identity_file: Option<&'a str>,
+}
+
+impl<'a> SshTarget<'a> {
+    pub fn simple(host: &'a str, user: &'a str) -> Self {
+        Self {
+            host,
+            user,
+            port: None,
+            identity_file: None,
+        }
+    }
+
+    pub fn from_host(h: &'a crate::types::SshHost) -> Self {
+        Self {
+            host: &h.ip,
+            user: &h.user,
+            port: h.port,
+            identity_file: h.identity_file.as_deref(),
+        }
+    }
+}
+
+/// Sanitize un chemin local passé à `ssh -i` (non vide, <= 512, aucun caractère
+/// de contrôle ni `-` en tête qui serait interprété comme un drapeau).
+pub fn ssh_path_safe(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty()
+        || t.len() > 512
+        || t.starts_with('-')
+        || t.chars().any(|c| c.is_control() || c == '\0')
+    {
+        return None;
+    }
+    Some(t.to_string())
+}
+
+/// Échappe une chaîne quelconque pour un shell POSIX (`'...'` avec `'\''`).
+/// Refuse `\0`, `\r`, `\n`.
+pub fn posix_shell_quote(s: &str) -> Result<String, String> {
+    if s.chars().any(|c| matches!(c, '\0' | '\r' | '\n')) {
+        return Err("caractère de contrôle interdit dans un argument shell".to_string());
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    Ok(out)
+}
+
+fn env_key_safe(k: &str) -> bool {
+    let mut chars = k.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    k.len() <= 128
+        && (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn ps_quote(s: &str) -> Result<String, String> {
+    if s.chars().any(|c| matches!(c, '\0' | '\r' | '\n')) {
+        return Err("caractère de contrôle interdit dans un argument PowerShell".to_string());
+    }
+    Ok(format!("'{}'", s.replace('\'', "''")))
+}
+
+pub(crate) fn build_ssh_args(
+    target: &SshTarget<'_>,
+    remote_cmd: &str,
+    connect_timeout: u64,
+) -> Result<Vec<String>, String> {
+    let host = ssh_safe(target.host).ok_or_else(|| "hôte invalide".to_string())?;
+    let user = ssh_safe(target.user).ok_or_else(|| "utilisateur SSH invalide".to_string())?;
+    let mut args = vec![
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
+        "-o".to_string(),
+        format!("ConnectTimeout={}", connect_timeout.clamp(2, 15)),
+    ];
+    if let Some(port) = target.port {
+        if port == 0 {
+            return Err("port SSH invalide".to_string());
+        }
+        if port != 22 {
+            args.push("-p".to_string());
+            args.push(port.to_string());
+        }
+    }
+    if let Some(raw_key) = target
+        .identity_file
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let key = ssh_path_safe(raw_key).ok_or_else(|| "chemin de clé SSH invalide".to_string())?;
+        args.push("-i".to_string());
+        args.push(key);
+    }
+    args.push(format!("{user}@{host}"));
+    args.push(remote_cmd.to_string());
+    Ok(args)
+}
+
 /// Exécute une commande sur la machine distante via le client ssh système
 /// (aucune dépendance : ssh.exe/OpenSSH livré avec Windows). Auth par clé
 /// obligatoire : BatchMode interdit toute invite. Retourne stdout, ou l'erreur
 /// ssh en clair (avec indication) pour l'UI.
-fn ssh_exec(
-    host: &str,
-    user: &str,
+fn ssh_exec_target(
+    target: &SshTarget<'_>,
     remote_cmd: &str,
     connect_timeout: u64,
 ) -> Result<String, String> {
-    let host = ssh_safe(host).ok_or_else(|| "hôte invalide".to_string())?;
-    let user = ssh_safe(user).ok_or_else(|| "utilisateur SSH invalide".to_string())?;
+    let args = build_ssh_args(target, remote_cmd, connect_timeout)?;
     let mut cmd = system_command("ssh");
-    cmd.args([
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-        "-o",
-        &format!("ConnectTimeout={}", connect_timeout.clamp(2, 15)),
-        &format!("{user}@{host}"),
-        remote_cmd,
-    ]);
+    cmd.args(&args);
     probe_hidden_cmd(&mut cmd);
     let out = cmd
         .output()
@@ -1522,7 +2673,121 @@ fn ssh_exec(
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     if !out.status.success() && stdout.trim().is_empty() {
         let hint = ssh_error_hint(&stderr);
-        return Err(format!("ssh {user}@{host} : {}{}", stderr.trim(), hint));
+        return Err(format!(
+            "ssh {}@{} : {}{}",
+            target.user,
+            target.host,
+            stderr.trim(),
+            hint
+        ));
+    }
+    Ok(stdout)
+}
+
+#[allow(dead_code)]
+fn ssh_exec(
+    host: &str,
+    user: &str,
+    remote_cmd: &str,
+    connect_timeout: u64,
+) -> Result<String, String> {
+    ssh_exec_target(&SshTarget::simple(host, user), remote_cmd, connect_timeout)
+}
+
+fn read_bounded_pipe<R: Read>(mut r: R, max_bytes: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    while out.len() < max_bytes {
+        match r.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let take = n.min(max_bytes - out.len());
+                out.extend_from_slice(&buf[..take]);
+            }
+        }
+    }
+    out
+}
+
+/// Exécute une commande SSH en poussant `stdin_bytes` puis en fermant stdin (EOF),
+/// avec lecture bornée (4 Mio) et échéance globale.
+fn ssh_exec_stdin(
+    target: &SshTarget<'_>,
+    remote_cmd: &str,
+    stdin_bytes: &[u8],
+    connect_timeout: u64,
+    io_timeout_secs: u64,
+) -> Result<String, String> {
+    const MAX_SSH_PIPE: usize = 4 * 1024 * 1024;
+    let args = build_ssh_args(target, remote_cmd, connect_timeout)?;
+    let mut cmd = system_command("ssh");
+    cmd.args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    probe_hidden_cmd(&mut cmd);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("client ssh introuvable ou injoignable : {e}"))?;
+
+    let payload = stdin_bytes.to_vec();
+    let writer = child.stdin.take().map(|mut sin| {
+        std::thread::spawn(move || {
+            let _ = sin.write_all(&payload);
+            let _ = sin.flush();
+            // sin est droppé ici → EOF côté distant
+        })
+    });
+    let out_reader = child
+        .stdout
+        .take()
+        .map(|sout| std::thread::spawn(move || read_bounded_pipe(sout, MAX_SSH_PIPE)));
+    let err_reader = child
+        .stderr
+        .take()
+        .map(|serr| std::thread::spawn(move || read_bounded_pipe(serr, MAX_SSH_PIPE)));
+
+    let deadline = Instant::now() + Duration::from_secs(io_timeout_secs.clamp(2, 60));
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => break None,
+        }
+    };
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
+    let stdout_bytes = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr_bytes = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+    let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
+
+    if timed_out {
+        return Err(format!(
+            "ssh {}@{} : délai d'exécution dépassé ({} s)",
+            target.user, target.host, io_timeout_secs
+        ));
+    }
+    let ok = status.is_some_and(|s| s.success());
+    if !ok && stdout.trim().is_empty() {
+        let hint = ssh_error_hint(&stderr);
+        return Err(format!(
+            "ssh {}@{} : {}{}",
+            target.user,
+            target.host,
+            stderr.trim(),
+            hint
+        ));
     }
     Ok(stdout)
 }
@@ -1531,26 +2796,34 @@ fn ssh_exec(
 /// clé fonctionne-t-elle ? Vrai contrôle en une commande (pas de scan) —
 /// à appeler AVANT toute découverte pour éviter un scan de 30 s sur une
 /// machine injoignable, et pour distinguer "machine éteinte" de "clé absente".
-pub fn ssh_health(host: &str, user: &str, timeout_secs: u64) -> Result<(), String> {
-    let out = ssh_exec(host, user, "echo __MCC_OK__", timeout_secs)?;
+pub fn ssh_health_target(target: &SshTarget<'_>, timeout_secs: u64) -> Result<(), String> {
+    let out = ssh_exec_target(target, "echo __MCC_OK__", timeout_secs)?;
     if out.contains("__MCC_OK__") {
         Ok(())
     } else {
         Err(format!(
-            "ssh {user}@{host} : connexion établie mais la commande distante n'a pas répondu"
+            "ssh {}@{} : connexion établie mais la commande distante n'a pas répondu",
+            target.user, target.host
         ))
     }
 }
 
+pub fn ssh_health(host: &str, user: &str, timeout_secs: u64) -> Result<(), String> {
+    ssh_health_target(&SshTarget::simple(host, user), timeout_secs)
+}
+
 /// Liste les ports en écoute d'une machine distante (netstat/ss exécutés sur place).
-pub fn ssh_netstat(host: &str, user: &str, timeout_secs: u64) -> Result<Vec<u16>, String> {
-    let stdout = ssh_exec(
-        host,
-        user,
+pub fn ssh_netstat_target(target: &SshTarget<'_>, timeout_secs: u64) -> Result<Vec<u16>, String> {
+    let stdout = ssh_exec_target(
+        target,
         "netstat -ano | findstr LISTENING || ss -tln",
         timeout_secs,
     )?;
     Ok(parse_listening_ports(&stdout))
+}
+
+pub fn ssh_netstat(host: &str, user: &str, timeout_secs: u64) -> Result<Vec<u16>, String> {
+    ssh_netstat_target(&SshTarget::simple(host, user), timeout_secs)
 }
 
 /// Ports TCP en écoute SUR CETTE machine (toutes interfaces), ports système
@@ -1638,6 +2911,75 @@ fn mcp_remote_curl(hostport: &str, path: &str, payload: &str, curl_timeout: u64)
 
 pub const MCC_PORT_MARKER: &str = "__MCC_PORT_";
 
+/// Sonde par lot DEPUIS la machine distante (plusieurs chemins MCP candidats) :
+/// un seul exec ssh boucle sur les ports avec curl interne sur 127.0.0.1.
+/// Retourne `(port, path, initialize_json)` pour le premier chemin MCP valide par port.
+pub fn ssh_probe_mcp_batch_target(
+    target: &SshTarget<'_>,
+    ports: &[u16],
+    paths: &[&str],
+    curl_timeout: u64,
+) -> Result<Vec<(u16, String, Value)>, String> {
+    if ports.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut safe_paths: Vec<String> = Vec::new();
+    for raw in paths {
+        let p = mcp_path_safe(raw);
+        if !safe_paths.contains(&p) {
+            safe_paths.push(p);
+        }
+    }
+    if safe_paths.is_empty() {
+        safe_paths.push("/mcp".to_string());
+    }
+    let list = ports
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let payload = mcp_remote_payload("initialize", 1);
+    let mut inner = String::new();
+    for (idx, mp) in safe_paths.iter().enumerate() {
+        let curl = mcp_remote_curl("${p}", mp, &payload, curl_timeout);
+        inner.push_str(&format!(
+            "echo \"{MCC_PORT_MARKER}${{p}}__{idx}__\"; {curl}; echo; "
+        ));
+    }
+    let remote = format!("for p in {list}; do {inner}done");
+    let out = ssh_exec_target(target, &remote, 8)?;
+    let mut results: Vec<(u16, String, Value)> = Vec::new();
+    for seg in out.split(MCC_PORT_MARKER).skip(1) {
+        let Some((pstr, rest)) = seg.split_once("__") else {
+            continue;
+        };
+        let Ok(port) = pstr.trim().parse::<u16>() else {
+            continue;
+        };
+        let Some((idx_str, body)) = rest.split_once("__") else {
+            continue;
+        };
+        let Ok(idx) = idx_str.trim().parse::<usize>() else {
+            continue;
+        };
+        let Some(path) = safe_paths.get(idx) else {
+            continue;
+        };
+        if results.iter().any(|(existing, _, _)| *existing == port) {
+            continue;
+        }
+        if let Some(v) = extract_json(body.as_bytes()) {
+            // VALIDATION STRICTE (même règle que la sonde locale/réseau) :
+            // serverInfo.name, protocolVersion ou capabilities. Un port qui
+            // répond `{"result":{}}` n'est PAS un serveur MCP.
+            if crate::validate::is_mcp(&v) {
+                results.push((port, path.clone(), v));
+            }
+        }
+    }
+    Ok(results)
+}
+
 /// Sonde par lot DEPUIS la machine distante : un seul exec ssh boucle sur les
 /// ports avec curl interne sur 127.0.0.1 (passe les binds localhost et ufw).
 /// Retourne les ports qui répondent à initialize avec un serverInfo + le résultat.
@@ -1648,47 +2990,16 @@ pub fn ssh_probe_mcp_batch(
     path: &str,
     curl_timeout: u64,
 ) -> Result<Vec<(u16, Value)>, String> {
-    if ports.is_empty() {
-        return Ok(vec![]);
-    }
-    let path = mcp_path_safe(path);
-    let list = ports
-        .iter()
-        .map(|p| p.to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let payload = mcp_remote_payload("initialize", 1);
-    let remote = format!(
-        "for p in {list}; do echo \"{MCC_PORT_MARKER}${{p}}__\"; {curl}; echo; done",
-        curl = mcp_remote_curl("${p}", &path, &payload, curl_timeout)
-    );
-    let out = ssh_exec(host, user, &remote, 8)?;
-    let mut results = Vec::new();
-    for seg in out.split(MCC_PORT_MARKER).skip(1) {
-        let Some((pstr, body)) = seg.split_once("__") else {
-            continue;
-        };
-        let Ok(port) = pstr.trim().parse::<u16>() else {
-            continue;
-        };
-        if let Some(v) = extract_json(body.as_bytes()) {
-            // VALIDATION STRICTE (même règle que la sonde locale/réseau) :
-            // serverInfo.name, protocolVersion ou capabilities. Un port qui
-            // répond `{"result":{}}` n'est PAS un serveur MCP.
-            if crate::validate::is_mcp(&v) {
-                results.push((port, v));
-            }
-        }
-    }
-    Ok(results)
+    let found =
+        ssh_probe_mcp_batch_target(&SshTarget::simple(host, user), ports, &[path], curl_timeout)?;
+    Ok(found.into_iter().map(|(p, _, v)| (p, v)).collect())
 }
 
 /// Sonde COMPLÈTE d'un serveur MCP (initialize + tools/list) exécutée DEPUIS la
 /// machine distante : un seul exec ssh, les deux réponses séparées par un
 /// marqueur. Utilisé pour le poll des serveurs via_ssh — cf. Server.via_ssh.
-pub fn ssh_probe_server(
-    host: &str,
-    user: &str,
+pub fn ssh_probe_server_target(
+    target: &SshTarget<'_>,
     port: u16,
     path: &str,
     curl_timeout: u64,
@@ -1705,17 +3016,31 @@ pub fn ssh_probe_server(
     let tmp = "/tmp/.mcc_session_$$";
     let remote = format!(
         "{init_curl} -D {tmp}; sid=$(grep -i mcp-session-id {tmp} | head -n 1 | tr -d '\\r' | sed 's/^[^:]*: *//' | tr -cd 'A-Za-z0-9-_' | head -c 100); \
-         rm -f {tmp}; echo __MCC_SEP__; {tools_curl} -H 'Mcp-Session-Id:'$sid; echo",
+         rm -f {tmp}; echo __MCC_SEP__; {tools_curl} -H 'Mcp-Session-Id:'$sid; echo; \
+         echo __MCC_DOCKER__; \
+         if command -v docker >/dev/null 2>&1; then \
+           (command -v timeout >/dev/null 2>&1 && timeout 2 docker ps --format '{{{{.Names}}}}|{{{{.Ports}}}}' || docker ps --format '{{{{.Names}}}}|{{{{.Ports}}}}') 2>/dev/null; \
+         elif command -v podman >/dev/null 2>&1; then \
+           (command -v timeout >/dev/null 2>&1 && timeout 2 podman ps --format '{{{{.Names}}}}|{{{{.Ports}}}}' || podman ps --format '{{{{.Names}}}}|{{{{.Ports}}}}') 2>/dev/null; \
+         fi; \
+         echo __MCC_SS__; \
+         ss -tlnp 2>/dev/null | grep -E ':{port}([^0-9]|$)'; \
+         for p in $(ss -tlnp 2>/dev/null | grep -E ':{port}([^0-9]|$)' | grep -o 'pid=[0-9]*' | cut -d= -f2); do cat /proc/$p/cgroup 2>/dev/null; done",
         init_curl = mcp_remote_curl(&port.to_string(), &path, &init, curl_timeout),
         tools_curl = mcp_remote_curl(&port.to_string(), &path, &tools, curl_timeout),
         tmp = tmp,
+        port = port,
     );
-    let out = match ssh_exec(host, user, &remote, 8) {
+    let out = match ssh_exec_target(target, &remote, 8) {
         Ok(o) => o,
         Err(e) => return McpProbe::fail(e, false),
     };
     let latency = t0.elapsed().as_millis() as u64;
-    let (init_body, tools_body) = out.split_once("__MCC_SEP__").unwrap_or((out.as_str(), ""));
+    let (init_body, rest) = out.split_once("__MCC_SEP__").unwrap_or((out.as_str(), ""));
+    let (tools_body, container_rest) = rest.split_once("__MCC_DOCKER__").unwrap_or((rest, ""));
+    let (docker_out, ss_out) = container_rest
+        .split_once("__MCC_SS__")
+        .unwrap_or((container_rest, ""));
     let remote_open = !init_body.trim().is_empty();
     let Some(v) = extract_json(init_body.as_bytes()) else {
         return McpProbe::fail(
@@ -1762,12 +3087,13 @@ pub fn ssh_probe_server(
             }
         }
     }
+    let (in_container, container_name) = parse_ssh_container_probe(docker_out, ss_out, port);
     McpProbe {
         mcp_up: true,
         port_open: true,
         locked: false,
         pid: None,
-        host: Some(host.to_string()),
+        host: Some(target.host.to_string()),
         name,
         version,
         protocol,
@@ -1776,11 +3102,732 @@ pub fn ssh_probe_server(
         ws: false,
         lang,
         framework,
+        in_container,
+        container_name,
         tools,
         metadata_reused: false,
         latency_ms: latency,
         error: None,
     }
+}
+
+pub fn ssh_probe_server(
+    host: &str,
+    user: &str,
+    port: u16,
+    path: &str,
+    curl_timeout: u64,
+) -> McpProbe {
+    ssh_probe_server_target(&SshTarget::simple(host, user), port, path, curl_timeout)
+}
+
+/// Informations relevées sur une machine SSH distante lors du premier contact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteEnvInfo {
+    pub os: String,
+    pub arch: String,
+    pub cli_path: Option<String>,
+    pub cli_version: Option<String>,
+    pub cli_running: bool,
+    pub cli_port: Option<u16>,
+    pub cli_config_dir: Option<String>,
+}
+
+fn normalize_remote_os(raw: &str) -> String {
+    let low = raw.trim().to_ascii_lowercase();
+    if low.contains("linux") {
+        "linux".to_string()
+    } else if low.contains("darwin") || low.contains("macos") {
+        "macos".to_string()
+    } else if low.contains("win") {
+        "windows".to_string()
+    } else {
+        low
+    }
+}
+
+fn normalize_remote_arch(raw: &str) -> String {
+    let low = raw.trim().to_ascii_lowercase();
+    match low.as_str() {
+        "amd64" | "x86_64" | "x64" => "x86_64".to_string(),
+        "arm64" | "aarch64" => "aarch64".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Parse la sortie structurée de [`ssh_inspect_remote`].
+pub fn parse_remote_env_output(stdout: &str) -> Result<RemoteEnvInfo, String> {
+    if !stdout.contains("__MCC_OK__") {
+        return Err("réponse d'inspection SSH invalide".to_string());
+    }
+    let mut os = String::new();
+    let mut arch = String::new();
+    let mut cli_path = None;
+    let mut cli_version = None;
+    let mut cli_port = None;
+    let mut cli_config_dir = None;
+    let mut hello_raw = None;
+    for line in stdout.lines() {
+        let l = line.trim();
+        if let Some(v) = l.strip_prefix("OS=") {
+            if !v.trim().is_empty() {
+                os = normalize_remote_os(v);
+            }
+        } else if let Some(v) = l.strip_prefix("ARCH=") {
+            if !v.trim().is_empty() {
+                arch = normalize_remote_arch(v);
+            }
+        } else if let Some(v) = l.strip_prefix("CLI=") {
+            let t = v.trim();
+            if !t.is_empty() {
+                cli_path = Some(t.to_string());
+            }
+        } else if let Some(v) = l.strip_prefix("CFGDIR=") {
+            let t = v.trim();
+            if !t.is_empty() {
+                cli_config_dir = Some(t.to_string());
+            }
+        } else if let Some(v) = l.strip_prefix("VER=") {
+            let t = v.trim();
+            if !t.is_empty() {
+                cli_version = Some(t.to_string());
+            }
+        } else if let Some(v) = l.strip_prefix("PORT=") {
+            if let Ok(p) = v.trim().parse::<u16>() {
+                if p > 0 {
+                    cli_port = Some(p);
+                }
+            }
+        } else if let Some(v) = l.strip_prefix("HELLO=") {
+            let t = v.trim();
+            if !t.is_empty() {
+                hello_raw = Some(t.to_string());
+            }
+        }
+    }
+    if os.is_empty() {
+        return Err("OS distant indéterminable".to_string());
+    }
+    if arch.is_empty() {
+        arch = "unknown".to_string();
+    }
+    if cli_version.is_none() {
+        if let Some(ref h) = hello_raw {
+            if let Ok(v) = serde_json::from_str::<Value>(h) {
+                cli_version = v
+                    .get("version")
+                    .and_then(|x| x.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
+            }
+        }
+    }
+    let cli_running = cli_port.is_some();
+    Ok(RemoteEnvInfo {
+        os,
+        arch,
+        cli_path,
+        cli_version,
+        cli_running,
+        cli_port,
+        cli_config_dir,
+    })
+}
+
+/// Inspecte la machine distante en une connexion SSH : OS, arch, présence du
+/// binaire `mcp-control`, dossier de config et port actif éventuel (5090/5091).
+pub fn ssh_inspect_remote(
+    target: &SshTarget<'_>,
+    connect_timeout: u64,
+) -> Result<RemoteEnvInfo, String> {
+    let posix_cmd = "echo __MCC_OK__; \
+        if command -v uname >/dev/null 2>&1; then echo OS=$(uname -s); echo ARCH=$(uname -m); fi; \
+        CLI=''; \
+        for cand in \"$(command -v mcp-control 2>/dev/null || true)\" \"$HOME/.local/share/mcp-control/mcp-control\" \"$HOME/.local/bin/mcp-control\" \"$HOME/.cargo/bin/mcp-control\" /usr/local/bin/mcp-control; do \
+          if [ -n \"$cand\" ] && [ -x \"$cand\" ] && [ ! -d \"$cand\" ]; then CLI=\"$cand\"; break; fi; \
+        done; \
+        echo \"CLI=$CLI\"; \
+        CFGDIR=''; \
+        if [ -n \"$CLI\" ]; then \
+          REAL=$(readlink -f \"$CLI\" 2>/dev/null || readlink \"$CLI\" 2>/dev/null || echo \"$CLI\"); \
+          case \"$REAL\" in /*) ;; *) REAL=\"$(dirname \"$CLI\")/$REAL\" ;; esac; \
+          CFGDIR=$(dirname \"$REAL\"); \
+        fi; \
+        if [ -z \"$CFGDIR\" ] && [ -f \"$HOME/.local/share/mcp-control/config.json\" ]; then CFGDIR=\"$HOME/.local/share/mcp-control\"; fi; \
+        echo \"CFGDIR=$CFGDIR\"; \
+        RUN_PORT=''; HELLO=''; \
+        for port in 5090 5091; do \
+          H=''; \
+          if command -v curl >/dev/null 2>&1; then H=$(curl -fsS -m 1 \"http://127.0.0.1:$port/api/hello\" 2>/dev/null || true); \
+          elif command -v wget >/dev/null 2>&1; then H=$(wget -qO- -T 1 \"http://127.0.0.1:$port/api/hello\" 2>/dev/null || true); fi; \
+          if [ -n \"$H\" ] && printf '%s' \"$H\" | grep -q '\"mcp-control\"'; then RUN_PORT=\"$port\"; HELLO=\"$H\"; break; fi; \
+        done; \
+        echo \"PORT=$RUN_PORT\"; echo \"HELLO=$HELLO\"";
+
+    match ssh_exec_target(target, posix_cmd, connect_timeout) {
+        Ok(out) if out.contains("__MCC_OK__") && out.contains("OS=") => {
+            return parse_remote_env_output(&out);
+        }
+        Ok(out) if !out.contains("OS=") && out.trim().is_empty() => {}
+        Err(e) if e.contains("clé SSH refusée") || e.contains("machine injoignable") => {
+            return Err(e);
+        }
+        _ => {}
+    }
+
+    // Repli Windows OpenSSH (cmd.exe / PowerShell)
+    let ps_script = "Write-Output '__MCC_OK__'; Write-Output 'OS=windows'; \
+        Write-Output ('ARCH=' + $env:PROCESSOR_ARCHITECTURE); \
+        $cands = @((Get-Command mcp-control -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1), (Join-Path $env:LOCALAPPDATA 'mcp-control\\mcp-control.exe')); \
+        $cli = ($cands | Where-Object { $_ -and (Test-Path $_ -PathType Leaf) } | Select-Object -First 1); \
+        Write-Output ('CLI=' + ($cli -as [string])); \
+        $cfg = if ($cli) { Split-Path -Parent $cli } else { Join-Path $env:LOCALAPPDATA 'mcp-control' }; \
+        Write-Output ('CFGDIR=' + $cfg); \
+        $rport = ''; $hello = ''; \
+        foreach ($p in 5090, 5091) { \
+          try { $r = Invoke-RestMethod -TimeoutSec 1 -Uri ('http://127.0.0.1:' + $p + '/api/hello'); if ($r.app -eq 'mcp-control') { $rport = [string]$p; $hello = ($r | ConvertTo-Json -Compress); break } } catch {} \
+        }; \
+        Write-Output ('PORT=' + $rport); Write-Output ('HELLO=' + $hello)";
+    let win_cmd = format!(
+        "powershell -NoProfile -NonInteractive -Command {}",
+        ps_quote(ps_script)?
+    );
+    let out = ssh_exec_target(target, &win_cmd, connect_timeout)?;
+    parse_remote_env_output(&out)
+}
+
+pub(crate) fn validate_cli_install_params(url: &str, expected_sha256: &str) -> Result<(), String> {
+    const PREFIX: &str = "https://github.com/DeamonDev888/mcp-control/releases/download/";
+    if !url.starts_with(PREFIX)
+        || url.len() > 512
+        || !url
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | ':' | '.' | '-' | '_'))
+    {
+        return Err("URL de binaire CLI hors périmètre autorisé".to_string());
+    }
+    if expected_sha256.len() != 64
+        || !expected_sha256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err("empreinte SHA-256 attendue invalide".to_string());
+    }
+    Ok(())
+}
+
+/// Installe le binaire CLI `mcp-control` sur la machine distante en vérifiant
+/// strictement son empreinte SHA-256 avant de le placer en destination finale.
+pub fn ssh_install_cli(
+    target: &SshTarget<'_>,
+    os: &str,
+    url: &str,
+    expected_sha256: &str,
+) -> Result<String, String> {
+    validate_cli_install_params(url, expected_sha256)?;
+    let os_norm = normalize_remote_os(os);
+    if os_norm == "windows" {
+        let ps_script = format!(
+            "$ErrorActionPreference = 'Stop'; \
+            $dir = Join-Path $env:LOCALAPPDATA 'mcp-control'; \
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null; \
+            $tmp = Join-Path $dir ('.mcp-control.tmp.' + $PID + '.exe'); \
+            $bin = Join-Path $dir 'mcp-control.exe'; \
+            Invoke-WebRequest -UseBasicParsing -TimeoutSec 60 -Uri {url_q} -OutFile $tmp; \
+            $got = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLowerInvariant(); \
+            if ($got -ne {sha_q}) {{ Remove-Item -Force $tmp -ErrorAction SilentlyContinue; throw ('SHA-256 invalide : ' + $got) }}; \
+            Move-Item -Force $tmp $bin; \
+            Write-Output ('__MCC_INSTALLED__' + $bin)",
+            url_q = ps_quote(url)?,
+            sha_q = ps_quote(expected_sha256)?,
+        );
+        let cmd = format!(
+            "powershell -NoProfile -NonInteractive -Command {}",
+            ps_quote(&ps_script)?
+        );
+        let out = ssh_exec_target(target, &cmd, 15)?;
+        return out
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("__MCC_INSTALLED__").map(String::from))
+            .ok_or_else(|| "installation CLI Windows distante incomplète".to_string());
+    }
+    if os_norm != "linux" && os_norm != "macos" {
+        return Err(format!("OS distant non pris en charge pour CLI : {os}"));
+    }
+    let url_q = posix_shell_quote(url)?;
+    let sha_q = posix_shell_quote(expected_sha256)?;
+    let cmd = format!(
+        "set -e; \
+        DIR=\"$HOME/.local/share/mcp-control\"; \
+        BIN=\"$DIR/mcp-control\"; \
+        TMP=\"$DIR/.mcp-control.tmp.$$\"; \
+        mkdir -p \"$DIR\" \"$HOME/.local/bin\"; \
+        rm -f \"$TMP\"; \
+        if command -v curl >/dev/null 2>&1; then curl -fsSL -m 60 -o \"$TMP\" {url_q}; \
+        elif command -v wget >/dev/null 2>&1; then wget -q -T 60 -O \"$TMP\" {url_q}; \
+        else echo 'curl ou wget requis' >&2; exit 1; fi; \
+        if command -v sha256sum >/dev/null 2>&1; then GOT=$(sha256sum \"$TMP\" | awk '{{print $1}}'); \
+        elif command -v shasum >/dev/null 2>&1; then GOT=$(shasum -a 256 \"$TMP\" | awk '{{print $1}}'); \
+        elif command -v openssl >/dev/null 2>&1; then GOT=$(openssl dgst -sha256 \"$TMP\" | awk '{{print $NF}}'); \
+        else rm -f \"$TMP\"; echo 'sha256sum/shasum introuvable' >&2; exit 1; fi; \
+        GOT=$(printf '%s' \"$GOT\" | tr 'A-F' 'a-f'); \
+        if [ \"$GOT\" != {sha_q} ]; then rm -f \"$TMP\"; echo \"SHA-256 invalide : $GOT\" >&2; exit 1; fi; \
+        chmod 700 \"$TMP\"; \
+        mv -f \"$TMP\" \"$BIN\"; \
+        ln -sf \"$BIN\" \"$HOME/.local/bin/mcp-control\"; \
+        echo \"__MCC_INSTALLED__$BIN\""
+    );
+    let out = ssh_exec_target(target, &cmd, 15)?;
+    out.lines()
+        .find_map(|l| l.trim().strip_prefix("__MCC_INSTALLED__").map(String::from))
+        .ok_or_else(|| "installation CLI distante incomplète".to_string())
+}
+
+/// Démarre `mcp-control` en mode détaché sur la machine distante s'il ne répond pas déjà,
+/// puis attend qu'il écoute sur `127.0.0.1:5090` ou `5091`.
+pub fn ssh_ensure_cli_running(
+    target: &SshTarget<'_>,
+    os: &str,
+    cli_path: &str,
+) -> Result<u16, String> {
+    let os_norm = normalize_remote_os(os);
+    if os_norm == "windows" {
+        let cli_q = ps_quote(cli_path)?;
+        let ps_script = format!(
+            "$p = $null; \
+            foreach ($cand in 5090, 5091) {{ try {{ $r = Invoke-RestMethod -TimeoutSec 1 -Uri ('http://127.0.0.1:' + $cand + '/api/hello'); if ($r.app -eq 'mcp-control') {{ $p = $cand; break }} }} catch {{}} }}; \
+            if (-not $p) {{ \
+              Start-Process -WindowStyle Hidden -FilePath {cli_q} -ArgumentList '--hidden'; \
+              for ($i = 0; $i -lt 8; $i++) {{ \
+                Start-Sleep -Milliseconds 500; \
+                foreach ($cand in 5090, 5091) {{ try {{ $r = Invoke-RestMethod -TimeoutSec 1 -Uri ('http://127.0.0.1:' + $cand + '/api/hello'); if ($r.app -eq 'mcp-control') {{ $p = $cand; break }} }} catch {{}} }}; \
+                if ($p) {{ break }} \
+              }} \
+            }}; \
+            if ($p) {{ Write-Output ('__MCC_RUNNING_PORT__' + $p) }} else {{ throw 'mcp-control distant non joignable après lancement' }}"
+        );
+        let cmd = format!(
+            "powershell -NoProfile -NonInteractive -Command {}",
+            ps_quote(&ps_script)?
+        );
+        let out = ssh_exec_target(target, &cmd, 12)?;
+        return out
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("__MCC_RUNNING_PORT__"))
+            .and_then(|s| s.parse::<u16>().ok())
+            .filter(|&p| p > 0)
+            .ok_or_else(|| "mcp-control Windows distant non démarré".to_string());
+    }
+
+    let cli_q = posix_shell_quote(cli_path)?;
+    let cmd = format!(
+        "probe_hello() {{ \
+          for port in 5090 5091; do \
+            H=''; \
+            if command -v curl >/dev/null 2>&1; then H=$(curl -fsS -m 1 \"http://127.0.0.1:$port/api/hello\" 2>/dev/null || true); \
+            elif command -v wget >/dev/null 2>&1; then H=$(wget -qO- -T 1 \"http://127.0.0.1:$port/api/hello\" 2>/dev/null || true); fi; \
+            if [ -n \"$H\" ] && printf '%s' \"$H\" | grep -q '\"mcp-control\"'; then echo \"$port\"; return 0; fi; \
+          done; \
+          return 1; \
+        }}; \
+        P=$(probe_hello || true); \
+        if [ -z \"$P\" ]; then \
+          nohup {cli_q} </dev/null >/dev/null 2>&1 & \
+          i=0; \
+          while [ $i -lt 8 ]; do \
+            sleep 0.5; \
+            P=$(probe_hello || true); \
+            if [ -n \"$P\" ]; then break; fi; \
+            i=$((i + 1)); \
+          done; \
+        fi; \
+        if [ -n \"$P\" ]; then echo \"__MCC_RUNNING_PORT__$P\"; else echo 'non démarré' >&2; exit 1; fi"
+    );
+    let out = ssh_exec_target(target, &cmd, 12)?;
+    out.lines()
+        .find_map(|l| l.trim().strip_prefix("__MCC_RUNNING_PORT__"))
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|&p| p > 0)
+        .ok_or_else(|| "mcp-control distant non démarré".to_string())
+}
+
+/// Lit l'état assaini du pair `mcp-control` distant via SSH :
+/// 1. `mcp-control auth state` (CLI >= 0.8.9) ;
+/// 2. repli `state-cache.json` (zéro secret, compatible v0.8.8).
+pub fn ssh_read_remote_peer_state(
+    target: &SshTarget<'_>,
+    os: &str,
+    cli_path: Option<&str>,
+    cli_config_dir: Option<&str>,
+    _cli_port: u16,
+) -> Option<Value> {
+    let os_norm = normalize_remote_os(os);
+    if os_norm == "windows" {
+        if let Some(cli) = cli_path {
+            if let Ok(cli_q) = ps_quote(cli) {
+                let ps = format!("& {cli_q} auth state");
+                if let Ok(cmd) = ps_quote(&ps) {
+                    if let Ok(out) = ssh_exec_target(
+                        target,
+                        &format!("powershell -NoProfile -NonInteractive -Command {cmd}"),
+                        8,
+                    ) {
+                        if let Ok(v) = serde_json::from_str::<Value>(out.trim()) {
+                            if v.get("servers").is_some() && v.get("stats").is_some() {
+                                return Some(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(cfg) = cli_config_dir {
+            if let Ok(cache_q) = ps_quote(&format!("{cfg}\\state-cache.json")) {
+                let ps = format!("if (Test-Path {cache_q}) {{ Get-Content -Raw {cache_q} }}");
+                if let Ok(cmd) = ps_quote(&ps) {
+                    if let Ok(out) = ssh_exec_target(
+                        target,
+                        &format!("powershell -NoProfile -NonInteractive -Command {cmd}"),
+                        8,
+                    ) {
+                        if let Ok(v) = serde_json::from_str::<Value>(out.trim()) {
+                            if let Some(arr) = v.get("servers").and_then(|x| x.as_array()) {
+                                let up = arr
+                                    .iter()
+                                    .filter(|s| {
+                                        s.get("state").and_then(|x| x.as_str()) == Some("UP")
+                                    })
+                                    .count();
+                                return Some(json!({
+                                    "servers": arr,
+                                    "stats": {"total": arr.len(), "up": up}
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return None;
+    }
+
+    if let Some(cli) = cli_path {
+        if let Ok(cli_q) = posix_shell_quote(cli) {
+            if let Ok(out) = ssh_exec_target(target, &format!("{cli_q} auth state 2>/dev/null"), 8)
+            {
+                if let Ok(v) = serde_json::from_str::<Value>(out.trim()) {
+                    if v.get("servers").is_some() && v.get("stats").is_some() {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut cache_candidates: Vec<String> = Vec::new();
+    if let Some(cfg) = cli_config_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        cache_candidates.push(format!("{}/state-cache.json", cfg.trim_end_matches('/')));
+    }
+    for cand in cache_candidates {
+        if let Ok(cand_q) = posix_shell_quote(&cand) {
+            if let Ok(out) = ssh_exec_target(target, &format!("cat {cand_q} 2>/dev/null"), 8) {
+                if let Ok(v) = serde_json::from_str::<Value>(out.trim()) {
+                    if let Some(arr) = v.get("servers").and_then(|x| x.as_array()) {
+                        let up = arr
+                            .iter()
+                            .filter(|s| s.get("state").and_then(|x| x.as_str()) == Some("UP"))
+                            .count();
+                        return Some(json!({
+                            "servers": arr,
+                            "stats": {"total": arr.len(), "up": up}
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Appelle un outil (`tools/call`) sur un serveur MCP distant via SSH :
+/// le payload JSON-RPC est envoyé exclusivement sur **stdin** (`--data-binary @-`),
+/// sans jamais interpoler les arguments dans le shell distant.
+pub fn ssh_call_tool(
+    target: &SshTarget<'_>,
+    port: u16,
+    path: &str,
+    protocol: Option<&str>,
+    tool: &str,
+    arguments: Value,
+    timeout_secs: u64,
+) -> Result<(Value, u64), String> {
+    if port == 0 {
+        return Err("port invalide pour appel SSH".to_string());
+    }
+    let t0 = Instant::now();
+    let safe_path = mcp_path_safe(path);
+    let proto = protocol
+        .map(str::trim)
+        .filter(|p| {
+            !p.is_empty()
+                && p.len() <= 32
+                && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+        .unwrap_or("2024-11-05");
+    let init_payload = mcp_remote_payload("initialize", 1);
+    let tmp = "/tmp/.mcc_call_$$";
+    let curl_t = timeout_secs.clamp(2, 60);
+    let init_curl = format!(
+        "curl -s -m {t} -X POST 'http://127.0.0.1:{port}{safe_path}' \
+         -H 'Content-Type: application/json' \
+         -H 'Accept: application/json, text/event-stream' \
+         -H 'MCP-Protocol-Version: {proto}' \
+         -d '{init_payload}'",
+        t = curl_t.min(10),
+    );
+    let call_curl = format!(
+        "curl -s -m {curl_t} -X POST 'http://127.0.0.1:{port}{safe_path}' \
+         -H 'Content-Type: application/json' \
+         -H 'Accept: application/json, text/event-stream' \
+         -H 'MCP-Protocol-Version: {proto}' \
+         -H 'Mcp-Session-Id:'$sid \
+         --data-binary @-"
+    );
+    let remote = format!(
+        "{init_curl} -D {tmp} </dev/null >/dev/null; \
+         sid=$(grep -i mcp-session-id {tmp} | head -n 1 | tr -d '\\r' | sed 's/^[^:]*: *//' | tr -cd 'A-Za-z0-9-_' | head -c 100); \
+         rm -f {tmp}; echo __MCC_CALL_SEP__; {call_curl}; echo"
+    );
+    let call_body = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": tool,
+            "arguments": arguments,
+        }
+    })
+    .to_string();
+
+    let out = ssh_exec_stdin(target, &remote, call_body.as_bytes(), 8, curl_t + 5)?;
+    let elapsed = t0.elapsed().as_millis() as u64;
+    let body = out
+        .split_once("__MCC_CALL_SEP__")
+        .map(|(_, after)| after)
+        .unwrap_or(out.as_str());
+    let v = extract_json(body.as_bytes())
+        .ok_or_else(|| format!("via ssh : réponse non JSON ({} octets)", body.len()))?;
+    if let Some(err) = v.get("error") {
+        return Err(format!("rpc error: {err}"));
+    }
+    let res = v.get("result").cloned().unwrap_or(Value::Null);
+    Ok((res, elapsed))
+}
+
+/// Démarre un processus détaché sur la machine distante via SSH.
+/// Tous les arguments, variables d'env et chemins sont strictement validés et quotés.
+pub fn ssh_spawn_remote(
+    target: &SshTarget<'_>,
+    os_hint: Option<&str>,
+    cmd: &crate::types::StartCmd,
+) -> Result<Option<u32>, String> {
+    if cmd.program.trim().is_empty() {
+        return Err("programme de lancement vide".to_string());
+    }
+    if os_hint.is_some_and(|o| normalize_remote_os(o) == "windows") {
+        let prog_q = ps_quote(cmd.program.trim())?;
+        let mut arg_items = Vec::with_capacity(cmd.args.len());
+        for a in &cmd.args {
+            arg_items.push(ps_quote(a)?);
+        }
+        let mut env_cmds = String::new();
+        for (k, v) in &cmd.env {
+            if !env_key_safe(k) {
+                return Err(format!("nom de variable d'environnement invalide : {k}"));
+            }
+            env_cmds.push_str(&format!("$env:{k} = {}; ", ps_quote(v)?));
+        }
+        let wd_part = match cmd
+            .workdir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(wd) => format!(" -WorkingDirectory {}", ps_quote(wd)?),
+            None => String::new(),
+        };
+        let args_part = if arg_items.is_empty() {
+            String::new()
+        } else {
+            format!(" -ArgumentList @({})", arg_items.join(", "))
+        };
+        let ps_script = format!(
+            "{env_cmds}$p = Start-Process -WindowStyle Hidden -PassThru -FilePath {prog_q}{args_part}{wd_part}; \
+             Write-Output ('__MCC_PID_' + $p.Id + '__')"
+        );
+        let win_cmd = format!(
+            "powershell -NoProfile -NonInteractive -Command {}",
+            ps_quote(&ps_script)?
+        );
+        let out = ssh_exec_target(target, &win_cmd, 8)?;
+        return Ok(parse_remote_pid(&out));
+    }
+
+    let mut env_prefix = String::new();
+    for (k, v) in &cmd.env {
+        if !env_key_safe(k) {
+            return Err(format!("nom de variable d'environnement invalide : {k}"));
+        }
+        env_prefix.push_str(&format!("{k}={} ", posix_shell_quote(v)?));
+    }
+    let cd_part = match cmd
+        .workdir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(wd) => format!("cd {} || exit 1; ", posix_shell_quote(wd)?),
+        None => String::new(),
+    };
+    let mut parts = Vec::with_capacity(1 + cmd.args.len());
+    parts.push(posix_shell_quote(cmd.program.trim())?);
+    for a in &cmd.args {
+        parts.push(posix_shell_quote(a)?);
+    }
+    let remote = format!(
+        "{cd_part}{env_prefix}nohup {} </dev/null >/dev/null 2>&1 & echo __MCC_PID_$!__",
+        parts.join(" ")
+    );
+    let out = ssh_exec_target(target, &remote, 8)?;
+    Ok(parse_remote_pid(&out))
+}
+
+fn parse_remote_pid(out: &str) -> Option<u32> {
+    let (_, rest) = out.split_once("__MCC_PID_")?;
+    let (digits, _) = rest.split_once("__")?;
+    digits.trim().parse::<u32>().ok().filter(|&p| p > 0)
+}
+
+/// Parse les PID et noms de processus écoutant sur `port` depuis `ss -tlnp`,
+/// `lsof`, `netstat -tlnp` ou `netstat -ano`.
+pub fn parse_remote_port_listeners(text: &str, port: u16) -> Vec<(u32, String)> {
+    let mut out: Vec<(u32, String)> = Vec::new();
+    let suffix_colon = format!(":{port}");
+    let suffix_dot = format!(".{port}");
+    for line in text.lines() {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        if toks.is_empty() {
+            continue;
+        }
+        // Windows netstat -ano : TCP 0.0.0.0:3000 0.0.0.0:0 LISTENING 1234
+        if toks.len() >= 5 && toks.contains(&"LISTENING") && toks[1].ends_with(&suffix_colon) {
+            if let Ok(pid) = toks.last().unwrap_or(&"").parse::<u32>() {
+                if pid > 0 && !out.iter().any(|(p, _)| *p == pid) {
+                    out.push((pid, "remote".to_string()));
+                }
+            }
+            continue;
+        }
+        // lsof -nP -iTCP:<port> -sTCP:LISTEN : node 1234 user ... TCP *:3000 (LISTEN)
+        if toks.len() >= 9 && line.contains("(LISTEN)") && line.contains(&suffix_colon) {
+            if let Ok(pid) = toks[1].parse::<u32>() {
+                if pid > 0 && !out.iter().any(|(p, _)| *p == pid) {
+                    out.push((pid, toks[0].to_string()));
+                }
+            }
+            continue;
+        }
+        // ss -tlnp : LISTEN 0 128 0.0.0.0:3000 ... users:(("node",pid=1234,fd=18))
+        let matches_port = toks
+            .iter()
+            .any(|t| t.ends_with(&suffix_colon) || t.ends_with(&suffix_dot));
+        if !matches_port {
+            continue;
+        }
+        if let Some(pos) = line.find("pid=") {
+            let after = &line[pos + 4..];
+            let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(pid) = digits.parse::<u32>() {
+                let proc_name = line[..pos]
+                    .rsplit('"')
+                    .nth(1)
+                    .unwrap_or("remote")
+                    .to_string();
+                if pid > 0 && !out.iter().any(|(p, _)| *p == pid) {
+                    out.push((pid, proc_name));
+                }
+                continue;
+            }
+        }
+        // netstat -tlnp : tcp 0 0 0.0.0.0:3000 0.0.0.0:* LISTEN 1234/node
+        if toks.contains(&"LISTEN") {
+            if let Some(last) = toks.last() {
+                if let Some((pid_s, name)) = last.split_once('/') {
+                    if let Ok(pid) = pid_s.parse::<u32>() {
+                        if pid > 0 && !out.iter().any(|(p, _)| *p == pid) {
+                            out.push((pid, name.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Liste `(pid, process)` écoutant sur `port` sur la machine distante SSH.
+pub fn ssh_port_listeners(
+    target: &SshTarget<'_>,
+    os_hint: Option<&str>,
+    port: u16,
+) -> Vec<(u32, String)> {
+    if port == 0 {
+        return Vec::new();
+    }
+    let remote = if os_hint.is_some_and(|o| normalize_remote_os(o) == "windows") {
+        "netstat -ano | findstr LISTENING".to_string()
+    } else {
+        format!(
+            "ss -tlnp 2>/dev/null || lsof -nP -iTCP:{port} -sTCP:LISTEN 2>/dev/null || netstat -tlnp 2>/dev/null || true"
+        )
+    };
+    match ssh_exec_target(target, &remote, 8) {
+        Ok(out) => parse_remote_port_listeners(&out, port),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Termine une liste de PIDs sur la machine distante SSH (`force` = SIGKILL / `/F`).
+pub fn ssh_kill_pids(
+    target: &SshTarget<'_>,
+    os_hint: Option<&str>,
+    pids: &[u32],
+    force: bool,
+) -> Result<(), String> {
+    let valid: Vec<u32> = pids.iter().copied().filter(|&p| p > 0).collect();
+    if valid.is_empty() {
+        return Ok(());
+    }
+    let remote = if os_hint.is_some_and(|o| normalize_remote_os(o) == "windows") {
+        let mut args = String::from("taskkill /T");
+        if force {
+            args.push_str(" /F");
+        }
+        for p in &valid {
+            args.push_str(&format!(" /PID {p}"));
+        }
+        args
+    } else {
+        let sig = if force { "-KILL" } else { "-TERM" };
+        let list = valid
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("kill {sig} {list} 2>/dev/null || true")
+    };
+    ssh_exec_target(target, &remote, 8).map(|_| ())
 }
 
 /// Vrai si l'erreur de [`http_request`] correspond à un hôte qui n'a JAMAIS
@@ -2653,11 +4700,15 @@ pub fn probe_http_with(port: u16, path: &str, timeout_ms: u64, hint: &ProbeHint<
                 .unwrap_or_else(|| "pas de réponse initialize".to_string());
             if motif.contains(crate::auth::net::LOCKED_SERVER_MSG) {
                 let health = health_ok_host(open_host, port, timeout_ms.clamp(400, 1200));
-                return McpProbe::locked_litemcp(
+                let mut probe = McpProbe::locked_litemcp(
                     open_host.to_string(),
                     health,
                     t0.elapsed().as_millis() as u64,
                 );
+                let (in_container, container_name) = port_owner_container(port);
+                probe.in_container = in_container;
+                probe.container_name = container_name;
+                return probe;
             }
             return McpProbe::fail(motif, true);
         }
@@ -2718,6 +4769,8 @@ pub fn probe_http_with(port: u16, path: &str, timeout_ms: u64, hint: &ProbeHint<
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             tools: Vec::new(),
             metadata_reused: true,
             latency_ms: latency,
@@ -2792,6 +4845,7 @@ pub fn probe_http_with(port: u16, path: &str, timeout_ms: u64, hint: &ProbeHint<
         .ok()
         .flatten()
         .is_some();
+    let (in_container, container_name) = port_owner_container(port);
     McpProbe {
         mcp_up: true,
         port_open: true,
@@ -2806,6 +4860,8 @@ pub fn probe_http_with(port: u16, path: &str, timeout_ms: u64, hint: &ProbeHint<
         ws,
         lang,
         framework,
+        in_container,
+        container_name,
         tools,
         metadata_reused: false,
         latency_ms: latency,
@@ -2831,7 +4887,7 @@ fn read_bounded_line<R: std::io::BufRead>(
 }
 
 /// Lignes stderr conservées par process stdio (diagnostic de démarrage).
-const STDERR_TAIL_LINES: usize = 8;
+const STDERR_TAIL_LINES: usize = 16;
 /// Longueur max du résumé stderr ajouté à un message d'erreur.
 const STDERR_SUMMARY_MAX: usize = 300;
 
@@ -2846,9 +4902,13 @@ fn stderr_summary(tail: &std::collections::VecDeque<String>) -> String {
             !(b.starts_with("npm warn") || b.starts_with("npm notice"))
         })
         .collect();
-    // Crash Node/Python : la ligne « …Error: … » est la seule parlante (la
-    // pile et « Node.js vXX » qui suivent n'apprennent rien).
-    let s = match utiles.iter().rev().find(|l| l.contains("Error:")) {
+    // Crash Node/Python : la ligne « …Error: … » ou « …Exception: … » est la
+    // seule parlante (la pile et « Node.js vXX » qui suivent n'apprennent rien).
+    let s = match utiles
+        .iter()
+        .rev()
+        .find(|l| l.contains("Error:") || l.contains("Exception:"))
+    {
         Some(l) => l.to_string(),
         None => utiles[utiles.len().saturating_sub(2)..].join(" | "),
     };
@@ -2872,12 +4932,28 @@ pub fn probe_stdio(
     env: &[(String, String)],
 ) -> Result<(McpProbe, Option<StdioHandle>), String> {
     let t0 = Instant::now();
-    let program = resolve_windows_cmd(program);
-    let mut cmd = Command::new(&program);
-    cmd.args(args)
+    let (launch_program, launch_args) = resolve_stdio_command(program, args);
+    let mut cmd = Command::new(&launch_program);
+    cmd.args(&launch_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Hygiène par défaut sur les sous-processus stdio (UTF-8 Python sous Windows,
+    // stdout Python non bufferisé, suppression du bruit couleur/notifier npm) —
+    // chaque variable explicitement fournie par l'utilisateur reste prioritaire.
+    for (k, v) in [
+        ("PYTHONUTF8", "1"),
+        ("PYTHONUNBUFFERED", "1"),
+        ("NO_COLOR", "1"),
+        ("NPM_CONFIG_UPDATE_NOTIFIER", "false"),
+        ("NPM_CONFIG_FUND", "false"),
+        ("NPM_CONFIG_AUDIT", "false"),
+        ("npm_config_yes", "true"),
+    ] {
+        if !env.iter().any(|(ek, _)| ek.eq_ignore_ascii_case(k)) {
+            cmd.env(k, v);
+        }
+    }
     // env additionnel du transport stdio (import mcpServers, lot 3) : les
     // valeurs ne vivent que dans le process enfant — jamais journalisées.
     cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
@@ -2961,8 +5037,10 @@ pub fn probe_stdio(
     }
     let _ = stdin.flush();
 
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut got_init = false;
+    let mut tools_req_id: u64 = 2;
+    const MAX_TOOLS_PAGES: u64 = 10;
     let mut name: Option<String> = None;
     let mut version: Option<String> = None;
     let mut protocol: Option<String> = None;
@@ -2979,7 +5057,7 @@ pub fn probe_stdio(
         let wait = deadline - now;
         match rx.recv_timeout(wait) {
             Ok(line) => {
-                let t = line.trim();
+                let t = line.trim().trim_start_matches('\u{feff}');
                 if !t.starts_with('{') {
                     continue;
                 } // logs/bruits
@@ -2987,8 +5065,10 @@ pub fn probe_stdio(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let id = v.get("id").and_then(|x| x.as_u64());
-                if id == Some(1) && !got_init {
+                if v.get("method").is_some() {
+                    continue;
+                }
+                if rpc_id_matches(v.get("id"), 1) && !got_init {
                     if let Some(err) = v.get("error") {
                         init_err = Some(format!("initialize rejeté: {}", err));
                         break;
@@ -3003,6 +5083,9 @@ pub fn probe_stdio(
                         .and_then(|x| x.as_str())
                         .map(String::from);
                     got_init = true;
+                    // Fenêtre dédiée à `tools/list` pour qu'une installation à froid lente
+                    // sur `initialize` ne prive pas l'inventaire des outils de budget.
+                    deadline = Instant::now() + Duration::from_millis(20_000);
                     let _ = writeln!(
                         stdin,
                         "{}",
@@ -3011,15 +5094,40 @@ pub fn probe_stdio(
                     let _ = writeln!(
                         stdin,
                         "{}",
-                        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+                        json!({"jsonrpc": "2.0", "id": tools_req_id, "method": "tools/list", "params": {}})
                     );
                     let _ = stdin.flush();
-                } else if id == Some(2) {
+                } else if got_init && rpc_id_matches(v.get("id"), tools_req_id) {
+                    let mut next_cursor: Option<String> = None;
                     if let Some(res) = v.get("result") {
                         if let Some(arr) = res.get("tools").and_then(|x| x.as_array()) {
                             for t in arr {
                                 tools.push(parse_tool_info(t));
                             }
+                        }
+                        next_cursor = res
+                            .get("nextCursor")
+                            .and_then(|x| x.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                    }
+                    if let Some(cursor) = next_cursor {
+                        if tools_req_id < 2 + MAX_TOOLS_PAGES - 1 {
+                            tools_req_id += 1;
+                            deadline = Instant::now() + Duration::from_millis(15_000);
+                            let _ = writeln!(
+                                stdin,
+                                "{}",
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": tools_req_id,
+                                    "method": "tools/list",
+                                    "params": { "cursor": cursor }
+                                })
+                            );
+                            let _ = stdin.flush();
+                            continue;
                         }
                     }
                     break;
@@ -3092,6 +5200,7 @@ pub fn probe_stdio(
     .or_else(|| crate::frameworks::detect_by_name(&args_join));
     let framework = fw.map(|f| f.id.to_string());
     let lang = lang.or_else(|| fw.map(|f| f.lang.to_string()));
+    let (in_container, container_name) = detect_container_cmd(program, args);
     if keep_alive {
         Ok((
             McpProbe {
@@ -3108,6 +5217,8 @@ pub fn probe_stdio(
                 ws: false,
                 lang,
                 framework,
+                in_container,
+                container_name,
                 tools,
                 metadata_reused: false,
                 latency_ms: latency,
@@ -3116,7 +5227,7 @@ pub fn probe_stdio(
             Some(handle_de_child(
                 child,
                 Some(StdioRpc {
-                    stdin,
+                    stdin: Box::new(stdin),
                     rx,
                     next_id: 100,
                 }),
@@ -3140,6 +5251,8 @@ pub fn probe_stdio(
                 ws: false,
                 lang,
                 framework,
+                in_container,
+                container_name,
                 tools,
                 metadata_reused: false,
                 latency_ms: latency,
@@ -3163,11 +5276,9 @@ pub fn rpc_call_host(
     rpc_call_host_headers(host, port, path, method, params, id, timeout_ms, &[])
 }
 
-/// Un appel JSON-RPC HTTP vers un hôte précis avec en-têtes additionnels (ex. `Mcp-Session-Id`).
-#[allow(clippy::too_many_arguments)]
 /// Extrait un [`ToolInfo`] complet (nom, description jusqu'à 4096 car., schéma JSON
 /// `inputSchema` éventuel) depuis une entrée `tools/list`.
-fn parse_tool_info(t: &Value) -> ToolInfo {
+pub fn parse_tool_info(t: &Value) -> ToolInfo {
     ToolInfo {
         name: t
             .get("name")
@@ -3433,11 +5544,17 @@ pub fn probe_http_host_with(
             let motif = err_hote.unwrap_or_else(|| "pas de réponse initialize".to_string());
             if motif.contains(crate::auth::net::LOCKED_SERVER_MSG) {
                 let health = health_ok_host(host, port, timeout_ms.clamp(400, 1200));
-                return McpProbe::locked_litemcp(
+                let mut probe = McpProbe::locked_litemcp(
                     host.to_string(),
                     health,
                     t0.elapsed().as_millis() as u64,
                 );
+                if crate::is_loopback_bind(host) {
+                    let (in_container, container_name) = port_owner_container(port);
+                    probe.in_container = in_container;
+                    probe.container_name = container_name;
+                }
+                return probe;
             }
             return McpProbe::fail(motif, true);
         }
@@ -3497,6 +5614,8 @@ pub fn probe_http_host_with(
             ws: false,
             lang: None,
             framework: None,
+            in_container: false,
+            container_name: None,
             tools: Vec::new(),
             metadata_reused: true,
             latency_ms: latency,
@@ -3511,7 +5630,9 @@ pub fn probe_http_host_with(
     let sse_endpoint = sse_get_host(host, port, sse_path, timeout_ms.clamp(500, 1200));
     // Transport WS : upgrade WebSocket acceptée (101) → badge « WS » dans l'UI.
     let ws = ws_upgrade_host(host, port, path, timeout_ms.clamp(300, 800));
-    let lang_hint = detect_lang_http(&head, name.as_deref());
+    let is_loopback = crate::is_loopback_bind(host);
+    let lang_hint = detect_lang_http(&head, name.as_deref())
+        .or_else(|| if is_loopback { port_owner_lang(port) } else { None });
     let health = protocol.as_deref() == Some(crate::LITEMCP_PROTOCOL)
         && health_ok_host(host, port, timeout_ms.clamp(400, 1200));
     let fw = crate::frameworks::detect(
@@ -3558,6 +5679,11 @@ pub fn probe_http_host_with(
         .ok()
         .flatten()
         .is_some();
+    let (in_container, container_name) = if is_loopback {
+        port_owner_container(port)
+    } else {
+        (false, None)
+    };
     McpProbe {
         mcp_up: true,
         port_open: true,
@@ -3572,6 +5698,8 @@ pub fn probe_http_host_with(
         ws,
         lang,
         framework,
+        in_container,
+        container_name,
         tools,
         metadata_reused: false,
         latency_ms: latency,
@@ -5029,5 +7157,314 @@ tcp4       0      0  127.0.0.1.135          *.*                    LISTEN\n";
             out.status.success(),
             "le vrai reg.exe doit répondre même avec un leurre dans cwd"
         );
+    }
+
+    #[test]
+    fn resolve_npx_in_dir_trouve_node_et_npx_cli_ou_rend_none() {
+        let dir = std::env::temp_dir().join(format!("mcc-npx-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(resolve_npx_in_dir(&dir), None);
+
+        std::fs::write(dir.join("node.exe"), b"").unwrap();
+        assert_eq!(resolve_npx_in_dir(&dir), None);
+
+        let cli = dir
+            .join("node_modules")
+            .join("npm")
+            .join("bin")
+            .join("npx-cli.js");
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(&cli, b"// npx").unwrap();
+
+        let (node_path, cli_path) = resolve_npx_in_dir(&dir).expect("doit résoudre node + npx-cli");
+        assert!(node_path.ends_with("node.exe"), "{node_path}");
+        assert!(cli_path.ends_with("npx-cli.js"), "{cli_path}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn call_stdio_rpc_ignore_bom_et_requete_entrante_meme_id() {
+        let (tx_in, rx_in) = std::sync::mpsc::channel::<String>();
+        let (tx_out, rx_out) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for line in rx_in {
+                let req: Value = serde_json::from_str(line.trim()).unwrap();
+                let id = req["id"].as_u64().unwrap();
+                // 1. Requête serveur->client partageant le même id (à ignorer)
+                let _ = tx_out.send(
+                    json!({"jsonrpc":"2.0","id":id,"method":"roots/list","params":{}}).to_string(),
+                );
+                // 2. Bruit non-JSON
+                let _ = tx_out.send("debug banner".to_string());
+                // 3. Réponse valide précédée d'un BOM UTF-8
+                let _ = tx_out.send(format!(
+                    "\u{feff}{}",
+                    json!({"jsonrpc":"2.0","id":id,"result":{"ok":true,"echo":req["method"]}})
+                ));
+            }
+        });
+        let rpc = std::sync::Arc::new(std::sync::Mutex::new(StdioRpc {
+            stdin: Box::new(LineChannelWriter {
+                tx: tx_in,
+                buf: Vec::new(),
+            }),
+            rx: rx_out,
+            next_id: 100,
+        }));
+        let (res, _ms) = call_stdio_rpc(&rpc, "tools/list", json!({}), 2_000).unwrap();
+        assert_eq!(res["ok"], json!(true));
+        assert_eq!(res["echo"], json!("tools/list"));
+    }
+
+    #[test]
+    fn posix_shell_quote_et_ssh_path_safe_protegent_des_injections() {
+        assert_eq!(posix_shell_quote("simple").unwrap(), "'simple'");
+        assert_eq!(
+            posix_shell_quote("a'b $PATH `id`").unwrap(),
+            "'a'\\''b $PATH `id`'"
+        );
+        assert!(posix_shell_quote("bad\nline").is_err());
+        assert!(posix_shell_quote("bad\0nul").is_err());
+
+        assert_eq!(
+            ssh_path_safe(" ~/.ssh/id_ed25519 "),
+            Some("~/.ssh/id_ed25519".to_string())
+        );
+        assert_eq!(ssh_path_safe("-oProxyCommand=evil"), None);
+        assert_eq!(ssh_path_safe("key\n-oEvil"), None);
+        assert_eq!(ssh_path_safe(""), None);
+    }
+
+    #[test]
+    fn build_ssh_args_gere_port_cle_et_batchmode() {
+        let t_def = SshTarget::simple("192.168.1.50", "ubuntu");
+        let args_def = build_ssh_args(&t_def, "echo ok", 8).unwrap();
+        assert!(!args_def.contains(&"-p".to_string()));
+        assert!(!args_def.contains(&"-i".to_string()));
+        assert_eq!(args_def.last().map(String::as_str), Some("echo ok"));
+
+        let t_22 = SshTarget {
+            host: "192.168.1.50",
+            user: "ubuntu",
+            port: Some(22),
+            identity_file: None,
+        };
+        assert!(!build_ssh_args(&t_22, "echo ok", 8)
+            .unwrap()
+            .contains(&"-p".to_string()));
+
+        let t_custom = SshTarget {
+            host: "192.168.1.50",
+            user: "ubuntu",
+            port: Some(2222),
+            identity_file: Some("C:\\Users\\demo\\.ssh\\id_ed25519"),
+        };
+        let args_c = build_ssh_args(&t_custom, "echo ok", 8).unwrap();
+        assert!(args_c.windows(2).any(|w| w == ["-p", "2222"]));
+        assert!(args_c
+            .windows(2)
+            .any(|w| w == ["-i", "C:\\Users\\demo\\.ssh\\id_ed25519"]));
+        assert!(args_c.contains(&"BatchMode=yes".to_string()));
+    }
+
+    #[test]
+    fn parse_remote_env_output_linux_macos_windows_et_cli() {
+        let linux_out = "__MCC_OK__\nOS=Linux\nARCH=x86_64\nCLI=/home/u/.local/share/mcp-control/mcp-control\nCFGDIR=/home/u/.local/share/mcp-control\nPORT=5090\nHELLO={\"app\":\"mcp-control\",\"version\":\"0.8.8\",\"nonce\":\"abc\"}\n";
+        let info = parse_remote_env_output(linux_out).unwrap();
+        assert_eq!(info.os, "linux");
+        assert_eq!(info.arch, "x86_64");
+        assert_eq!(
+            info.cli_path.as_deref(),
+            Some("/home/u/.local/share/mcp-control/mcp-control")
+        );
+        assert!(info.cli_running);
+        assert_eq!(info.cli_port, Some(5090));
+        assert_eq!(info.cli_version.as_deref(), Some("0.8.8"));
+
+        let mac_absent = "__MCC_OK__\nOS=Darwin\nARCH=arm64\nCLI=\nCFGDIR=\nPORT=\nHELLO=\n";
+        let info2 = parse_remote_env_output(mac_absent).unwrap();
+        assert_eq!(info2.os, "macos");
+        assert_eq!(info2.arch, "aarch64");
+        assert_eq!(info2.cli_path, None);
+        assert!(!info2.cli_running);
+        assert_eq!(info2.cli_port, None);
+
+        let win_out = "__MCC_OK__\nOS=windows\nARCH=AMD64\nCLI=C:\\Users\\u\\AppData\\Local\\mcp-control\\mcp-control.exe\nCFGDIR=C:\\Users\\u\\AppData\\Local\\mcp-control\nPORT=\nHELLO=\n";
+        let info3 = parse_remote_env_output(win_out).unwrap();
+        assert_eq!(info3.os, "windows");
+        assert_eq!(info3.arch, "x86_64");
+        assert!(info3.cli_path.is_some());
+        assert!(!info3.cli_running);
+
+        assert!(parse_remote_env_output("bad").is_err());
+    }
+
+    #[test]
+    fn ssh_install_cli_refuse_url_ou_sha256_invalides() {
+        let t = SshTarget::simple("192.0.2.10", "demo");
+        let ok_sha = "a".repeat(64);
+        let ok_url = "https://github.com/DeamonDev888/mcp-control/releases/download/v0.8.8/mcp-control-cli-linux-x86_64";
+        assert!(validate_cli_install_params(ok_url, &ok_sha).is_ok());
+
+        // Mauvaise URL ou injection
+        assert!(ssh_install_cli(&t, "linux", "https://evil.example/bin", &ok_sha).is_err());
+        assert!(ssh_install_cli(&t, "linux", &format!("{ok_url};id"), &ok_sha).is_err());
+        // Mauvais SHA-256
+        assert!(ssh_install_cli(&t, "linux", ok_url, "abcd").is_err());
+        assert!(ssh_install_cli(&t, "linux", ok_url, &"Z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn parse_remote_port_listeners_ss_lsof_et_netstat() {
+        let ss = "LISTEN 0 128 127.0.0.1:3099 0.0.0.0:* users:((\"node\",pid=4321,fd=19))\n";
+        assert_eq!(
+            parse_remote_port_listeners(ss, 3099),
+            vec![(4321, "node".to_string())]
+        );
+
+        let lsof = "python3 8877 demo 9u IPv4 0x123 0t0 TCP 127.0.0.1:8787 (LISTEN)\n";
+        assert_eq!(
+            parse_remote_port_listeners(lsof, 8787),
+            vec![(8877, "python3".to_string())]
+        );
+
+        let win = "  TCP    127.0.0.1:4500         0.0.0.0:0              LISTENING       9012\n";
+        assert_eq!(
+            parse_remote_port_listeners(win, 4500),
+            vec![(9012, "remote".to_string())]
+        );
+    }
+
+    #[test]
+    fn detect_container_cmd_docker_podman_wrappers_et_negatifs() {
+        let s = |arr: &[&str]| arr.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            detect_container_cmd("docker", &s(&["run", "-i", "--rm", "mcp/github"])),
+            (true, None)
+        );
+        assert_eq!(
+            detect_container_cmd("docker", &s(&["run", "--name", "my-mcp", "-i", "img"])),
+            (true, Some("my-mcp".to_string()))
+        );
+        assert_eq!(
+            detect_container_cmd("docker", &s(&["run", "-i", "--name=eq-mcp", "img"])),
+            (true, Some("eq-mcp".to_string()))
+        );
+        assert_eq!(
+            detect_container_cmd("docker", &s(&["exec", "-i", "my-ctr", "node", "srv.js"])),
+            (true, Some("my-ctr".to_string()))
+        );
+        assert_eq!(
+            detect_container_cmd(
+                r"C:\Program Files\Docker\Docker\resources\bin\docker.exe",
+                &s(&["run", "--name", "win-mcp", "img"]),
+            ),
+            (true, Some("win-mcp".to_string()))
+        );
+        assert_eq!(
+            detect_container_cmd(
+                "docker-compose",
+                &s(&["-f", "compose.yml", "exec", "-T", "svc", "cmd"]),
+            ),
+            (true, Some("svc".to_string()))
+        );
+        assert_eq!(
+            detect_container_cmd("podman", &s(&["run", "--rm", "-i", "mcp/git"])),
+            (true, None)
+        );
+        assert_eq!(
+            detect_container_cmd(
+                "wsl",
+                &s(&["-d", "Ubuntu", "--", "docker", "run", "--name", "wsl-mcp", "img"]),
+            ),
+            (true, Some("wsl-mcp".to_string()))
+        );
+        assert_eq!(
+            detect_container_cmd("cmd", &s(&["/c", "docker", "run", "-i", "img"])),
+            (true, None)
+        );
+        assert_eq!(
+            detect_container_cmd("sh", &s(&["-c", "docker run --name sh-mcp img"])),
+            (true, Some("sh-mcp".to_string()))
+        );
+
+        // Négatifs : outils hôtes qui gèrent Docker sans tourner dedans
+        assert_eq!(
+            detect_container_cmd("npx", &s(&["-y", "@modelcontextprotocol/server-docker"])),
+            (false, None)
+        );
+        assert_eq!(
+            detect_container_cmd("uvx", &s(&["docker-mcp"])),
+            (false, None)
+        );
+        assert_eq!(
+            detect_container_cmd("node", &s(&[r"C:\docker\index.js"])),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn parse_docker_ps_ports_ipv4_ipv6_ranges_et_filtres() {
+        let out = "\
+mcp-a|0.0.0.0:3000->3000/tcp, 127.0.0.1:5433->5433/tcp\n\
+mcp-b|[::]:8080->8080/tcp, :::8081->8081/tcp, 3001/tcp\n\
+mcp-range|0.0.0.0:9000-9002->9000-9002/tcp, 0.0.0.0:5353->5353/udp\n";
+        let map = parse_docker_ps_ports(out);
+        assert_eq!(map.get(&3000).map(String::as_str), Some("mcp-a"));
+        assert_eq!(map.get(&5433).map(String::as_str), Some("mcp-a"));
+        assert_eq!(map.get(&8080).map(String::as_str), Some("mcp-b"));
+        assert_eq!(map.get(&8081).map(String::as_str), Some("mcp-b"));
+        assert_eq!(map.get(&3001), None, "port exposé sans mapping hôte ignoré");
+        assert_eq!(map.get(&9000).map(String::as_str), Some("mcp-range"));
+        assert_eq!(map.get(&9001).map(String::as_str), Some("mcp-range"));
+        assert_eq!(map.get(&9002).map(String::as_str), Some("mcp-range"));
+        assert_eq!(map.get(&5353), None, "port UDP ignoré");
+    }
+
+    #[test]
+    fn is_container_proxy_image_et_cgroup_detection() {
+        for img in [
+            "com.docker.backend.exe",
+            "docker-proxy",
+            "vpnkit.exe",
+            "gvproxy.exe",
+        ] {
+            assert!(is_container_proxy_image(img), "{img} attendu proxy conteneur");
+        }
+        for img in ["node.exe", "python.exe", "wslrelay.exe"] {
+            assert!(
+                !is_container_proxy_image(img),
+                "{img} ne doit PAS être classé proxy conteneur"
+            );
+        }
+
+        assert!(is_cgroup_in_container("12:pids:/docker/3f8a1234abcd\n"));
+        assert!(is_cgroup_in_container(
+            "0::/system.slice/docker-3f8a1234abcd.scope\n"
+        ));
+        assert!(is_cgroup_in_container(
+            "0::/kubepods.slice/kubepods-burstable.slice/cri-containerd-abc.scope\n"
+        ));
+        assert!(is_cgroup_in_container(
+            "0::/user.slice/user-1000.slice/libpod-abcdef.scope/container\n"
+        ));
+        assert!(!is_cgroup_in_container("0::/system.slice/docker.service\n"));
+        assert!(!is_cgroup_in_container("0::/user.slice/user-1000.slice\n"));
+    }
+
+    #[test]
+    fn parse_ssh_container_probe_toutes_sources() {
+        assert_eq!(
+            parse_ssh_container_probe("mcp-remote|0.0.0.0:3100->3100/tcp\n", "", 3100),
+            (true, Some("mcp-remote".to_string()))
+        );
+        let ss_proxy = "LISTEN 0 128 0.0.0.0:3100 0.0.0.0:* users:((\"docker-proxy\",pid=999,fd=4))\n";
+        assert_eq!(parse_ssh_container_probe("", ss_proxy, 3100), (true, None));
+        let ss_cg = "LISTEN 0 128 127.0.0.1:3100 0.0.0.0:* users:((\"node\",pid=777,fd=8))\n0::/system.slice/docker-abc.scope\n";
+        assert_eq!(parse_ssh_container_probe("", ss_cg, 3100), (true, None));
+        let ss_host = "LISTEN 0 128 127.0.0.1:3100 0.0.0.0:* users:((\"node\",pid=777,fd=8))\n0::/user.slice/user-1000.slice\n";
+        assert_eq!(parse_ssh_container_probe("", ss_host, 3100), (false, None));
     }
 }
