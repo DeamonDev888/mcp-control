@@ -3211,7 +3211,20 @@ fn resolve_config_path_dev_existant_gagne() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("config.json"), "{}").unwrap();
     let p = resolve_config_path(&dir.to_string_lossy(), None);
-    assert_eq!(p, dir.join("config.json").to_string_lossy().to_string());
+    if cfg!(debug_assertions) {
+        assert_eq!(p, dir.join("config.json").to_string_lossy().to_string());
+    } else {
+        assert!(
+            p.ends_with("config.json"),
+            "doit finir par config.json, got {}",
+            p
+        );
+        assert!(
+            !p.starts_with(&dir.to_string_lossy().to_string()),
+            "en release, manifest_dir doit être ignoré, got {}",
+            p
+        );
+    }
 }
 
 #[test]
