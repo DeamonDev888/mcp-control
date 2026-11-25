@@ -4,14 +4,20 @@
 use super::*;
 
 pub fn version_newer(latest: &str, current: &str) -> bool {
-    let parse = |v: &str| -> Vec<u64> {
-        v.trim()
-            .trim_start_matches('v')
+    let parse = |v: &str| -> (Vec<u64>, Option<String>) {
+        let trimmed = v.trim().trim_start_matches('v');
+        let no_build = trimmed.split('+').next().unwrap_or(trimmed);
+        let (core, pre) = match no_build.split_once('-') {
+            Some((c, p)) => (c, Some(p.to_string())),
+            None => (no_build, None),
+        };
+        let nums: Vec<u64> = core
             .split('.')
             .map(|p| p.trim().parse::<u64>().unwrap_or(0))
-            .collect()
+            .collect();
+        (nums, pre)
     };
-    let (a, b) = (parse(latest), parse(current));
+    let ((a, a_pre), (b, b_pre)) = (parse(latest), parse(current));
     for i in 0..a.len().max(b.len()) {
         let (x, y) = (
             a.get(i).copied().unwrap_or(0),
@@ -21,7 +27,14 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
             return x > y;
         }
     }
-    false
+    // SemVer §11 : à cœur égal, une version stable (sans pré-version) est plus
+    // récente qu'une pré-version (`0.9.0 > 0.9.0-rc.1`).
+    match (a_pre, b_pre) {
+        (None, Some(_)) => true,
+        (Some(_), None) => false,
+        (Some(pa), Some(pb)) => pa > pb,
+        (None, None) => false,
+    }
 }
 
 /// Interroge la dernière release GitHub. `curl` d'abord (léger, présent sur
@@ -36,6 +49,9 @@ pub(crate) fn github_latest_tag() -> Result<Option<String>, &'static str> {
     if let Ok(out) = c
         .args([
             "-fsSL",
+            "--proto",
+            "=https",
+            "--tlsv1.2",
             "-m",
             "10",
             "-H",
@@ -55,6 +71,7 @@ pub(crate) fn github_latest_tag() -> Result<Option<String>, &'static str> {
     let mut cmd = crate::probe::system_command("powershell");
     cmd.args([
         "-NoProfile",
+        "-NonInteractive",
         "-Command",
         "(Invoke-RestMethod -TimeoutSec 10 -Headers @{ 'User-Agent' = 'mcp-control' }           'https://api.github.com/repos/DeamonDev888/mcp-control/releases/latest').tag_name",
     ]);
@@ -292,7 +309,17 @@ fn fetch_text(url: &str) -> Result<String, &'static str> {
     let mut c = crate::probe::system_command("curl");
     probe::probe_hidden_cmd(&mut c);
     if let Ok(out) = c
-        .args(["-fsSL", "-m", "6", "-H", "User-Agent: mcp-control", url])
+        .args([
+            "-fsSL",
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "-m",
+            "6",
+            "-H",
+            "User-Agent: mcp-control",
+            url,
+        ])
         .output()
     {
         if out.status.success() && out.stdout.len() <= MAX {
@@ -304,6 +331,7 @@ fn fetch_text(url: &str) -> Result<String, &'static str> {
     let mut cmd = crate::probe::system_command("powershell");
     cmd.args([
         "-NoProfile",
+        "-NonInteractive",
         "-Command",
         &format!(
             "(Invoke-WebRequest -UseBasicParsing -TimeoutSec 6 -Headers @{{ 'User-Agent' = 'mcp-control' }} '{url}').Content"
@@ -395,11 +423,21 @@ const UPDATE_MAX_BYTES: u64 = 150 * 1024 * 1024;
 /// le `TcpListener::bind` de la nouvelle instance.
 pub const UPDATE_WAIT_ENV: &str = "MCC_UPDATE_WAIT_PID";
 
-/// Attend brièvement au démarrage si le processus vient d'être relancé par une
-/// auto-mise à jour, afin que l'ancienne instance termine sa sortie proprement.
+/// Attend au démarrage la sortie réelle de l'ancienne instance (jusqu'à 10 s)
+/// si le processus vient d'être relancé par une auto-mise à jour, afin que le
+/// port UI et les fichiers soient totalement libérés.
 pub fn wait_if_restarting_from_update() {
-    if std::env::var(UPDATE_WAIT_ENV).is_ok() {
+    if let Ok(raw) = std::env::var(UPDATE_WAIT_ENV) {
         std::env::remove_var(UPDATE_WAIT_ENV);
+        if let Ok(pid) = raw.trim().parse::<u32>() {
+            if pid != 0 && pid != std::process::id() {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while std::time::Instant::now() < deadline && probe::process_alive(pid) {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+                return;
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(1200));
     }
 }
@@ -473,9 +511,65 @@ pub fn release_download_url(tag: &str, asset: &str) -> Option<String> {
     ))
 }
 
+/// Extrait le dernier `Content-Length` valide (hors réponse intermédiaire
+/// de redirection `301`/`302` et borné à `1..=UPDATE_MAX_BYTES`) depuis
+/// les en-têtes bruts renvoyés par `curl -I`.
+fn parse_last_content_length(headers: &str) -> Option<u64> {
+    let mut current: Option<u64> = None;
+    for line in headers.lines() {
+        let trimmed = line.trim();
+        if trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case("http/") {
+            current = None;
+            continue;
+        }
+        if let Some((name, val)) = trimmed.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                current = val
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&n| (1..=UPDATE_MAX_BYTES).contains(&n));
+            }
+        }
+    }
+    current
+}
+
+/// Interroge en HTTPS la taille attendue de l'actif via un `HEAD` préalable
+/// (`None` si indisponible ou réponse chunked ; le téléchargement continue).
+fn fetch_remote_content_length(url: &str) -> Option<u64> {
+    let mut c = crate::probe::system_command("curl");
+    probe::probe_hidden_cmd(&mut c);
+    let out = c
+        .args([
+            "-fsSLI",
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "-m",
+            "10",
+            "-H",
+            "User-Agent: mcp-control",
+            url,
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_last_content_length(&String::from_utf8_lossy(&out.stdout))
+}
+
 /// Télécharge l'actif de release en HTTPS uniquement (TLS ≥ 1.2) via `curl`
-/// système dans `dest`.
-fn download_release_binary(tag: &str, asset: &str, dest: &std::path::Path) -> Result<(), String> {
+/// système dans `dest`, en remontant périodiquement les octets écrits.
+fn download_release_binary(
+    tag: &str,
+    asset: &str,
+    dest: &std::path::Path,
+    on_progress: impl Fn(u64, Option<u64>),
+) -> Result<(), String> {
+    use std::io::Read;
+
     let url = release_download_url(tag, asset)
         .ok_or_else(|| "tag ou actif de release hors table blanche".to_string())?;
     if let Some(parent) = dest.parent() {
@@ -483,9 +577,12 @@ fn download_release_binary(tag: &str, asset: &str, dest: &std::path::Path) -> Re
             .map_err(|e| format!("impossible de créer le dossier de mise à jour : {e}"))?;
     }
     let _ = std::fs::remove_file(dest);
+    let total = fetch_remote_content_length(&url);
+    on_progress(0, total);
+
     let mut c = crate::probe::system_command("curl");
     probe::probe_hidden_cmd(&mut c);
-    let out = c
+    let mut child = c
         .args([
             "-fsSL",
             "--proto",
@@ -501,17 +598,55 @@ fn download_release_binary(tag: &str, asset: &str, dest: &std::path::Path) -> Re
         ])
         .arg(dest)
         .arg(&url)
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("téléchargement impossible (curl) : {e}"))?;
-    if !out.status.success() {
+
+    let err_reader = child.stderr.take().map(|pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.take(4096).read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).trim().to_string()
+        })
+    });
+
+    let mut last_bytes: u64 = 0;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                let bytes = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+                if bytes != last_bytes {
+                    last_bytes = bytes;
+                    on_progress(bytes, total);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(h) = err_reader {
+                    let _ = h.join();
+                }
+                let _ = std::fs::remove_file(dest);
+                return Err(format!("téléchargement impossible (curl) : {e}"));
+            }
+        }
+    };
+    let stderr = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+    if !status.success() {
         let _ = std::fs::remove_file(dest);
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
-            format!("téléchargement échoué ({})", out.status)
+            format!("téléchargement échoué ({status})")
         } else {
             format!("téléchargement échoué : {stderr}")
         });
     }
+    let final_bytes = std::fs::metadata(dest)
+        .map(|m| m.len())
+        .unwrap_or(last_bytes);
+    on_progress(final_bytes, total.or(Some(final_bytes)));
     Ok(())
 }
 
@@ -562,15 +697,17 @@ fn launch_verified_update(downloaded: &std::path::Path, asset: &str) -> Result<(
     if is_nsis {
         let mut cmd = std::process::Command::new(downloaded);
         // Mode silencieux NSIS : aucun clic de wizard requis ; le hook
-        // `NSIS_HOOK_POSTINSTALL` relance automatiquement l'application.
+        // `NSIS_HOOK_POSTINSTALL` relance automatiquement l'application qui
+        // hérite de `MCC_UPDATE_WAIT_PID` pour attendre notre sortie réelle.
         cmd.arg("/S")
+            .env(UPDATE_WAIT_ENV, std::process::id().to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0000_0200 | 0x0000_0008);
+            cmd.creation_flags(0x0000_0200);
         }
         cmd.spawn()
             .map_err(|e| format!("lancement de l'installateur impossible : {e}"))?;
@@ -588,113 +725,335 @@ fn launch_verified_update(downloaded: &std::path::Path, asset: &str) -> Result<(
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000 | 0x0000_0200 | 0x0000_0008);
+            cmd.creation_flags(0x0800_0000 | 0x0000_0200);
         }
         cmd.spawn()
             .map_err(|e| format!("relance de la nouvelle version impossible : {e}"))?;
     }
-    // Laisse 700 ms à la réponse HTTP `{"ok": true, "restarting": true}` pour
-    // parvenir à l'interface avant de libérer l'exécutable et le port.
+    // Laisse 1500 ms à l'interface (polling 350 ms) pour observer
+    // `phase: "restarting"`, puis arrête proprement le moteur avant de sortir.
     std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(700));
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        crate::shutdown_engine();
         std::process::exit(0);
     });
     Ok(())
 }
 
-/// Orchestration complète de l'action locale `install_update` :
-/// 1. Vérifie la dernière release GitHub ;
-/// 2. Lit `SHA256SUMS.txt` de ce même tag (échec fermé si absent/malformé) ;
-/// 3. Télécharge l'actif de la plateforme courante en HTTPS uniquement ;
-/// 4. Vérifie le SHA-256 en temps constant (supprime le fichier si écart) ;
-/// 5. Lance l'installation silencieuse / remplacement + redémarrage automatique.
-pub fn perform_auto_update(state: &Arc<AppState>) -> Value {
+static UPDATE_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+struct UpdateGuard;
+impl Drop for UpdateGuard {
+    fn drop(&mut self) {
+        UPDATE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone)]
+struct UpdateStatus {
+    active: bool,
+    phase: String,
+    version: Option<String>,
+    asset: Option<String>,
+    bytes_downloaded: u64,
+    bytes_total: Option<u64>,
+    message: String,
+    error: Option<String>,
+    started_at: u64,
+    updated_at: u64,
+}
+
+impl Default for UpdateStatus {
+    fn default() -> Self {
+        Self {
+            active: false,
+            phase: "idle".to_string(),
+            version: None,
+            asset: None,
+            bytes_downloaded: 0,
+            bytes_total: None,
+            message: String::new(),
+            error: None,
+            started_at: 0,
+            updated_at: 0,
+        }
+    }
+}
+
+static UPDATE_STATUS: std::sync::OnceLock<std::sync::Mutex<UpdateStatus>> =
+    std::sync::OnceLock::new();
+
+fn update_status_cell() -> &'static std::sync::Mutex<UpdateStatus> {
+    UPDATE_STATUS.get_or_init(|| std::sync::Mutex::new(UpdateStatus::default()))
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn set_update_status(f: impl FnOnce(&mut UpdateStatus)) {
+    let mut s = lockv(update_status_cell());
+    f(&mut s);
+    s.updated_at = now_epoch_secs();
+}
+
+fn update_percent(downloaded: u64, total: Option<u64>) -> Option<u8> {
+    let tot = total.filter(|&t| t > 0)?;
+    Some(((downloaded as u128 * 100) / tot as u128).min(100) as u8)
+}
+
+pub(crate) fn current_update_status() -> Value {
+    let s = lockv(update_status_cell()).clone();
+    let percent = update_percent(s.bytes_downloaded, s.bytes_total);
+    json!({
+        "active": s.active,
+        "phase": s.phase,
+        "version": s.version,
+        "asset": s.asset,
+        "bytes_downloaded": s.bytes_downloaded,
+        "bytes_total": s.bytes_total,
+        "percent": percent,
+        "message": s.message,
+        "error": s.error,
+        "started_at": s.started_at,
+        "updated_at": s.updated_at,
+    })
+}
+
+pub(crate) fn update_status_hash<H: std::hash::Hasher>(h: &mut H) {
+    use std::hash::Hash;
+    let s = lockv(update_status_cell());
+    s.active.hash(h);
+    s.phase.hash(h);
+    s.version.hash(h);
+    s.asset.hash(h);
+    s.bytes_downloaded.hash(h);
+    s.bytes_total.hash(h);
+    s.message.hash(h);
+    s.error.hash(h);
+    s.started_at.hash(h);
+    s.updated_at.hash(h);
+}
+
+/// Dossier privé de staging de mise à jour (`<config_dir>/update-staging/`,
+/// hors `/tmp` partagé).
+fn private_update_dir(config_path: &str) -> std::path::PathBuf {
+    let base = if !config_path.is_empty() {
+        std::path::Path::new(config_path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(std::path::Path::to_path_buf)
+    } else {
+        None
+    };
+    base.or_else(default_user_config_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("update-staging")
+}
+
+/// Pipeline asynchrone d'auto-mise à jour avec suivi d'avancement temps réel
+/// (`UPDATE_STATUS` / `/api/state`).
+fn run_auto_update_job(state: &Arc<AppState>, guard: UpdateGuard) {
+    let fail = |msg: String| {
+        add_log(state, "warn", &format!("[update] {msg}"));
+        set_update_status(|s| {
+            s.active = false;
+            s.phase = "error".to_string();
+            s.error = Some(msg.clone());
+            s.message = msg;
+        });
+    };
+
     let tag = match github_latest_tag() {
         Ok(Some(t)) => t,
         Ok(None) | Err(_) => {
-            return json!({
-                "ok": false,
-                "error": "impossible de joindre GitHub pour vérifier la dernière release",
-            });
+            fail("impossible de joindre GitHub pour vérifier la dernière release".to_string());
+            return;
         }
     };
     let version = tag.strip_prefix('v').unwrap_or(&tag).to_string();
     let current = env!("CARGO_PKG_VERSION");
+    set_update_status(|s| {
+        s.version = Some(version.clone());
+    });
     if !version_newer(&version, current) {
-        return json!({
-            "ok": false,
-            "error": format!("déjà à jour (v{current}, dernière release : v{version})"),
-            "current": current,
-            "latest": version,
-        });
+        fail(format!(
+            "déjà à jour (v{current}, dernière release : v{version})"
+        ));
+        return;
     }
     let Some(asset) = running_asset() else {
-        return json!({
-            "ok": false,
-            "error": format!("plateforme non prise en charge ({})", engine_os()),
-        });
+        fail(format!("plateforme non prise en charge ({})", engine_os()));
+        return;
     };
+    set_update_status(|s| {
+        s.asset = Some(asset.to_string());
+        s.phase = "verifying_manifest".to_string();
+        s.message = format!("Vérification de SHA256SUMS.txt pour v{version}…");
+    });
     let expected = match expected_sha256(&tag, asset) {
         Ok(Sha256Lookup::Found(sum)) => sum,
         Ok(Sha256Lookup::Absent) => {
-            return json!({
-                "ok": false,
-                "error": format!("empreinte SHA-256 absente de SHA256SUMS.txt pour {asset} — mise à jour refusée par sécurité"),
-            });
+            fail(format!(
+                "empreinte SHA-256 absente de SHA256SUMS.txt pour {asset} — mise à jour refusée par sécurité"
+            ));
+            return;
         }
         Ok(Sha256Lookup::Malformed) => {
-            return json!({
-                "ok": false,
-                "error": "SHA256SUMS.txt invalide ou ambigu — mise à jour refusée par sécurité",
-            });
+            fail(
+                "SHA256SUMS.txt invalide ou ambigu — mise à jour refusée par sécurité".to_string(),
+            );
+            return;
         }
         Err(e) => {
-            return json!({
-                "ok": false,
-                "error": format!("impossible de lire SHA256SUMS.txt ({e}) — mise à jour refusée par sécurité"),
-            });
+            fail(format!(
+                "impossible de lire SHA256SUMS.txt ({e}) — mise à jour refusée par sécurité"
+            ));
+            return;
         }
     };
-    let upd_dir = std::env::temp_dir().join("mcp-control-update");
-    let dest = upd_dir.join(asset);
+
+    let upd_dir = private_update_dir(&state.config_path);
+    let _ = std::fs::create_dir_all(&upd_dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&upd_dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let dest = upd_dir.join(format!("{}-{asset}", std::process::id()));
     add_log(
         state,
         "info",
         &format!("[update] téléchargement de {asset} (v{version})…"),
     );
-    if let Err(e) = download_release_binary(&tag, asset, &dest) {
-        add_log(state, "warn", &format!("[update] {e}"));
-        return json!({ "ok": false, "error": e, "asset": asset, "version": version });
+    set_update_status(|s| {
+        s.phase = "downloading".to_string();
+        s.bytes_downloaded = 0;
+        s.bytes_total = None;
+        s.message = format!("Téléchargement de {asset} (v{version})…");
+    });
+    if let Err(e) = download_release_binary(&tag, asset, &dest, |dl, tot| {
+        set_update_status(|s| {
+            s.bytes_downloaded = dl;
+            s.bytes_total = tot;
+        });
+    }) {
+        let _ = std::fs::remove_file(&dest);
+        fail(e);
+        return;
     }
+
+    set_update_status(|s| {
+        s.phase = "verifying_sha256".to_string();
+        s.message = format!("Vérification SHA-256 de {asset}…");
+    });
     let verified_sha = match verify_file_sha256(&dest, &expected) {
         Ok(s) => s,
         Err(e) => {
-            add_log(state, "warn", &format!("[update] {e}"));
-            return json!({ "ok": false, "error": e, "asset": asset, "version": version });
+            let _ = std::fs::remove_file(&dest);
+            fail(e);
+            return;
         }
     };
+
+    set_update_status(|s| {
+        s.phase = "installing".to_string();
+        s.message = format!("Installation de v{version}…");
+    });
     add_log(
         state,
         "info",
-        &format!("[update] {asset} (v{version}) vérifié (SHA-256 {verified_sha}) — installation et redémarrage automatique"),
+        &format!(
+            "[update] {asset} (v{version}) vérifié (SHA-256 {verified_sha}) — installation et redémarrage automatique"
+        ),
     );
     if let Err(e) = launch_verified_update(&dest, asset) {
         let _ = std::fs::remove_file(&dest);
-        add_log(state, "warn", &format!("[update] {e}"));
-        return json!({ "ok": false, "error": e, "asset": asset, "version": version });
+        fail(e);
+        return;
     }
-    json!({
-        "ok": true,
-        "restarting": true,
-        "version": version,
-        "asset": asset,
-        "sha256": verified_sha,
-    })
+    set_update_status(|s| {
+        s.active = true;
+        s.phase = "restarting".to_string();
+        s.error = None;
+        s.message = format!("v{version} vérifiée (SHA-256 OK) — redémarrage en cours…");
+    });
+    // Conserve le verrou pendant le court délai de sortie avant arrêt du processus.
+    std::mem::forget(guard);
+}
+
+/// Orchestration non bloquante de l'action locale `install_update` :
+/// démarre la mise à jour vérifiée en tâche de fond et renvoie aussitôt
+/// l'état initial (`update_status`), ensuite diffusé en direct via `/api/state`.
+pub fn perform_auto_update(state: &Arc<AppState>) -> Value {
+    if UPDATE_IN_PROGRESS
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return json!({
+            "ok": true,
+            "started": false,
+            "already_running": true,
+            "update_status": current_update_status(),
+        });
+    }
+    let guard = UpdateGuard;
+    let initial_version = lockv(&state.update_latest).clone();
+    let initial_asset = running_asset().map(str::to_string);
+    let now = now_epoch_secs();
+    set_update_status(|s| {
+        s.active = true;
+        s.phase = "checking".to_string();
+        s.version = initial_version;
+        s.asset = initial_asset;
+        s.bytes_downloaded = 0;
+        s.bytes_total = None;
+        s.message = "Vérification de la dernière release GitHub…".to_string();
+        s.error = None;
+        s.started_at = now;
+    });
+    let st = Arc::clone(state);
+    match std::thread::Builder::new()
+        .name("mcc-auto-update".to_string())
+        .spawn(move || run_auto_update_job(&st, guard))
+    {
+        Ok(_) => json!({
+            "ok": true,
+            "started": true,
+            "update_status": current_update_status(),
+        }),
+        Err(e) => {
+            let msg = format!("impossible de lancer le thread de mise à jour : {e}");
+            set_update_status(|s| {
+                s.active = false;
+                s.phase = "error".to_string();
+                s.error = Some(msg.clone());
+                s.message = msg.clone();
+            });
+            json!({
+                "ok": false,
+                "error": msg,
+                "update_status": current_update_status(),
+            })
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::cli_release_asset;
+    use super::{
+        cli_release_asset, current_update_status, parse_last_content_length, update_percent,
+        UPDATE_MAX_BYTES,
+    };
 
     #[test]
     fn cli_release_asset_table_blanche() {
@@ -720,5 +1079,61 @@ mod tests {
         );
         assert_eq!(cli_release_asset("linux", "aarch64"), None);
         assert_eq!(cli_release_asset("freebsd", "x86_64"), None);
+    }
+
+    #[test]
+    fn parse_last_content_length_suit_redirections_et_bornes() {
+        assert_eq!(
+            parse_last_content_length("HTTP/1.1 200 OK\r\nContent-Length: 123456\r\n\r\n"),
+            Some(123_456)
+        );
+        assert_eq!(
+            parse_last_content_length(
+                "HTTP/1.1 302 Found\r\nLocation: https://objects.example/bin\r\nContent-Length: 0\r\n\r\nHTTP/2 200\r\ncontent-length: 42991616\r\n\r\n"
+            ),
+            Some(42_991_616)
+        );
+        assert_eq!(
+            parse_last_content_length(
+                "HTTP/1.1 302 Found\r\nContent-Length: 512\r\n\r\nHTTP/2 200\r\nTransfer-Encoding: chunked\r\n\r\n"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_last_content_length("HTTP/2 200\r\nContent-Length: 0\r\n\r\n"),
+            None
+        );
+        let too_big = format!(
+            "HTTP/2 200\r\nContent-Length: {}\r\n\r\n",
+            UPDATE_MAX_BYTES + 1
+        );
+        assert_eq!(parse_last_content_length(&too_big), None);
+    }
+
+    #[test]
+    fn current_update_status_expose_champs_attendus() {
+        let st = current_update_status();
+        for key in [
+            "active",
+            "phase",
+            "version",
+            "asset",
+            "bytes_downloaded",
+            "bytes_total",
+            "percent",
+            "message",
+            "error",
+            "started_at",
+            "updated_at",
+        ] {
+            assert!(
+                st.get(key).is_some(),
+                "champ `{key}` manquant dans update_status : {st}"
+            );
+        }
+        assert_eq!(update_percent(0, None), None);
+        assert_eq!(update_percent(50, Some(0)), None);
+        assert_eq!(update_percent(50, Some(200)), Some(25));
+        assert_eq!(update_percent(300, Some(200)), Some(100));
     }
 }

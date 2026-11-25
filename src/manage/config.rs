@@ -77,13 +77,64 @@ pub(super) fn default_servers() -> Vec<Server> {
     Vec::new()
 }
 
+/// Dossier de données utilisateur partagé entre `mcp-control` (CLI) et
+/// `mcp-control-desktop` (Tauri) lorsqu'aucune config portable n'existe à côté
+/// de l'exécutable :
+/// - Windows : `%LOCALAPPDATA%\mcp-control` (repli `%APPDATA%\mcp-control`)
+/// - macOS   : `~/Library/Application Support/mcp-control`
+/// - Linux   : `$XDG_CONFIG_HOME/mcp-control` (repli `~/.config/mcp-control`)
+pub fn default_user_config_dir() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        let base = std::env::var("LOCALAPPDATA")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("APPDATA")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })?;
+        Some(std::path::PathBuf::from(base).join("mcp-control"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME")
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
+        Some(
+            std::path::PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("mcp-control"),
+        )
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        if let Some(xdg) = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Some(std::path::PathBuf::from(xdg).join("mcp-control"));
+        }
+        let home = std::env::var("HOME")
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
+        Some(
+            std::path::PathBuf::from(home)
+                .join(".config")
+                .join("mcp-control"),
+        )
+    }
+}
+
 /// Résolution du chemin de config au runtime (voir main.rs) :
-/// 1. override explicite (MCC_CONFIG)
-/// 2. dossier de l'exe / config.json s'il existe (installé : l'app a SA config)
-/// 3. CARGO_MANIFEST_DIR/config.json s'il existe (dev local — l'exe de dev vit
-///    dans target/, l'installé à côté de sa config ; un exe installé ne doit
-///    JAMAIS réécrire la config du dossier de dev)
-/// 4. dossier de l'exe / config.json (premier boot d'une install fraîche)
+/// 1. override explicite (`MCC_CONFIG`) ;
+/// 2. `<exe_dir>/config.json` s'il existe déjà (mode portable existant préservé) ;
+/// 3. en build de développement uniquement (`cfg!(debug_assertions)`),
+///    `<manifest_dir>/config.json` s'il existe (jamais compilé en release) ;
+/// 4. dossier utilisateur standard partagé entre Desktop et CLI
+///    (`%LOCALAPPDATA%\mcp-control\config.json` / `~/.config/mcp-control/config.json`)
+///    s'il existe ou peut être créé, sinon repli `<exe_dir>/config.json`.
 pub fn resolve_config_path(manifest_dir: &str, override_env: Option<String>) -> String {
     if let Some(p) = override_env {
         if !p.is_empty() {
@@ -98,11 +149,62 @@ pub fn resolve_config_path(manifest_dir: &str, override_env: Option<String>) -> 
     if exe_config.exists() {
         return exe_config.to_string_lossy().to_string();
     }
-    let dev_path = std::path::Path::new(manifest_dir).join("config.json");
-    if dev_path.exists() {
-        return dev_path.to_string_lossy().to_string();
+    #[cfg(debug_assertions)]
+    {
+        let dev_path = std::path::Path::new(manifest_dir).join("config.json");
+        if dev_path.exists() {
+            return dev_path.to_string_lossy().to_string();
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = manifest_dir;
+    if let Some(user_dir) = default_user_config_dir() {
+        if user_dir.is_dir() || std::fs::create_dir_all(&user_dir).is_ok() {
+            return user_dir.join("config.json").to_string_lossy().to_string();
+        }
     }
     exe_config.to_string_lossy().to_string()
+}
+
+/// Résout l'exécutable à proposer dans l'UI pour `bridge` et `auth` :
+/// 1. `mcp-control` dans le `PATH` → `"mcp-control"` ;
+/// 2. binaire compagnon `mcp-control` (`.exe`) à côté de l'exécutable courant ;
+/// 3. exécutable courant lui-même (`mcp-control-desktop` embarque aussi `bridge`
+///    et `auth`), hors binaires de test `deps/` ;
+/// 4. repli `"mcp-control"`.
+pub fn current_bridge_command() -> String {
+    let cli_name = if cfg!(windows) {
+        "mcp-control.exe"
+    } else {
+        "mcp-control"
+    };
+    if let Ok(path_var) = std::env::var("PATH") {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        for raw_dir in path_var.split(sep) {
+            let dir = raw_dir.trim().trim_matches('"').trim();
+            if !dir.is_empty() && std::path::Path::new(dir).join(cli_name).is_file() {
+                return "mcp-control".to_string();
+            }
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let is_test_bin = exe
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == "deps");
+        if !is_test_bin {
+            if let Some(parent) = exe.parent() {
+                let sibling = parent.join(cli_name);
+                if sibling.is_file() {
+                    return sibling.to_string_lossy().to_string();
+                }
+            }
+            if exe.is_file() {
+                return exe.to_string_lossy().to_string();
+            }
+        }
+    }
+    "mcp-control".to_string()
 }
 
 /// Charge le journal runtime persisté (backoff d'autoboot + historique des
@@ -762,6 +864,17 @@ where
         std::process::id(),
         SAVE_SEQ.fetch_add(1, Ordering::Relaxed)
     );
+    // Créer le temporaire vide puis restreindre ses permissions AVANT d'y écrire
+    // tout contenu (ferme la fenêtre TOCTOU avant rename) [M-07].
+    if let Err(e) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)
+    {
+        return Err(format!("{label} : écriture impossible ({tmp}): {e}"));
+    }
+    let _ = restrict_permissions(&tmp);
     if let Err(e) = write_fn(&tmp) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("{label} : écriture impossible ({tmp}): {e}"));
@@ -831,12 +944,29 @@ pub fn purge_orphan_tmp(config_path: &str) -> usize {
         return 0;
     };
     let mut purged = 0usize;
+    let self_pid = std::process::id();
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        let candidat = name.ends_with(".tmp")
-            && (name.starts_with("state-cache.json.")
-                || cfg_prefix.as_deref().is_some_and(|p| name.starts_with(p)));
-        if candidat && std::fs::remove_file(e.path()).is_ok() {
+        let rest = if let Some(r) = name.strip_prefix("state-cache.json.") {
+            Some(r)
+        } else if let Some(p) = cfg_prefix.as_deref() {
+            name.strip_prefix(p)
+        } else {
+            None
+        };
+        let Some(rest) = rest.and_then(|r| r.strip_suffix(".tmp")) else {
+            continue;
+        };
+        // Si le nom porte un PID d'un autre processus encore vivant, ne pas supprimer
+        // son fichier temporaire en cours d'écriture [M-07].
+        if let Some(pid_str) = rest.split('.').next() {
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                if pid != 0 && pid != self_pid && crate::probe::process_alive(pid) {
+                    continue;
+                }
+            }
+        }
+        if std::fs::remove_file(e.path()).is_ok() {
             purged += 1;
         }
     }

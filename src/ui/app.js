@@ -31,6 +31,50 @@ function applyThemeAndSave(t) {
   } catch (e) {}
 }
 
+const TEXT_COLORS = ['default', 'white', 'warm', 'amber', 'emerald', 'cyan', 'blue', 'violet', 'rose', 'lime'];
+function normalizeTextBright(v) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n)) return 100;
+  return Math.max(60, Math.min(140, Math.round(n / 5) * 5));
+}
+function applyTextStyle(color, bright) {
+  const c = TEXT_COLORS.includes(color) ? color : 'default';
+  const b = normalizeTextBright(bright);
+  const ds = document.documentElement.dataset;
+  if (c === 'default') delete ds.textColor; else ds.textColor = c;
+  if (b === 100) delete ds.textBright; else ds.textBright = String(b);
+  const rng = document.getElementById('sTextBright');
+  if (rng && rng.value !== String(b)) rng.value = String(b);
+  const val = document.getElementById('sTextBrightVal');
+  if (val) val.textContent = b + ' %';
+  const rst = document.getElementById('btnTextReset');
+  if (rst) rst.disabled = (c === 'default' && b === 100);
+  document.querySelectorAll('.txt-sw-btn').forEach(btn => {
+    const sel = btn.dataset.color === c;
+    btn.classList.toggle('sel', sel);
+    btn.setAttribute('aria-pressed', sel ? 'true' : 'false');
+  });
+}
+function applyTextColorAndSave(color) {
+  const b = document.documentElement.dataset.textBright || '100';
+  applyTextStyle(color, b);
+  const saved = document.documentElement.dataset.textColor || 'default';
+  try { localStorage.setItem('mcc.textColor', saved); } catch (e) {}
+}
+function applyTextBrightAndSave(val) {
+  const c = document.documentElement.dataset.textColor || 'default';
+  applyTextStyle(c, val);
+  const saved = document.documentElement.dataset.textBright || '100';
+  try { localStorage.setItem('mcc.textBright', saved); } catch (e) {}
+}
+function resetTextStyle() {
+  applyTextStyle('default', 100);
+  try {
+    localStorage.removeItem('mcc.textColor');
+    localStorage.removeItem('mcc.textBright');
+  } catch (e) {}
+}
+
 /* ===== Modale de confirmation accessible (<dialog id="confirmDlg">) =====
    Remplace tous les alert(), confirm() et prompt() natifs : promesse async,
    pile de focus pour modales imbriquées, annulation propre sur Échap/backdrop. */
@@ -125,6 +169,7 @@ const _mccFetch = window.fetch.bind(window);
    fragment : l'URL redevient celle qu'on peut copier sans rien livrer. */
 let sessionSecret = '';
 let sessionLost = false;
+let _updateSessionClosed = false;
 const SESSION_LOST_MSG = 'session expirée — rouvre le lien de démarrage (MCP Control)';
 async function exchangeSession() {
   let token = '';
@@ -182,6 +227,26 @@ window.fetch = async (url, opts = {}) => {
    Un code hérité réellement stocké (bind LAN, lecture seule) garde son dialogue ;
    sinon on annonce « session expirée » UNE fois et on cesse d'appeler /api/*. */
 function onUnauthorized() {
+  if (_updateRestarting) {
+    _updateRestarting = false;
+    _updateRestartSawDown = false;
+    _updatingNow = false;
+    sessionLost = true;
+    _updateSessionClosed = true;
+    setDead(false);
+    renderUpdateProgress({
+      active: false,
+      phase: 'done',
+      version: _updateTargetVer || null,
+      bytes_downloaded: 0,
+      bytes_total: null,
+      percent: 100,
+      message: 'Mise \u00e0 jour install\u00e9e \u2014 nouvelle version d\u00e9marr\u00e9e. Recharge ou ouvre la nouvelle fen\u00eatre.',
+      error: null,
+    });
+    toast('Nouvelle version d\u00e9marr\u00e9e', 'ok', 6000);
+    return;
+  }
   if (accessCode()) { showLogin(); return; }
   if (sessionLost) return;
   sessionLost = true;
@@ -381,6 +446,7 @@ function setDead(on, msg) {
     c.innerHTML = '<h1 class="sr-only">MCP Control</h1><div class="engine-wait">' + esc(msg) + '</div>';
   }
 }
+let _detailReqSeq = 0;
 async function load() {
   if (document.hidden) return; // fenêtre masquée (tray) : polling suspendu — CPU/mémoire au repos
   try {
@@ -389,6 +455,14 @@ async function load() {
     if (r.status === 304) {
       pollFails = 0;
       setDead(false);
+      if (_updateRestarting && _updateRestartSawDown) {
+        _updateRestarting = false;
+        _updateRestartSawDown = false;
+        _updatingNow = false;
+        toast('Nouvelle version d\u00e9marr\u00e9e \u2014 rechargement\u2026', 'ok');
+        setTimeout(() => location.reload(), 400);
+        return;
+      }
       armPolling();
     } else {
       // Un 401 (session expirée) n'est pas un état : ne jamais le rendre.
@@ -401,6 +475,14 @@ async function load() {
         selectedId = null; detailCache = null; _lastSelectedSrvSig = ''; _detailEtag = null; _detailEtagId = null; _sigOverview = '';
       }
       render();
+      if (_updateRestarting && (_updateRestartSawDown || (state && state.update_status && state.update_status.phase === 'idle'))) {
+        _updateRestarting = false;
+        _updateRestartSawDown = false;
+        _updatingNow = false;
+        toast('Nouvelle version d\u00e9marr\u00e9e \u2014 rechargement\u2026', 'ok');
+        setTimeout(() => location.reload(), 400);
+        return;
+      }
       const rev = state && state.access ? state.access.revision : null;
       if (rev !== _lastAccessRevision) {
         _lastAccessRevision = rev;
@@ -409,27 +491,49 @@ async function load() {
       }
     }
     if (selectedId && state) {
-      const needFreshDetail = !detailCache || detailCache.id !== selectedId || _detailEtagId !== selectedId;
+      const targetId = selectedId;
+      const needFreshDetail = !detailCache || detailCache.id !== targetId || _detailEtagId !== targetId;
       if (needFreshDetail) {
         _detailEtag = null;
-        _detailEtagId = selectedId;
+        _detailEtagId = targetId;
       }
-      const srvSummary = state.servers.find(s => s.id === selectedId);
+      const srvSummary = state.servers.find(s => s.id === targetId);
       const srvSig = JSON.stringify(srvSummary || null);
       if (needFreshDetail || srvSig !== _lastSelectedSrvSig) {
         _lastSelectedSrvSig = srvSig;
+        const reqSeq = ++_detailReqSeq;
         const dOpts = (!needFreshDetail && _detailEtag) ? {headers: {'If-None-Match': _detailEtag}} : {};
-        const r2 = await fetch('/api/detail?id=' + encodeURIComponent(selectedId), dOpts);
+        const r2 = await fetch('/api/detail?id=' + encodeURIComponent(targetId), dOpts);
+        if (reqSeq !== _detailReqSeq || selectedId !== targetId) return;
         if (r2.status === 304) return;
         if (r2.ok) {
           _detailEtag = r2.headers.get('ETag') || null;
           detailCache = await r2.json();
-          renderDetail();
+          if (reqSeq === _detailReqSeq && selectedId === targetId) renderDetail();
         }
       }
     }
   } catch(e) {
-    if (sessionLost) { setDead(true, SESSION_LOST_MSG); return; }
+    if (sessionLost) {
+      if (!_updateSessionClosed) setDead(true, SESSION_LOST_MSG);
+      return;
+    }
+    if (_updateRestarting) {
+      _updateRestartSawDown = true;
+      setDead(false);
+      renderUpdateProgress({
+        active: true,
+        phase: 'restarting',
+        version: _updateTargetVer || null,
+        bytes_downloaded: 0,
+        bytes_total: null,
+        percent: 100,
+        message: 'Red\u00e9marrage vers la nouvelle version \u2014 reconnexion en cours\u2026',
+        error: null,
+      });
+      scheduleNext(1000);
+      return;
+    }
     if (document.getElementById('loginDlg')?.open) return;
     pollFails++;
     if (state === null) setDead(true, DEAD_BOOT_MSG);
@@ -463,15 +567,30 @@ function render() {
     }
   }
   const upd = document.getElementById('stUpdate');
-  if (state.update_available && state.latest_version) {
-    setHidden(upd, false);
-    if (upd.dataset.ver !== String(state.latest_version)) {
-      upd.dataset.ver = String(state.latest_version);
-      upd.innerHTML = ic('download') + '<span class="tb-lbl">Mise &agrave; jour v' + esc(String(state.latest_version)) + '</span>';
-      upd.title = 'Mettre à jour vers v' + state.latest_version + ' (installée : v' + MCC_VERSION
-        + ') — clic : téléchargement et installation directe';
-    }
-  } else setHidden(upd, true);
+  const uSt = state.update_status || null;
+  if (upd) {
+    if (uSt && uSt.active) {
+      setHidden(upd, false);
+      const pct = (uSt.phase === 'downloading' && typeof uSt.percent === 'number')
+        ? (' ' + uSt.percent + '%') : '';
+      const phaseTxt = uSt.phase === 'restarting' ? 'Red\u00e9marrage\u2026'
+        : uSt.phase === 'verifying_sha256' ? 'V\u00e9rif SHA-256\u2026'
+        : uSt.phase === 'installing' ? 'Installation\u2026'
+        : 'Mise \u00e0 jour' + pct + '\u2026';
+      delete upd.dataset.ver;
+      upd.innerHTML = ic('download') + '<span class="tb-lbl">' + esc(phaseTxt) + '</span>';
+      upd.title = updatePhaseLabel(uSt) || 'Mise \u00e0 jour en cours';
+    } else if (state.update_available && state.latest_version) {
+      setHidden(upd, false);
+      if (upd.dataset.ver !== String(state.latest_version)) {
+        upd.dataset.ver = String(state.latest_version);
+        upd.innerHTML = ic('download') + '<span class="tb-lbl">Mise &agrave; jour v' + esc(String(state.latest_version)) + '</span>';
+        upd.title = 'Mettre à jour vers v' + state.latest_version + ' (installée : v' + MCC_VERSION
+          + ') — clic : téléchargement et installation directe';
+      }
+    } else setHidden(upd, true);
+  }
+  renderUpdateProgress(uSt);
   renderServers();
   renderPeers();
   syncAnnouncements();
@@ -996,7 +1115,22 @@ function saveFold(el) {
 }
 
 async function toggleAutostart() {
-  await postAction({action: 'set_autostart', enabled: !state.autostart});
+  const next = !state.autostart;
+  const r = await postAction({action: 'set_autostart', enabled: next}, {quiet: true});
+  if (r && r.needs_confirm) {
+    const ok = await askConfirm({
+      title: 'Remplacer le d\u00e9marrage automatique',
+      msg: (r.error || 'Une autre installation est d\u00e9j\u00e0 enregistr\u00e9e au d\u00e9marrage.')
+        + (r.recorded ? '\n\nChemin actuel : ' + r.recorded : ''),
+      okLabel: 'Remplacer',
+      danger: true,
+    });
+    if (ok) {
+      await postAction({action: 'set_autostart', enabled: next, confirm: true});
+    }
+  } else if (r && !r.ok && r.error) {
+    toast(r.error, 'err', 4000);
+  }
   await load();
 }
 
@@ -1461,9 +1595,10 @@ const srvUrl = s => {
 function hermesYaml(s) {
   const hUrl = hybridUrl(s);
   const n = srvName(s);
+  const bCmd = (state && state.bridge_command) || 'mcp-control';
   if (hUrl) {
     const hArgs = ['bridge', '--url', hUrl].map(a => JSON.stringify(a)).join(', ');
-    return 'mcp_servers:\n  ' + n + ':\n    command: mcp-control\n    args: [' + hArgs + ']\n    enabled: true';
+    return 'mcp_servers:\n  ' + n + ':\n    command: ' + JSON.stringify(bCmd) + '\n    args: [' + hArgs + ']\n    enabled: true';
   }
   if (s.transport === 'http')
     return 'mcp_servers:\n  ' + n + ':\n    url: ' + srvUrl(s) + '\n    enabled: true';
@@ -1472,11 +1607,12 @@ function hermesYaml(s) {
 }
 function mcpJson(s) {
   const hUrl = hybridUrl(s);
+  const bCmd = (state && state.bridge_command) || 'mcp-control';
   if (hUrl) {
     return JSON.stringify({
       mcpServers: {
         [s.id]: {
-          command: 'mcp-control',
+          command: bCmd,
           args: ['bridge', '--url', hUrl],
         },
       },
@@ -1494,8 +1630,9 @@ const quoteShellArg = a => {
 };
 function claudeCmd(s) {
   const hUrl = hybridUrl(s);
+  const bCmd = (state && state.bridge_command) || 'mcp-control';
   if (hUrl)
-    return 'claude mcp add ' + quoteShellArg(s.id) + ' -- mcp-control bridge --url ' + quoteShellArg(hUrl);
+    return 'claude mcp add ' + quoteShellArg(s.id) + ' -- ' + quoteShellArg(bCmd) + ' bridge --url ' + quoteShellArg(hUrl);
   const n = srvName(s);
   if (s.transport === 'http') return 'claude mcp add --transport http ' + n + ' ' + srvUrl(s);
   const prog = quoteShellArg(s.transport_info.program || 'npx');
@@ -2624,10 +2761,17 @@ document.addEventListener('keydown', (e) => {
       const swapIdx = e.key === 'ArrowUp' ? idx - 1 : idx + 1;
       if (idx >= 0 && swapIdx >= 0 && swapIdx < ids.length) {
         const tmp = ids[idx]; ids[idx] = ids[swapIdx]; ids[swapIdx] = tmp;
+        // Fusionner les serveurs masqués/filtrés pour ne jamais perdre leur ordre [M-16]
+        const fullIds = [...ids];
+        if (state && Array.isArray(state.servers)) {
+          for (const s of state.servers) {
+            if (!fullIds.includes(s.id)) fullIds.push(s.id);
+          }
+        }
         manualOrder = null;
         const sel = document.getElementById('sortSel');
         if (sel) sel.value = 'manuel';
-        postReorder(ids).then(() => {
+        postReorder(fullIds).then(() => {
           const movedEl = document.querySelector(`#srvList .srow[data-id="${CSS.escape(id)}"]`);
           if (movedEl) movedEl.focus();
         });
@@ -3035,7 +3179,15 @@ function openSettingsDlg() {
   if (discOnlyEl) discOnlyEl.value = (s.discovery_ports_only || []).join(', ');
   const discExclEl = document.getElementById('sDiscExcl');
   if (discExclEl) discExclEl.value = (s.discovery_ports_excluded || []).join(', ');
-  document.getElementById('sUiBind').value = s.ui_bind || '127.0.0.1';
+  const bindSel = document.getElementById('sUiBind');
+  const bindVal = s.ui_bind || '127.0.0.1';
+  if (bindSel && ![...bindSel.options].some(o => o.value === bindVal)) {
+    const opt = document.createElement('option');
+    opt.value = bindVal;
+    opt.textContent = bindVal + ' (personnalis\u00e9)';
+    bindSel.appendChild(opt);
+  }
+  if (bindSel) bindSel.value = bindVal;
   document.getElementById('sUiPort').value = s.ui_port || 5090;
   // Notifications (moteur : action set_notify, section notify de config.json).
   // Lot 5 : les en-têtes ne sortent plus de l'API (headers_set) — le champ vide
@@ -3067,11 +3219,17 @@ function openSettingsDlg() {
   if (state.update_available) upd.classList.add('tone-warn');
   _updateAvailableKnown = !!state.update_available;
   const updBtn = document.getElementById('btnUpdInstall');
-  if (updBtn && !_updatingNow) {
+  const updActive = !!(_updatingNow || (state.update_status && state.update_status.active));
+  if (updBtn && !updActive) {
     updBtn.disabled = !_updateAvailableKnown;
     updBtn.title = _updateAvailableKnown
       ? 'T\u00e9l\u00e9charge, v\u00e9rifie (SHA-256), installe et relance automatiquement la nouvelle version'
       : 'Aucune mise \u00e0 jour disponible pour le moment (v\u00e9rifie d\u2019abord ci-contre)';
+  }
+  if (state.update_status && state.update_status.phase && state.update_status.phase !== 'idle') {
+    renderUpdateProgress(state.update_status);
+  } else {
+    setHidden(document.getElementById('updProgRow'), true);
   }
   const row = document.getElementById('resetMsgRow');
   if (row) row.hidden = true;
@@ -3092,6 +3250,7 @@ function openSettingsDlg() {
   const foot = document.getElementById('settingsFootNote');
   if (foot) foot.textContent = 'Les r\u00e9glages sont enregistr\u00e9s dans config.json.';
   applyTheme(document.documentElement.dataset.theme === 'light' ? 'light' : 'dark');
+  applyTextStyle(document.documentElement.dataset.textColor || 'default', document.documentElement.dataset.textBright || '100');
   const d = document.getElementById('settingsDlg');
   if (d && !d.open) { rememberFocus(); d.showModal(); }
   const nav = document.querySelector('#settingsDlg .set-nav-btn.sel');
@@ -3180,12 +3339,188 @@ function browserOs() {
 let lastUpdateUrl = null;
 let _updatingNow = false;
 let _updateAvailableKnown = false;
+let _updateRestarting = false;
+let _updateRestartSawDown = false;
+let _updateTargetVer = '';
+let _updateDismissedAt = 0;
+let _lastUpdateErrorAt = 0;
+let _lastUpdateRestartToast = false;
+
+function fmtBytes(n) {
+  const b = Number(n);
+  if (!Number.isFinite(b) || b < 0) return '0 o';
+  if (b < 1024) return Math.round(b) + ' o';
+  if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' Ko';
+  return (b / (1024 * 1024)).toFixed(1) + ' Mo';
+}
+
+function updatePhaseLabel(u) {
+  if (!u) return '';
+  if (u.message) return String(u.message);
+  const ver = u.version ? (' v' + u.version) : '';
+  switch (u.phase) {
+    case 'checking': return 'V\u00e9rification de la derni\u00e8re release GitHub\u2026';
+    case 'verifying_manifest': return 'V\u00e9rification de SHA256SUMS.txt' + ver + '\u2026';
+    case 'downloading': return 'T\u00e9l\u00e9chargement' + ver + '\u2026';
+    case 'verifying_sha256': return 'V\u00e9rification de l\u2019empreinte SHA-256\u2026';
+    case 'installing': return 'Installation' + ver + '\u2026';
+    case 'restarting': return 'Red\u00e9marrage vers la nouvelle version\u2026';
+    case 'done': return 'Mise \u00e0 jour install\u00e9e.';
+    case 'error': return '\u00c9chec : ' + (u.error || 'erreur inconnue');
+    default: return '';
+  }
+}
+
+function updateProgressMeta(u) {
+  if (!u) return '';
+  if (u.phase === 'downloading') {
+    const dl = fmtBytes(u.bytes_downloaded || 0);
+    const tot = (typeof u.bytes_total === 'number' && u.bytes_total > 0)
+      ? (' / ' + fmtBytes(u.bytes_total)) : '';
+    const pct = (typeof u.percent === 'number') ? (' \u00b7 ' + u.percent + ' %') : '';
+    return dl + tot + pct;
+  }
+  if (u.phase === 'verifying_sha256' || u.phase === 'installing' || u.phase === 'restarting' || u.phase === 'done') {
+    return u.version ? ('v' + u.version) : '';
+  }
+  return '';
+}
+
+function setProgressBar(bar, u) {
+  if (!bar || !u) return;
+  const st = String(u.phase || 'idle');
+  bar.classList.toggle('upd-ok', st === 'restarting' || st === 'done');
+  bar.classList.toggle('upd-err', st === 'error');
+  if (st === 'downloading' && typeof u.percent === 'number') {
+    bar.max = 100;
+    bar.value = Math.max(0, Math.min(100, u.percent));
+  } else if (st === 'restarting' || st === 'done') {
+    bar.max = 100;
+    bar.value = 100;
+  } else if (st === 'error') {
+    bar.max = 100;
+    bar.value = 0;
+  } else {
+    bar.removeAttribute('value');
+  }
+}
+
+function dismissUpdateBanner() {
+  const u = state && state.update_status;
+  if (u && u.active) return;
+  _updateDismissedAt = (u && u.updated_at) ? u.updated_at : Date.now();
+  setHidden(document.getElementById('updateBanner'), true);
+}
+
+async function fetchManualUpdateUrl() {
+  const manual = {action: 'download_update'};
+  const os = browserOs();
+  if (os) manual.os = os;
+  const dl = await postAction(manual, {quiet: true});
+  if (dl && dl.url && /^https:\/\//i.test(dl.url)) lastUpdateUrl = dl.url;
+}
+
+function renderUpdateProgress(u) {
+  const banner = document.getElementById('updateBanner');
+  const bTxt = document.getElementById('updBannerTxt');
+  const bMeta = document.getElementById('updBannerMeta');
+  const bClose = document.getElementById('updBannerClose');
+  const bProg = document.getElementById('updBannerProg');
+  const row = document.getElementById('updProgRow');
+  const sPhase = document.getElementById('updProgPhase');
+  const sMeta = document.getElementById('updProgMeta');
+  const sBar = document.getElementById('updProgBar');
+  const msg = document.getElementById('updMsg');
+  const btn = document.getElementById('btnUpdInstall');
+
+  if (_updateRestarting && (!u || u.phase === 'idle')) {
+    u = {
+      active: true,
+      phase: 'restarting',
+      version: _updateTargetVer || null,
+      bytes_downloaded: 0,
+      bytes_total: null,
+      percent: 100,
+      message: 'Red\u00e9marrage vers la nouvelle version\u2026',
+      error: null,
+    };
+  }
+
+  if (!u || !u.phase || u.phase === 'idle') {
+    _updatingNow = false;
+    setHidden(banner, true);
+    setHidden(row, true);
+    if (btn) btn.disabled = !_updateAvailableKnown;
+    return;
+  }
+
+  const phase = String(u.phase);
+  const active = !!u.active;
+  const isOk = phase === 'restarting' || phase === 'done';
+  const isErr = phase === 'error';
+  _updatingNow = active;
+  if (u.version) _updateTargetVer = String(u.version);
+  if (active) _updateDismissedAt = 0;
+
+  if (phase === 'restarting') {
+    _updateRestarting = true;
+    if (!_lastUpdateRestartToast) {
+      _lastUpdateRestartToast = true;
+      toast('Mise \u00e0 jour v' + (u.version || _updateTargetVer || '') + ' v\u00e9rifi\u00e9e \u2014 red\u00e9marrage en cours\u2026', 'ok');
+    }
+  } else if (isErr) {
+    _updatingNow = false;
+    _updateRestarting = false;
+    _updateRestartSawDown = false;
+    _lastUpdateRestartToast = false;
+    const errKey = u.updated_at || u.error || 'err';
+    if (errKey !== _lastUpdateErrorAt) {
+      _lastUpdateErrorAt = errKey;
+      toast(u.error || '\u00e9chec de la mise \u00e0 jour', 'err');
+      if (u.error && !String(u.error).includes('d\u00e9j\u00e0 \u00e0 jour') && !String(u.error).includes('SHA-256')) {
+        fetchManualUpdateUrl();
+      }
+    }
+  }
+
+  const label = updatePhaseLabel(u);
+  const meta = updateProgressMeta(u);
+  const dismissed = !active && _updateDismissedAt && u.updated_at && _updateDismissedAt === u.updated_at;
+
+  if (banner) {
+    setHidden(banner, !!dismissed);
+    banner.classList.toggle('upd-active', active);
+    banner.classList.toggle('upd-ok', isOk);
+    banner.classList.toggle('upd-err', isErr);
+  }
+  setText(bTxt, label);
+  setText(bMeta, meta);
+  setHidden(bClose, active);
+  setProgressBar(bProg, u);
+
+  setHidden(row, false);
+  setText(sPhase, label);
+  setText(sMeta, meta);
+  setProgressBar(sBar, u);
+
+  if (msg) {
+    msg.classList.remove('tone-warn', 'tone-ok');
+    if (isOk) msg.classList.add('tone-ok');
+    else if (isErr) msg.classList.add('tone-warn');
+    setText(msg, isErr ? ('\u2717 ' + (u.error || '\u00e9chec de la mise \u00e0 jour automatique')) : label);
+  }
+  if (btn) btn.disabled = !!(active || !_updateAvailableKnown);
+}
+
 /* Mettre à jour & relancer : téléchargement HTTPS + vérification SHA-256 +
    installation silencieuse (NSIS /S) ou remplacement binaire + redémarrage
-   automatique de la nouvelle version. Repli manuel (`download_update`) si
-   l'auto-installation échoue. */
+   automatique de la nouvelle version avec suivi temps réel via /api/state. */
 async function downloadUpdate() {
-  if (_updatingNow) return;
+  if (_updatingNow || (state && state.update_status && state.update_status.active)) {
+    openSettingsDlg();
+    setPane('updates');
+    return;
+  }
   const ver = (state && state.latest_version) ? ('v' + state.latest_version) : 'la derni\u00e8re version';
   const ok = await askConfirm({
     title: 'Mettre \u00e0 jour et relancer',
@@ -3195,44 +3530,51 @@ async function downloadUpdate() {
   });
   if (!ok) return;
   _updatingNow = true;
-  const btn = document.getElementById('btnUpdInstall');
-  const msg = document.getElementById('updMsg');
-  if (btn) btn.disabled = true;
-  if (msg) {
-    msg.classList.remove('tone-warn', 'tone-ok');
-    msg.textContent = 'T\u00e9l\u00e9chargement et v\u00e9rification SHA-256 de ' + ver + '\u2026';
-  }
-  toast('T\u00e9l\u00e9chargement et v\u00e9rification SHA-256 en cours\u2026', 'ok');
+  _updateDismissedAt = 0;
+  _updateRestartSawDown = false;
+  _updateSessionClosed = false;
+  _lastUpdateRestartToast = false;
+  _updateTargetVer = (state && state.latest_version) ? String(state.latest_version) : '';
+  renderUpdateProgress({
+    active: true,
+    phase: 'checking',
+    version: _updateTargetVer || null,
+    asset: null,
+    bytes_downloaded: 0,
+    bytes_total: null,
+    percent: null,
+    message: 'D\u00e9marrage de la mise \u00e0 jour ' + ver + '\u2026',
+    error: null,
+  });
+  toast('Mise \u00e0 jour ' + ver + ' lanc\u00e9e\u2026', 'ok');
   const j = await postAction({action: 'install_update'}, {quiet: true});
-  if (j.ok && j.restarting) {
-    if (msg) {
-      msg.classList.add('tone-ok');
-      msg.textContent = '\u2713 v' + (j.version || '') + ' v\u00e9rifi\u00e9e (SHA-256 OK) \u2014 installation et red\u00e9marrage automatique\u2026';
-    }
-    toast('Mise \u00e0 jour v' + (j.version || '') + ' v\u00e9rifi\u00e9e \u2014 red\u00e9marrage en cours\u2026', 'ok');
-    setTimeout(() => { _updatingNow = false; if (btn) btn.disabled = !_updateAvailableKnown; load(); }, 4000);
+  if (j.ok && (j.started || j.already_running)) {
+    if (j.update_status) renderUpdateProgress(j.update_status);
+    scheduleNext(POLL_UPDATE_MS);
     return;
   }
   _updatingNow = false;
-  if (btn) btn.disabled = !_updateAvailableKnown;
   if (j.netDown) {
+    setHidden(document.getElementById('updateBanner'), true);
+    setHidden(document.getElementById('updProgRow'), true);
     if (lastUpdateUrl && /^https:\/\//i.test(lastUpdateUrl)) window.open(lastUpdateUrl, '_blank', 'noopener,noreferrer');
     else toast('moteur injoignable \u2014 r\u00e9essaie plus tard', 'err');
     return;
   }
-  if (msg) {
-    msg.classList.add('tone-warn');
-    msg.textContent = '\u2717 ' + (j.error || '\u00e9chec de la mise \u00e0 jour automatique');
-  }
-  // Si l'auto-mise à jour a échoué (ex. déjà à jour ou refus), afficher l'erreur
-  // et proposer le téléchargement manuel si ce n'est pas « déjà à jour ».
-  toast(j.error || '\u00e9chec de la mise \u00e0 jour', 'err');
-  if (j.error && !String(j.error).includes('d\u00e9j\u00e0 \u00e0 jour') && !String(j.error).includes('SHA-256')) {
-    const manual = {action: 'download_update'};
-    const os = browserOs();
-    if (os) manual.os = os;
-    const dl = await postAction(manual, {quiet: true});
-    if (dl.url && /^https:\/\//i.test(dl.url)) lastUpdateUrl = dl.url;
+  if (j.update_status) {
+    renderUpdateProgress(j.update_status);
+  } else {
+    renderUpdateProgress({
+      active: false,
+      phase: 'error',
+      version: _updateTargetVer || null,
+      bytes_downloaded: 0,
+      bytes_total: null,
+      percent: 0,
+      message: j.error || '\u00e9chec de la mise \u00e0 jour automatique',
+      error: j.error || '\u00e9chec de la mise \u00e0 jour automatique',
+      updated_at: Date.now(),
+    });
   }
 }
 async function resetState(what) {
@@ -3432,7 +3774,7 @@ async function resetRuntime() {
   const d = document.getElementById('settingsDlg');
   if (!d) return;
   const onEdit = e => {
-    if (e.target && e.target.id === 'sResetWhat') return;
+    if (e.target && (e.target.id === 'sResetWhat' || e.target.id === 'sTextBright')) return;
     setDirty(true);
   };
   d.addEventListener('input', onEdit);
@@ -3711,7 +4053,6 @@ async function addServer(ev) {
       document.getElementById('dlg').close();
       restoreFocus();
       if (j.id) {
-        selectedId = j.id;
         await act('refresh', j.id);
         await select(j.id);
       } else {
@@ -4161,11 +4502,12 @@ function copyDataText(el) {
 }
 function pairGuideHtml(uiUrl) {
   const url = uiUrl || (window.location && window.location.origin) || 'http://127.0.0.1:5090';
-  const cmdPair = 'mcp-control auth pair ' + url;
+  const bCmd = (state && state.bridge_command) || 'mcp-control';
+  const cmdPair = quoteShellArg(bCmd) + ' auth pair ' + url;
   const jsonBridge = JSON.stringify({
     mcpServers: {
       'mcp-control': {
-        command: 'mcp-control',
+        command: bCmd,
         args: ['bridge', '--url', url]
       }
     }
@@ -4238,10 +4580,10 @@ function renderAccIdentity() {
     </div>
     <div class="acc-card">
       <div class="acc-h">
-        <span class="acc-tool">Journal d'audit cha&icirc;n&eacute; (SHA-256)</span>
-        <span class="acc-tag">${ic('shield')} audit.jsonl</span>
+        <span class="acc-tool">Journal d'audit cha&icirc;n&eacute; (HMAC-SHA256)</span>
+        <span class="acc-tag">${ic('shield')} auth-audit.log</span>
       </div>
-      <div class="acc-who">Chaque d&eacute;cision d'authentification et d'autorisation sur <code>/mcp</code> est scell&eacute;e par le hachage SHA-256 de l'entr&eacute;e pr&eacute;c&eacute;dente. V&eacute;rifiez l'int&eacute;grit&eacute; de la cha&icirc;ne avec :</div>
+      <div class="acc-who">Chaque d&eacute;cision d'authentification et d'autorisation sur <code>/mcp</code> est scell&eacute;e par un code HMAC-SHA256 cha&icirc;n&eacute; &agrave; l'entr&eacute;e pr&eacute;c&eacute;dente. V&eacute;rifiez l'int&eacute;grit&eacute; de la cha&icirc;ne avec :</div>
       <div class="conf-block"><div class="conf-head"><span class="conf-lang">CLI</span><span>V&eacute;rification d'int&eacute;grit&eacute; du journal</span><button type="button" class="copy-btn" data-act="copy-conf">${ic('copy')}<span>Copier</span></button></div><pre>${hlCli(verifyCmd)}</pre></div>
     </div>`;
 }
@@ -4716,11 +5058,16 @@ async function pairReject(pairId) {
    au retour par visibilitychange). */
 let pollTimer = null;
 const POLL_RETRY_MS = 2000; // panne : réessai rapide (lot C #2)
+const POLL_UPDATE_MS = 350; // suivi temps réel pendant une mise à jour
 function scheduleNext(ms) {
   if (pollTimer) clearTimeout(pollTimer);
   pollTimer = setTimeout(load, ms);
 }
 function armPolling() {
+  if (_updatingNow || _updateRestarting || (state && state.update_status && state.update_status.active)) {
+    scheduleNext(POLL_UPDATE_MS);
+    return;
+  }
   const secs = Math.max(5, (state && state.settings && state.settings.refresh_secs) || 5);
   scheduleNext(secs * 1000);
 }
@@ -4793,6 +5140,7 @@ const ACT = {
   'net-detail': () => showNetDetail(),
   'autostart': () => toggleAutostart(),
   'update-download': () => downloadUpdate(),
+  'upd-banner-close': () => dismissUpdateBanner(),
   // -- contrôles de fenêtre (desktop Tauri : sans effet dans un navigateur)
   'win-min': () => winAction('min'),
   'win-max': () => winAction('max'),
@@ -4857,6 +5205,9 @@ const ACT = {
   // -- réglages
   'set-pane': el => setPane(el.dataset.pane),
   'theme': el => applyThemeAndSave(el.dataset.theme),
+  'text-bright': el => applyTextBrightAndSave(el.value),
+  'text-color': el => applyTextColorAndSave(el.dataset.color),
+  'text-style-reset': () => resetTextStyle(),
   'test-notify': () => testNotify(),
   'check-update': () => checkUpdateNow(),
   'copy-sha256': () => copySha256(),
@@ -4933,6 +5284,7 @@ function runAction(ev) {
 loadFrameworks();
 loadStoreLogos();
 updateLogoutBtn();
+applyTextStyle(document.documentElement.dataset.textColor || 'default', document.documentElement.dataset.textBright || '100');
 load();
 armPolling();
 // retour de la fenêtre (tray → visible) : reprise immédiate du rafraîchissement

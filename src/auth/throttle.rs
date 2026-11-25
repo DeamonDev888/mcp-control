@@ -195,9 +195,10 @@ fn exempte(peer: Option<IpAddr>) -> bool {
 /// clé inventée ne fait pas grossir la mémoire indéfiniment.
 fn borner<V: Clone + Eq + std::hash::Hash>(map: &mut HashMap<V, Compteur>) {
     while map.len() > MAX_ENTREES {
+        // Ne jamais évincer une entrée activement bloquée avant une entrée non bloquée [M-04].
         let Some(plus_vieux) = map
             .iter()
-            .min_by_key(|(_, c)| c.dernier)
+            .min_by_key(|(_, c)| (c.bloque_jusqua > 0, c.dernier))
             .map(|(k, _)| k.clone())
         else {
             break;

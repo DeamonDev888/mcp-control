@@ -181,62 +181,140 @@ pub fn masked_arguments(v: &Value) -> Value {
 }
 
 /// Extrait les programmes d'une configuration MCP importée (bloc
-/// `mcpServers` / `servers` / objet direct). Le TEXTE importé n'est jamais
-/// recopié : ni à l'écran, ni au journal — il peut porter des jetons.
+/// `mcpServers` / `mcp_servers` / `servers` / objet direct, `claude mcp add`,
+/// URL HTTP ou ligne CLI `npx`/`uvx`/`docker`/`node`/`python`). Le TEXTE
+/// importé n'est jamais recopié brut : ni à l'écran, ni au journal — il peut
+/// porter des jetons `[H-07]`.
 fn programmes_importes(texte: &str) -> Vec<Value> {
-    let Ok(v) = serde_json::from_str::<Value>(texte) else {
-        return vec![json!({"label": "(texte illisible)", "program": "?", "args": []})];
-    };
-    let bloc = v
-        .get("mcpServers")
-        .or_else(|| v.get("servers"))
-        .or_else(|| v.get("mcp"))
-        .unwrap_or(&v);
-    let mut out = Vec::new();
-    if let Some(o) = bloc.as_object() {
-        for (nom, entree) in o.iter().take(10) {
-            match entree.get("command").and_then(Value::as_str) {
-                Some(cmd) => {
-                    let args: Vec<String> = entree
-                        .get("args")
-                        .and_then(Value::as_array)
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(Value::as_str)
-                                .take(8)
-                                .map(|s| court(s, 80))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    out.push(json!({
-                        "label": court(nom, 64),
-                        "program": court(cmd, 120),
-                        "args": args,
-                        // noms des env du bloc importé — jamais les valeurs
-                        "env": entree.get("env").and_then(Value::as_object)
-                            .map(|e| e.keys().take(12).cloned().collect::<Vec<_>>())
-                            .unwrap_or_default(),
-                    }));
-                }
-                None => {
-                    let url = entree
-                        .get("url")
-                        .or_else(|| entree.get("serverUrl"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("?");
-                    out.push(json!({
-                        "label": court(nom, 64),
-                        "program": court(url, 120),
-                        "args": [],
-                    }));
+    if let Ok(v) = serde_json::from_str::<Value>(texte) {
+        let bloc = v
+            .get("mcpServers")
+            .or_else(|| v.get("mcp_servers"))
+            .or_else(|| v.get("servers"))
+            .or_else(|| v.get("mcp"))
+            .unwrap_or(&v);
+        let mut out = Vec::new();
+        if let Some(o) = bloc.as_object() {
+            for (nom, entree) in o.iter().take(10) {
+                match entree.get("command").and_then(Value::as_str) {
+                    Some(cmd) => {
+                        let args: Vec<String> = entree
+                            .get("args")
+                            .and_then(Value::as_array)
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(Value::as_str)
+                                    .take(8)
+                                    .map(|s| court(s, 80))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        out.push(json!({
+                            "label": court(nom, 64),
+                            "program": court(cmd, 120),
+                            "args": args,
+                            // noms des env du bloc importé — jamais les valeurs
+                            "env": entree.get("env").and_then(Value::as_object)
+                                .map(|e| e.keys().take(12).cloned().collect::<Vec<_>>())
+                                .unwrap_or_default(),
+                        }));
+                    }
+                    None => {
+                        let url = entree
+                            .get("url")
+                            .or_else(|| entree.get("serverUrl"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("?");
+                        out.push(json!({
+                            "label": court(nom, 64),
+                            "program": court(url, 120),
+                            "args": [],
+                        }));
+                    }
                 }
             }
+            if o.len() > 10 {
+                out.push(json!({
+                    "label": format!("(+{} autre(s) serveur(s))", o.len() - 10),
+                    "program": "…",
+                    "args": [],
+                }));
+            }
+        }
+        if !out.is_empty() {
+            return out;
         }
     }
-    if out.is_empty() {
-        out.push(json!({"label": "(aucun programme reconnu)", "program": "?", "args": []}));
+    let trimmed = texte.trim();
+    let toks: Vec<&str> = trimmed.split_whitespace().collect();
+    // 1. `claude mcp add ...`
+    if toks.len() >= 4 && toks[0] == "claude" && toks[1] == "mcp" && toks[2] == "add" {
+        let mut i = 3usize;
+        let mut env_keys: Vec<String> = Vec::new();
+        let mut positional: Vec<&str> = Vec::new();
+        while i < toks.len() {
+            if toks[i] == "--" {
+                positional.extend_from_slice(&toks[i + 1..]);
+                break;
+            }
+            if matches!(toks[i], "-e" | "--env") {
+                if let Some(kv) = toks.get(i + 1) {
+                    let k = kv.split('=').next().unwrap_or("");
+                    if !k.is_empty() && env_keys.len() < 12 {
+                        env_keys.push(court(k, 64));
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            if matches!(toks[i], "-s" | "--scope" | "-t" | "--transport") {
+                i += 2;
+                continue;
+            }
+            if toks[i].starts_with('-') {
+                i += 1;
+                continue;
+            }
+            positional.push(toks[i]);
+            i += 1;
+        }
+        if positional.len() >= 2 {
+            let label = court(positional[0], 64);
+            let prog = court(positional[1], 120);
+            let args: Vec<String> = positional[2..]
+                .iter()
+                .take(8)
+                .map(|s| court(s, 80))
+                .collect();
+            return vec![json!({
+                "label": label,
+                "program": prog,
+                "args": args,
+                "env": env_keys,
+            })];
+        }
     }
-    out
+    // 2. URL HTTP/HTTPS directe
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let first = toks.first().copied().unwrap_or(trimmed);
+        return vec![json!({
+            "label": "URL MCP",
+            "program": court(first, 120),
+            "args": [],
+        })];
+    }
+    // 3. Ligne de commande directe (`npx`, `uvx`, `uv`, `docker`, `node`, `python`, `python3`)
+    if let Some(&first) = toks.first() {
+        if ["npx", "uvx", "uv", "docker", "node", "python", "python3"].contains(&first) {
+            let args: Vec<String> = toks[1..].iter().take(8).map(|s| court(s, 80)).collect();
+            return vec![json!({
+                "label": format!("commande {first}"),
+                "program": court(first, 120),
+                "args": args,
+            })];
+        }
+    }
+    vec![json!({"label": "(aucun programme reconnu)", "program": "?", "args": []})]
 }
 
 /// Commande de lancement connue d'un serveur supervisé (par son id) — c'est
@@ -296,6 +374,14 @@ pub fn effect_of(state: &Arc<AppState>, tool: &str, args: &Value) -> Value {
         // ---- lancements : programme + arguments + dossier de travail ----
         "start_server" | "toggle_server" | "set_auto_restart" => {
             let id = s("id");
+            let enabled = args.get("enabled").and_then(Value::as_bool);
+            let note = match (tool, enabled) {
+                ("start_server", _) => "démarrage du programme",
+                ("toggle_server", Some(false)) => "interrupteur OFF : arrêt du serveur",
+                ("toggle_server", _) => "interrupteur ON : le programme est relancé",
+                ("set_auto_restart", Some(false)) => "désactivation de la relance automatique",
+                _ => "relance automatique au boot et après un crash",
+            };
             match commande_du_serveur(state, id) {
                 Some(c) => json!({
                     "kind": "lancement",
@@ -310,16 +396,19 @@ pub fn effect_of(state: &Arc<AppState>, tool: &str, args: &Value) -> Value {
                     "args": c["args"],
                     "workdir": c["workdir"],
                     "env": c["env"],
-                    "note": if tool == "start_server" { "démarrage du programme" }
-                            else if tool == "toggle_server" { "interrupteur ON : le programme est relancé" }
-                            else { "relance automatique au boot et après un crash" },
+                    "enabled": enabled,
+                    "note": note,
                 }),
-                None => lancement(
-                    &format!("serveur {id}"),
-                    "(aucune commande de lancement connue)",
-                    vec![],
-                    "",
-                ),
+                None => {
+                    let mut v = lancement(
+                        &format!("serveur {id}"),
+                        "(aucune commande de lancement connue)",
+                        vec![],
+                        "",
+                    );
+                    v["note"] = json!(note);
+                    v
+                }
             }
         }
         "add_server" => match s("transport") {
@@ -350,6 +439,12 @@ pub fn effect_of(state: &Arc<AppState>, tool: &str, args: &Value) -> Value {
                     arr("args"),
                     s("workdir"),
                 );
+                let env_keys: Vec<String> = args
+                    .get("env")
+                    .and_then(Value::as_object)
+                    .map(|o| o.keys().take(12).cloned().collect())
+                    .unwrap_or_default();
+                v["env"] = json!(env_keys);
                 v["note"] = json!("cette commande sera exécutée par start_server et à l'autoboot");
                 v
             }
@@ -425,12 +520,17 @@ pub fn effect_of(state: &Arc<AppState>, tool: &str, args: &Value) -> Value {
                 (_, true) => "exécute ssh vers la machine et prépare le CLI mcp-control",
                 (_, false) => "exécute ssh vers la machine",
             };
-            json!({
+            let id_file = s("identity_file");
+            let mut obj = json!({
                 "kind": "ssh",
                 "target": target,
                 "resume": format!("SSH {}@{}{}", s("user"), s("ip"), port_sfx),
                 "note": note,
-            })
+            });
+            if !id_file.is_empty() {
+                obj["identity_file"] = json!(court(id_file, 160));
+            }
+            obj
         }
         _ => json!({
             "kind": "autre",
@@ -769,6 +869,17 @@ pub fn reset_store_for_tests() {
     c.entrees.clear();
     c.decisions.clear();
     c.rev_seq = 0;
+}
+
+/// Purge toutes les demandes en attente et tous les permis (`UneFois`/`Fenetre`)
+/// d'un client donné — appelé immédiatement lors d'une révocation, d'une rotation
+/// ou d'un changement de droits `[B-06]`.
+pub fn purge_client(keyid: &str) {
+    if keyid.is_empty() {
+        return;
+    }
+    let mut c = lock_store();
+    c.entrees.retain(|e| e.keyid != keyid);
 }
 
 /// Journalise des lignes produites par la machine à états. Aucune de ces lignes

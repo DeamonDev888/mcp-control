@@ -2,6 +2,14 @@
 // (split v0.7.20 : manage.rs reste la racine — API stable via réexport)
 use super::*;
 
+fn notify_cooldown_map(
+) -> &'static std::sync::Mutex<std::collections::HashMap<(usize, String), u64>> {
+    static MAP: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(usize, String), u64>>,
+    > = std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// NOTIFICATION d'incident : déclenchée sur une transition UP → DOWN/PORT-ONLY.
 /// Deux canaux : toast desktop (Windows) et webhook HTTP. Le délai minimum
 /// (`min_interval_secs`) évite le spam quand un serveur oscille.
@@ -13,25 +21,31 @@ pub(crate) fn notify_incident(app: &Arc<AppState>, label: &str, new_state: &str,
     if !cfg.wants(new_state) {
         return;
     }
-    // anti-spam : pas deux notifications du même serveur dans l'intervalle
+    // anti-spam : pas deux notifications du même serveur dans l'intervalle [H-14]
+    // (stocké hors `state.runtime` pour ne pas polluer config.json ni /api/runtime)
     let now = crate::types::now_ts();
     {
-        let mut rt = lockv(&app.runtime);
-        let entry = rt.entry(format!("notify:{label}")).or_default();
-        if entry.last_attempt_ts != 0
-            && now.saturating_sub(entry.last_attempt_ts) < cfg.min_interval_secs
-        {
-            return;
+        let mut cd = lockv(notify_cooldown_map());
+        let key = (Arc::as_ptr(app) as usize, label.to_string());
+        if let Some(&prev) = cd.get(&key) {
+            if now.saturating_sub(prev) < cfg.min_interval_secs {
+                return;
+            }
         }
-        entry.last_attempt_ts = now;
+        cd.insert(key, now);
     }
     if cfg.desktop {
         let title = format!("MCP — {label}");
         let msg = format!("{new_state} : {detail}");
-        // un toast raté ne doit JAMAIS faire tomber le poller
-        if let Err(e) = crate::notify::desktop_toast(&title, &msg) {
-            add_log(app, "warn", &format!("[notif] desktop : {e}"));
-        }
+        let app_bg = app.clone();
+        // Exécution asynchrone : un toast lent (PowerShell) ne bloque jamais un worker de sondage [H-14].
+        let _ = std::thread::Builder::new()
+            .name("mcc-toast".into())
+            .spawn(move || {
+                if let Err(e) = crate::notify::desktop_toast(&title, &msg) {
+                    add_log(&app_bg, "warn", &format!("[notif] desktop : {e}"));
+                }
+            });
     }
     if !cfg.webhook_url.trim().is_empty() {
         match crate::notify::send_webhook(&cfg, label, new_state, detail) {
@@ -78,16 +92,18 @@ pub(crate) fn runtime_event(state: &AppState, id: &str, kind: &str, detail: &str
 /// désactive l'auto-restart (sinon boucle infinie d'essais + warnings sur une
 /// machine cliente où les chemins des seeds n'existent pas).
 pub(crate) fn note_spawn_failure(state: &AppState, id: &str) {
+    // Ordre des verrous : `servers` lu et relâché AVANT `runtime` (jamais
+    // `servers` sous `runtime` — prévient tout interblocage) [H-13].
+    let label = lockv(&state.servers)
+        .iter()
+        .find(|s| s.id == id)
+        .map(|s| s.label.clone())
+        .unwrap_or_else(|| id.to_string());
     let (fails, backoff, disable) = {
         let mut rt = lockv(&state.runtime);
         let entry = rt.entry(id.to_string()).or_default();
         entry.fails += 1;
         entry.last_attempt_ts = crate::types::now_ts();
-        let label = lockv(&state.servers)
-            .iter()
-            .find(|s| s.id == id)
-            .map(|s| s.label.clone())
-            .unwrap_or_else(|| id.to_string());
         entry.push_event(crate::runtime::RuntimeEvent {
             ts: crate::types::now_ts(),
             id: id.to_string(),

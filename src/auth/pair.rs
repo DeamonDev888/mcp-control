@@ -276,6 +276,20 @@ pub fn handle_post(
         });
         return (200, "application/json", resp.to_string().into_bytes());
     }
+    // Borne par adresse IP : au plus 2 demandes en attente simultanées [M-04]
+    // pour empêcher une seule IP de saturer et évincer la file globale (16).
+    if from.is_some()
+        && pairs
+            .iter()
+            .filter(|p| p.is_pending(now) && p.paired_from == paired_from)
+            .count()
+            >= 2
+    {
+        return json_error(
+            429,
+            "trop de demandes d'appairage en attente pour cette adresse",
+        );
+    }
     let Some(pair_id) = crate::random_hex(2) else {
         return json_error(503, "entropie OS indisponible");
     };
@@ -650,23 +664,56 @@ mod tests {
         let mut refusees = 0;
         for i in 0..12 {
             let keyid = format!("mcc-a-{:016x}", i);
-            let (s, _, _) = handle_post(&st, &corps(now, &keyid, CLIENT_PUB), ip, now);
+            let (s, _, body) = handle_post(&st, &corps(now, &keyid, CLIENT_PUB), ip, now);
             match s {
-                200 => acceptees += 1,
+                200 => {
+                    acceptees += 1;
+                    // Trancher la demande pour tester le plafond de débit 5/min
+                    // indépendamment de la borne à 2 demandes en attente par IP.
+                    if let Ok(v) = serde_json::from_slice::<Value>(&body) {
+                        if let Some(pid) = v.get("pair_id").and_then(|x| x.as_str()) {
+                            let _ = reject(&st, pid, now);
+                        }
+                    }
+                }
                 429 => refusees += 1,
                 autre => panic!("statut inattendu {autre}"),
             }
         }
         assert_eq!(acceptees, PAIR_RATE_MAX);
         assert_eq!(refusees, 12 - PAIR_RATE_MAX);
-        // une autre adresse a son propre quota
-        let (s, _, _) = handle_post(
-            &st,
-            &corps(now, "mcc-a-00000000000000ff", CLIENT_PUB),
-            Some("192.0.2.13".parse().unwrap()),
-            now,
+        // une autre adresse a son propre quota et est bornée à 2 demandes en attente simultanées [M-04]
+        let ip2 = Some("192.0.2.13".parse().unwrap());
+        assert_eq!(
+            handle_post(
+                &st,
+                &corps(now, "mcc-a-00000000000000f1", CLIENT_PUB),
+                ip2,
+                now
+            )
+            .0,
+            200
         );
-        assert_eq!(s, 200);
+        assert_eq!(
+            handle_post(
+                &st,
+                &corps(now, "mcc-a-00000000000000f2", CLIENT_PUB),
+                ip2,
+                now
+            )
+            .0,
+            200
+        );
+        assert_eq!(
+            handle_post(
+                &st,
+                &corps(now, "mcc-a-00000000000000f3", CLIENT_PUB),
+                ip2,
+                now
+            )
+            .0,
+            429
+        );
         // la fenêtre glisse : une minute plus tard, le quota est reconstitué
         assert!(pair_rate_ok("192.0.2.12".parse().unwrap(), now + 61));
     }

@@ -304,11 +304,36 @@ fn extract_session_cookie(head: &str) -> Option<String> {
     None
 }
 
-/// Ouvre une session locale S1 via le canal fichier utilisateur puis l'échange
-/// sur `POST /api/session` (R-5). Aucun jeton, cookie ni secret n'est affiché.
-fn local_session(port: u16) -> Result<(String, String), String> {
+/// Garde RAII d'une session locale éphémère ouverte par une sous-commande CLI :
+/// ferme immédiatement la session via `POST /api/session/close` à la sortie
+/// afin de ne jamais saturer le plafond de 8 sessions locales.
+struct CliSession {
+    port: u16,
+    cookie_hdr: String,
+    secret: String,
+}
+
+impl Drop for CliSession {
+    fn drop(&mut self) {
+        let _ = http_with_headers(
+            "127.0.0.1",
+            self.port,
+            "POST",
+            "/api/session/close",
+            &[
+                ("Cookie", &self.cookie_hdr),
+                ("X-MCC-Session", &self.secret),
+            ],
+            Some("{}"),
+        );
+    }
+}
+
+/// Ouvre une session locale S1 éphémère via le canal fichier utilisateur puis
+/// l'échange sur `POST /api/session` (R-5). Aucun jeton, cookie ni secret n'est affiché.
+fn local_session(port: u16) -> Result<CliSession, String> {
     let token = crate::auth::session::request_bootstrap(&config_path(), Duration::from_secs(5))?;
-    let body = json!({ "token": token }).to_string();
+    let body = json!({ "token": token, "ephemeral": true }).to_string();
     let (status, head, corps) =
         http_with_headers("127.0.0.1", port, "POST", "/api/session", &[], Some(&body))?;
     if status != 200 {
@@ -325,20 +350,27 @@ fn local_session(port: u16) -> Result<(String, String), String> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "secret de session absent de la réponse /api/session".to_string())?
         .to_string();
-    Ok((cookie, secret))
+    let cookie_hdr = format!("{}={cookie}", crate::auth::session::COOKIE_NAME);
+    Ok(CliSession {
+        port,
+        cookie_hdr,
+        secret,
+    })
 }
 
 fn action(v: Value) -> Result<Value, String> {
     let port = local_port()?;
-    let (cookie, secret) = local_session(port)?;
-    let cookie_hdr = format!("{}={cookie}", crate::auth::session::COOKIE_NAME);
+    let sess = local_session(port)?;
     let body = v.to_string();
     let (status, _, corps) = http_with_headers(
         "127.0.0.1",
         port,
         "POST",
         "/api/action",
-        &[("Cookie", &cookie_hdr), ("X-MCC-Session", &secret)],
+        &[
+            ("Cookie", &sess.cookie_hdr),
+            ("X-MCC-Session", &sess.secret),
+        ],
         Some(&body),
     )?;
     if status != 200 {
@@ -752,20 +784,22 @@ fn cmd_state() -> i32 {
             return 1;
         }
     };
-    let (cookie, secret) = match local_session(port) {
+    let sess = match local_session(port) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("auth state : {e}");
             return 1;
         }
     };
-    let cookie_hdr = format!("{}={cookie}", crate::auth::session::COOKIE_NAME);
     let (status, _, corps) = match http_with_headers(
         "127.0.0.1",
         port,
         "GET",
         "/api/state",
-        &[("Cookie", &cookie_hdr), ("X-MCC-Session", &secret)],
+        &[
+            ("Cookie", &sess.cookie_hdr),
+            ("X-MCC-Session", &sess.secret),
+        ],
         None,
     ) {
         Ok(r) => r,
@@ -940,13 +974,6 @@ fn cmd_verify_log(chemin: Option<&str>) -> i32 {
         Some(p) => PathBuf::from(p),
         None => crate::audit::path_for(&config_path()),
     };
-    if !path.exists() {
-        println!(
-            "verify-log : aucun journal d'audit ({}) — rien à vérifier.",
-            path.display()
-        );
-        return 0;
-    }
     let key_dir = match chemin {
         Some(_) => path
             .parent()
@@ -955,6 +982,21 @@ fn cmd_verify_log(chemin: Option<&str>) -> i32 {
             .unwrap_or_else(config_dir),
         None => config_dir(),
     };
+    let has_artifacts = crate::audit::has_audit_artifacts(&path);
+    if !has_artifacts {
+        if crate::auth::secret::audit_key_path(&key_dir).exists() {
+            eprintln!(
+                "verify-log : journal d'audit absent ({}) alors qu'une clé HMAC existe — suppression probable !",
+                path.display()
+            );
+            return 1;
+        }
+        println!(
+            "verify-log : aucun journal d'audit ({}) — rien à vérifier.",
+            path.display()
+        );
+        return 0;
+    }
     let cle = match crate::auth::secret::load_audit_key(
         &key_dir,
         crate::auth::secret::service().as_deref(),

@@ -384,11 +384,22 @@ fn hello_rate_decide(now: u64, prior: &[u64]) -> (Result<(), ()>, Vec<u64>) {
 
 /// Limiteur de débit /api/hello par adresse : true = requête admise (et
 /// comptabilisée), false = au-delà de HELLO_RATE_MAX requêtes dans la fenêtre.
+/// Table bornée à 1024 entrées (éviction des plus anciennes) `[M-04]`.
 fn hello_rate_ok(ip: IpAddr) -> bool {
+    const HELLO_RATE_KEYS_MAX: usize = 1024;
     let now = crate::types::now_ts();
     let mut slot = hello_rate_slot().lock().unwrap_or_else(|p| p.into_inner());
     let (decision, next) = hello_rate_decide(now, slot.get(&ip).map(Vec::as_slice).unwrap_or(&[]));
     slot.insert(ip, next);
+    if slot.len() > HELLO_RATE_KEYS_MAX {
+        if let Some(oldest) = slot
+            .iter()
+            .min_by_key(|(_, stamps)| stamps.last().copied().unwrap_or(0))
+            .map(|(k, _)| *k)
+        {
+            slot.remove(&oldest);
+        }
+    }
     decision.is_ok()
 }
 
@@ -544,8 +555,11 @@ fn listes_hosts_origins(
 ) -> (Vec<String>, Vec<String>) {
     let mut origins: Vec<String> = vec![
         format!("http://127.0.0.1:{ui_port}"),
+        format!("https://127.0.0.1:{ui_port}"),
         format!("http://localhost:{ui_port}"),
+        format!("https://localhost:{ui_port}"),
         format!("http://[::1]:{ui_port}"),
+        format!("https://[::1]:{ui_port}"),
     ];
     let mut hosts: Vec<String> = vec![
         "127.0.0.1".to_string(),
@@ -553,7 +567,13 @@ fn listes_hosts_origins(
         "::1".to_string(),
     ];
     for ip in local_ips {
-        origins.push(format!("http://{ip}:{ui_port}"));
+        let host_url = if ip.contains(':') && !ip.starts_with('[') {
+            format!("[{ip}]")
+        } else {
+            ip.clone()
+        };
+        origins.push(format!("http://{host_url}:{ui_port}"));
+        origins.push(format!("https://{host_url}:{ui_port}"));
         hosts.push(ip.clone());
     }
     for o in extra_origins {
@@ -965,6 +985,9 @@ pub fn run_headless() -> RunOutcome {
         lan_ok: Mutex::new(None),
         config_path,
     });
+    *active_state_slot()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&state));
     // cache de démarrage : restaure le dernier état connu AVANT la première
     // sonde — l'UI est peuplée instantanément, les sondes corrigent ensuite
     manage::load_cache(&state);
@@ -1223,13 +1246,28 @@ pub fn run_headless() -> RunOutcome {
             manage::sync_autostart_at_boot(&st);
         });
     }
-    let ui_host = if ui_bind == "0.0.0.0" {
+    let ui_host = if ui_bind == "0.0.0.0" || ui_bind == "::" {
         "<ip-lan>".to_string()
+    } else if ui_bind.contains(':') && !ui_bind.starts_with('[') {
+        format!("[{ui_bind}]")
     } else {
         ui_bind.clone()
     };
-    let ui_url_host = if ui_bind == "0.0.0.0" {
+    // Si le bind est une IP LAN précise (hors loopback et hors wildcard 0.0.0.0 / ::),
+    // ouvrir un écouteur auxiliaire local sur 127.0.0.1:<ui_port> afin que la
+    // webview Tauri et la CLI `auth` joignent toujours l'UI en loopback HTTP.
+    let local_aux_listener =
+        if !is_loopback_bind(&ui_bind) && ui_bind != "0.0.0.0" && ui_bind != "::" {
+            TcpListener::bind(("127.0.0.1", ui_port)).ok()
+        } else {
+            None
+        };
+    let ui_url_host = if !is_loopback_bind(&ui_bind)
+        && (ui_bind == "0.0.0.0" || ui_bind == "::" || local_aux_listener.is_some())
+    {
         "127.0.0.1".to_string()
+    } else if ui_bind.contains(':') && !ui_bind.starts_with('[') {
+        format!("[{ui_bind}]")
     } else {
         ui_bind.clone()
     };
@@ -1391,6 +1429,28 @@ pub fn run_headless() -> RunOutcome {
         });
     }
 
+    if let Some(aux_listener) = local_aux_listener {
+        let aux_state = Arc::clone(&state);
+        thread::spawn(move || {
+            for stream in aux_listener.incoming() {
+                match stream {
+                    Ok(s) => match admit_conn(s.peer_addr().ok().map(|a| a.ip())) {
+                        Ok(guard) => {
+                            let st = aux_state.clone();
+                            thread::spawn(move || {
+                                #[cfg(feature = "tls")]
+                                handle_conn(s, st, guard, None);
+                                #[cfg(not(feature = "tls"))]
+                                handle_conn(s, st, guard);
+                            });
+                        }
+                        Err(raison) => write_conn_rejected(s, 503, raison),
+                    },
+                    Err(e) => eprintln!("[accept-loopback] {}", e),
+                }
+            }
+        });
+    }
     // serveur HTTP/TLS en tâche de fond : run_headless retourne, l'app hôte décide
     // (main = park forever, desktop = boucle d'événements Tauri)
     thread::spawn(move || {
@@ -1427,6 +1487,37 @@ pub fn run_headless() -> RunOutcome {
     }
 }
 
+fn active_state_slot() -> &'static Mutex<Option<Arc<AppState>>> {
+    static SLOT: std::sync::OnceLock<Mutex<Option<Arc<AppState>>>> = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Arrêt propre du moteur (appelé depuis le menu « Quitter » du tray Desktop et
+/// avant un redémarrage d'auto-mise à jour) : stoppe les threads de fond et
+/// termine tous les sous-processus supervisés appartenant à cette instance.
+pub fn shutdown_engine() {
+    shutdown_bg();
+    let state_opt = active_state_slot()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    if let Some(state) = state_opt {
+        let handles: Vec<probe::StdioHandle> = {
+            let mut ch = lockv(&state.children);
+            ch.drain().map(|(_, h)| h).collect()
+        };
+        for h in handles {
+            let same_proc = match h.started {
+                Some(ts) => probe::process_creation(h.pid) == Some(ts),
+                None => true,
+            };
+            if same_proc && h.pid != 0 {
+                probe::kill_tree(h.pid);
+            }
+        }
+    }
+}
+
 /// Bloque le thread courant indéfiniment (mode CLI headless).
 pub fn park_forever() {
     loop {
@@ -1453,6 +1544,14 @@ impl ConnStream {
             ConnStream::Plain(s) => s.set_read_timeout(dur),
             #[cfg(feature = "tls")]
             ConnStream::Tls(s) => s.sock.set_read_timeout(dur),
+        }
+    }
+
+    fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            ConnStream::Plain(s) => s.set_write_timeout(dur),
+            #[cfg(feature = "tls")]
+            ConnStream::Tls(s) => s.sock.set_write_timeout(dur),
         }
     }
 
@@ -1571,9 +1670,11 @@ fn handle_conn_stream(
         match stream.read(&mut tmp) {
             Ok(0) => break,
             Ok(n) => {
+                let prev_len = buf.len();
                 buf.extend_from_slice(&tmp[..n]);
-                if let Some(p) = find_sub(&buf, b"\r\n\r\n") {
-                    head_end = Some(p);
+                let search_from = prev_len.saturating_sub(3);
+                if let Some(rel) = find_sub(&buf[search_from..], b"\r\n\r\n") {
+                    head_end = Some(search_from + rel);
                     break;
                 }
                 if buf.len() > 1_048_576 {
@@ -1596,8 +1697,23 @@ fn handle_conn_stream(
     let mut content_length = 0usize;
     let mut headers: Vec<(String, String)> = Vec::new();
     for l in lines {
-        if let Some((name, value)) = l.split_once(':') {
-            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+        if let Some((raw_name, value)) = l.split_once(':') {
+            // RFC 9112 §5.1 : aucun espace n'est autorisé dans le nom d'en-tête
+            // ni avant `:`. Un nom malformé est rejeté par 400 (anti-smuggling).
+            if raw_name.is_empty() || raw_name.bytes().any(|b| b.is_ascii_whitespace()) {
+                let j = serde_json::json!({"ok": false, "error": "Bad Request"}).to_string();
+                let resp = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Cache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+                    j.len(),
+                    SECURITY_HEADERS,
+                    j
+                );
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+                return;
+            }
+            headers.push((raw_name.to_ascii_lowercase(), value.trim().to_string()));
         }
     }
     let mut cl_seen = false;
@@ -1622,12 +1738,26 @@ fn handle_conn_stream(
                         SECURITY_HEADERS,
                         j
                     );
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
                     let _ = stream.write_all(resp.as_bytes());
                     let _ = stream.flush();
                     return;
                 }
             }
         }
+    }
+    if content_length > MAX_BODY {
+        let j = serde_json::json!({"ok": false, "error": "body trop grand (max 2 Mo)"}).to_string();
+        let resp = format!(
+            "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Cache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+            j.len(),
+            SECURITY_HEADERS,
+            j
+        );
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.flush();
+        return;
     }
     let mut body = buf[head_end + 4..].to_vec();
     while body.len() < content_length {
@@ -1654,10 +1784,25 @@ fn handle_conn_stream(
             SECURITY_HEADERS,
             j
         );
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
         let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.flush();
         return;
     }
-    body.truncate(content_length.min(MAX_BODY));
+    if body.len() < content_length {
+        let j = serde_json::json!({"ok": false, "error": "corps HTTP incomplet"}).to_string();
+        let resp = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Cache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+            j.len(),
+            SECURITY_HEADERS,
+            j
+        );
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.flush();
+        return;
+    }
+    body.truncate(content_length);
 
     // contrôle d'accès (session locale, code hérité, Origin, Host, cadrage) puis
     // routage. Lot M2 : le loopback n'est plus une zone de confiance (DA2 = a).
@@ -1687,8 +1832,12 @@ fn handle_conn_stream(
     };
     // Session locale de la fenêtre (docs/auth.md §6) : cookie `mcc_session`
     // + en-tête secret `X-MCC-Session` (S-1), émis par POST /api/session.
-    // Valable sur /api/* UNIQUEMENT — jamais sur /mcp (test du lot M2).
-    let session_id = crate::auth::session::authorized_session(&headers);
+    // Valable sur /api/* UNIQUEMENT en loopback — jamais sur /mcp ni depuis le LAN [H-06].
+    let session_id = if peer_is_loopback {
+        crate::auth::session::authorized_session(&headers)
+    } else {
+        None
+    };
     let session_ok = session_id.is_some();
     // Code hérité (§10, DA3 = a) : toléré en LECTURE SEULE pendant 0.8.x.
     // `?access=` n'existe plus (supprimé au lot M2).
@@ -1937,6 +2086,7 @@ fn handle_conn_stream(
         }
     }
     resp.push_str("Connection: close\r\n\r\n");
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let _ = stream.write_all(resp.as_bytes());
     if status != 304 && !payload.is_empty() {
         let _ = stream.write_all(&payload);
@@ -1951,10 +2101,15 @@ struct StaticAsset {
 }
 
 fn build_static_asset(src: &str) -> StaticAsset {
+    build_static_bytes(
+        src.replace("__MCC_VERSION__", env!("CARGO_PKG_VERSION"))
+            .as_bytes(),
+    )
+}
+
+fn build_static_bytes(src: &[u8]) -> StaticAsset {
     use std::hash::{Hash, Hasher};
-    let bytes = src
-        .replace("__MCC_VERSION__", env!("CARGO_PKG_VERSION"))
-        .into_bytes();
+    let bytes = src.to_vec();
     let mut h = std::collections::hash_map::DefaultHasher::new();
     env!("CARGO_PKG_VERSION").hash(&mut h);
     bytes.hash(&mut h);
@@ -1986,6 +2141,16 @@ fn asset_app_boot_js() -> &'static StaticAsset {
 fn asset_app_js() -> &'static StaticAsset {
     static ASSET: std::sync::OnceLock<StaticAsset> = std::sync::OnceLock::new();
     ASSET.get_or_init(|| build_static_asset(ui::APP_JS))
+}
+
+fn asset_favicon_svg() -> &'static StaticAsset {
+    static ASSET: std::sync::OnceLock<StaticAsset> = std::sync::OnceLock::new();
+    ASSET.get_or_init(|| build_static_asset(ui::FAVICON_SVG))
+}
+
+fn asset_favicon_ico() -> &'static StaticAsset {
+    static ASSET: std::sync::OnceLock<StaticAsset> = std::sync::OnceLock::new();
+    ASSET.get_or_init(|| build_static_bytes(ui::FAVICON_ICO))
 }
 
 pub fn route(
@@ -2074,11 +2239,16 @@ pub fn route_peer_session_cond(
                 serde_json::json!({"ok": false, "error": "session locale uniquement"}),
             );
         }
-        let token = serde_json::from_slice::<serde_json::Value>(body)
-            .ok()
+        let parsed_body = serde_json::from_slice::<serde_json::Value>(body).ok();
+        let token = parsed_body
+            .as_ref()
             .and_then(|v| v.get("token").and_then(|t| t.as_str()).map(String::from))
             .unwrap_or_default();
-        return match crate::auth::session::exchange(&token) {
+        let ephemeral = parsed_body
+            .as_ref()
+            .and_then(|v| v.get("ephemeral").and_then(|b| b.as_bool()))
+            .unwrap_or(false);
+        return match crate::auth::session::exchange_with_mode(&token, ephemeral) {
             Some(issued) => Reply::json(
                 200,
                 serde_json::json!({"ok": true, "secret": issued.secret}),
@@ -2093,6 +2263,22 @@ pub fn route_peer_session_cond(
                     "ok": false,
                     "error": "jeton d'amorçage refusé (inconnu, déjà utilisé, expiré ou plafond de sessions atteint)"
                 }),
+            ),
+        };
+    }
+    // ---- Fermeture de la session courante (sessions CLI éphémères) : loopback uniquement.
+    if method == "POST" && bare_path == "/api/session/close" {
+        if !peer.is_some_and(|ip| ip.is_loopback()) {
+            return Reply::json(
+                403,
+                serde_json::json!({"ok": false, "error": "session locale uniquement"}),
+            );
+        }
+        return match session.filter(|s| crate::auth::session::close_session(s)) {
+            Some(_) => Reply::json(200, serde_json::json!({"ok": true})),
+            None => Reply::json(
+                401,
+                serde_json::json!({"ok": false, "error": "session absente ou expirée"}),
             ),
         };
     }
@@ -2142,6 +2328,16 @@ pub fn route_peer_session_cond(
             "text/javascript; charset=utf-8",
             if_none_match,
         );
+    }
+    if method == "GET" && bare_path == "/favicon.svg" {
+        return serve_static_asset(
+            asset_favicon_svg(),
+            "image/svg+xml; charset=utf-8",
+            if_none_match,
+        );
+    }
+    if method == "GET" && bare_path == "/favicon.ico" {
+        return serve_static_asset(asset_favicon_ico(), "image/x-icon", if_none_match);
     }
     if method == "GET" && bare_path == "/api/hello" {
         // amorce de la preuve de pair : identité + nonce à usage unique, aucun secret
@@ -2213,7 +2409,11 @@ pub fn route_peer_session_cond(
             .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(String::from))
             .unwrap_or_default();
         let local = peer.is_some_and(|ip| ip.is_loopback());
-        if crate::auth::action_reservee_admin(&nom) && !local {
+        // [H-06] : `/api/action` est l'API de contrôle de la fenêtre locale.
+        // Toute requête provenant d'une adresse réseau non-loopback est refusée.
+        if peer.is_some_and(|ip| !ip.is_loopback())
+            || (crate::auth::action_reservee_admin(&nom) && !local)
+        {
             return Reply::new(
                 403,
                 "application/json",
@@ -2230,7 +2430,7 @@ pub fn route_peer_session_cond(
             manage::invalidate_tools_cache(state);
         }
         let res = manage::handle_action(state, &text);
-        if nom == "settings" || nom == "save_settings" {
+        if nom == "set_settings" || nom == "settings" || nom == "save_settings" {
             wake_bg_poller();
         }
         gateway::notify_change();
@@ -2698,7 +2898,8 @@ mod tests {
             403,
             "une action d'authentification ne doit jamais être joignable du LAN"
         );
-        // une action ordinaire reste joignable (comportement inchangé)
+        // [H-06] : toute action POST /api/action venue du LAN est refusée par 403
+        // (l'API de contrôle appartient exclusivement à la session locale).
         assert_eq!(
             route_peer(
                 &state,
@@ -2706,6 +2907,17 @@ mod tests {
                 "/api/action",
                 br#"{"action":"client_inconnu_xyz"}"#,
                 Some("192.0.2.30".parse().unwrap())
+            )
+            .status,
+            403
+        );
+        assert_eq!(
+            route_peer(
+                &state,
+                "POST",
+                "/api/action",
+                br#"{"action":"client_inconnu_xyz"}"#,
+                loopback
             )
             .status,
             200
@@ -2877,9 +3089,13 @@ mod tests {
             &["http://mon-ui.local:8080".to_string()],
         );
         assert!(origins.contains(&"http://127.0.0.1:5392".to_string()));
+        assert!(origins.contains(&"https://127.0.0.1:5392".to_string()));
         assert!(origins.contains(&"http://localhost:5392".to_string()));
+        assert!(origins.contains(&"https://localhost:5392".to_string()));
         assert!(origins.contains(&"http://[::1]:5392".to_string()));
+        assert!(origins.contains(&"https://[::1]:5392".to_string()));
         assert!(origins.contains(&"http://10.2.0.2:5392".to_string()));
+        assert!(origins.contains(&"https://10.2.0.2:5392".to_string()));
         assert!(origins.contains(&"http://mon-ui.local:8080".to_string()));
         for h in [
             "127.0.0.1",
@@ -2891,7 +3107,6 @@ mod tests {
         ] {
             assert!(hosts.contains(&h.to_string()), "host {h} attendu");
         }
-        assert_eq!(origins.len(), hosts.len(), "les listes restent parallèles");
     }
 
     #[test]

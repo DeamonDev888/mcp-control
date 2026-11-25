@@ -25,41 +25,48 @@
 //! fichier d'épinglage `auth/clients/<keyid>.pin.json` écrit par
 //! `auth pair`.
 
-use litemcp::auth::sign::{RequestToSign, Signer, SigningKey};
+use litemcp::auth::sign::{RequestToSign, Signer};
 use serde_json::{json, Value};
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const USAGE: &str = "mcp-control bridge [--url http://127.0.0.1:<port>[/mcp/s/<id>]]\n\
+pub const USAGE: &str = "mcp-control bridge [--url http(s)://127.0.0.1:<port>[/mcp/s/<id>]]\n\
   parle MCP sur stdin/stdout et relaie vers /mcp (ou /mcp/s/<id> en mode\n\
   hybride stdio) en signant avec l'identité du client local (appairé par\n\
-  `mcp-control auth pair <url>`).\n\
+  `mcp-control auth pair <url>`, avec vérification PinnedServer en TLS 1.3).\n\
   Sans --url : le port UI du config.json local.";
 
-/// Identité locale utilisable pour signer : `keyid` + clé privée + épinglage.
+/// Identité locale utilisable pour signer : `keyid` + clé privée + épinglage TLS éventuel.
 pub(crate) struct Identite {
     pub(crate) keyid: String,
     pub(crate) signer: Signer,
 }
 
-/// Analyse une URL de pont `http://host[:port][path]` :
+fn format_authority(host: &str, port: u16) -> String {
+    let clean = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if clean.contains(':') {
+        format!("[{clean}]:{port}")
+    } else {
+        format!("{clean}:{port}")
+    }
+}
+
+/// Analyse une URL de pont `http(s)://host[:port][path]` :
 /// - `""`, `"/"`, `"/mcp"`, `"/mcp/"` → chemin `"/mcp"` ;
 /// - `"/mcp/s/<id>"` (slash final toléré, `<id>` ASCII `[A-Za-z0-9._-]+` sans `..`)
 ///   → chemin `"/mcp/s/<id>"` ;
-/// - `https://` et tout autre chemin sont refusés explicitement.
-pub(crate) fn parse_bridge_url(url: &str) -> Result<(String, u16, String), String> {
+/// - tout autre chemin ou schéma est refusé explicitement.
+pub(crate) fn parse_bridge_url_full(url: &str) -> Result<(bool, String, u16, String), String> {
     let url = url.trim();
-    if url.starts_with("https://") {
-        return Err(
-            "https:// non pris en charge sur cette commande HTTP locale (lot M4 : utiliser auth pair pour TLS)"
-                .to_string(),
-        );
-    }
-    let Some(reste) = url.strip_prefix("http://") else {
+    let (is_https, reste) = if let Some(r) = url.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (false, r)
+    } else {
         return Err(format!(
-            "URL attendue en http://hôte[:port][/mcp/s/<id>] — reçu « {url} »"
+            "URL attendue en http(s)://hôte[:port][/mcp/s/<id>] — reçu « {url} »"
         ));
     };
     let (authority_part, path_part) = match reste.find('/') {
@@ -76,7 +83,9 @@ pub(crate) fn parse_bridge_url(url: &str) -> Result<(String, u16, String), Strin
             "URL bridge invalide (requête ou fragment interdit) : « {url} »"
         ));
     }
-    let (host, port) = crate::auth::cli::parse_url(&format!("http://{authority_part}"))?;
+    let scheme = if is_https { "https" } else { "http" };
+    let (_, host, port) =
+        crate::auth::cli::parse_url_scheme(&format!("{scheme}://{authority_part}"))?;
     let target_path = if path_part.is_empty()
         || path_part == "/"
         || path_part == "/mcp"
@@ -104,7 +113,13 @@ pub(crate) fn parse_bridge_url(url: &str) -> Result<(String, u16, String), Strin
             "chemin non pris en charge dans l'URL bridge (attendu /, /mcp ou /mcp/s/<id>) : « {url} »"
         ));
     };
-    Ok((host, port, target_path))
+    Ok((is_https, host, port, target_path))
+}
+
+#[cfg(test)]
+pub(crate) fn parse_bridge_url(url: &str) -> Result<(String, u16, String), String> {
+    let (_, host, port, path) = parse_bridge_url_full(url)?;
+    Ok((host, port, path))
 }
 
 /// Point d'entrée du binaire. Rend le code de sortie du process.
@@ -128,24 +143,41 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let (host, port, target_path) = match parse_bridge_url(&url) {
+    let (mut is_https, host, port, target_path) = match parse_bridge_url_full(&url) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("bridge : {e}");
             return 2;
         }
     };
-    let authority = format!("{host}:{port}");
-    let pair_url = format!("http://{authority}");
-    let identite = match identite_locale(&host, port) {
-        Ok(i) => i,
+    if !is_https && !crate::is_loopback_bind(&host) {
+        eprintln!(
+            "bridge : connexion HTTP en clair hors loopback refusée (DA5 : utiliser https://{}{target_path})",
+            format_authority(&host, port)
+        );
+        return 2;
+    }
+    let (identite, tls_fp) = match identite_locale(is_https, &host, port, &target_path) {
+        Ok(v) => v,
         Err(message) => {
             eprintln!("{message}");
             return 2;
         }
     };
+    if !tls_fp.is_empty() {
+        is_https = true;
+    }
+    if is_https && !crate::auth::net::tls_compiled() {
+        eprintln!(
+            "bridge : connexion HTTPS impossible — ce binaire est compilé sans la feature `tls`"
+        );
+        return 2;
+    }
+    let scheme = if is_https { "https" } else { "http" };
+    let authority = format_authority(&host, port);
+    let pair_url = format!("{scheme}://{authority}");
     eprintln!(
-        "bridge : stdio → http://{authority}{target_path} (keyid {})",
+        "bridge : stdio → {scheme}://{authority}{target_path} (keyid {})",
         identite.keyid
     );
     let stdin = std::io::stdin();
@@ -161,6 +193,8 @@ pub fn run(args: &[String]) -> i32 {
         let reponse = traiter_ligne(
             &ligne,
             &identite,
+            is_https,
+            tls_fp.as_str(),
             &host,
             port,
             &authority,
@@ -209,9 +243,19 @@ fn option_url(args: &[String]) -> Result<Option<String>, String> {
 }
 
 /// Port UI du moteur local, lu dans `config.json` (aucune supposition).
+/// Si un épinglage local porte déjà une empreinte TLS (`tls_fp`), bascule
+/// automatiquement en `https://127.0.0.1:<port>` (compatibilité TLS 1.3).
 fn url_locale() -> Result<String, String> {
     let port = port_local()?;
-    Ok(format!("http://127.0.0.1:{port}"))
+    let use_https = crate::auth::net::find_existing_pin(&config_dir(), "127.0.0.1", port)
+        .and_then(|v| {
+            v.get("tls_fp")
+                .and_then(|t| t.as_str())
+                .map(|s| !s.trim().is_empty())
+        })
+        .unwrap_or(false);
+    let scheme = if use_https { "https" } else { "http" };
+    Ok(format!("{scheme}://127.0.0.1:{port}"))
 }
 
 fn config_path() -> String {
@@ -234,71 +278,53 @@ fn port_local() -> Result<u16, String> {
     v.get("settings")
         .and_then(|s| s.get("ui_port"))
         .and_then(|p| p.as_u64())
-        .map(|p| p as u16)
-        .ok_or_else(|| "ui_port absent de config.json — donne --url".to_string())
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|&p| p >= 1)
+        .ok_or_else(|| "ui_port absent ou invalide dans config.json — donne --url".to_string())
 }
 
-/// Retrouve l'identité du client local pour ce serveur : épinglage puis clé
-/// privée (trousseau, sinon repli fichier). Message actionnable sinon.
-fn identite_locale(host: &str, port: u16) -> Result<Identite, String> {
-    let dir = config_dir().join("auth").join("clients");
-    let voulu = format!("http://{host}:{port}");
-    let pin = trouver_pin(&dir, &voulu).ok_or_else(|| {
-        format!(
-            "bridge : ce poste n'est pas appairé avec {voulu}.\n\
-             Lance : mcp-control auth pair {voulu}\n\
-             puis approuve la demande dans la fenêtre locale de MCP Control."
-        )
-    })?;
-    if let Some(tls_fp) = pin
-        .get("tls_fp")
-        .and_then(|t| t.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        // Contrat C9 : l'empreinte épinglée interdit un repli HTTP en clair.
-        let _ = litemcp::auth::PinnedServer::new(tls_fp);
-        return Err(format!(
-            "bridge : {voulu} a une empreinte TLS épinglée — connexion HTTP en clair refusée (lot M4 requis)"
-        ));
-    }
-    let keyid = pin
-        .get("keyid")
-        .and_then(|k| k.as_str())
-        .unwrap_or("")
-        .to_string();
-    if !crate::auth::registry::valid_keyid(&keyid) {
-        return Err(format!(
-            "bridge : épinglage illisible pour {voulu} — relance : mcp-control auth pair {voulu}"
-        ));
-    }
-    let compte = format!("client-{host}:{port}");
-    let bloc = match crate::auth::secret::load_client_key(
-        crate::auth::secret::service().as_deref(),
-        &compte,
-    ) {
-        Ok(Some(b)) => Some(b),
-        _ => None,
-    };
-    let bloc = match bloc {
-        Some(b) => b,
-        None => std::fs::read_to_string(dir.join(format!("{keyid}.key"))).map_err(|_| {
+/// Retrouve l'identité du client local pour ce serveur : épinglage (avec
+/// normalisation loopback `localhost` ↔ `127.0.0.1` ↔ `::1`) puis clé privée
+/// (trousseau, sinon repli fichier). Vérifie le contrat C9 (jamais de repli
+/// HTTP en clair si une empreinte TLS est épinglée).
+fn identite_locale(
+    is_https: bool,
+    host: &str,
+    port: u16,
+    target_path: &str,
+) -> Result<(Identite, String), String> {
+    let authority = format_authority(host, port);
+    let scheme = if is_https { "https" } else { "http" };
+    let voulu = format!("{scheme}://{authority}");
+    let out = crate::auth::net::outbound_identity_for_dir(&config_dir(), host, port)
+        .map_err(|e| format!("bridge : {e} — relance : mcp-control auth pair {voulu}"))?
+        .ok_or_else(|| {
             format!(
-                "bridge : clé privée de {keyid} introuvable (trousseau et fichier) — relance : mcp-control auth pair {voulu}"
+                "bridge : ce poste n'est pas appairé avec {voulu}.\n\
+                 Lance : mcp-control auth pair {voulu}\n\
+                 puis approuve la demande dans la fenêtre locale de MCP Control."
             )
-        })?,
-    };
-    let cle = SigningKey::import(&bloc).map_err(|_| {
-        format!(
-            "bridge : clé privée de {keyid} illisible — relance : mcp-control auth pair {voulu}"
-        )
-    })?;
-    Ok(Identite {
-        keyid: keyid.clone(),
-        signer: Signer::new(cle).with_keyid(keyid),
-    })
+        })?;
+    if !out.tls_fp.is_empty() && !is_https {
+        return Err(format!(
+            "bridge : {authority} a une empreinte TLS épinglée — connexion HTTP en clair refusée (utiliser --url https://{authority}{target_path})"
+        ));
+    }
+    if is_https && out.tls_fp.is_empty() {
+        return Err(format!(
+            "bridge : {voulu} n'a aucune empreinte TLS épinglée — relance : mcp-control auth pair https://{authority}"
+        ));
+    }
+    Ok((
+        Identite {
+            keyid: out.keyid,
+            signer: out.signer,
+        },
+        out.tls_fp,
+    ))
 }
 
+#[cfg(test)]
 /// Épinglage le plus récent dont l'URL correspond exactement (`host:port`).
 fn trouver_pin(dir: &Path, url: &str) -> Option<Value> {
     let entrees = std::fs::read_dir(dir).ok()?;
@@ -391,9 +417,12 @@ pub(crate) fn construire_requete(
     Ok(requete)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn traiter_ligne(
     ligne: &str,
     identite: &Identite,
+    is_https: bool,
+    tls_fp: &str,
     host: &str,
     port: u16,
     authority: &str,
@@ -422,20 +451,21 @@ fn traiter_ligne(
         }
     };
 
-    let (statut, entete_reponse, corps_reponse) = match envoyer(host, port, requete.as_bytes()) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("bridge : {e}");
-            return (!est_notification).then(|| {
-                erreur_json(
-                    &id,
-                    -32603,
-                    &format!("moteur injoignable ({e}) — MCP Control est-il lancé ?"),
-                    None,
-                )
-            });
-        }
-    };
+    let (statut, entete_reponse, corps_reponse) =
+        match envoyer(is_https, tls_fp, host, port, requete.as_bytes()) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("bridge : {e}");
+                return (!est_notification).then(|| {
+                    erreur_json(
+                        &id,
+                        -32603,
+                        &format!("moteur injoignable ({e}) — MCP Control est-il lancé ?"),
+                        None,
+                    )
+                });
+            }
+        };
     match statut {
         // Notification (pas d'id) : 202 sans corps, rien à rendre.
         202 if corps_reponse.trim().is_empty() => None,
@@ -491,31 +521,53 @@ fn traiter_ligne(
     }
 }
 
-/// Requête HTTP/1.1 minimale, une connexion par message (`Connection: close`).
-fn envoyer(host: &str, port: u16, requete: &[u8]) -> Result<(u16, String, String), String> {
-    let addr = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("résolution {host}:{port} impossible : {e}"))?
-        .next()
-        .ok_or_else(|| format!("aucune adresse pour {host}:{port}"))?;
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .map_err(|e| format!("connexion {host}:{port} impossible : {e}"))?;
-    let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
-    let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
-    s.write_all(requete)
-        .map_err(|e| format!("envoi impossible : {e}"))?;
-    let mut data = Vec::new();
-    let mut tmp = [0u8; 16384];
-    loop {
-        match s.read(&mut tmp) {
-            Ok(0) => break,
-            Ok(n) => data.extend_from_slice(&tmp[..n]),
-            Err(e) => return Err(format!("lecture impossible : {e}")),
+/// Requête HTTP/1.1 minimale (en clair en loopback ou TLS 1.3 + `PinnedServer`
+/// si `is_https`), une connexion par message (`Connection: close`).
+fn envoyer(
+    is_https: bool,
+    tls_fp: &str,
+    host: &str,
+    port: u16,
+    requete: &[u8],
+) -> Result<(u16, String, String), String> {
+    let data = if is_https {
+        let expected = (!tls_fp.trim().is_empty()).then_some(tls_fp.trim());
+        let (raw, _) = crate::auth::net::https_exchange_raw(
+            host,
+            port,
+            requete,
+            Duration::from_secs(60),
+            expected,
+            64 * 1024 * 1024,
+        )?;
+        raw
+    } else {
+        let clean_host = host.trim().trim_start_matches('[').trim_end_matches(']');
+        let addr = (clean_host, port)
+            .to_socket_addrs()
+            .map_err(|e| format!("résolution {host}:{port} impossible : {e}"))?
+            .next()
+            .ok_or_else(|| format!("aucune adresse pour {host}:{port}"))?;
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+            .map_err(|e| format!("connexion {host}:{port} impossible : {e}"))?;
+        let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
+        let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+        s.write_all(requete)
+            .map_err(|e| format!("envoi impossible : {e}"))?;
+        let mut data = Vec::new();
+        let mut tmp = [0u8; 16384];
+        loop {
+            match s.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => data.extend_from_slice(&tmp[..n]),
+                Err(e) => return Err(format!("lecture impossible : {e}")),
+            }
+            if data.len() > 64 * 1024 * 1024 {
+                break;
+            }
         }
-        if data.len() > 64 * 1024 * 1024 {
-            break;
-        }
-    }
+        data
+    };
     if data.is_empty() {
         return Err(format!("{host}:{port} a fermé sans répondre"));
     }
@@ -550,6 +602,7 @@ fn erreur_json(id: &Value, code: i64, message: &str, raison: Option<&str>) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use litemcp::auth::sign::SigningKey;
 
     #[test]
     fn url_optionnelle_et_formes_acceptees() {
@@ -627,7 +680,23 @@ mod tests {
                 "/mcp/s/store-github".to_string()
             )
         );
-        assert!(parse_bridge_url("https://127.0.0.1:5090/mcp/s/store-github").is_err());
+        #[cfg(feature = "tls")]
+        {
+            assert_eq!(
+                parse_bridge_url_full("https://127.0.0.1:5090/mcp/s/store-github").unwrap(),
+                (
+                    true,
+                    "127.0.0.1".to_string(),
+                    5090,
+                    "/mcp/s/store-github".to_string()
+                )
+            );
+            assert_eq!(
+                parse_bridge_url_full("https://[::1]:5090/mcp").unwrap(),
+                (true, "::1".to_string(), 5090, "/mcp".to_string())
+            );
+        }
+        assert!(parse_bridge_url("ftp://127.0.0.1:5090/mcp").is_err());
         assert!(parse_bridge_url("http://127.0.0.1:5090/mcp/s/").is_err());
         assert!(parse_bridge_url("http://127.0.0.1:5090/mcp/s/a/b").is_err());
         assert!(parse_bridge_url("http://127.0.0.1:5090/mcp/s/..").is_err());

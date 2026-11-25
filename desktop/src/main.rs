@@ -17,60 +17,53 @@ use tauri::{
     Manager,
 };
 
+#[cfg(windows)]
+fn attach_parent_console() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(n_std_handle: u32) -> isize;
+        fn AttachConsole(dw_process_id: u32) -> i32;
+    }
+    const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if h == 0 || h == -1 {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
 fn main() {
-    // Auto-mise à jour : attend la sortie de l'ancienne instance si relancé
-    // juste après remplacement binaire, et nettoie un éventuel `.old`.
+    // Support natif des sous-commandes CLI `bridge` et `auth` directement dans
+    // le binaire Desktop (NSIS n'installe que ce binaire : l'utilisateur peut
+    // lancer `mcp-control-desktop auth pair ...` ou `bridge` sans CLI séparé).
+    let cli_args: Vec<String> = std::env::args().collect();
+    if cli_args.get(1).map(String::as_str) == Some("bridge") {
+        std::process::exit(mcp_control::bridge::run(&cli_args[2..]));
+    }
+    if cli_args.get(1).map(String::as_str) == Some("auth") {
+        #[cfg(windows)]
+        attach_parent_console();
+        std::process::exit(mcp_control::auth::cli::run(&cli_args[2..]));
+    }
+
+    // Auto-mise à jour : attend la sortie réelle de l'ancienne instance si
+    // relancé juste après remplacement binaire / NSIS, et nettoie `.old`.
     mcp_control::manage::wait_if_restarting_from_update();
     mcp_control::manage::cleanup_old_binary();
-    // Instance unique garantie à deux niveaux : (1) tauri_plugin_single_instance
-    // ci-dessous réaffiche la fenêtre existante si le desktop est relancé ;
-    // (2) run_headless se RECONNECTE à un moteur déjà en cours (headless ou
-    // desktop) au lieu d'en lancer un second — un seul processus supervise.
-    let outcome = mcp_control::run_headless();
-    // SESSION LOCALE (docs/auth.md §6) : le shell navigue vers l'URL à usage
-    // unique `http://127.0.0.1:<port>/#t=<jeton>` — le fragment n'est jamais
-    // envoyé au serveur, `app.js` l'échange contre le cookie `mcc_session` puis
-    // l'efface. Aucun jeton à demander à l'utilisateur.
-    // Si le moteur a été RÉUTILISÉ (un moteur tournait déjà, desktop ou
-    // headless), le shell demande un jeton par le canal fichier du dossier de
-    // config (S-1 pt 3) : même utilisateur seulement, 2 min, usage unique.
-    let base = outcome.url.clone();
-    let ui_url = if !outcome.session_url.is_empty() {
-        outcome.session_url.clone()
-    } else if outcome.reused {
-        match mcp_control::auth::session::request_bootstrap(
-            &outcome.config_path,
-            std::time::Duration::from_secs(5),
-        ) {
-            Ok(jeton) => format!("{}/#t={}", base.trim_end_matches('/'), jeton),
-            // Aucun jeton journalisé : seule l'absence est signalée.
-            Err(e) => {
-                eprintln!("[session] {e}");
-                base.clone()
-            }
-        }
-    } else {
-        base.clone()
-    };
-    // lancé au boot de Windows (entrée autostart) → pas de fenêtre, tray seulement
-    let hidden = std::env::args().any(|a| a == "--hidden");
-    // SEULE origine navigable : celle que le moteur vient de servir. Le
-    // fragment #t=<jeton> ne compte pas dans l'origine. Toute autre navigation
-    // est refusée : la fenêtre ne peut pas quitter l'UI (les liens externes
-    // passent par le moteur, action open_release_page → navigateur système).
-    let ui_target: tauri::Url = ui_url.parse().expect("URL UI invalide");
-    let ui_origin = ui_target.origin();
-    let is_loopback = matches!(
-        ui_target.host_str(),
-        Some("127.0.0.1" | "localhost" | "[::1]")
-    );
-    let ui_cap_origin = (matches!(ui_target.scheme(), "http" | "https") && is_loopback)
-        .then(|| ui_origin.ascii_serialization());
+
+    // lancé au boot de l'OS (entrée autostart) → pas de fenêtre, tray seulement
+    let hidden = cli_args.iter().any(|a| a == "--hidden");
 
     tauri::Builder::default()
-        // deuxième lancement pendant que l'app tourne : réafficher la fenêtre
-        // existante au lieu d'un deuxième moteur qui mourrait sur les ports UI
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        // Instance unique AVANT run_headless() : un deuxième lancement réaffiche
+        // la fenêtre existante et sort immédiatement sans démarrer ni sonder un
+        // second moteur ni consommer de jeton d'amorçage.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if args.iter().any(|a| a == "--hidden") {
+                return;
+            }
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
                 let _ = w.unminimize();
@@ -78,6 +71,33 @@ fn main() {
             }
         }))
         .setup(move |app| {
+            let outcome = mcp_control::run_headless();
+            let base = outcome.url.clone();
+            let ui_url = if !outcome.session_url.is_empty() {
+                outcome.session_url.clone()
+            } else if outcome.reused {
+                match mcp_control::auth::session::request_bootstrap(
+                    &outcome.config_path,
+                    std::time::Duration::from_secs(5),
+                ) {
+                    Ok(jeton) => format!("{}/#t={}", base.trim_end_matches('/'), jeton),
+                    Err(e) => {
+                        eprintln!("[session] {e}");
+                        base.clone()
+                    }
+                }
+            } else {
+                base.clone()
+            };
+            let ui_target: tauri::Url = ui_url.parse().expect("URL UI invalide");
+            let ui_origin = ui_target.origin();
+            let is_loopback = matches!(
+                ui_target.host_str(),
+                Some("127.0.0.1" | "localhost" | "[::1]")
+            );
+            let ui_cap_origin = (matches!(ui_target.scheme(), "http" | "https") && is_loopback)
+                .then(|| ui_origin.ascii_serialization());
+
             // S-5 : capacité distante réduite à l'UNIQUE origine réellement
             // servie par ce moteur (loopback:<port>) — aucune autre origine
             // locale ou distante ne reçoit les contrôles de fenêtre.
@@ -128,7 +148,9 @@ fn main() {
                     .clone(),
             )?
             .build()?;
-            let _ = win.set_focus();
+            if !hidden {
+                let _ = win.set_focus();
+            }
 
             // icône tray : afficher le tableau de bord, quitter
             let show = MenuItem::with_id(
@@ -157,7 +179,10 @@ fn main() {
                             let _ = w.set_focus();
                         }
                     }
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        mcp_control::shutdown_engine();
+                        app.exit(0);
+                    }
                     _ => {}
                 })
                 // clic gauche sur l'icône : afficher / masquer la fenêtre

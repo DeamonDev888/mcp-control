@@ -324,6 +324,7 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
         "servers": list, "log": logarr,
         "latest_version": latest,
         "update_available": latest.is_some(),
+        "update_status": current_update_status(),
         "autostart": autostart,
         // None = pas encore mesuré ; false = réseau local coupé (VPN le plus souvent)
         "lan_ok": lan,
@@ -334,6 +335,7 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
         "announcements_count": announcements_count,
         "sessions_active": sessions_active,
         "server_identity": server_identity,
+        "bridge_command": current_bridge_command(),
     })
 }
 
@@ -605,6 +607,7 @@ pub fn state_etag(state: &Arc<AppState>) -> String {
         }
     }
     lockv(&state.update_latest).hash(&mut h);
+    update_status_hash(&mut h);
     (*lockv(&state.lan_ok)).hash(&mut h);
     let access = crate::auth::confirm::summary(state);
     access.to_string().hash(&mut h);

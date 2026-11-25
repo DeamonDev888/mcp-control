@@ -119,14 +119,50 @@ pub(super) fn parse_url_parts(u: &str) -> Option<(String, u16, String)> {
         Some(i) => (&rest[..i], rest[i..].to_string()),
         None => (rest, "/mcp".to_string()),
     };
-    let (host, port) = match hostport.rsplit_once(':') {
-        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => (h.to_string(), p.parse().ok()?),
-        _ => (
-            hostport.to_string(),
-            if u.starts_with("https") { 443 } else { 80 },
-        ),
+    let (host, port) = if let Some(after_open) = hostport.strip_prefix('[') {
+        let (h, after_close) = after_open.split_once(']')?;
+        if h.is_empty() {
+            return None;
+        }
+        let port = if let Some(p_str) = after_close.strip_prefix(':') {
+            p_str.parse::<u16>().ok()?
+        } else if after_close.is_empty() {
+            80
+        } else {
+            return None;
+        };
+        (h.to_string(), port)
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+                (h.to_string(), p.parse().ok()?)
+            }
+            _ => (hostport.to_string(), 80),
+        }
     };
+    if host.is_empty() || port == 0 {
+        return None;
+    }
     Some((host, port, path))
+}
+
+fn sanitize_import_id(raw: &str) -> String {
+    let clean: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = clean.trim_matches('-');
+    if trimmed.is_empty() {
+        "serveur".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Porté de mcp-import.ts : collez n'importe quoi — snippet mcp.json, commande
@@ -144,7 +180,7 @@ pub fn import_mcp_text(state: &Arc<AppState>, raw: &str) -> Value {
                 let mut added = 0usize;
                 let mut skipped: Vec<Value> = Vec::new();
                 for (name, entry) in entries {
-                    let id = format!("store-{}", name);
+                    let id = format!("store-{}", sanitize_import_id(&name));
                     let mut servers = lockv(&state.servers);
                     if servers.iter().any(|s| s.id == id) {
                         continue;
@@ -194,14 +230,36 @@ pub fn import_mcp_text(state: &Arc<AppState>, raw: &str) -> Value {
         }
     }
 
-    // 2. `claude mcp add <name> <cmd> [args...]` — 5 tokens minimum (nom + programme),
-    //    sinon un « claude mcp add » tronqué paniquait sur toks[3]/toks[4] (audit 2026-10-24)
+    // 2. `claude mcp add [--transport ...] [--scope ...] [-e K=V] <name> [--] <cmd> [args...]`
     let toks: Vec<&str> = text.split_whitespace().collect();
-    if toks.len() >= 5 && toks[0] == "claude" && toks[1] == "mcp" && toks[2] == "add" {
-        let name = toks[3].to_string();
-        let program = toks[4].to_string();
-        let args: Vec<String> = toks[5..].iter().map(|s| s.to_string()).collect();
-        return push_imported(state, name, program, args);
+    if toks.len() >= 4 && toks[0] == "claude" && toks[1] == "mcp" && toks[2] == "add" {
+        let mut i = 3usize;
+        let mut positional: Vec<&str> = Vec::new();
+        while i < toks.len() {
+            if toks[i] == "--" {
+                positional.extend_from_slice(&toks[i + 1..]);
+                break;
+            }
+            if matches!(
+                toks[i],
+                "-e" | "--env" | "-s" | "--scope" | "-t" | "--transport"
+            ) {
+                i += 2;
+                continue;
+            }
+            if toks[i].starts_with('-') {
+                i += 1;
+                continue;
+            }
+            positional.push(toks[i]);
+            i += 1;
+        }
+        if positional.len() >= 2 {
+            let name = sanitize_import_id(positional[0]);
+            let program = positional[1].to_string();
+            let args: Vec<String> = positional[2..].iter().map(|s| s.to_string()).collect();
+            return push_imported(state, name, program, args);
+        }
     }
 
     // 3. URL directe → serveur HTTP (https refusé : pas de TLS dans ce client std)
@@ -210,10 +268,22 @@ pub fn import_mcp_text(state: &Arc<AppState>, raw: &str) -> Value {
     }
     if text.starts_with("http://") {
         if let Some((host, port, path)) = parse_url_parts(text) {
-            let name = name_from_url(&host);
-            let id = format!("store-{}", name);
+            let name = sanitize_import_id(&name_from_url(&host));
+            let base_id = format!("store-{}", name);
             let mut servers = lockv(&state.servers);
-            if !servers.iter().any(|s| s.id == id) {
+            let already_same_endpoint = servers.iter().any(|s| {
+                matches!(
+                    &s.transport,
+                    Transport::Http { host: Some(h), port: p, path: pa }
+                    if h == &host && *p == port && pa == &path
+                )
+            });
+            let id = if servers.iter().any(|s| s.id == base_id) {
+                format!("store-{}-{}", name, port)
+            } else {
+                base_id
+            };
+            if !already_same_endpoint && !servers.iter().any(|s| s.id == id) {
                 servers.push(Server {
                     start_cmd: None,
                     id: id.clone(),

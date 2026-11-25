@@ -67,6 +67,10 @@ pub const MAX_SESSIONS: usize = 8;
 /// est morte (une fenêtre oubliée ne vit pas indéfiniment).
 pub const IDLE_TTL: Duration = Duration::from_secs(12 * 3600);
 
+/// Expiration à l'inactivité d'une session CLI éphémère (60 s — filet de
+/// sécurité si le process CLI est tué avant `POST /api/session/close`).
+pub const EPHEMERAL_IDLE_TTL: Duration = Duration::from_secs(60);
+
 /// Durée absolue : une session meurt 24 h après son échange, même utilisée.
 pub const ABSOLUTE_TTL: Duration = Duration::from_secs(24 * 3600);
 
@@ -91,6 +95,8 @@ struct Session {
     issued: Instant,
     /// Dernière requête autorisée : borne l'inactivité.
     last_seen: Instant,
+    /// Durée d'inactivité propre à la session (`IDLE_TTL` ou `EPHEMERAL_IDLE_TTL`).
+    idle_ttl: Duration,
 }
 
 #[derive(Default)]
@@ -201,16 +207,22 @@ fn is_token(s: &str) -> bool {
 // ---------- cycle de vie ----------
 
 /// Une session est morte au-delà de la durée absolue ou de l'inactivité.
+fn expired_with_idle(issued_ago: Duration, idle_ago: Duration, idle_ttl: Duration) -> bool {
+    issued_ago >= ABSOLUTE_TTL || idle_ago >= idle_ttl
+}
+
+#[cfg(test)]
 fn expired(issued_ago: Duration, idle_ago: Duration) -> bool {
-    issued_ago >= ABSOLUTE_TTL || idle_ago >= IDLE_TTL
+    expired_with_idle(issued_ago, idle_ago, IDLE_TTL)
 }
 
 fn prune(s: &mut Slot) {
     let now = Instant::now();
     s.sessions.retain(|x| {
-        !expired(
+        !expired_with_idle(
             now.duration_since(x.issued),
             now.duration_since(x.last_seen),
+            x.idle_ttl,
         )
     });
     s.bootstraps
@@ -228,8 +240,8 @@ fn mint_bootstrap_with_ttl(ttl: Duration) -> Option<String> {
         issued: Instant::now(),
         ttl,
     });
-    // Borne : au plus quatre jetons en attente (console + canal fichier).
-    while s.bootstraps.len() > 4 {
+    // Borne : au plus 16 jetons en attente (évite d'évincer des CLI concurrentes).
+    while s.bootstraps.len() > 16 {
         s.bootstraps.remove(0);
     }
     Some(token)
@@ -259,6 +271,11 @@ pub struct Issued {
 /// périmé, plafond de sessions atteint ou entropie OS indisponible (échec
 /// fermé : aucun cookie n'est émis).
 pub fn exchange(token: &str) -> Option<Issued> {
+    exchange_with_mode(token, false)
+}
+
+/// Variante avec `ephemeral = true` (sessions CLI courtes, TTL 60 s).
+pub fn exchange_with_mode(token: &str, ephemeral: bool) -> Option<Issued> {
     {
         let mut s = slot();
         prune(&mut s);
@@ -299,6 +316,11 @@ pub fn exchange(token: &str) -> Option<Issued> {
         secret: secret.clone(),
         issued: now,
         last_seen: now,
+        idle_ttl: if ephemeral {
+            EPHEMERAL_IDLE_TTL
+        } else {
+            IDLE_TTL
+        },
     });
     Some(Issued { cookie: id, secret })
 }
@@ -382,12 +404,24 @@ pub fn active_count() -> usize {
     s.sessions
         .iter()
         .filter(|x| {
-            !expired(
+            !expired_with_idle(
                 now.duration_since(x.issued),
                 now.duration_since(x.last_seen),
+                x.idle_ttl,
             )
         })
         .count()
+}
+
+/// Révoque uniquement la session courante (utilisé par les commandes CLI
+/// éphémères dès la fin de leur appel, évitant de saturer le plafond de 8).
+pub fn close_session(current: &str) -> bool {
+    let mut s = slot();
+    prune(&mut s);
+    let before = s.sessions.len();
+    s.sessions
+        .retain(|x| !crate::crypto::ct_eq(x.id.as_bytes(), current.as_bytes()));
+    s.sessions.len() < before
 }
 
 /// Révoque toutes les sessions SAUF celle désignée par `current`. Rend le
@@ -481,72 +515,105 @@ fn remove_stale(path: &Path) {
     }
 }
 
-/// Côté MOTEUR : sert les demandes de jeton déposées par un second lancement.
-/// Thread dédié, une demande toutes les 250 ms. Chaque demande reçoit un jeton
-/// neuf (2 min, usage unique) ; le jeton n'apparaît jamais dans le journal.
+/// Côté MOTEUR : sert les demandes de jeton déposées par un second lancement ou
+/// par les sous-commandes CLI. Thread dédié, une passe toutes les 200 ms.
+/// Chaque demande utilise son propre couple `mcc-session-<id>.req` / `.grant`
+/// (zéro course entre plusieurs CLI simultanées) ; la forme héritée
+/// `mcc-session.req` / `.grant` reste également servie.
 pub fn serve_session_requests(config_path: &str) {
     let config_path = config_path.to_string();
     std::thread::spawn(move || {
-        let req = sidecar(&config_path, REQUEST_FILE);
-        let grant = sidecar(&config_path, GRANT_FILE);
-        remove_stale(&req);
-        remove_stale(&grant);
+        let dir = Path::new(&config_path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let legacy_req = sidecar(&config_path, REQUEST_FILE);
+        let legacy_grant = sidecar(&config_path, GRANT_FILE);
+        remove_stale(&legacy_req);
+        remove_stale(&legacy_grant);
         journal(
             "info",
             "canal de session fichier utilisateur actif (demande → jeton à usage unique 2 min, permissions utilisateur seul)",
         );
         loop {
-            std::thread::sleep(Duration::from_millis(250));
-            let Ok(texte) = std::fs::read_to_string(&req) else {
+            std::thread::sleep(Duration::from_millis(200));
+            let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
-            let nonce = texte.trim().to_string();
-            if !is_token(&nonce) {
-                let _ = std::fs::remove_file(&req);
-                journal(
-                    "warn",
-                    "demande de session ignorée (format de nonce invalide)",
-                );
-                continue;
-            }
-            // La demande est retirée AVANT de répondre : une seule réponse par
-            // demande, même si plusieurs moteurs regardaient le même dossier.
-            if std::fs::remove_file(&req).is_err() {
-                continue;
-            }
-            match mint_bootstrap_with_ttl(BOOTSTRAP_FILE_TTL) {
-                Some(token) => {
-                    let corps = format!("{nonce}\n{token}\n");
-                    match write_private(&grant, corps.as_bytes()) {
-                        Ok(()) => journal(
-                            "info",
-                            "demande de session servie (canal fichier utilisateur, jeton à usage unique 2 min)",
-                        ),
-                        Err(e) => journal(
-                            "warn",
-                            &format!("réponse de session non écrite : {e}"),
-                        ),
-                    }
+            for entry in entries.flatten() {
+                let fname = entry.file_name().to_string_lossy().to_string();
+                let path = entry.path();
+                if fname.starts_with("mcc-session") && fname.ends_with(".grant") {
+                    remove_stale(&path);
+                    continue;
                 }
-                None => journal(
-                    "error",
-                    "demande de session refusée : entropie OS indisponible (aucun jeton)",
-                ),
+                let grant_path = if fname == REQUEST_FILE {
+                    legacy_grant.clone()
+                } else if let Some(rest) = fname.strip_prefix("mcc-session-") {
+                    let Some(req_id) = rest.strip_suffix(".req") else {
+                        continue;
+                    };
+                    if req_id.is_empty()
+                        || req_id.len() > 32
+                        || !req_id.chars().all(|c| c.is_ascii_hexdigit())
+                    {
+                        remove_stale(&path);
+                        continue;
+                    }
+                    dir.join(format!("mcc-session-{req_id}.grant"))
+                } else {
+                    continue;
+                };
+                let Ok(texte) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let nonce = texte.trim().to_string();
+                if !is_token(&nonce) {
+                    let _ = std::fs::remove_file(&path);
+                    journal(
+                        "warn",
+                        "demande de session ignorée (format de nonce invalide)",
+                    );
+                    continue;
+                }
+                // La demande est retirée AVANT de répondre : une seule réponse par demande.
+                if std::fs::remove_file(&path).is_err() {
+                    continue;
+                }
+                match mint_bootstrap_with_ttl(BOOTSTRAP_FILE_TTL) {
+                    Some(token) => {
+                        let corps = format!("{nonce}\n{token}\n");
+                        match write_private(&grant_path, corps.as_bytes()) {
+                            Ok(()) => journal(
+                                "info",
+                                "demande de session servie (canal fichier utilisateur, jeton à usage unique 2 min)",
+                            ),
+                            Err(e) => journal(
+                                "warn",
+                                &format!("réponse de session non écrite : {e}"),
+                            ),
+                        }
+                    }
+                    None => journal(
+                        "error",
+                        "demande de session refusée : entropie OS indisponible (aucun jeton)",
+                    ),
+                }
             }
         }
     });
 }
 
-/// Côté SHELL : demande un jeton d'amorçage au moteur par le canal fichier.
-/// `Err` = aucune réponse dans le délai (moteur d'une version antérieure,
-/// dossier non inscriptible) — l'appelant ouvre l'UI sans session.
+/// Côté SHELL / CLI : demande un jeton d'amorçage au moteur par un couple
+/// dédié `mcc-session-<id>.req` / `.grant` (sans course entre appels concurrents).
 pub fn request_bootstrap(config_path: &str, timeout: Duration) -> Result<String, String> {
     let nonce = fresh_token(32)
         .ok_or_else(|| "entropie OS indisponible : aucun jeton de session".to_string())?;
-    let req = sidecar(config_path, REQUEST_FILE);
-    let grant = sidecar(config_path, GRANT_FILE);
-    // Un résidu de réponse précédente ne doit pas être pris pour la nôtre.
-    let _ = std::fs::remove_file(&grant);
+    let req_id = crate::random_hex(1)
+        .ok_or_else(|| "entropie OS indisponible : aucun identifiant de demande".to_string())?;
+    let req = sidecar(config_path, &format!("mcc-session-{req_id}.req"));
+    let grant = sidecar(config_path, &format!("mcc-session-{req_id}.grant"));
     write_private(&req, nonce.as_bytes())
         .map_err(|e| format!("écriture de la demande de session impossible : {e}"))?;
     let fin = Instant::now() + timeout;
@@ -564,12 +631,13 @@ pub fn request_bootstrap(config_path: &str, timeout: Duration) -> Result<String,
         }
         if Instant::now() >= fin {
             let _ = std::fs::remove_file(&req);
+            let _ = std::fs::remove_file(&grant);
             return Err(
                 "aucune réponse du moteur au canal fichier (moteur antérieur au lot S1 ?)"
                     .to_string(),
             );
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(80));
     }
 }
 

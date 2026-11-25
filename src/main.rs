@@ -35,18 +35,20 @@ fn main() {
             "mcp-control : un moteur tourne déjà sur {} — rien à lancer, sortie.",
             outcome.url
         );
-        // S-1 pt 3 : second lancement = jeton d'amorçage par le canal fichier
-        // (dossier de config, permissions utilisateur, 2 min, usage unique).
-        match mcp_control::auth::session::request_bootstrap(
-            &outcome.config_path,
-            std::time::Duration::from_secs(5),
-        ) {
-            Ok(jeton) => println!(
-                "[session] {}/#t={}",
-                outcome.url.trim_end_matches('/'),
-                jeton
-            ),
-            Err(e) => eprintln!("[session] {e}"),
+        // En mode `--hidden` (autostart sans console visible), personne ne lira
+        // le lien de session : inutile de consommer un jeton d'amorçage.
+        if !args.iter().any(|a| a == "--hidden") {
+            match mcp_control::auth::session::request_bootstrap(
+                &outcome.config_path,
+                std::time::Duration::from_secs(5),
+            ) {
+                Ok(jeton) => println!(
+                    "[session] {}/#t={}",
+                    outcome.url.trim_end_matches('/'),
+                    jeton
+                ),
+                Err(e) => eprintln!("[session] {e}"),
+            }
         }
         return;
     }

@@ -218,24 +218,28 @@ static POOL_DEMARRE: OnceLock<()> = OnceLock::new();
 /// à la fin du poll_one). Le cycle suivant SAUTE un serveur encore en sonde
 /// au lieu d'attendre la sonde la plus lente (lot A) ou d'empiler des sondes
 /// doublons du même serveur muet.
-static SONDAGE_EN_COURS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+static SONDAGE_EN_COURS: OnceLock<Mutex<HashMap<(usize, String), Instant>>> = OnceLock::new();
+static LAST_WORKER_CACHE_SAVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn sonde_en_cours_map() -> &'static Mutex<HashMap<String, Instant>> {
+fn sonde_en_cours_map() -> &'static Mutex<HashMap<(usize, String), Instant>> {
     SONDAGE_EN_COURS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Filtre les ids encore en sonde ET marque les autres en UNE seule section
 /// verrouillée : le poller et le tool refresh appellent poll_all en concurrence
 /// — sans l'atomicité, deux appelants verraient le même serveur libre et
-/// empileraient deux sondes du même id.
-fn filtrer_et_marquer_sondage(ids: Vec<String>) -> Vec<String> {
+/// empileraient deux sondes du même id. Clé scopée par `Arc::as_ptr(state)`
+/// pour isoler les instances distinctes `[M-14]`.
+fn filtrer_et_marquer_sondage(state: &Arc<AppState>, ids: Vec<String>) -> Vec<String> {
     let mut map = lockv(sonde_en_cours_map());
     map.retain(|_, t| t.elapsed().as_secs() < SONDAGE_MAX_SECS);
     let maintenant = Instant::now();
+    let ptr = Arc::as_ptr(state) as usize;
     let mut retenus = Vec::with_capacity(ids.len());
     for id in ids {
-        if !map.contains_key(&id) {
-            map.insert(id.clone(), maintenant);
+        let key = (ptr, id.clone());
+        if let std::collections::hash_map::Entry::Vacant(e) = map.entry(key) {
+            e.insert(maintenant);
             retenus.push(id);
         }
     }
@@ -244,8 +248,9 @@ fn filtrer_et_marquer_sondage(ids: Vec<String>) -> Vec<String> {
 
 /// Libère le marqueur à la fin d'un poll_one (branche normale OU panic —
 /// le worker appelle après catch_unwind).
-fn liberer_sondage(id: &str) {
-    lockv(sonde_en_cours_map()).remove(id);
+fn liberer_sondage(state: &Arc<AppState>, id: &str) {
+    let key = (Arc::as_ptr(state) as usize, id.to_string());
+    lockv(sonde_en_cours_map()).remove(&key);
 }
 
 fn file_travail() -> (&'static Mutex<VecDeque<Travail>>, &'static Condvar) {
@@ -279,7 +284,23 @@ fn worker_sondes() {
         }));
         // le marqueur est libéré même en cas de panic : le serveur sera
         // re-sondé au cycle suivant (jamais sauté pour toujours)
-        liberer_sondage(&id);
+        liberer_sondage(&state, &id);
+        // [M-14] : persister le cache d'état à la fin des sondes (borné à 1/5 s)
+        // afin que les nouveaux états observés par les workers survivent à l'arrêt.
+        let now = crate::types::now_ts();
+        let prev = LAST_WORKER_CACHE_SAVE.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(prev) >= 5
+            && LAST_WORKER_CACHE_SAVE
+                .compare_exchange(
+                    prev,
+                    now,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            save_cache(&state);
+        }
     }
 }
 
@@ -333,7 +354,7 @@ pub fn poll_all(state: &Arc<AppState>) {
     // Un serveur encore en sonde (cycle précédent) est simplement SAUTÉ :
     // son poll_one publiera son état à sa fin, sans retarder ce cycle-ci ni
     // empiler un doublon (lot A — période des sains ≤ refresh + 2 s).
-    let ids = filtrer_et_marquer_sondage(ids);
+    let ids = filtrer_et_marquer_sondage(state, ids);
     // Sondes en parallèle via le pool persistant, sans attente de fin.
     // Chaque poll_one prend ses verrous brièvement et relâche avant d'écrire
     // au journal ; les spawns concurrents restent protégés par `state.spawning`.

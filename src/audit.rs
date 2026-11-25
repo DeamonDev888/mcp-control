@@ -124,6 +124,14 @@ fn segment_path(base: &Path, n: usize) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Indique si un journal d'audit ou l'un de ses artefacts (segments `.1`..`.5`,
+/// ancre `.head`) existe sur disque `[H-04][H-05]`.
+pub fn has_audit_artifacts(base: &Path) -> bool {
+    base.exists()
+        || head_path(base).exists()
+        || (1..=ROTATE_KEEP).any(|i| segment_path(base, i).exists())
+}
+
 /// Fichier d'ancre créé lors d'une rotation qui évince le segment `.5` (§11) :
 /// conserve le `seq` et le `mac` de la dernière ligne évincée, signés par HMAC,
 /// pour permettre de reprendre la chaîne tout en empêchant la suppression
@@ -142,7 +150,9 @@ fn write_head(path: &Path, seq: u64, mac: &str, cle: &[u8]) -> Result<(), String
                 .map_err(|e| format!("dossier {} impossible : {e}", parent.display()))?;
         }
     }
-    let tmp = path.with_extension("head.tmp");
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp_os);
     std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -225,10 +235,10 @@ fn read_head(path: &Path, cle: &[u8]) -> Result<(u64, String), Falsification> {
 }
 
 /// Dernière ligne exploitable d'un fichier : `(seq, mac)`. `None` = fichier
-/// absent ou vide. Un fichier non vide dont la dernière ligne est illisible
-/// est une **erreur** : on n'écrit pas à la suite d'une chaîne inconnue
-/// (échec fermé).
-fn derniere_ligne(path: &Path) -> Result<Option<(u64, String)>, String> {
+/// absent ou vide. Un fichier non vide dont la dernière ligne est illisible ou
+/// dont le MAC ne se recalcule pas (si `cle` est fournie) est une **erreur** :
+/// on n'écrit pas à la suite d'une chaîne inconnue ou falsifiée (échec fermé).
+fn derniere_ligne(path: &Path, cle: Option<&[u8]>) -> Result<Option<(u64, String)>, String> {
     let texte = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -243,6 +253,16 @@ fn derniere_ligne(path: &Path) -> Result<Option<(u64, String)>, String> {
             path.display()
         )
     })?;
+    if let Some(k) = cle {
+        let i_mac = l.rfind(" mac=").unwrap_or(0);
+        let recalcule = mac_de(k, &l[..i_mac + 1]);
+        if !crate::crypto::ct_eq(recalcule.as_bytes(), lue.mac.as_bytes()) {
+            return Err(format!(
+                "dernière ligne falsifiée dans {} (MAC invalide) — écriture refusée",
+                path.display()
+            ));
+        }
+    }
     Ok(Some((lue.seq, lue.mac.to_string())))
 }
 
@@ -256,7 +276,23 @@ struct Journal {
 
 impl Journal {
     fn open(path: PathBuf, cle: Vec<u8>) -> Result<Self, String> {
-        let (seq, last) = derniere_ligne(&path)?.unwrap_or((0, ZERO_MAC.to_string()));
+        let (seq, last) = match derniere_ligne(&path, Some(&cle))? {
+            Some(pair) => pair,
+            None => {
+                // Échec fermé [H-05] : si le journal courant a été supprimé ou vidé
+                // alors que des segments archivés ou une ancre `.head` existent,
+                // ne pas repartir silencieusement à seq=0.
+                let has_older = head_path(&path).exists()
+                    || (1..=ROTATE_KEEP).any(|i| segment_path(&path, i).exists());
+                if has_older {
+                    return Err(format!(
+                        "journal courant {} absent ou vide alors que des segments archivés existent — chaîne rompue, écriture refusée",
+                        path.display()
+                    ));
+                }
+                (0, ZERO_MAC.to_string())
+            }
+        };
         Ok(Self {
             path,
             cle,
@@ -275,7 +311,7 @@ impl Journal {
         }
         let evince = segment_path(&self.path, ROTATE_KEEP);
         if evince.exists() {
-            if let Some((seq_evince, mac_evince)) = derniere_ligne(&evince)? {
+            if let Some((seq_evince, mac_evince)) = derniere_ligne(&evince, Some(&self.cle))? {
                 write_head(&head_path(&self.path), seq_evince, &mac_evince, &self.cle)?;
             }
         }
@@ -310,6 +346,7 @@ impl Journal {
         let (ligne, mac) = ligne_complete(seq, &entete, &self.last, &self.cle);
         std::fs::write(&self.path, format!("{ligne}\n"))
             .map_err(|e| format!("écriture {} impossible : {e}", self.path.display()))?;
+        let _ = crate::manage::restrict_permissions(&self.path.to_string_lossy());
         self.seq = seq;
         self.last = mac;
         Ok(())
@@ -325,11 +362,15 @@ impl Journal {
                     .map_err(|e| format!("dossier {} impossible : {e}", parent.display()))?;
             }
         }
+        let nouveau = !self.path.exists();
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
             .map_err(|e| format!("ouverture {} impossible : {e}", self.path.display()))?;
+        if nouveau {
+            let _ = crate::manage::restrict_permissions(&self.path.to_string_lossy());
+        }
         f.write_all(ligne.as_bytes())
             .and_then(|()| f.write_all(b"\n"))
             .map_err(|e| format!("écriture {} impossible : {e}", self.path.display()))?;
@@ -701,6 +742,17 @@ pub fn verify(path: &Path, cle: &[u8]) -> Result<Rapport, Falsification> {
     } else {
         (0u64, ZERO_MAC.to_string(), 1u64, false)
     };
+    if !path.exists() && (!fichiers.is_empty() || head.exists()) {
+        return Err(Falsification::Supprimee {
+            fichier: path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| AUDIT_FILE.to_string()),
+            ligne: 1,
+            attendu: attendu_seq + 1,
+            trouve: 0,
+        });
+    }
     let mut lignes = 0u64;
     let mut dernier_seq = 0u64;
     let mut premier_vu = false;

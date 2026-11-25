@@ -20,7 +20,7 @@ use std::net::IpAddr;
 /// Points d'écoute de cette instance : (port UI réel, IP locales de la machine).
 /// Enregistré par run_headless au boot ; une URL de webhook qui vise l'un de
 /// ces points est CETTE instance → refusée à l'enregistrement comme à l'envoi.
-static SELF_LISTEN: std::sync::OnceLock<(u16, Vec<String>)> = std::sync::OnceLock::new();
+static SELF_LISTEN: std::sync::RwLock<Option<(u16, Vec<String>)>> = std::sync::RwLock::new(None);
 
 /// Chemin du journal mcc.log, branché par run_headless : send_webhook n'a pas
 /// d'AppState mais doit tracer chaque envoi (cible + résultat).
@@ -34,8 +34,7 @@ pub fn set_webhook_log_path(path: &str) {
 }
 
 /// Enregistre le port UI réel (après repli +1..+9) et les IP locales de la
-/// machine. Idempotent : le premier appel gagne (le boot ne s'exécute qu'une
-/// fois par processus).
+/// machine (`RwLock` pour refléter un redémarrage ou changement d'interfaces) `[H-16]`.
 pub fn note_self_listen(ui_port: u16, local_ips: &[String], ui_bind: &str) {
     let mut hosts: Vec<String> = Vec::new();
     if !matches!(ui_bind.trim(), "" | "0.0.0.0" | "*" | "::") {
@@ -44,7 +43,9 @@ pub fn note_self_listen(ui_port: u16, local_ips: &[String], ui_bind: &str) {
     for ip in local_ips {
         hosts.push(ip.trim().to_ascii_lowercase());
     }
-    let _ = SELF_LISTEN.set((ui_port, hosts));
+    if let Ok(mut guard) = SELF_LISTEN.write() {
+        *guard = Some((ui_port, hosts));
+    }
 }
 
 /// Hôte d'URL normalisé (crochets IPv6 retirés, minuscules).
@@ -57,24 +58,43 @@ fn url_host_only(h: &str) -> String {
 
 /// Cette URL (hôte:port) vise-t-elle cette instance elle-même ? Uniquement si
 /// le port correspond au port UI réel, et que l'hôte est de boucle
-/// (127.x, ::1), localhost, 0.0.0.0, ou une des IP locales de la machine.
+/// (127.x, ::1, ::ffff:127.0.0.1), localhost, 0.0.0.0, une des IP locales,
+/// ou un nom DNS résolvant vers une de ces adresses `[H-16]`.
 fn is_own_instance(host: &str, port: u16) -> bool {
-    let Some((self_port, hosts)) = SELF_LISTEN.get() else {
+    let guard = match SELF_LISTEN.read() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let Some((self_port, hosts)) = guard.as_ref() else {
         return false;
     };
     if *self_port != port {
         return false;
     }
     let h = url_host_only(host);
-    if h.is_empty() || h == "localhost" || h == "0.0.0.0" {
+    if h.is_empty() || h == "localhost" || h == "0.0.0.0" || h == "::" {
         return true;
     }
+    let is_self_ip = |ip: IpAddr| -> bool {
+        let canon = ip.to_canonical();
+        canon.is_loopback()
+            || canon.is_unspecified()
+            || hosts.iter().any(|known| known == &canon.to_string())
+    };
     if let Ok(ip) = h.parse::<IpAddr>() {
-        if ip.is_loopback() {
-            return true;
+        return is_self_ip(ip);
+    }
+    if hosts.contains(&h) {
+        return true;
+    }
+    if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(h.as_str(), port)) {
+        for a in addrs {
+            if is_self_ip(a.ip()) {
+                return true;
+            }
         }
     }
-    hosts.contains(&h)
+    false
 }
 
 /// Configuration des notifications (persistée dans config.json).

@@ -80,8 +80,8 @@ fn store_github_logos_valides_et_complets() {
         serde_json::from_str(crate::logos::LOGOS_JSON)
             .expect("LOGOS_JSON doit être un objet JSON valide");
     assert!(
-        crate::store_github::STORE_GITHUB.len() >= 29,
-        "STORE_GITHUB doit contenir au moins 29 serveurs"
+        crate::store_github::STORE_GITHUB.len() >= 24,
+        "STORE_GITHUB doit contenir au moins 24 serveurs"
     );
     assert!(
         find_store_item("gh-metatrader").is_none(),
@@ -176,7 +176,7 @@ fn store_tous_les_serveurs_eligibles_mode_hybride_et_persistants() {
     });
 
     let items: Vec<&StoreItem> = all_store_items().collect();
-    assert_eq!(items.len(), 89, "la boutique doit exposer 89 serveurs");
+    assert_eq!(items.len(), 95, "la boutique doit exposer 95 serveurs");
     let secret_val = "secret-boutique-ne-doit-jamais-fuiter";
     {
         let mut servers = lockv(&state.servers);

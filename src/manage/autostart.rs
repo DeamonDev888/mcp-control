@@ -32,14 +32,7 @@ fn autostart_entry_args() -> String {
 pub fn autostart_active() -> bool {
     #[cfg(windows)]
     {
-        let mut c = Command::new(probe::system_tool("reg"));
-        probe::probe_hidden_cmd(&mut c);
-        c.args(["query", &run_key(), "/v", AUTOSTART_RUN_NAME])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        recorded_run_value().is_some()
     }
     #[cfg(not(windows))]
     {
@@ -47,29 +40,59 @@ pub fn autostart_active() -> bool {
     }
 }
 
+/// Échappe une chaîne pour insertion dans un élément `<string>` XML (.plist macOS).
+#[cfg_attr(any(windows, test), allow(dead_code))]
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Échappe un chemin d'exécutable pour la ligne `Exec="..."` d'un fichier `.desktop` XDG.
+#[cfg_attr(any(windows, test), allow(dead_code))]
+fn desktop_exec_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
+}
+
 /// Applique la préférence : crée ou supprime l'entrée de démarrage automatique.
 /// Windows : registre HKCU …\Run. Linux : ~/.config/autostart/*.desktop.
 /// macOS : ~/Library/LaunchAgents/*.plist.
-pub fn apply_autostart(state: &Arc<AppState>, enable: bool) {
+pub fn apply_autostart(state: &Arc<AppState>, enable: bool) -> Result<(), String> {
     // les tests ne doivent JAMAIS toucher le registre/fichiers de l'OS réels
     #[cfg(test)]
     {
         let _ = (state, enable);
+        Ok(())
     }
     // corps réel séparé : le garde cfg(test) ne laisse rien d'inatteignable
     // (l'ancien `return` en build test déclenchait unreachable_code — clippy)
     #[cfg(not(test))]
-    apply_autostart_os(state, enable);
+    apply_autostart_os(state, enable)
 }
 
 /// Corps réel de l'alignement autostart (compilé hors tests seulement).
 #[cfg(not(test))]
-#[allow(unused_must_use)]
-fn apply_autostart_os(state: &Arc<AppState>, enable: bool) {
+fn apply_autostart_os(state: &Arc<AppState>, enable: bool) -> Result<(), String> {
     #[cfg_attr(not(windows), allow(unused_variables))] // lu dans le bloc cfg(windows)
     let args = autostart_entry_args();
     #[cfg(windows)]
     {
+        if !enable && recorded_run_value().is_none() {
+            return Ok(());
+        }
         let root = run_key();
         let mut c = Command::new(probe::system_tool("reg"));
         probe::probe_hidden_cmd(&mut c);
@@ -103,58 +126,46 @@ fn apply_autostart_os(state: &Arc<AppState>, enable: bool) {
                     if enable { "créée" } else { "supprimée" }
                 ),
             );
+            Ok(())
         } else {
-            add_log(
-                state,
-                "warn",
-                "[autostart] reg a échoué — l'entrée n'a pas changé",
-            );
+            let msg = "[autostart] reg a échoué — l'entrée n'a pas changé";
+            add_log(state, "warn", msg);
+            Err(msg.to_string())
         }
     }
     #[cfg(not(windows))]
     {
         let Some(path) = autostart_file_path() else {
-            return;
+            return Err("dossier HOME introuvable pour l'entrée autostart".to_string());
         };
         if enable {
             if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir);
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| format!("création dossier autostart impossible : {e}"))?;
             }
             let exe = std::env::current_exe()
                 .map(|e| e.to_string_lossy().to_string())
                 .unwrap_or_default();
             let content = if path.extension().map(|e| e == "desktop").unwrap_or(false) {
                 format!(
-                    "[Desktop Entry]
-Type=Application
-Name=MCP Control
-Exec=\"{}\" --hidden
-Hidden=false
-X-GNOME-Autostart-enabled=true
-",
-                    exe
+                    "[Desktop Entry]\nType=Application\nName=MCP Control\nExec=\"{}\" --hidden\nHidden=false\nX-GNOME-Autostart-enabled=true\n",
+                    desktop_exec_escape(&exe)
                 )
             } else {
                 format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-<plist version=\"1.0\"><dict>
-<key>Label</key><string>com.deamondev.mcp-control</string>
-<key>ProgramArguments</key><array>
-<string>{}</string><string>--hidden</string>
-</array>
-<key>RunAtLoad</key><true/>
-</dict></plist>
-",
-                    exe
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>com.deamondev.mcp-control</string>\n<key>ProgramArguments</key><array>\n<string>{}</string><string>--hidden</string>\n</array>\n<key>RunAtLoad</key><true/>\n</dict></plist>\n",
+                    xml_escape(&exe)
                 )
             };
-            std::fs::write(&path, content);
+            std::fs::write(&path, content)
+                .map_err(|e| format!("écriture autostart impossible : {e}"))?;
             add_log(state, "info", "[autostart] entrée de démarrage créée");
         } else if path.exists() {
-            std::fs::remove_file(&path);
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("suppression autostart impossible : {e}"))?;
             add_log(state, "info", "[autostart] entrée de démarrage supprimée");
         }
+        Ok(())
     }
 }
 
@@ -427,8 +438,12 @@ pub fn sync_autostart_at_boot(state: &Arc<AppState>) {
         .unwrap_or_default();
     match autostart_boot_decision(recorded.as_deref(), &current, want) {
         AutostartBootAction::Aucun => {}
-        AutostartBootAction::Activer => apply_autostart(state, true),
-        AutostartBootAction::Desactiver => apply_autostart(state, false),
+        AutostartBootAction::Activer => {
+            let _ = apply_autostart(state, true);
+        }
+        AutostartBootAction::Desactiver => {
+            let _ = apply_autostart(state, false);
+        }
     }
 }
 

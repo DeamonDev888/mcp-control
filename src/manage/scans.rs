@@ -57,6 +57,24 @@ pub(crate) fn poll_one_bg(state: &Arc<AppState>, id: &str) {
 }
 
 #[allow(unused_must_use)]
+/// Serveurs réellement confirmés UP pendant cette session (évite les fausses
+/// alertes de crash au boot depuis un `state-cache.json` périmé) `[M-14]`.
+fn confirmed_up_set() -> &'static std::sync::Mutex<std::collections::HashSet<(usize, String)>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(usize, String)>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn mark_confirmed_up(state: &Arc<AppState>, id: &str) {
+    let key = (Arc::as_ptr(state) as usize, id.to_string());
+    lockv(confirmed_up_set()).insert(key);
+}
+
+fn take_confirmed_up(state: &Arc<AppState>, id: &str) -> bool {
+    let key = (Arc::as_ptr(state) as usize, id.to_string());
+    lockv(confirmed_up_set()).remove(&key)
+}
+
 fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
     crate::auth::net::set_config_path(&state.config_path);
     let (transport, enabled, via_ssh, was_up, has_tools, prev_name, prev_version) = {
@@ -182,6 +200,20 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                     }
                 };
                 if echec_demarrage {
+                    // [H-12] : si le lanceur HTTP est toujours vivant après expiration
+                    // de START_WINDOW_SECS sans jamais répondre MCP, le tuer pour ne
+                    // pas accumuler de processus bloqués.
+                    if !via_ssh && child_alive {
+                        if let Some(h) = lockv(&state.children).remove(id) {
+                            let same = match h.started {
+                                Some(ts) => probe::process_creation(h.pid) == Some(ts),
+                                None => true,
+                            };
+                            if same && h.pid != 0 {
+                                probe::kill_tree(h.pid);
+                            }
+                        }
+                    }
                     let motif = if child_alive || via_ssh {
                         format!(
                             "échéance de démarrage ({} s) dépassée sans réponse MCP",
@@ -353,110 +385,140 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
             };
             let mut log_event: Option<(&'static str, String)> = None;
             let mut gw_changed = false;
+            let mut incident: Option<(String, &'static str, String)> = None;
+            let mut kill_orphan_child = false;
             {
                 let mut servers = lockv(&state.servers);
-                if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
-                    if res.mcp_up {
-                        let changed = srv.server_name != res.name || srv.state != SState::Up;
-                        let tools_changed =
-                            !res.metadata_reused && srv.tools.len() != res.tools.len();
-                        if changed || tools_changed {
-                            gw_changed = true;
-                        }
-                        srv.state = SState::Up;
-                        srv.bound_host = res.host.clone();
-                        srv.server_name = res.name.clone();
-                        srv.version = res.version.clone();
-                        srv.protocol = res.protocol.clone();
-                        if !res.metadata_reused {
-                            srv.sse = res.sse;
-                            srv.sse_endpoint = res.sse_endpoint;
-                            srv.ws = res.ws;
-                            srv.lang = res.lang.clone();
-                            srv.framework = res.framework.clone();
-                            srv.in_container = res.in_container;
-                            srv.container_name = res.container_name.clone();
-                            srv.tools = res.tools.clone();
-                        }
-                        srv.latency_ms = Some(res.latency_ms);
-                        srv.last_seen_ts = Some(crate::types::now_ts());
-                        srv.last_error = None;
-                        if res.pid.is_some() {
-                            srv.pid = res.pid;
-                        }
-                        if changed {
-                            log_event = Some((
-                                "info",
-                                format!(
-                                    "[{}] UP : {} v{} — {} tools ({} ms)",
-                                    srv.label,
-                                    res.name.as_deref().unwrap_or("?"),
-                                    res.version.as_deref().unwrap_or("?"),
-                                    tools_actifs(srv),
-                                    res.latency_ms
-                                ),
-                            ));
-                        }
-                    } else {
-                        // Démarrage en cours (marqueur posé au spawn, échéance non
-                        // atteinte) : ni DOWN ni PORT-ONLY, pas d'incident, pid
-                        // conservé — le serveur est revérifié aux cycles suivants.
-                        if en_demarrage > crate::types::now_ts() {
-                            srv.last_error = Some("démarrage en cours…".to_string());
-                        } else {
-                            let was_up = srv.state == SState::Up;
-                            // port fermé = DOWN ; port ouvert sans MCP = PORT-ONLY (zombie)
-                            let new_state = if res.port_open {
-                                SState::PortOnly
-                            } else {
-                                SState::Down
-                            };
-                            if srv.state != new_state {
+                match servers.iter_mut().find(|s| s.id == id) {
+                    Some(srv) if !srv.enabled => {
+                        // [H-12] : désactivé pendant que la sonde tournait — ne pas
+                        // écraser son état et nettoyer un éventuel enfant fraîchement lancé.
+                        kill_orphan_child = true;
+                    }
+                    Some(srv) => {
+                        if res.mcp_up {
+                            let changed = srv.server_name != res.name || srv.state != SState::Up;
+                            let tools_changed =
+                                !res.metadata_reused && srv.tools.len() != res.tools.len();
+                            if changed || tools_changed {
                                 gw_changed = true;
                             }
-                            srv.state = new_state;
-                            if res.locked {
-                                if res.host.is_some() {
-                                    srv.bound_host = res.host.clone();
+                            srv.state = SState::Up;
+                            mark_confirmed_up(state, id);
+                            srv.bound_host = res.host.clone();
+                            srv.server_name = res.name.clone();
+                            srv.version = res.version.clone();
+                            srv.protocol = res.protocol.clone();
+                            if !res.metadata_reused {
+                                srv.sse = res.sse;
+                                srv.sse_endpoint = res.sse_endpoint;
+                                srv.ws = res.ws;
+                                srv.lang = res.lang.clone();
+                                srv.framework = res.framework.clone();
+                                srv.in_container = res.in_container;
+                                srv.container_name = res.container_name.clone();
+                                srv.tools = res.tools.clone();
+                            }
+                            srv.latency_ms = Some(res.latency_ms);
+                            srv.last_seen_ts = Some(crate::types::now_ts());
+                            srv.last_error = None;
+                            if res.pid.is_some() {
+                                srv.pid = res.pid;
+                            }
+                            if changed {
+                                log_event = Some((
+                                    "info",
+                                    format!(
+                                        "[{}] UP : {} v{} — {} tools ({} ms)",
+                                        srv.label,
+                                        res.name.as_deref().unwrap_or("?"),
+                                        res.version.as_deref().unwrap_or("?"),
+                                        tools_actifs(srv),
+                                        res.latency_ms
+                                    ),
+                                ));
+                            }
+                        } else {
+                            // Démarrage en cours (marqueur posé au spawn, échéance non
+                            // atteinte) : ni DOWN ni PORT-ONLY, pas d'incident, pid
+                            // conservé — le serveur est revérifié aux cycles suivants.
+                            if en_demarrage > crate::types::now_ts() {
+                                srv.last_error = Some("démarrage en cours…".to_string());
+                            } else {
+                                let was_up = srv.state == SState::Up;
+                                // port fermé = DOWN ; port ouvert sans MCP = PORT-ONLY (zombie)
+                                let new_state = if res.port_open {
+                                    SState::PortOnly
+                                } else {
+                                    SState::Down
+                                };
+                                if srv.state != new_state {
+                                    gw_changed = true;
                                 }
-                                if res.framework.is_some() {
-                                    srv.framework = res.framework.clone();
+                                srv.state = new_state;
+                                if res.locked {
+                                    if res.host.is_some() {
+                                        srv.bound_host = res.host.clone();
+                                    }
+                                    if res.framework.is_some() {
+                                        srv.framework = res.framework.clone();
+                                    }
+                                    if res.lang.is_some() {
+                                        srv.lang = res.lang.clone();
+                                    }
+                                    if res.in_container {
+                                        srv.in_container = true;
+                                        if res.container_name.is_some() {
+                                            srv.container_name = res.container_name.clone();
+                                        }
+                                    }
                                 }
-                                if res.lang.is_some() {
-                                    srv.lang = res.lang.clone();
+                                srv.last_error = res.error.clone();
+                                srv.latency_ms = None;
+                                if !res.port_open && (host.is_none() || via_ssh) {
+                                    srv.pid = None;
                                 }
-                                if res.in_container {
-                                    srv.in_container = true;
-                                    if res.container_name.is_some() {
-                                        srv.container_name = res.container_name.clone();
+                                if was_up {
+                                    let st_lbl = if res.port_open { "PORT-ONLY" } else { "DOWN" };
+                                    log_event = Some((
+                                        "warn",
+                                        format!(
+                                            "[{}] {} : {}",
+                                            srv.label,
+                                            st_lbl,
+                                            res.error.as_deref().unwrap_or("?")
+                                        ),
+                                    ));
+                                    if take_confirmed_up(state, id) {
+                                        incident = Some((
+                                            srv.label.clone(),
+                                            st_lbl,
+                                            res.error.clone().unwrap_or_else(|| "?".to_string()),
+                                        ));
                                     }
                                 }
                             }
-                            srv.last_error = res.error.clone();
-                            srv.latency_ms = None;
-                            if !res.port_open && (host.is_none() || via_ssh) {
-                                srv.pid = None;
-                            }
-                            if was_up {
-                                let st_lbl = if res.port_open { "PORT-ONLY" } else { "DOWN" };
-                                log_event = Some((
-                                    "warn",
-                                    format!(
-                                        "[{}] {} : {}",
-                                        srv.label,
-                                        st_lbl,
-                                        res.error.as_deref().unwrap_or("?")
-                                    ),
-                                ));
-                                // NOTIFICATION d'incident (desktop + webhook) :
-                                // déclenchée une seule fois, à la transition.
-                                let lbl = srv.label.clone();
-                                let det = res.error.clone().unwrap_or_else(|| "?".to_string());
-                                notify_incident(state, &lbl, st_lbl, &det);
-                            }
                         }
                     }
+                    None => {
+                        kill_orphan_child = true;
+                    }
                 }
+            }
+            if kill_orphan_child {
+                if let Some(h) = lockv(&state.children).remove(id) {
+                    let same = match h.started {
+                        Some(ts) => probe::process_creation(h.pid) == Some(ts),
+                        None => true,
+                    };
+                    if same && h.pid != 0 {
+                        probe::kill_tree(h.pid);
+                    }
+                }
+                return;
+            }
+            if let Some((lbl, st_lbl, det)) = incident {
+                notify_incident(state, &lbl, st_lbl, &det);
             }
             if res.mcp_up {
                 if !res.metadata_reused {
@@ -518,11 +580,15 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                 add_log(state, "warn", &format!("[{id}] {detail}"));
                 runtime_event(state, id, "crash", &detail);
                 let mut gw_changed = false;
+                let mut stdio_incident: Option<String> = None;
                 {
                     let mut servers = lockv(&state.servers);
                     if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
                         if srv.state == SState::Up {
                             gw_changed = true;
+                            if take_confirmed_up(state, id) {
+                                stdio_incident = Some(srv.label.clone());
+                            }
                         }
                         srv.state = SState::Down;
                         srv.pid = None;
@@ -530,6 +596,9 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                             srv.last_error = Some(detail.clone());
                         }
                     }
+                }
+                if let Some(lbl) = stdio_incident {
+                    notify_incident(state, &lbl, "DOWN", &detail);
                 }
                 if gw_changed {
                     crate::gateway::notify_change();
@@ -543,6 +612,7 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                 }
             };
             if alive {
+                mark_confirmed_up(state, id);
                 let rpc_opt = if force_full {
                     lockv(&state.children).get(id).and_then(|h| h.rpc.clone())
                 } else {
@@ -985,7 +1055,7 @@ pub(super) fn store_package_key(program: &str, args: &[String]) -> Option<(Strin
         .to_ascii_lowercase();
     match stem.as_str() {
         "npx" => npx_package_name(args).map(|p| ("npx".to_string(), p)),
-        "uvx" => uv_purge_targets(args)
+        "uvx" | "uv" => uv_purge_targets(args)
             .into_iter()
             .next()
             .map(|p| ("uvx".to_string(), p)),
@@ -1208,7 +1278,7 @@ pub(super) fn purge_store_package_files_in_dirs(
                 }
             }
         }
-        "uvx" => {
+        "uvx" | "uv" => {
             let targets = uv_purge_targets(args);
             if run_uv_cli && !targets.is_empty() {
                 let mut cmd = Command::new("uv");
@@ -1753,6 +1823,17 @@ pub fn scan_network(state: &Arc<AppState>, range: Option<(u16, u16)>) {
             (s.scan_from, s.scan_to)
         }
     };
+    if from == 0 || to < from || (to as u32 - from as u32) >= SCAN_MAX_PORTS as u32 {
+        add_log(
+            state,
+            "warn",
+            &format!(
+                "scan réseau refusé : plage {}..{} invalide (max {} ports)",
+                from, to, SCAN_MAX_PORTS
+            ),
+        );
+        return;
+    }
     let prefixes = network_prefixes();
     if prefixes.is_empty() {
         add_log(state, "warn", "scan réseau : aucune interface IPv4 trouvée");
@@ -2262,8 +2343,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(stdio_start_timeout_ms("node", &v(&["x.js"])), 30_000);
         assert_eq!(stdio_start_timeout_ms("bunx", &v(&["mcp-x"])), 180_000);
+        // Chemin complet classé par file_stem : séparateurs natifs par OS
+        // (Path::file_stem ne découpe pas les `\` sous unix).
+        #[cfg(windows)]
         assert_eq!(
             stdio_start_timeout_ms(r"C:\x\uvx.exe", &v(&["paquet-uv-inexistant-mcc-zz9"])),
+            300_000
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            stdio_start_timeout_ms("/usr/local/bin/uvx", &v(&["paquet-uv-inexistant-mcc-zz9"])),
             300_000
         );
         assert_eq!(
@@ -2306,9 +2395,20 @@ mod tests {
             ),
             300_000
         );
+        // Chemin complet classé par file_stem : séparateurs natifs par OS
+        // (Path::file_stem ne découpe pas les `\` sous unix).
+        #[cfg(windows)]
         assert_eq!(
             stdio_start_timeout_ms(
                 r"C:\tools\uvx.exe",
+                &v(&["--from", "git+https://github.com/org/repo.git", "mcp-repo"])
+            ),
+            300_000
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            stdio_start_timeout_ms(
+                "/usr/local/bin/uvx",
                 &v(&["--from", "git+https://github.com/org/repo.git", "mcp-repo"])
             ),
             300_000
@@ -2374,7 +2474,9 @@ mod tests {
         #[cfg(windows)]
         {
             (
-                probe::system_tool("powershell").to_string_lossy().to_string(),
+                probe::system_tool("powershell")
+                    .to_string_lossy()
+                    .to_string(),
                 vec![
                     "-NoProfile".to_string(),
                     "-NonInteractive".to_string(),

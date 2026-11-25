@@ -500,11 +500,17 @@ fn read_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                         "label": s.label,
                         "state": s.state.as_str(),
                         "framework": s.framework,
-                        "tools": s.tools.iter().map(|t| json!({
-                            "name": t.name,
-                            "description": t.desc,
-                            "disabled": s.tools_disabled.contains(&t.name),
-                        })).collect::<Vec<_>>(),
+                        "tools": s.tools.iter().map(|t| {
+                            let mut obj = json!({
+                                "name": t.name,
+                                "description": t.desc,
+                                "disabled": s.tools_disabled.contains(&t.name),
+                            });
+                            if let Some(ref schema) = t.input_schema {
+                                obj["inputSchema"] = schema.clone();
+                            }
+                            obj
+                        }).collect::<Vec<_>>(),
                     }))
                 }
             },
@@ -1234,35 +1240,17 @@ fn proxy_tools(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                             }
                         }
                         ProxyTarget::Http { host, port, path } => {
-                            let rpc_id = PROXY_RPC_ID.fetch_add(1, Ordering::Relaxed);
-                            let stateless = protocol.as_deref() == Some(crate::LITEMCP_PROTOCOL);
-                            let params = if stateless {
-                                json!({
-                                    "name": tool,
-                                    "arguments": arguments,
-                                    "_meta": {
-                                        "io.modelcontextprotocol/protocolVersion": crate::LITEMCP_PROTOCOL
-                                    }
-                                })
-                            } else {
-                                json!({ "name": tool, "arguments": arguments })
-                            };
-                            let mut extra: Vec<(&str, &str)> =
-                                vec![("Mcp-Method", "tools/call"), ("Mcp-Name", tool)];
-                            if stateless {
-                                extra.push(("MCP-Protocol-Version", crate::LITEMCP_PROTOCOL));
-                            }
-                            match probe::rpc_call_host_headers(
+                            let _ = PROXY_RPC_ID.fetch_add(1, Ordering::Relaxed);
+                            match probe::call_http_tool(
                                 &host,
                                 port,
                                 &path,
-                                "tools/call",
-                                params,
-                                rpc_id,
+                                protocol.as_deref(),
+                                tool,
+                                arguments,
                                 PROXY_TIMEOUT_MS,
-                                &extra,
                             ) {
-                                Ok((result, _head)) => {
+                                Ok((result, _ms)) => {
                                     // transparence : le résultat du serveur distant
                                     // (CallToolResult upstream) est rendu tel quel —
                                     // un isError distant reste visible par le client
@@ -3927,7 +3915,7 @@ mod tests {
             .chain(crate::store_glama::STORE_GLAMA.iter())
             .chain(crate::store_github::STORE_GITHUB.iter())
             .collect();
-        assert_eq!(items.len(), 89, "la boutique doit contenir 89 serveurs");
+        assert_eq!(items.len(), 95, "la boutique doit contenir 95 serveurs");
         {
             let mut servers = lockv(&state.servers);
             for it in &items {

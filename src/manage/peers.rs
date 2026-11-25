@@ -209,7 +209,7 @@ pub fn import_peer(state: &Arc<AppState>, ip: &str) -> Value {
             }
             let is_local_on_peer = raw_host
                 .as_deref()
-                .map(crate::is_loopback_bind)
+                .map(|h| crate::is_loopback_bind(h) || matches!(h, "0.0.0.0" | "::" | "[::]" | "*"))
                 .unwrap_or(true);
             // host local côté pair → réécrire vers l'IP du pair si ce n'est pas notre machine
             let host = if is_local_on_peer {

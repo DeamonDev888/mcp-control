@@ -113,7 +113,9 @@ pub fn write_secret_file(path: &Path, secret: &str) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("dossier {} impossible : {}", parent.display(), e))?;
     }
-    let tmp = path.with_extension("key.tmp");
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp_os);
     // 1. Créer le fichier temporaire vide avant d'y poser le moindre octet secret.
     std::fs::OpenOptions::new()
         .write(true)
@@ -164,7 +166,20 @@ fn read_secret_file(path: &Path) -> Result<Option<String>, String> {
 /// illisible est une ERREUR (on ne régénère jamais une identité par accident :
 /// tout client appairé la refuserait ensuite).
 pub fn load_or_create_server(dir: &Path, service: Option<&str>) -> Result<LoadedKey, String> {
+    load_or_create_server_checked(dir, service, false)
+}
+
+/// Variante de [`load_or_create_server`] qui refuse de régénérer une nouvelle
+/// identité si une clé publique est déjà publiée dans `config.json` et que le
+/// trousseau système est indisponible (verrouillé / erreur) : évite d'écraser
+/// ou de dupliquer l'identité au repli fichier `[H-04]`.
+pub fn load_or_create_server_checked(
+    dir: &Path,
+    service: Option<&str>,
+    already_published: bool,
+) -> Result<LoadedKey, String> {
     let path = server_key_path(dir);
+    let mut keyring_err: Option<String> = None;
     if let Some(svc) = service {
         match keyring_read(svc, ACCOUNT_SERVER) {
             Ok(Some(block)) => {
@@ -177,8 +192,11 @@ pub fn load_or_create_server(dir: &Path, service: Option<&str>) -> Result<Loaded
             }
             Ok(None) => {}
             // trousseau indisponible : on ne s'arrête pas, on le DIT (l'appelant
-            // journalise le repli) — mais on ne perd pas une clé déjà en fichier.
-            Err(_) => {}
+            // journalise le repli) — mais on ne perd pas une clé déjà en fichier,
+            // et on ne régénère JAMAIS une nouvelle clé si une identité est déjà publiée.
+            Err(e) => {
+                keyring_err = Some(e);
+            }
         }
     }
     if let Some(block) = read_secret_file(&path)? {
@@ -188,6 +206,13 @@ pub fn load_or_create_server(dir: &Path, service: Option<&str>) -> Result<Loaded
             key,
             store: SecretStore::File,
         });
+    }
+    if already_published {
+        if let Some(err) = keyring_err {
+            return Err(format!(
+                "trousseau indisponible ({err}) alors qu'une identité serveur est déjà publiée — régénération refusée (déverrouille le trousseau)"
+            ));
+        }
     }
     let key = SigningKey::generate();
     let block = key.export();
@@ -285,6 +310,7 @@ pub fn load_or_create_audit_key(
     dir: &Path,
     service: Option<&str>,
 ) -> Result<LoadedAuditKey, String> {
+    let mut keyring_err: Option<String> = None;
     if let Some(svc) = service {
         match keyring_read(svc, ACCOUNT_AUDIT) {
             Ok(Some(hex)) => {
@@ -297,7 +323,9 @@ pub fn load_or_create_audit_key(
             Ok(None) => {}
             // trousseau indisponible : on continue vers le repli, l'appelant
             // journalise que le fichier est moins protecteur (§9).
-            Err(_) => {}
+            Err(e) => {
+                keyring_err = Some(e);
+            }
         }
     }
     let path = audit_key_path(dir);
@@ -307,6 +335,13 @@ pub fn load_or_create_audit_key(
             store: SecretStore::File,
             created: false,
         });
+    }
+    if crate::audit::has_audit_artifacts(&dir.join(crate::audit::AUDIT_FILE)) {
+        if let Some(err) = keyring_err {
+            return Err(format!(
+                "trousseau indisponible ({err}) alors qu'un journal d'audit existe déjà — régénération de clé HMAC refusée"
+            ));
+        }
     }
     let mut buf = [0u8; 32];
     if !crate::os_random(&mut buf) {
@@ -344,7 +379,11 @@ pub fn ensure_server_identity(state: &std::sync::Arc<crate::types::AppState>) {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let svc = service();
-    let loaded = match load_or_create_server(&dir, svc.as_deref()) {
+    let existante = {
+        let settings = crate::types::lockv(&state.settings);
+        settings.auth.server.clone()
+    };
+    let loaded = match load_or_create_server_checked(&dir, svc.as_deref(), existante.is_some()) {
         Ok(l) => l,
         Err(e) => {
             crate::manage::add_log(
@@ -359,10 +398,6 @@ pub fn ensure_server_identity(state: &std::sync::Arc<crate::types::AppState>) {
         }
     };
     let public_key = crate::crypto::hex(&loaded.key.verifying_key().to_bytes());
-    let existante = {
-        let settings = crate::types::lockv(&state.settings);
-        settings.auth.server.clone()
-    };
     let mut creee = false;
     match existante {
         Some(ident) if ident.public_key == public_key => {}

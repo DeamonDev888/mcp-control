@@ -287,7 +287,8 @@ impl Engine {
             ui_bind: self.bind,
             api_access: self.code.clone(),
         };
-        let neuf = spawn_in(cfg, self.tmp.clone(), self.discovery).map_err(|e| e.to_string())?;
+        let tmp = std::mem::take(&mut self.tmp);
+        let neuf = spawn_in(cfg, tmp, self.discovery).map_err(|e| e.to_string())?;
         *self = neuf;
         self.wait_ready(Duration::from_secs(30))
     }
@@ -922,16 +923,23 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        // kill + wait : pas de zombie. Le tmp est conservé (verrous Windows +
-        // pistage post-mortem des logs mcc-*.log).
+        // kill + wait : pas de zombie.
         let _ = self.child.kill();
         let _ = self.child.wait();
-        // Clé Run de TEST : supprimée systématiquement (jamais l'entrée réelle).
-        let _ = Command::new("reg")
-            .args(["delete", &self.reg_key, "/f"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // Clé Run de TEST et dossier temporaire : supprimés au Drop final
+        // uniquement (pas lors du swap interne d'Engine::restart, où `self.tmp`
+        // a été transféré au nouveau moteur).
+        if !self.tmp.as_os_str().is_empty() {
+            let _ = Command::new("reg")
+                .args(["delete", &self.reg_key, "/f"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            // Nettoyage RAII du dossier temporaire (désactivable via MCC_E2E_KEEP_TMP=1) [M-18].
+            if std::env::var_os("MCC_E2E_KEEP_TMP").is_none() {
+                let _ = std::fs::remove_dir_all(&self.tmp);
+            }
+        }
     }
 }
 

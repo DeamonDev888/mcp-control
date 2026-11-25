@@ -432,6 +432,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                                 s.state = SState::Down;
                             }
                         }
+                        let _ = save_config_checked(state);
                         if !restants.is_empty() {
                             let desc = decrire_processus(&restants);
                             add_log(
@@ -513,6 +514,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                             s.state = SState::Down;
                         }
                     }
+                    let _ = save_config_checked(state);
                     if !restants.is_empty() {
                         let desc = decrire_processus(&restants);
                         add_log(
@@ -574,6 +576,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                         s.state = SState::Down;
                     }
                 }
+                let _ = save_config_checked(state);
                 add_log(
                     state,
                     "warn",
@@ -614,6 +617,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     s.state = SState::Down;
                 }
             }
+            let _ = save_config_checked(state);
             add_log(
                 state,
                 "warn",
@@ -964,7 +968,13 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 req.get("user").and_then(|x| x.as_str()),
             ) {
                 (Some(i), Some(u)) if !i.trim().is_empty() && !u.trim().is_empty() => {
-                    (i.trim().to_string(), u.trim().to_string())
+                    let Some(safe_ip) = probe::ssh_safe(i.trim()) else {
+                        return json!({"ok": false, "error": "hôte SSH invalide"});
+                    };
+                    let Some(safe_user) = probe::ssh_safe(u.trim()) else {
+                        return json!({"ok": false, "error": "utilisateur SSH invalide"});
+                    };
+                    (safe_ip, safe_user)
                 }
                 _ => return json!({"ok": false, "error": "ip et user requis"}),
             };
@@ -1084,10 +1094,23 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 .unwrap_or_default();
             srv.start_cmd = Some(StartCmd {
                 program: program.clone(),
-                args,
-                workdir,
-                env,
+                args: args.clone(),
+                workdir: workdir.clone(),
+                env: env.clone(),
             });
+            // [H-13] : synchroniser aussi `Transport::Stdio` pour que `detail_json`
+            // et `bridge`/lancements reflètent la nouvelle commande.
+            if let Transport::Stdio {
+                program: ref mut tp,
+                args: ref mut ta,
+                workdir: ref mut tw,
+                ..
+            } = srv.transport
+            {
+                *tp = program.clone();
+                *ta = args;
+                *tw = workdir;
+            }
             // Un serveur découvert (scan) n'est PAS persisté (redétecté au boot).
             // Donner une commande = l'utilisateur le revendique : promotion en
             // manual pour que commande et boutons survivent au redémarrage.
@@ -1117,6 +1140,38 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     return json!({"ok": false, "error": "host requis (IP ou hostname de la machine)"});
                 }
             };
+            // [M-13] : garde SSRF sur set_host (rejette caractères de contrôle,
+            // 0.0.0.0/::, link-local 169.254.0.0/16 & fe80::/10, multicast).
+            let bare_host = host_arg
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or(&host_arg);
+            if bare_host.is_empty()
+                || bare_host.len() > 253
+                || bare_host
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace() || c == '/')
+            {
+                return json!({"ok": false, "error": "hôte invalide"});
+            }
+            if let Ok(ip) = bare_host.parse::<std::net::IpAddr>() {
+                let forbidden = match ip.to_canonical() {
+                    std::net::IpAddr::V4(v4) => {
+                        v4.is_unspecified()
+                            || v4.is_link_local()
+                            || v4.is_multicast()
+                            || v4.is_broadcast()
+                    }
+                    std::net::IpAddr::V6(v6) => {
+                        v6.is_unspecified()
+                            || v6.is_multicast()
+                            || (v6.segments()[0] & 0xffc0) == 0xfe80
+                    }
+                };
+                if forbidden {
+                    return json!({"ok": false, "error": "adresse hôte interdite (link-local, multicast ou non spécifiée)"});
+                }
+            }
             let mut servers = lockv(&state.servers);
             let Some(srv) = servers.iter_mut().find(|s| s.id == id) else {
                 return json!({"ok": false, "error": "serveur inconnu"});
@@ -1180,13 +1235,14 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 st.ssh_hosts.retain(|h| h.ip != ip);
                 before != st.ssh_hosts.len()
             };
-            if removed {
-                clear_ssh_status_one(state, &ip);
+            if !removed {
+                return json!({"ok": false, "error": "machine SSH inconnue"});
             }
+            clear_ssh_status_one(state, &ip);
             if let Err(e) = save_config_checked(state) {
                 return json!({"ok": false, "error": format!("config non écrite : {e}")});
             }
-            json!({"ok": removed})
+            json!({"ok": true})
         }
         "open_path" => {
             // « Ouvrir dans l'explorateur » (menu contextuel de l'explorateur).
@@ -1198,7 +1254,11 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            if path.is_empty() || path.chars().any(|c| c.is_control()) {
+            if path.is_empty()
+                || path.starts_with("\\\\")
+                || path.starts_with("//")
+                || path.chars().any(|c| c.is_control())
+            {
                 return json!({"ok": false, "error": "chemin invalide"});
             }
             let pb = std::path::PathBuf::from(&path);
@@ -1208,20 +1268,29 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             #[cfg(windows)]
             let mut cmd = {
                 let mut c = std::process::Command::new(probe::system_tool("explorer"));
-                if pb.is_file() {
+                if pb.is_file() && !path.contains(',') {
                     c.arg(format!("/select,{}", pb.display()));
+                } else if pb.is_file() {
+                    c.arg(pb.parent().unwrap_or(&pb));
                 } else {
                     c.arg(&pb);
                 }
                 c
             };
-            #[cfg(not(windows))]
+            #[cfg(target_os = "macos")]
             let mut cmd = {
-                let mut c = std::process::Command::new(if cfg!(target_os = "macos") {
-                    "open"
+                let mut c = std::process::Command::new("open");
+                if pb.is_file() {
+                    c.arg("-R").arg(&pb);
                 } else {
-                    "xdg-open"
-                });
+                    c.arg(&pb);
+                }
+                c
+            };
+            #[cfg(all(not(windows), not(target_os = "macos")))]
+            let mut cmd = {
+                let mut c = std::process::Command::new("xdg-open");
+                c.arg("--");
                 if pb.is_file() {
                     c.arg(pb.parent().unwrap_or(&pb));
                 } else {
@@ -1745,8 +1814,15 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     "error": "l'entrée de démarrage appartient à une autre installation : confirmez pour la réécrire (confirm:true)",
                 });
             }
+            if let Err(e) = apply_autostart(state, enable) {
+                return json!({
+                    "ok": false,
+                    "autostart": lockv(&state.settings).autostart,
+                    "active": autostart_active(),
+                    "error": e,
+                });
+            }
             lockv(&state.settings).autostart = enable;
-            apply_autostart(state, enable);
             if let Err(e) = save_config_checked(state) {
                 return json!({"ok": false, "error": format!("config non écrite : {e}")});
             }
@@ -1765,10 +1841,6 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 match servers.iter_mut().find(|s| s.id == id) {
                     Some(srv) => {
                         srv.auto_restart = enable;
-                        // réactiver l'autoboot après des échecs doit repartir de zéro
-                        if enable {
-                            lockv(&state.spawn_fails).remove(&id);
-                        }
                         (srv.label.clone(), true)
                     }
                     None => (String::new(), false),
@@ -1776,6 +1848,11 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             };
             if !found {
                 return json!({"ok": false, "error": "serveur inconnu"});
+            }
+            // [H-13] : réactiver l'autoboot remet à zéro le compteur d'échecs et
+            // le backoff dans `state.runtime` (hors verrou `servers`).
+            if enable {
+                reset_spawn_retry(state, &id);
             }
             if let Err(e) = save_config_checked(state) {
                 return json!({"ok": false, "error": format!("config non écrite : {e}")});
@@ -2416,6 +2493,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 .set_rights(keyid, rights.clone());
             match res {
                 Ok(()) => {
+                    crate::auth::confirm::purge_client(keyid);
                     if let Err(e) = save_config_checked(state) {
                         return json!({"ok": false, "error": format!("config non écrite : {e}")});
                     }
@@ -2434,6 +2512,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             let res = lockv(&state.settings).auth.revoke(keyid);
             match res {
                 Ok(()) => {
+                    crate::auth::confirm::purge_client(keyid);
                     let revoked_at = lockv(&state.settings)
                         .auth
                         .find(keyid)
@@ -2472,6 +2551,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 .rotate(keyid, new_keyid, public_key);
             match res {
                 Ok(rec) => {
+                    crate::auth::confirm::purge_client(keyid);
                     if let Err(e) = save_config_checked(state) {
                         return json!({"ok": false, "error": format!("config non écrite : {e}")});
                     }

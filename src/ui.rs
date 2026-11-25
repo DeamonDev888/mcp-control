@@ -9,6 +9,8 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MCP Control</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=__MCC_VERSION__">
+<link rel="icon" type="image/x-icon" href="/favicon.ico?v=__MCC_VERSION__">
 <link rel="stylesheet" href="/app.css?v=__MCC_VERSION__">
 <script src="/app-boot.js?v=__MCC_VERSION__"></script>
 <script src="/app.js?v=__MCC_VERSION__" defer></script>
@@ -21,11 +23,7 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x='3' y='4' width='18' height='16' rx='2'/><path d='M9 4v16'/></svg>
   </button>
   <button type="button" class="logo" data-act="go-home" id="tbHome" data-tauri-drag-region="false" aria-label="MCP Control — Retour à l'accueil (tableau de bord)" title="Retour à l'accueil — Tableau de bord MCP Control">
-    <svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
-      <rect x="2.5" y="4.5" width="19" height="15" rx="3.2" fill="none" stroke="currentColor" stroke-width="1.5"/>
-      <circle cx="8" cy="10" r="1.7" fill="currentColor"/>
-      <path d="M5.5 16.2c1.6-1.5 3.1-2.2 4.6-2.2s3 .7 4.6 2.2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-    </svg>
+    <img class="mark" src="/favicon.svg?v=__MCC_VERSION__" alt="" aria-hidden="true">
     <span class="wordmark">MCP<span class="wm-dim"> Control</span></span>
   </button>
   <span class="tb-badge ok" title="Serveurs MCP qui répondent, sur le total suivi">UP <b id="stUp">0</b>/<b id="stTotal">0</b></span>
@@ -77,6 +75,16 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 <div id="deadBanner" hidden aria-live="polite" role="status"></div>
 
 <div id="accessBanner" hidden aria-live="polite" role="status"><button type="button" id="accessBannerBtn" class="access-banner-btn" data-act="access-open" data-pending="1" title="Une demande attend une d&eacute;cision locale &mdash; cliquer pour ouvrir l'&eacute;cran Acc&egrave;s"></button></div>
+
+<div id="updateBanner" hidden aria-live="polite" role="status">
+  <div class="upd-b-main">
+    <span class="upd-b-dot" aria-hidden="true"></span>
+    <span id="updBannerTxt" class="upd-b-txt">Mise &agrave; jour en cours&hellip;</span>
+    <span id="updBannerMeta" class="upd-b-meta"></span>
+    <button type="button" id="updBannerClose" class="upd-b-close" data-act="upd-banner-close" hidden title="Fermer le bandeau">&times;</button>
+  </div>
+  <progress id="updBannerProg" class="upd-prog" max="100"></progress>
+</div>
 
 <div id="main">
   <aside id="explorer" aria-label="Explorateur de serveurs MCP">
@@ -311,6 +319,36 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
               <button type="button" id="tLight" class="seg-btn" data-act="theme" data-theme="light" aria-pressed="false" title="Th&egrave;me clair">Clair</button>
             </div>
           </div>
+          <div class="set-row">
+            <div class="set-label"><label for="sTextBright">Luminosit&eacute; des &eacute;critures</label>
+              <em id="desc_text_bright">Ajuste l'&eacute;clat des textes dans toute l'interface (60&nbsp;% &agrave; 140&nbsp;%). Conserv&eacute; sur ce poste.</em></div>
+            <div class="set-ctrl txt-bright-ctrl">
+              <input id="sTextBright" type="range" min="60" max="140" step="5" value="100" class="txt-range" data-act="text-bright" aria-describedby="desc_text_bright">
+              <span id="sTextBrightVal" class="set-static txt-bright-val">100&nbsp;%</span>
+              <button type="button" id="btnTextReset" data-act="text-style-reset" title="R&eacute;tablir la luminosit&eacute; et la couleur par d&eacute;faut">D&eacute;faut</button>
+            </div>
+          </div>
+          <div class="set-row col">
+            <div class="set-label"><span>Couleur des &eacute;critures</span>
+              <em>Teinte des textes (principaux et secondaires), calibr&eacute;e pour les th&egrave;mes sombre et clair.</em></div>
+            <div class="set-ctrl txt-swatches" role="group" aria-label="Couleur des &eacute;critures">
+              <button type="button" class="txt-sw-btn sel" data-act="text-color" data-color="default" aria-pressed="true"><span class="txt-sw-dot" aria-hidden="true"></span><span>D&eacute;faut</span></button>
+              <button type="button" class="txt-sw-btn" data-act="text-color" data-color="white" aria-pressed="false"><span class="txt-sw-dot" aria-hidden="true"></span><span>Pur</span></button>
+              <button type="button" class="txt-sw-btn" data-act="text-color" data-color="warm" aria-pressed="false"><span class="txt-sw-dot" aria-hidden="true"></span><span>Cr&egrave;me</span></button>
+              <button type="button" class="txt-sw-btn" data-act="text-color" data-color="amber" aria-pressed="false"><span class="txt-sw-dot" aria-hidden="true"></span><span>Ambre</span></button>
+              <button type="button" class="txt-sw-btn" data-act="text-color" data-color="emerald" aria-pressed="false"><span class="txt-sw-dot" aria-hidden="true"></span><span>Vert</span></button>
+              <button type="button" class="txt-sw-btn" data-act="text-color" data-color="cyan" aria-pressed="false"><span class="txt-sw-dot" aria-hidden="true"></span><span>Cyan</span></button>
+              <button type="button" class="txt-sw-btn" data-act="text-color" data-color="blue" aria-pressed="false"><span class="txt-sw-dot" aria-hidden="true"></span><span>Bleu</span></button>
+              <button type="button" class="txt-sw-btn" data-act="text-color" data-color="violet" aria-pressed="false"><span class="txt-sw-dot" aria-hidden="true"></span><span>Violet</span></button>
+              <button type="button" class="txt-sw-btn" data-act="text-color" data-color="rose" aria-pressed="false"><span class="txt-sw-dot" aria-hidden="true"></span><span>Rose</span></button>
+              <button type="button" class="txt-sw-btn" data-act="text-color" data-color="lime" aria-pressed="false"><span class="txt-sw-dot" aria-hidden="true"></span><span>Matrix</span></button>
+            </div>
+            <div class="txt-preview" aria-hidden="true">
+              <strong class="txt-prev-1">Texte principal</strong>
+              <span class="txt-prev-2">Texte secondaire</span>
+              <span class="txt-prev-3">Texte discret</span>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -449,6 +487,13 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
               <button type="button" class="primary" id="btnUpdInstall" data-act="update-download" title="T&eacute;l&eacute;charge, v&eacute;rifie (SHA-256), installe et relance automatiquement la nouvelle version"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 15.5V4m0 0L7.5 8.5M12 4l4.5 4.5'/><path d='M4 16.5V19a1.5 1.5 0 0 0 1.5 1.5h13A1.5 1.5 0 0 0 20 19v-2.5'/></svg> Mettre &agrave; jour &amp; relancer</button>
               <button type="button" data-act="release-page" title="Toutes les versions et archives"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M14 4h6v6M20 4l-9 9'/><path d='M19 14v5a1.5 1.5 0 0 1-1.5 1.5h-12A1.5 1.5 0 0 1 4 19V7.5A1.5 1.5 0 0 1 5.5 6H10'/></svg> Releases</button>
             </div>
+          </div>
+          <div class="set-row col" id="updProgRow" hidden>
+            <div class="upd-set-head">
+              <span id="updProgPhase" class="upd-set-phase">Mise &agrave; jour en cours&hellip;</span>
+              <span id="updProgMeta" class="upd-set-meta"></span>
+            </div>
+            <progress id="updProgBar" class="upd-prog upd-prog-lg" max="100"></progress>
           </div>
           <div class="set-row col" id="sSha256Row" hidden>
             <div class="set-label"><span>Empreinte SHA-256 attendue (<span id="sSha256Asset">&ndash;</span>)</span>
@@ -592,6 +637,10 @@ pub const APP_BOOT_JS: &str = include_str!("ui/app-boot.js");
 
 /// Script principal de l'UI — servis par GET /app.js (defer, après le DOM).
 pub const APP_JS: &str = include_str!("ui/app.js");
+
+pub const FAVICON_SVG: &str = include_str!("ui/favicon.svg");
+
+pub const FAVICON_ICO: &[u8] = include_bytes!("../desktop/icons/icon.ico");
 
 #[cfg(test)]
 mod tests {
@@ -1986,6 +2035,99 @@ mod tests {
                 APP_CSS.contains(cls),
                 "app.css doit définir la classe {cls}"
             );
+        }
+    }
+
+    #[test]
+    fn progression_mise_a_jour_en_direct_et_csp_stricte() {
+        for needle in [
+            r#"id="updateBanner""#,
+            r#"id="updBannerProg""#,
+            r#"id="updProgRow""#,
+            r#"id="updProgBar""#,
+            r#"data-act="upd-banner-close""#,
+        ] {
+            assert!(
+                INDEX_HTML.contains(needle),
+                "INDEX_HTML doit contenir `{needle}`"
+            );
+        }
+        for needle in [
+            "renderUpdateProgress",
+            "fmtBytes",
+            "dismissUpdateBanner",
+            "POLL_UPDATE_MS",
+            "update_status",
+        ] {
+            assert!(APP_JS.contains(needle), "APP_JS doit contenir `{needle}`");
+        }
+        for cls in ["#updateBanner", ".upd-prog"] {
+            assert!(APP_CSS.contains(cls), "APP_CSS doit définir `{cls}`");
+        }
+        for fname in ["renderUpdateProgress", "setProgressBar"] {
+            let body = fn_body(APP_JS, fname);
+            assert!(
+                !body.contains("style=") && !body.contains(".style."),
+                "{fname}() ne doit contenir aucune mutation de style en ligne (CSP stricte)"
+            );
+        }
+    }
+
+    #[test]
+    fn reglages_luminosite_et_couleur_texte_csp_stricte() {
+        for needle in [
+            r#"id="sTextBright""#,
+            r#"id="sTextBrightVal""#,
+            r#"data-act="text-bright""#,
+            r#"data-act="text-color""#,
+            r#"data-act="text-style-reset""#,
+        ] {
+            assert!(
+                INDEX_HTML.contains(needle),
+                "INDEX_HTML doit contenir `{needle}`"
+            );
+        }
+        for color in [
+            "default", "white", "warm", "amber", "emerald", "cyan", "blue", "violet", "rose",
+            "lime",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!(r#"data-color="{color}""#)),
+                "INDEX_HTML doit proposer la nuance `{color}`"
+            );
+        }
+        for needle in [
+            "applyTextStyle",
+            "applyTextColorAndSave",
+            "applyTextBrightAndSave",
+            "resetTextStyle",
+            "mcc.textColor",
+            "mcc.textBright",
+        ] {
+            assert!(APP_JS.contains(needle), "APP_JS doit contenir `{needle}`");
+        }
+        for fname in [
+            "applyTextStyle",
+            "applyTextColorAndSave",
+            "applyTextBrightAndSave",
+            "resetTextStyle",
+        ] {
+            let body = fn_body(APP_JS, fname);
+            assert!(
+                !body.contains("style=") && !body.contains(".style."),
+                "{fname}() ne doit contenir aucune mutation de style en ligne (CSP stricte)"
+            );
+        }
+        assert!(
+            APP_BOOT_JS.contains("mcc.textColor") && APP_BOOT_JS.contains("mcc.textBright"),
+            "app-boot.js doit restaurer textColor et textBright avant le premier rendu"
+        );
+        for sel in [
+            r#":root[data-text-bright]:not([data-text-bright="100"])"#,
+            r#":root[data-text-color="emerald"]"#,
+            r#":root[data-theme="light"][data-text-color="emerald"]"#,
+        ] {
+            assert!(APP_CSS.contains(sel), "APP_CSS doit définir `{sel}`");
         }
     }
 }

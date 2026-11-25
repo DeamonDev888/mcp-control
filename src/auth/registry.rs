@@ -193,7 +193,13 @@ impl ClientRecord {
     }
 
     pub fn is_active(&self) -> bool {
-        self.status == "active"
+        if self.status != "active" {
+            return false;
+        }
+        if let Some(exp) = self.expires_at.as_deref().filter(|s| !s.trim().is_empty()) {
+            return parse_iso_utc(exp).is_some_and(|ts| crate::types::now_ts() < ts);
+        }
+        true
     }
 
     /// Vrai si la clé est active et inutilisée depuis plus de 180 jours
@@ -542,6 +548,22 @@ impl litemcp::auth::sign::KeyStore for RegistryStore {
             // exactement une seconde décompression + une vérification Ed25519,
             // comme `SignatureVerifier` sur `signature_invalid`.
             verification_fantome_octets(&public_key);
+        } else {
+            // Mettre à jour `last_used_at` au plus une fois par minute [M-03]
+            // pour que `stale_180d` et l'écran « Accès » reflètent l'activité réelle.
+            let now = crate::types::now_ts();
+            let needs_touch = rec
+                .last_used_at
+                .as_deref()
+                .and_then(parse_iso_utc)
+                .map(|prev| now.saturating_sub(prev) >= 60)
+                .unwrap_or(true);
+            if needs_touch {
+                let mut settings = lockv(&self.state.settings);
+                if let Some(c) = settings.auth.clients.iter_mut().find(|c| c.keyid == keyid) {
+                    c.last_used_at = Some(crate::types::iso_utc(now));
+                }
+            }
         }
         let mut key = litemcp::auth::sign::ClientKey::new(rec.keyid.clone(), public_key);
         if !rec.label.is_empty() {

@@ -240,9 +240,98 @@ pub struct StdioHandle {
     pub rpc: Option<std::sync::Arc<std::sync::Mutex<StdioRpc>>>,
 }
 
+/// Sous Windows, associe un sous-processus au Job Object partagé configuré avec
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` : si MCP Control meurt brutalement,
+/// Windows termine automatiquement tous ses sous-processus sans laisser
+/// d'orphelins. Best-effort (silencieux si un Job parent interdit l'imbrication).
+#[cfg(windows)]
+fn assign_child_to_job(pid: u32) {
+    use std::sync::OnceLock;
+    #[repr(C)]
+    struct JobObjectBasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+    #[repr(C)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+    #[repr(C)]
+    struct JobObjectExtendedLimitInformation {
+        basic_limit_information: JobObjectBasicLimitInformation,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateJobObjectW(attrs: *const std::ffi::c_void, name: *const u16) -> isize;
+        fn SetInformationJobObject(
+            job: isize,
+            class: u32,
+            info: *const std::ffi::c_void,
+            len: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(job: isize, process: isize) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+    const PROCESS_SET_QUOTA: u32 = 0x0100;
+    const PROCESS_TERMINATE: u32 = 0x0001;
+
+    static JOB: OnceLock<isize> = OnceLock::new();
+    let job = *JOB.get_or_init(|| unsafe {
+        let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if h == 0 {
+            return 0;
+        }
+        let mut info: JobObjectExtendedLimitInformation = std::mem::zeroed();
+        info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            h,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            (&info as *const JobObjectExtendedLimitInformation).cast(),
+            std::mem::size_of::<JobObjectExtendedLimitInformation>() as u32,
+        );
+        if ok == 0 {
+            CloseHandle(h);
+            return 0;
+        }
+        h
+    });
+    if job == 0 || pid == 0 {
+        return;
+    }
+    unsafe {
+        let proc_h = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+        if proc_h != 0 {
+            let _ = AssignProcessToJobObject(job, proc_h);
+            CloseHandle(proc_h);
+        }
+    }
+}
+
 /// Construit le handle et démarre le watcher qui récolte la sortie du process.
 fn handle_de_child(mut child: Child, rpc: Option<StdioRpc>) -> StdioHandle {
     let pid = child.id();
+    #[cfg(windows)]
+    assign_child_to_job(pid);
     let started = process_creation(pid);
     let exit = std::sync::Arc::new(std::sync::Mutex::new(None));
     let slot = std::sync::Arc::clone(&exit);
@@ -376,7 +465,7 @@ fn resolve_windows_cmd(program: &str) -> String {
         let p = std::path::Path::new(program);
         if p.extension().is_none() {
             if program.contains('\\') || program.contains('/') {
-                for ext in ["cmd", "bat", "exe"] {
+                for ext in ["exe", "cmd", "bat"] {
                     let cand = std::path::PathBuf::from(format!("{program}.{ext}"));
                     if cand.exists() {
                         return cand.to_string_lossy().to_string();
@@ -389,7 +478,7 @@ fn resolve_windows_cmd(program: &str) -> String {
                     if dir.is_empty() {
                         continue;
                     }
-                    for ext in ["cmd", "bat", "exe"] {
+                    for ext in ["exe", "cmd", "bat"] {
                         let cand = std::path::Path::new(dir).join(format!("{program}.{ext}"));
                         if cand.exists() {
                             return cand.to_string_lossy().to_string();
@@ -410,20 +499,26 @@ fn resolve_windows_cmd(program: &str) -> String {
 /// renvoie `(node_exe, npx_cli_js)` pour contourner `cmd.exe` / `npx.cmd`.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn resolve_npx_in_dir(dir: &std::path::Path) -> Option<(String, String)> {
-    let node_exe = dir.join("node.exe");
     let npx_cli = dir
         .join("node_modules")
         .join("npm")
         .join("bin")
         .join("npx-cli.js");
-    if node_exe.is_file() && npx_cli.is_file() {
-        Some((
-            node_exe.to_string_lossy().to_string(),
-            npx_cli.to_string_lossy().to_string(),
-        ))
-    } else {
-        None
+    if !npx_cli.is_file() {
+        return None;
     }
+    let local_node = dir.join("node.exe");
+    let node_exe = if local_node.is_file() {
+        local_node.to_string_lossy().to_string()
+    } else {
+        let on_path = resolve_windows_cmd("node");
+        if std::path::Path::new(&on_path).is_file() {
+            on_path
+        } else {
+            return None;
+        }
+    };
+    Some((node_exe, npx_cli.to_string_lossy().to_string()))
 }
 
 /// Résout la commande réelle à spawner pour un serveur stdio :
@@ -1128,9 +1223,19 @@ pub fn kill_port(port: u16) {
 
 #[cfg(not(windows))]
 fn kill_pid_unix(pid: u32) {
-    let mut c = Command::new("kill");
-    probe_hidden_cmd(&mut c);
-    let _ = c.arg("-9").arg(pid.to_string()).status();
+    if pid == 0 || pid == std::process::id() || pid > i32::MAX as u32 {
+        return;
+    }
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+    unsafe {
+        // Tue le groupe de processus (-pid) s'il a été lancé avec process_group(0),
+        // puis le PID directement par sécurité.
+        let _ = kill(-(pid as i32), SIGKILL);
+        let _ = kill(pid as i32, SIGKILL);
+    }
 }
 
 /// Spawn un process serveur (HTTP/HTTPS lancé par MCP Control) sans handshake
@@ -1158,6 +1263,11 @@ pub fn spawn_process(
         // (contrairement à DETACHED_PROCESS qui fait ignorer CREATE_NO_WINDOW par
         // Win32 et échoue dans un JobObject sans breakaway) tout en isolant Ctrl+C.
         cmd.creation_flags(0x0800_0000 | 0x0000_0200);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
     }
     if let Some(wd) = workdir {
         cmd.current_dir(wd);
@@ -2169,13 +2279,29 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 pub fn socket_addr(host: &str, port: u16) -> Result<SocketAddr, std::net::AddrParseError> {
+    let bare = host
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host.trim());
     // crochets uniquement pour IPv6 ("[::1]:p") ; "127.0.0.1:p" tel quel
-    let s = if host.contains(':') {
-        format!("[{}]:{}", host, port)
+    let s = if bare.contains(':') {
+        format!("[{}]:{}", bare, port)
     } else {
-        format!("{}:{}", host, port)
+        format!("{}:{}", bare, port)
     };
-    s.parse()
+    match s.parse() {
+        Ok(addr) => Ok(addr),
+        Err(parse_err) => {
+            // [H-16] : repli DNS (ex. "localhost" ou hostname LAN) via ToSocketAddrs.
+            if let Ok(mut iter) = std::net::ToSocketAddrs::to_socket_addrs(&(bare, port)) {
+                if let Some(addr) = iter.next() {
+                    return Ok(addr);
+                }
+            }
+            Err(parse_err)
+        }
+    }
 }
 
 pub fn port_open(host: &str, port: u16, timeout: Duration) -> bool {
@@ -2510,9 +2636,10 @@ pub fn probe_mcp_any_path(port: u16, timeout_ms: u64) -> Option<(&'static str, M
 /// Sanitize d'un hôte/utilisateur pour la ligne de commande ssh (anti-injection :
 /// ces valeurs arrivent de l'UI). Hôte : lettres/chiffres/point/tiret/deux-points
 /// (IPv6) ; utilisateur : lettres/chiffres/point/tiret/underscore.
-fn ssh_safe(s: &str) -> Option<String> {
+pub(crate) fn ssh_safe(s: &str) -> Option<String> {
     let ok = !s.is_empty()
         && s.len() <= 253
+        && !s.starts_with('-')
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'));
     if ok {
@@ -2651,6 +2778,8 @@ pub fn ssh_path_safe(s: &str) -> Option<String> {
     if t.is_empty()
         || t.len() > 512
         || t.starts_with('-')
+        || t.starts_with("\\\\")
+        || t.starts_with("//")
         || t.chars().any(|c| c.is_control() || c == '\0')
     {
         return None;
@@ -2708,6 +2837,10 @@ pub(crate) fn build_ssh_args(
         "StrictHostKeyChecking=accept-new".to_string(),
         "-o".to_string(),
         format!("ConnectTimeout={}", connect_timeout.clamp(2, 15)),
+        "-o".to_string(),
+        "ServerAliveInterval=5".to_string(),
+        "-o".to_string(),
+        "ServerAliveCountMax=2".to_string(),
     ];
     if let Some(port) = target.port {
         if port == 0 {
@@ -2727,6 +2860,7 @@ pub(crate) fn build_ssh_args(
         args.push("-i".to_string());
         args.push(key);
     }
+    args.push("--".to_string());
     args.push(format!("{user}@{host}"));
     args.push(remote_cmd.to_string());
     Ok(args)
@@ -2734,33 +2868,15 @@ pub(crate) fn build_ssh_args(
 
 /// Exécute une commande sur la machine distante via le client ssh système
 /// (aucune dépendance : ssh.exe/OpenSSH livré avec Windows). Auth par clé
-/// obligatoire : BatchMode interdit toute invite. Retourne stdout, ou l'erreur
-/// ssh en clair (avec indication) pour l'UI.
+/// obligatoire : BatchMode interdit toute invite. Routée via [`ssh_exec_stdin`]
+/// pour garantir une lecture bornée (4 Mio) et une échéance globale `[H-11]`.
 fn ssh_exec_target(
     target: &SshTarget<'_>,
     remote_cmd: &str,
     connect_timeout: u64,
 ) -> Result<String, String> {
-    let args = build_ssh_args(target, remote_cmd, connect_timeout)?;
-    let mut cmd = system_command("ssh");
-    cmd.args(&args);
-    probe_hidden_cmd(&mut cmd);
-    let out = cmd
-        .output()
-        .map_err(|e| format!("client ssh introuvable ou injoignable : {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    if !out.status.success() && stdout.trim().is_empty() {
-        let hint = ssh_error_hint(&stderr);
-        return Err(format!(
-            "ssh {}@{} : {}{}",
-            target.user,
-            target.host,
-            stderr.trim(),
-            hint
-        ));
-    }
-    Ok(stdout)
+    let io_timeout = connect_timeout.saturating_add(12).clamp(15, 60);
+    ssh_exec_stdin(target, remote_cmd, b"", connect_timeout, io_timeout)
 }
 
 #[allow(dead_code)]
@@ -2895,7 +3011,7 @@ pub fn ssh_health(host: &str, user: &str, timeout_secs: u64) -> Result<(), Strin
 pub fn ssh_netstat_target(target: &SshTarget<'_>, timeout_secs: u64) -> Result<Vec<u16>, String> {
     let stdout = ssh_exec_target(
         target,
-        "netstat -ano | findstr LISTENING || ss -tln",
+        "netstat -ano | findstr LISTENING || ss -tln || netstat -an -p tcp",
         timeout_secs,
     )?;
     Ok(parse_listening_ports(&stdout))
@@ -3092,10 +3208,10 @@ pub fn ssh_probe_server_target(
     // session sanitisée (uuid) puis rejouée. AUCUNE double-quote dans la
     // commande distante (l'échappement Windows ssh les mutilerait) : l'en-tête
     // est toujours ajouté — vide quand le serveur n'en émet pas (ignoré).
-    let tmp = "/tmp/.mcc_session_$$";
     let remote = format!(
-        "{init_curl} -D {tmp}; sid=$(grep -i mcp-session-id {tmp} | head -n 1 | tr -d '\\r' | sed 's/^[^:]*: *//' | tr -cd 'A-Za-z0-9-_' | head -c 100); \
-         rm -f {tmp}; echo __MCC_SEP__; {tools_curl} -H 'Mcp-Session-Id:'$sid; echo; \
+        "tmp=$(mktemp /tmp/.mcc_session.XXXXXX 2>/dev/null || echo /tmp/.mcc_session_$$); \
+         {init_curl} -D $tmp; sid=$(grep -i mcp-session-id $tmp | head -n 1 | tr -d '\\r' | sed 's/^[^:]*: *//' | tr -cd 'A-Za-z0-9-_' | head -c 100); \
+         rm -f $tmp; echo __MCC_SEP__; {tools_curl} -H 'Mcp-Session-Id:'$sid; echo; \
          echo __MCC_DOCKER__; \
          if command -v docker >/dev/null 2>&1; then \
            (command -v timeout >/dev/null 2>&1 && timeout 2 docker ps --format '{{{{.Names}}}}|{{{{.Ports}}}}' || docker ps --format '{{{{.Names}}}}|{{{{.Ports}}}}') 2>/dev/null; \
@@ -3107,7 +3223,6 @@ pub fn ssh_probe_server_target(
          for p in $(ss -tlnp 2>/dev/null | grep -E ':{port}([^0-9]|$)' | grep -o 'pid=[0-9]*' | cut -d= -f2); do cat /proc/$p/cgroup 2>/dev/null; done",
         init_curl = mcp_remote_curl(&port.to_string(), &path, &init, curl_timeout),
         tools_curl = mcp_remote_curl(&port.to_string(), &path, &tools, curl_timeout),
-        tmp = tmp,
         port = port,
     );
     let out = match ssh_exec_target(target, &remote, 8) {
@@ -4080,11 +4195,18 @@ fn http_request_trusted(
             for (n, v) in trusted_headers {
                 // SÉCURITÉ : un CR/LF Allow-Injection d'en-têtes (request
                 // splitting) reste interdit — seuls les espaces et la
-                // ponctuation sont tolérés.
+                // ponctuation sont tolérés. Les en-têtes de cadrage réservés
+                // sont ignorés pour éviter tout doublon `[H-17]`.
                 if v.is_empty() || v.len() > 512 || v.contains('\r') || v.contains('\n') {
                     continue;
                 }
                 if n.contains('\r') || n.contains('\n') || n.contains(':') {
+                    continue;
+                }
+                if matches!(
+                    n.to_ascii_lowercase().as_str(),
+                    "host" | "content-length" | "transfer-encoding" | "connection"
+                ) {
                     continue;
                 }
                 req.push_str(&format!("{}: {}\r\n", n, v));
@@ -4103,6 +4225,7 @@ fn http_request_trusted(
             if let Err(e) = stream.write_all(req.as_bytes()) {
                 last_err = format!("écriture: {e}");
             } else {
+                const MAX_TRUSTED_READ: usize = 256 * 1024;
                 let mut data = Vec::new();
                 let mut tmp = [0u8; 16384];
                 let deadline = Instant::now() + timeout;
@@ -4110,7 +4233,7 @@ fn http_request_trusted(
                 let mut status_ok = false;
                 loop {
                     let remain = deadline.saturating_duration_since(Instant::now());
-                    if remain.is_zero() {
+                    if remain.is_zero() || data.len() >= MAX_TRUSTED_READ {
                         break;
                     }
                     if header_len.is_none() {
@@ -4140,7 +4263,10 @@ fn http_request_trusted(
                     }
                     match stream.read(&mut tmp) {
                         Ok(0) => break,
-                        Ok(n) => data.extend_from_slice(&tmp[..n]),
+                        Ok(n) => {
+                            let take = n.min(MAX_TRUSTED_READ.saturating_sub(data.len()));
+                            data.extend_from_slice(&tmp[..take]);
+                        }
                         Err(e) => {
                             last_err = format!("lecture: {e}");
                             break;
@@ -4544,6 +4670,7 @@ fn dechunk(data: &[u8]) -> Vec<u8> {
 /// Extrait le JSON-RPC d'une réponse (JSON brut ou flux SSE avec lignes "data:").
 pub fn extract_json(body: &[u8]) -> Option<Value> {
     let text = String::from_utf8_lossy(body);
+    let mut sse_buf = String::new();
     for line in text.lines() {
         let t = line.trim();
         if let Some(rest) = t.strip_prefix("data:") {
@@ -4553,11 +4680,38 @@ pub fn extract_json(body: &[u8]) -> Option<Value> {
                     return Some(v);
                 }
             }
+            if !sse_buf.is_empty() {
+                sse_buf.push('\n');
+            }
+            sse_buf.push_str(rest);
+        } else if t.is_empty() && !sse_buf.is_empty() {
+            if let Ok(v) = serde_json::from_str::<Value>(&sse_buf) {
+                if v.get("result").is_some() || v.get("error").is_some() {
+                    return Some(v);
+                }
+            }
+            sse_buf.clear();
+        }
+    }
+    if !sse_buf.is_empty() {
+        if let Ok(v) = serde_json::from_str::<Value>(&sse_buf) {
+            if v.get("result").is_some() || v.get("error").is_some() {
+                return Some(v);
+            }
         }
     }
     if let Some(start) = text.find('{') {
         if let Ok(v) = serde_json::from_str::<Value>(text[start..].trim()) {
             return Some(v);
+        }
+        // Si le corps est encore encodé en chunked (`<hex>\r\n{...}\r\n0\r\n`),
+        // extraire entre le premier `{` et le dernier `}` `[M-12]`.
+        if let Some(end) = text.rfind('}') {
+            if end > start {
+                if let Ok(v) = serde_json::from_str::<Value>(&text[start..=end]) {
+                    return Some(v);
+                }
+            }
         }
         for line in text.lines() {
             let t = line.trim();
@@ -4898,28 +5052,16 @@ pub fn probe_http_with(port: u16, path: &str, timeout_ms: u64, hint: &ProbeHint<
         session_hdr.push(("MCP-Protocol-Version", "2026-07-28"));
         session_hdr.push(("Mcp-Method", "tools/list"));
     }
-    let tools_params = if stateless_mode {
-        json!({ "_meta": strict_meta })
-    } else {
-        json!({})
-    };
-    let mut tools = Vec::new();
-    if let Ok((tr, _)) = rpc_call_host_headers(
+    let tools = fetch_http_tools_paginated(
         &host,
         port,
         path,
-        "tools/list",
-        tools_params,
-        2,
         timeout_ms,
+        stateless_mode,
+        &head.session_id,
+        &strict_meta,
         &session_hdr,
-    ) {
-        if let Some(arr) = tr.get("tools").and_then(|t| t.as_array()) {
-            for t in arr {
-                tools.push(parse_tool_info(t));
-            }
-        }
-    }
+    );
     let locked = crate::auth::net::outbound_identity_for(&host, port)
         .ok()
         .flatten()
@@ -5036,6 +5178,32 @@ fn stderr_summary(tail: &std::collections::VecDeque<String>) -> String {
 
 /// Probe/handshake MCP stdio (JSON délimité par nouvelles lignes sur stdin/stdout).
 /// keep_alive=true → ne tue pas le process, renvoie un StdioHandle.
+/// Interpole `${VAR}` dans les arguments d'un serveur stdio à partir de ses
+/// variables d'environnement configurées (ex. `at-browseract` qui passe
+/// `Authorization: Bearer ${BROWSERACT_API_KEY}`) — jamais journalisé `[B-03]`.
+fn interpolate_env_args(args: &[String], env: &[(String, String)]) -> Vec<String> {
+    if env.is_empty() {
+        return args.to_vec();
+    }
+    args.iter()
+        .map(|arg| {
+            if !arg.contains("${") {
+                return arg.clone();
+            }
+            let mut out = arg.clone();
+            for (k, v) in env {
+                if !k.is_empty() {
+                    let needle = format!("${{{k}}}");
+                    if out.contains(&needle) {
+                        out = out.replace(&needle, v);
+                    }
+                }
+            }
+            out
+        })
+        .collect()
+}
+
 pub fn probe_stdio(
     program: &str,
     args: &[String],
@@ -5045,7 +5213,8 @@ pub fn probe_stdio(
     env: &[(String, String)],
 ) -> Result<(McpProbe, Option<StdioHandle>), String> {
     let t0 = Instant::now();
-    let (launch_program, launch_args) = resolve_stdio_command(program, args);
+    let expanded_args = interpolate_env_args(args, env);
+    let (launch_program, launch_args) = resolve_stdio_command(program, &expanded_args);
     let mut cmd = Command::new(&launch_program);
     cmd.args(&launch_args)
         .stdin(Stdio::piped())
@@ -5074,6 +5243,11 @@ pub fn probe_stdio(
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
     }
     if let Some(wd) = workdir {
         cmd.current_dir(wd);
@@ -5430,6 +5604,76 @@ pub fn parse_tool_info(t: &Value) -> ToolInfo {
 /// Exécute un appel `tools/call` sur un serveur MCP HTTP (mode stateless LiteMCP
 /// `2026-07-28` ou MCP HTTP standard avec repli automatique `initialize` pour
 /// récupérer `Mcp-Session-Id`). Retourne `(résultat, durée_ms)`.
+/// Récupère tous les outils d'un serveur HTTP MCP avec pagination `nextCursor`
+/// (plafonné à 16 pages) et notification `notifications/initialized` préalable
+/// en mode stateful (`Mcp-Session-Id`) `[H-15]`.
+#[allow(clippy::too_many_arguments)]
+fn fetch_http_tools_paginated(
+    host: &str,
+    port: u16,
+    path: &str,
+    timeout_ms: u64,
+    stateless_mode: bool,
+    session_id: &str,
+    strict_meta: &Value,
+    session_hdr: &[(&str, &str)],
+) -> Vec<ToolInfo> {
+    if !stateless_mode && !session_id.is_empty() {
+        let notif = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let _ = http_post_host(
+            host,
+            port,
+            path,
+            notif,
+            timeout_ms.min(2000),
+            &[("Mcp-Session-Id", session_id)],
+        );
+    }
+    let mut tools = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for page in 0..16u64 {
+        let mut params = if stateless_mode {
+            json!({ "_meta": strict_meta })
+        } else {
+            json!({})
+        };
+        if let Some(ref c) = cursor {
+            if let Some(obj) = params.as_object_mut() {
+                obj.insert("cursor".into(), json!(c));
+            }
+        }
+        let Ok((tr, _)) = rpc_call_host_headers(
+            host,
+            port,
+            path,
+            "tools/list",
+            params,
+            2 + page,
+            timeout_ms,
+            session_hdr,
+        ) else {
+            break;
+        };
+        if let Some(arr) = tr.get("tools").and_then(|t| t.as_array()) {
+            for t in arr {
+                tools.push(parse_tool_info(t));
+            }
+        }
+        let next = tr
+            .get("nextCursor")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        match next {
+            Some(c) if seen_cursors.insert(c.clone()) => cursor = Some(c),
+            _ => break,
+        }
+    }
+    tools
+}
+
 pub fn call_http_tool(
     host: &str,
     port: u16,
@@ -5449,7 +5693,7 @@ pub fn call_http_tool(
         if let Some(obj) = params.as_object_mut() {
             obj.insert(
                 "_meta".into(),
-                json!({"mcpProtocolVersion": crate::LITEMCP_PROTOCOL}),
+                json!({"io.modelcontextprotocol/protocolVersion": crate::LITEMCP_PROTOCOL}),
             );
         }
         let hdrs = [
@@ -5470,7 +5714,7 @@ pub fn call_http_tool(
         return Ok((res, t0.elapsed().as_millis() as u64));
     }
 
-    // Mode MCP HTTP standard : essai direct, puis repli initialize + Mcp-Session-Id
+    // Mode MCP HTTP standard : essai direct, puis repli initialize + notifications/initialized + Mcp-Session-Id
     match rpc_call_host_headers(
         host,
         port,
@@ -5504,6 +5748,8 @@ pub fn call_http_tool(
                 return Err(first_err);
             }
             let hdrs = [("Mcp-Session-Id", head.session_id.as_str())];
+            let notif = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+            let _ = http_post_host(host, port, path, notif, timeout_ms.min(2000), &hdrs);
             let (res, _) = rpc_call_host_headers(
                 host,
                 port,
@@ -5789,28 +6035,16 @@ pub fn probe_http_host_with(
         session_hdr.push(("MCP-Protocol-Version", "2026-07-28"));
         session_hdr.push(("Mcp-Method", "tools/list"));
     }
-    let tools_params = if stateless_mode {
-        json!({ "_meta": strict_meta })
-    } else {
-        json!({})
-    };
-    let mut tools = Vec::new();
-    if let Ok((tr, _)) = rpc_call_host_headers(
+    let tools = fetch_http_tools_paginated(
         host,
         port,
         path,
-        "tools/list",
-        tools_params,
-        2,
         timeout_ms,
+        stateless_mode,
+        &head.session_id,
+        &strict_meta,
         &session_hdr,
-    ) {
-        if let Some(arr) = tr.get("tools").and_then(|t| t.as_array()) {
-            for t in arr {
-                tools.push(parse_tool_info(t));
-            }
-        }
-    }
+    );
     let locked = crate::auth::net::outbound_identity_for(host, port)
         .ok()
         .flatten()
@@ -6030,10 +6264,11 @@ pub fn control_ui_at_hosts(port: u16, hosts: &[&str]) -> Option<String> {
         if let Ok((bytes, _)) = http_get_host(host, port, "/api/hello", 2000) {
             if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
                 if v.get("app").and_then(|x| x.as_str()) == Some("mcp-control") {
-                    let h = if host.contains(':') {
-                        format!("[{}]:{}", host, port)
+                    let clean = host.trim_start_matches('[').trim_end_matches(']');
+                    let h = if clean.contains(':') {
+                        format!("[{}]:{}", clean, port)
                     } else {
-                        format!("{}:{}", host, port)
+                        format!("{}:{}", clean, port)
                     };
                     return Some(format!("http://{}", h));
                 }
@@ -6055,12 +6290,13 @@ pub fn control_ui_at_hosts(port: u16, hosts: &[&str]) -> Option<String> {
                 if let Some(sep) = find_sub(&raw, b"\r\n\r\n") {
                     if let Ok(v) = serde_json::from_slice::<Value>(&raw[sep + 4..]) {
                         if v.get("app").and_then(|x| x.as_str()) == Some("mcp-control") {
-                            let h = if host.contains(':') {
-                                format!("[{}]:{}", host, port)
+                            let clean = host.trim_start_matches('[').trim_end_matches(']');
+                            let h = if clean.contains(':') {
+                                format!("[{}]:{}", clean, port)
                             } else {
-                                format!("{}:{}", host, port)
+                                format!("{}:{}", clean, port)
                             };
-                            return Some(format!("http://{}", h));
+                            return Some(format!("https://{}", h));
                         }
                     }
                 }

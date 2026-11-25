@@ -157,7 +157,7 @@ jobs:
       # `tauri build` réutilise le binaire déjà compilé et n'ajoute que le bundle.
       - name: CLI Tauri (Windows — installateur NSIS)
         if: runner.os == 'Windows'
-        run: npm install --global @tauri-apps/cli@^2
+        run: npm install --global @tauri-apps/cli@2.5.0
 
       - name: Installateur NSIS (Windows — wizard)
         if: runner.os == 'Windows'
@@ -189,6 +189,9 @@ jobs:
           if [ -n "$SETUP" ]; then
             cp "$SETUP" "${{ matrix.artifact }}-setup.exe"
             echo "SETUP=${{ matrix.artifact }}-setup.exe" >> "$GITHUB_ENV"
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            echo "Erreur : installateur NSIS introuvable sous target/${{ matrix.target }}/release/bundle/nsis/" >&2
+            exit 1
           fi
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (épinglé SHA)
@@ -230,7 +233,7 @@ jobs:
 
       - name: Générer les SBOM
         run: |
-          cargo cyclonedx --format json --spec-version 1.5
+          cargo cyclonedx --format json --spec-version 1.5 --all-features
           cp mcp-control.cdx.json dist/
           cp desktop/mcp-control-desktop.cdx.json dist/
           ls -l dist/*.cdx.json
@@ -249,7 +252,7 @@ jobs:
       - uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
           subject-path: |
-            dist/mcp-control-*
+            dist/mcp-control*
             dist/SHA256SUMS.txt
 
       # Signature keyless (pas de clé privée à stocker) : le certificat éphémère
