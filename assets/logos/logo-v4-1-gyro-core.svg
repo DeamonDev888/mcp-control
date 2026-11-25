@@ -1,0 +1,146 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Deep Space Obsidian Chassis -->
+    <linearGradient id="bg41" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#141824"/>
+      <stop offset="50%" stop-color="#0b0e16"/>
+      <stop offset="100%" stop-color="#06070c"/>
+    </linearGradient>
+
+    <radialGradient id="aura41" cx="50%" cy="50%" r="54%">
+      <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.32"/>
+      <stop offset="45%" stop-color="#1d4ed8" stop-opacity="0.10"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="rim41" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#93c5fd" stop-opacity="0.28"/>
+      <stop offset="30%" stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.02"/>
+    </linearGradient>
+
+    <!-- Orbital Ring Metallic/Glass Gradients -->
+    <linearGradient id="orbitBlue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#bfdbfe" stop-opacity="0.95"/>
+      <stop offset="45%" stop-color="#3b82f6" stop-opacity="0.75"/>
+      <stop offset="100%" stop-color="#1e3a8a" stop-opacity="0.25"/>
+    </linearGradient>
+
+    <linearGradient id="orbitCyan" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#6ee7b7" stop-opacity="0.9"/>
+      <stop offset="45%" stop-color="#38bdf8" stop-opacity="0.75"/>
+      <stop offset="100%" stop-color="#1e40af" stop-opacity="0.2"/>
+    </linearGradient>
+
+    <linearGradient id="orbitBack" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#60a5fa" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#1d4ed8" stop-opacity="0.08"/>
+    </linearGradient>
+
+    <!-- Luminous Core Sphere -->
+    <radialGradient id="core41" cx="35%" cy="30%" r="68%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="28%" stop-color="#e0f2fe"/>
+      <stop offset="65%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#1e3a8a"/>
+    </radialGradient>
+
+    <!-- Pearl Satellite -->
+    <radialGradient id="satPearl" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="55%" stop-color="#dbeafe"/>
+      <stop offset="100%" stop-color="#3b82f6"/>
+    </radialGradient>
+
+    <!-- Emerald Satellite -->
+    <radialGradient id="satEmerald" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#d1fae5"/>
+      <stop offset="50%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#047857"/>
+    </radialGradient>
+
+    <filter id="glowCore41" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="0" stdDeviation="20" flood-color="#3b82f6" flood-opacity="0.65"/>
+    </filter>
+
+    <filter id="glowSat41" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="0" stdDeviation="8" flood-color="#60a5fa" flood-opacity="0.6"/>
+    </filter>
+
+    <filter id="glowEm41" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="0" stdDeviation="10" flood-color="#34d399" flood-opacity="0.75"/>
+    </filter>
+
+    <!-- Clip Paths for True 3D Front/Back Orbit Layering -->
+    <clipPath id="frontClipA">
+      <rect x="0" y="256" width="512" height="256"/>
+    </clipPath>
+    <clipPath id="backClipA">
+      <rect x="0" y="0" width="512" height="256"/>
+    </clipPath>
+  </defs>
+
+  <!-- App Squircle -->
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#bg41)"/>
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#aura41)"/>
+  <rect x="25.5" y="25.5" width="461" height="461" rx="106.5" fill="none" stroke="url(#rim41)" stroke-width="2.5"/>
+
+  <!-- Subtle Equatorial Reference Ring -->
+  <circle cx="256" cy="256" r="162" fill="none" stroke="#93c5fd" stroke-opacity="0.09" stroke-width="1.5" stroke-dasharray="4 8"/>
+
+  <!-- BACK HALVES OF TILTED ORBITS (Behind the core) -->
+  <g transform="rotate(-32 256 256)" clip-path="url(#backClipA)">
+    <ellipse cx="256" cy="256" rx="172" ry="66" fill="none" stroke="url(#orbitBack)" stroke-width="7"/>
+  </g>
+  <g transform="rotate(32 256 256)" clip-path="url(#backClipA)">
+    <ellipse cx="256" cy="256" rx="172" ry="66" fill="none" stroke="url(#orbitBack)" stroke-width="7"/>
+  </g>
+
+  <!-- Vertical Subtle Meridian Ring (Back) -->
+  <ellipse cx="256" cy="256" rx="54" ry="156" fill="none" stroke="#60a5fa" stroke-opacity="0.16" stroke-width="2.5"/>
+
+  <!-- CENTRAL LUMINOUS SINGULARITY CORE -->
+  <g filter="url(#glowCore41)">
+    <!-- Precision Halo Ring -->
+    <circle cx="256" cy="256" r="64" fill="#090e1c" fill-opacity="0.85" stroke="#60a5fa" stroke-opacity="0.45" stroke-width="2"/>
+    <!-- Main Core Orb -->
+    <circle cx="256" cy="256" r="50" fill="url(#core41)"/>
+    <!-- Crisp Glass Specular Highlight -->
+    <path d="M 226 234 A 38 38 0 0 1 280 224" fill="none" stroke="#ffffff" stroke-opacity="0.82" stroke-width="5" stroke-linecap="round"/>
+    <circle cx="236" cy="236" r="6" fill="#ffffff" opacity="0.6"/>
+  </g>
+
+  <!-- FRONT HALVES OF TILTED ORBITS (Sweeping cleanly in front of the core) -->
+  <g transform="rotate(-32 256 256)" clip-path="url(#frontClipA)">
+    <ellipse cx="256" cy="256" rx="172" ry="66" fill="none" stroke="url(#orbitBlue)" stroke-width="9" stroke-linecap="round"/>
+    <ellipse cx="256" cy="256" rx="172" ry="66" fill="none" stroke="#ffffff" stroke-opacity="0.45" stroke-width="2"/>
+  </g>
+  <g transform="rotate(32 256 256)" clip-path="url(#frontClipA)">
+    <ellipse cx="256" cy="256" rx="172" ry="66" fill="none" stroke="url(#orbitCyan)" stroke-width="9" stroke-linecap="round"/>
+    <ellipse cx="256" cy="256" rx="172" ry="66" fill="none" stroke="#ffffff" stroke-opacity="0.4" stroke-width="2"/>
+  </g>
+
+  <!-- ORBITING SERVER NODES (Positioned precisely on the ellipses) -->
+  <!-- Top-Right Emerald Active Node -->
+  <g transform="translate(384, 152)" filter="url(#glowEm41)">
+    <circle cx="0" cy="0" r="19" fill="#061412" stroke="#34d399" stroke-width="3"/>
+    <circle cx="0" cy="0" r="11" fill="url(#satEmerald)"/>
+    <circle cx="-3" cy="-3" r="3" fill="#ffffff" opacity="0.8"/>
+  </g>
+
+  <!-- Bottom-Left Sapphire Node -->
+  <g transform="translate(122, 344)" filter="url(#glowSat41)">
+    <circle cx="0" cy="0" r="18" fill="#091122" stroke="#60a5fa" stroke-width="3"/>
+    <circle cx="0" cy="0" r="10.5" fill="url(#satPearl)"/>
+  </g>
+
+  <!-- Bottom-Right Node -->
+  <g transform="translate(390, 344)" filter="url(#glowSat41)">
+    <circle cx="0" cy="0" r="15" fill="#091122" stroke="#93c5fd" stroke-width="2.5"/>
+    <circle cx="0" cy="0" r="8.5" fill="url(#satPearl)"/>
+  </g>
+
+  <!-- Top Meridian Micro-Node -->
+  <circle cx="256" cy="100" r="8.5" fill="#0b1120" stroke="#93c5fd" stroke-width="2.5"/>
+  <circle cx="256" cy="100" r="3.5" fill="#ffffff"/>
+</svg>

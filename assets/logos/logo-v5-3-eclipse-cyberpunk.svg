@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Deep Ultraviolet-Obsidian Chassis -->
+    <linearGradient id="bg53" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#130921"/>
+      <stop offset="55%" stop-color="#090412"/>
+      <stop offset="100%" stop-color="#040208"/>
+    </linearGradient>
+
+    <linearGradient id="rim53" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.38"/>
+      <stop offset="45%" stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#f43f5e" stop-opacity="0.28"/>
+    </linearGradient>
+
+    <!-- Cyberpunk Dual-Bloom Ambient Corona -->
+    <radialGradient id="corona53a" cx="38%" cy="35%" r="48%">
+      <stop offset="0%" stop-color="#06b6d4" stop-opacity="0.58"/>
+      <stop offset="45%" stop-color="#3b82f6" stop-opacity="0.20"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="corona53b" cx="62%" cy="62%" r="46%">
+      <stop offset="0%" stop-color="#ec4899" stop-opacity="0.42"/>
+      <stop offset="50%" stop-color="#7c3aed" stop-opacity="0.14"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Electric Cyan -> Magenta Eclipse Rim -->
+    <linearGradient id="eclipse53" x1="12%" y1="12%" x2="88%" y2="88%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="25%" stop-color="#22d3ee"/>
+      <stop offset="58%" stop-color="#a855f7"/>
+      <stop offset="86%" stop-color="#f43f5e" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#1e0826" stop-opacity="0.15"/>
+    </linearGradient>
+
+    <!-- Pure Pitch-Black Event Horizon -->
+    <radialGradient id="hole53" cx="35%" cy="30%" r="75%">
+      <stop offset="0%" stop-color="#0e0918"/>
+      <stop offset="42%" stop-color="#06030b"/>
+      <stop offset="100%" stop-color="#020104"/>
+    </radialGradient>
+
+    <!-- Hyper-Neon Sweeping Orbital Ring -->
+    <linearGradient id="sweepFront53" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#06b6d4" stop-opacity="0.35"/>
+      <stop offset="32%" stop-color="#67e8f9" stop-opacity="1"/>
+      <stop offset="68%" stop-color="#f472b6" stop-opacity="1"/>
+      <stop offset="100%" stop-color="#e11d48" stop-opacity="0.35"/>
+    </linearGradient>
+
+    <linearGradient id="sweepBack53" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.18"/>
+      <stop offset="50%" stop-color="#c084fc" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#f43f5e" stop-opacity="0.18"/>
+    </linearGradient>
+
+    <!-- Cyberpunk Satellites -->
+    <radialGradient id="satCyan53" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="52%" stop-color="#67e8f9"/>
+      <stop offset="100%" stop-color="#0891b2"/>
+    </radialGradient>
+
+    <radialGradient id="satPink53" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#fce7f3"/>
+      <stop offset="52%" stop-color="#f472b6"/>
+      <stop offset="100%" stop-color="#be185d"/>
+    </radialGradient>
+
+    <filter id="glow53" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="15" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+
+    <filter id="cyanGlow53" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="0" stdDeviation="10" flood-color="#22d3ee" flood-opacity="0.85"/>
+    </filter>
+
+    <filter id="pinkGlow53" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="0" stdDeviation="10" flood-color="#ec4899" flood-opacity="0.9"/>
+    </filter>
+
+    <clipPath id="back53"><rect x="0" y="0" width="512" height="256"/></clipPath>
+    <clipPath id="front53"><rect x="0" y="256" width="512" height="256"/></clipPath>
+  </defs>
+
+  <!-- Squircle Container -->
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#bg53)"/>
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#corona53a)"/>
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#corona53b)"/>
+  <rect x="25.5" y="25.5" width="461" height="461" rx="106.5" fill="none" stroke="url(#rim53)" stroke-width="2.5"/>
+
+  <!-- Back Half of Orbital Ring -->
+  <g transform="rotate(-24 256 256)" clip-path="url(#back53)">
+    <ellipse cx="256" cy="256" rx="182" ry="58" fill="none" stroke="url(#sweepBack53)" stroke-width="5"/>
+  </g>
+
+  <!-- Blazing Cyberpunk Eclipse Corona -->
+  <circle cx="252" cy="252" r="96" fill="none" stroke="url(#eclipse53)" stroke-width="11" filter="url(#glow53)"/>
+
+  <!-- Pure Empty Black Hole Sphere -->
+  <circle cx="259" cy="259" r="93" fill="url(#hole53)"/>
+
+  <!-- Front Half of Orbital Ring -->
+  <g transform="rotate(-24 256 256)" clip-path="url(#front53)">
+    <ellipse cx="256" cy="256" rx="182" ry="58" fill="none" stroke="url(#sweepFront53)" stroke-width="8" stroke-linecap="round"/>
+    <ellipse cx="256" cy="256" rx="182" ry="58" fill="none" stroke="#ffffff" stroke-opacity="0.55" stroke-width="2"/>
+  </g>
+
+  <!-- Satellites -->
+  <!-- Foreground Hot Magenta Satellite -->
+  <g transform="translate(362, 266)" filter="url(#pinkGlow53)">
+    <circle cx="0" cy="0" r="16" fill="#1a0414" stroke="#f472b6" stroke-width="2.5"/>
+    <circle cx="0" cy="0" r="9.5" fill="url(#satPink53)"/>
+    <circle cx="-2.5" cy="-2.5" r="2.5" fill="#ffffff" opacity="0.85"/>
+  </g>
+
+  <!-- Left Horizon Electric Cyan Satellite -->
+  <g transform="translate(106, 312)" filter="url(#cyanGlow53)">
+    <circle cx="0" cy="0" r="15" fill="#04151c" stroke="#22d3ee" stroke-width="2.5"/>
+    <circle cx="0" cy="0" r="8.5" fill="url(#satCyan53)"/>
+  </g>
+
+  <!-- Distant Top-Right Violet-Cyan Satellite -->
+  <g transform="translate(402, 186)">
+    <circle cx="0" cy="0" r="9.5" fill="#120620" stroke="#c084fc" stroke-width="2"/>
+    <circle cx="0" cy="0" r="4.5" fill="#ffffff"/>
+  </g>
+</svg>

@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Pure Neutral Carbon-Black Chassis -->
+    <linearGradient id="bg54" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#18181b"/>
+      <stop offset="55%" stop-color="#0b0b0d"/>
+      <stop offset="100%" stop-color="#040405"/>
+    </linearGradient>
+
+    <linearGradient id="rim54" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.28"/>
+      <stop offset="30%" stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.02"/>
+    </linearGradient>
+
+    <!-- Silver-White Monochrome Corona Bloom -->
+    <radialGradient id="corona54" cx="42%" cy="38%" r="52%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.45"/>
+      <stop offset="38%" stop-color="#a1a1aa" stop-opacity="0.18"/>
+      <stop offset="72%" stop-color="#52525b" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Pure Platinum-White Eclipse Rim -->
+    <linearGradient id="eclipse54" x1="15%" y1="10%" x2="88%" y2="90%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="30%" stop-color="#e4e4e7"/>
+      <stop offset="62%" stop-color="#a1a1aa"/>
+      <stop offset="86%" stop-color="#52525b" stop-opacity="0.65"/>
+      <stop offset="100%" stop-color="#18181b" stop-opacity="0.08"/>
+    </linearGradient>
+
+    <!-- Pure Absolute-Black Event Horizon -->
+    <radialGradient id="hole54" cx="35%" cy="30%" r="75%">
+      <stop offset="0%" stop-color="#121215"/>
+      <stop offset="42%" stop-color="#060608"/>
+      <stop offset="100%" stop-color="#000000"/>
+    </radialGradient>
+
+    <!-- Liquid Silver Orbital Ring -->
+    <linearGradient id="sweepFront54" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#71717a" stop-opacity="0.22"/>
+      <stop offset="35%" stop-color="#ffffff" stop-opacity="0.98"/>
+      <stop offset="68%" stop-color="#d4d4d8" stop-opacity="0.92"/>
+      <stop offset="100%" stop-color="#52525b" stop-opacity="0.22"/>
+    </linearGradient>
+
+    <linearGradient id="sweepBack54" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#a1a1aa" stop-opacity="0.12"/>
+      <stop offset="50%" stop-color="#e4e4e7" stop-opacity="0.30"/>
+      <stop offset="100%" stop-color="#71717a" stop-opacity="0.12"/>
+    </linearGradient>
+
+    <!-- Liquid Chrome Satellites -->
+    <radialGradient id="satChrome54" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="55%" stop-color="#d4d4d8"/>
+      <stop offset="100%" stop-color="#52525b"/>
+    </radialGradient>
+
+    <radialGradient id="satDark54" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#f4f4f5"/>
+      <stop offset="50%" stop-color="#a1a1aa"/>
+      <stop offset="100%" stop-color="#27272a"/>
+    </radialGradient>
+
+    <filter id="glow54" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="13" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+
+    <filter id="satGlow54" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="0" stdDeviation="8" flood-color="#ffffff" flood-opacity="0.55"/>
+    </filter>
+
+    <clipPath id="back54"><rect x="0" y="0" width="512" height="256"/></clipPath>
+    <clipPath id="front54"><rect x="0" y="256" width="512" height="256"/></clipPath>
+  </defs>
+
+  <!-- Squircle Container -->
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#bg54)"/>
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#corona54)"/>
+  <rect x="25.5" y="25.5" width="461" height="461" rx="106.5" fill="none" stroke="url(#rim54)" stroke-width="2.5"/>
+
+  <!-- Back Half of Orbital Ring -->
+  <g transform="rotate(-24 256 256)" clip-path="url(#back54)">
+    <ellipse cx="256" cy="256" rx="182" ry="58" fill="none" stroke="url(#sweepBack54)" stroke-width="4.5"/>
+  </g>
+
+  <!-- Pure White-Platinum Eclipse Corona -->
+  <circle cx="252" cy="252" r="96" fill="none" stroke="url(#eclipse54)" stroke-width="10" filter="url(#glow54)"/>
+
+  <!-- Pure Empty Black Hole Sphere -->
+  <circle cx="259" cy="259" r="93" fill="url(#hole54)"/>
+
+  <!-- Front Half of Orbital Ring -->
+  <g transform="rotate(-24 256 256)" clip-path="url(#front54)">
+    <ellipse cx="256" cy="256" rx="182" ry="58" fill="none" stroke="url(#sweepFront54)" stroke-width="7.5" stroke-linecap="round"/>
+    <ellipse cx="256" cy="256" rx="182" ry="58" fill="none" stroke="#ffffff" stroke-opacity="0.5" stroke-width="1.8"/>
+  </g>
+
+  <!-- Satellites -->
+  <!-- Foreground Chrome Satellite -->
+  <g transform="translate(362, 266)" filter="url(#satGlow54)">
+    <circle cx="0" cy="0" r="16" fill="#09090b" stroke="#e4e4e7" stroke-width="2.5"/>
+    <circle cx="0" cy="0" r="9.5" fill="url(#satChrome54)"/>
+    <circle cx="-2.5" cy="-2.5" r="2.5" fill="#ffffff" opacity="0.9"/>
+  </g>
+
+  <!-- Left Horizon Silver Satellite -->
+  <g transform="translate(106, 312)" filter="url(#satGlow54)">
+    <circle cx="0" cy="0" r="15" fill="#09090b" stroke="#a1a1aa" stroke-width="2.5"/>
+    <circle cx="0" cy="0" r="8.5" fill="url(#satDark54)"/>
+  </g>
+
+  <!-- Distant Top-Right Platinum Satellite -->
+  <g transform="translate(402, 186)">
+    <circle cx="0" cy="0" r="9.5" fill="#09090b" stroke="#d4d4d8" stroke-opacity="0.85" stroke-width="2"/>
+    <circle cx="0" cy="0" r="4.5" fill="#ffffff"/>
+  </g>
+</svg>

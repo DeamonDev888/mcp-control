@@ -1,0 +1,125 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Deep Warm Espresso-Charcoal Chassis -->
+    <linearGradient id="bg52" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1c1712"/>
+      <stop offset="55%" stop-color="#110e0b"/>
+      <stop offset="100%" stop-color="#080605"/>
+    </linearGradient>
+
+    <linearGradient id="rim52" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#e5c07b" stop-opacity="0.30"/>
+      <stop offset="30%" stop-color="#f5e6cc" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.02"/>
+    </linearGradient>
+
+    <!-- Antique Champagne-Gold Corona Bloom -->
+    <radialGradient id="corona52" cx="42%" cy="38%" r="52%">
+      <stop offset="0%" stop-color="#d4a359" stop-opacity="0.50"/>
+      <stop offset="38%" stop-color="#926227" stop-opacity="0.22"/>
+      <stop offset="72%" stop-color="#5c3a14" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Vintage Burnished Gold & Ivory Eclipse Rim -->
+    <linearGradient id="eclipse52" x1="15%" y1="10%" x2="88%" y2="90%">
+      <stop offset="0%" stop-color="#fdf6e3"/>
+      <stop offset="28%" stop-color="#e5c07b"/>
+      <stop offset="60%" stop-color="#b8843c"/>
+      <stop offset="86%" stop-color="#784f1e" stop-opacity="0.65"/>
+      <stop offset="100%" stop-color="#1c150e" stop-opacity="0.1"/>
+    </linearGradient>
+
+    <!-- Pure Velvety Ink-Black Event Horizon -->
+    <radialGradient id="hole52" cx="34%" cy="30%" r="75%">
+      <stop offset="0%" stop-color="#14110e"/>
+      <stop offset="45%" stop-color="#090706"/>
+      <stop offset="100%" stop-color="#030202"/>
+    </radialGradient>
+
+    <!-- Antique Brass Orbital Ring -->
+    <linearGradient id="sweepFront52" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#8c6228" stop-opacity="0.25"/>
+      <stop offset="36%" stop-color="#f5e6cc" stop-opacity="0.92"/>
+      <stop offset="68%" stop-color="#d4a359" stop-opacity="0.88"/>
+      <stop offset="100%" stop-color="#784f1e" stop-opacity="0.22"/>
+    </linearGradient>
+
+    <linearGradient id="sweepBack52" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#b8843c" stop-opacity="0.14"/>
+      <stop offset="50%" stop-color="#e5c07b" stop-opacity="0.30"/>
+      <stop offset="100%" stop-color="#8c6228" stop-opacity="0.12"/>
+    </linearGradient>
+
+    <!-- Ivory & Brass Satellites -->
+    <radialGradient id="satIvory52" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#fdf6e3"/>
+      <stop offset="58%" stop-color="#e5c07b"/>
+      <stop offset="100%" stop-color="#8c6228"/>
+    </radialGradient>
+
+    <radialGradient id="satCopper52" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#fde6c4"/>
+      <stop offset="52%" stop-color="#c97b4b"/>
+      <stop offset="100%" stop-color="#753d1c"/>
+    </radialGradient>
+
+    <filter id="glow52" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="11" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+
+    <filter id="satGlow52" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="0" stdDeviation="7" flood-color="#d4a359" flood-opacity="0.55"/>
+    </filter>
+
+    <clipPath id="back52"><rect x="0" y="0" width="512" height="256"/></clipPath>
+    <clipPath id="front52"><rect x="0" y="256" width="512" height="256"/></clipPath>
+  </defs>
+
+  <!-- Squircle Container -->
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#bg52)"/>
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#corona52)"/>
+  <rect x="25.5" y="25.5" width="461" height="461" rx="106.5" fill="none" stroke="url(#rim52)" stroke-width="2.5"/>
+
+  <!-- Subtle Vintage Observatory Engraved Frame & Celestial Meridian -->
+  <rect x="46" y="46" width="420" height="420" rx="88" fill="none" stroke="#e5c07b" stroke-opacity="0.10" stroke-width="1.2"/>
+  <circle cx="256" cy="256" r="154" fill="none" stroke="#e5c07b" stroke-opacity="0.14" stroke-width="1.2" stroke-dasharray="3 7"/>
+
+  <!-- Back Half of Orbital Ring -->
+  <g transform="rotate(-24 256 256)" clip-path="url(#back52)">
+    <ellipse cx="256" cy="256" rx="182" ry="58" fill="none" stroke="url(#sweepBack52)" stroke-width="4.5"/>
+  </g>
+
+  <!-- Antique Gold Eclipse Corona Rim -->
+  <circle cx="252" cy="252" r="96" fill="none" stroke="url(#eclipse52)" stroke-width="9" filter="url(#glow52)"/>
+
+  <!-- Pure Empty Black Hole Sphere -->
+  <circle cx="259" cy="259" r="93" fill="url(#hole52)"/>
+
+  <!-- Front Half of Orbital Ring -->
+  <g transform="rotate(-24 256 256)" clip-path="url(#front52)">
+    <ellipse cx="256" cy="256" rx="182" ry="58" fill="none" stroke="url(#sweepFront52)" stroke-width="7" stroke-linecap="round"/>
+    <ellipse cx="256" cy="256" rx="182" ry="58" fill="none" stroke="#fdf6e3" stroke-opacity="0.4" stroke-width="1.5"/>
+  </g>
+
+  <!-- Satellites -->
+  <!-- Foreground Burnished Copper-Gold Satellite -->
+  <g transform="translate(362, 266)" filter="url(#satGlow52)">
+    <circle cx="0" cy="0" r="16" fill="#17100a" stroke="#d4a359" stroke-width="2.5"/>
+    <circle cx="0" cy="0" r="9.5" fill="url(#satCopper52)"/>
+    <circle cx="-2.5" cy="-2.5" r="2.5" fill="#fdf6e3" opacity="0.75"/>
+  </g>
+
+  <!-- Left Horizon Ivory-Brass Satellite -->
+  <g transform="translate(106, 312)" filter="url(#satGlow52)">
+    <circle cx="0" cy="0" r="15" fill="#17120c" stroke="#e5c07b" stroke-width="2.5"/>
+    <circle cx="0" cy="0" r="8.5" fill="url(#satIvory52)"/>
+  </g>
+
+  <!-- Distant Top-Right Brass Satellite -->
+  <g transform="translate(402, 186)">
+    <circle cx="0" cy="0" r="9.5" fill="#17120c" stroke="#d4a359" stroke-opacity="0.85" stroke-width="2"/>
+    <circle cx="0" cy="0" r="4.5" fill="#fdf6e3"/>
+  </g>
+</svg>

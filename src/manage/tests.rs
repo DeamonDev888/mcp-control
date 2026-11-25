@@ -4276,8 +4276,26 @@ fn ui_api_state_json_expose_decouverte_annonces_sessions_et_revision() {
     ));
 
     std::env::set_var("MCC_LITEMP_REGISTRY", &dir);
-    let j1 = state_json(&state);
-    let j2 = state_json(&state);
+    // access.revision hache aussi le store GLOBAL des confirmations / sessions :
+    // un autre test exécuté en parallèle peut le modifier entre deux lectures et
+    // donner un faux « changement » (échec intermittent en CI). On relit jusqu'à
+    // obtenir deux lectures consécutives concordantes (borné).
+    let (j1, j2) = {
+        let mut stable = None;
+        for _ in 0..64 {
+            let a = state_json(&state);
+            let b = state_json(&state);
+            if a["access"]["revision"] == b["access"]["revision"] {
+                stable = Some((a, b));
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        stable.expect(
+            "access.revision instable : le store global des confirmations \
+             n'a pas cessé de changer pendant le test",
+        )
+    };
     std::env::remove_var("MCC_LITEMP_REGISTRY");
 
     assert_eq!(

@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bg50" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#111521"/>
+      <stop offset="55%" stop-color="#090b12"/>
+      <stop offset="100%" stop-color="#05060a"/>
+    </linearGradient>
+
+    <linearGradient id="rim50" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#93c5fd" stop-opacity="0.26"/>
+      <stop offset="30%" stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.02"/>
+    </linearGradient>
+
+    <radialGradient id="corona50" cx="42%" cy="38%" r="52%">
+      <stop offset="0%" stop-color="#60a5fa" stop-opacity="0.65"/>
+      <stop offset="35%" stop-color="#2563eb" stop-opacity="0.28"/>
+      <stop offset="68%" stop-color="#10b981" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="eclipse50" x1="15%" y1="10%" x2="88%" y2="90%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="28%" stop-color="#93c5fd"/>
+      <stop offset="58%" stop-color="#3b82f6"/>
+      <stop offset="85%" stop-color="#10b981" stop-opacity="0.65"/>
+      <stop offset="100%" stop-color="#0f172a" stop-opacity="0.1"/>
+    </linearGradient>
+
+    <radialGradient id="hole50" cx="35%" cy="30%" r="75%">
+      <stop offset="0%" stop-color="#121724"/>
+      <stop offset="42%" stop-color="#070910"/>
+      <stop offset="100%" stop-color="#020306"/>
+    </radialGradient>
+
+    <linearGradient id="sweepFront50" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.2"/>
+      <stop offset="35%" stop-color="#bfdbfe" stop-opacity="0.95"/>
+      <stop offset="70%" stop-color="#34d399" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#10b981" stop-opacity="0.2"/>
+    </linearGradient>
+
+    <linearGradient id="sweepBack50" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#60a5fa" stop-opacity="0.15"/>
+      <stop offset="50%" stop-color="#93c5fd" stop-opacity="0.32"/>
+      <stop offset="100%" stop-color="#34d399" stop-opacity="0.12"/>
+    </linearGradient>
+
+    <radialGradient id="satWhite50" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="60%" stop-color="#dbeafe"/>
+      <stop offset="100%" stop-color="#3b82f6"/>
+    </radialGradient>
+
+    <radialGradient id="satGreen50" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#d1fae5"/>
+      <stop offset="55%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#047857"/>
+    </radialGradient>
+
+    <filter id="glow50" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="14" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+
+    <filter id="satGlow50" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="0" stdDeviation="8" flood-color="#60a5fa" flood-opacity="0.7"/>
+    </filter>
+
+    <filter id="greenGlow50" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="0" stdDeviation="9" flood-color="#34d399" flood-opacity="0.8"/>
+    </filter>
+
+    <clipPath id="back50"><rect x="0" y="0" width="512" height="256"/></clipPath>
+    <clipPath id="front50"><rect x="0" y="256" width="512" height="256"/></clipPath>
+  </defs>
+
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#bg50)"/>
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#corona50)"/>
+  <rect x="25.5" y="25.5" width="461" height="461" rx="106.5" fill="none" stroke="url(#rim50)" stroke-width="2.5"/>
+
+  <g transform="rotate(-24 256 256)" clip-path="url(#back50)">
+    <ellipse cx="256" cy="256" rx="182" ry="58" fill="none" stroke="url(#sweepBack50)" stroke-width="5"/>
+  </g>
+
+  <circle cx="252" cy="252" r="96" fill="none" stroke="url(#eclipse50)" stroke-width="10" filter="url(#glow50)"/>
+  <circle cx="259" cy="259" r="93" fill="url(#hole50)"/>
+
+  <g transform="rotate(-24 256 256)" clip-path="url(#front50)">
+    <ellipse cx="256" cy="256" rx="182" ry="58" fill="none" stroke="url(#sweepFront50)" stroke-width="7.5" stroke-linecap="round"/>
+    <ellipse cx="256" cy="256" rx="182" ry="58" fill="none" stroke="#ffffff" stroke-opacity="0.45" stroke-width="1.8"/>
+  </g>
+
+  <g transform="translate(362, 266)" filter="url(#greenGlow50)">
+    <circle cx="0" cy="0" r="16" fill="#041510" stroke="#34d399" stroke-width="2.5"/>
+    <circle cx="0" cy="0" r="9.5" fill="url(#satGreen50)"/>
+    <circle cx="-2.5" cy="-2.5" r="2.5" fill="#ffffff" opacity="0.8"/>
+  </g>
+
+  <g transform="translate(106, 312)" filter="url(#satGlow50)">
+    <circle cx="0" cy="0" r="15" fill="#081020" stroke="#93c5fd" stroke-width="2.5"/>
+    <circle cx="0" cy="0" r="8.5" fill="url(#satWhite50)"/>
+  </g>
+
+  <g transform="translate(402, 186)">
+    <circle cx="0" cy="0" r="9.5" fill="#091122" stroke="#60a5fa" stroke-opacity="0.85" stroke-width="2"/>
+    <circle cx="0" cy="0" r="4.5" fill="#dbeafe"/>
+  </g>
+</svg>

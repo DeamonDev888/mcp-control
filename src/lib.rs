@@ -3422,24 +3422,60 @@ mod tests {
             .find(|(k, _)| k == "ETag")
             .map(|(_, v)| v.clone())
             .expect("ETag manquant sur /api/state");
-
-        // 2. Même état + changements volatils seuls (latency_ms, last_seen_ts) → 304 sans corps
-        {
-            let mut srvs = lockv(&state.servers);
-            srvs[0].latency_ms = Some(42);
-            srvs[0].last_seen_ts = Some(999);
-        }
-        let r2 = route_peer_session_cond(
-            &state,
-            "GET",
-            "/api/state",
-            b"",
-            loopback,
-            None,
-            Some(&etag1),
+        assert!(
+            etag1.starts_with("\"s-"),
+            "ETag de /api/state attendu (préfixe s-) : {etag1}"
         );
-        assert_eq!(r2.status, 304);
+
+        // 2. Même état + changements volatils seuls (latency_ms, last_seen_ts) → 304 sans corps.
+        // L'ETag de /api/state couvre aussi, à juste titre, des compteurs GLOBAUX au
+        // processus (confirmations, sessions actives, statut de mise à jour, annonces
+        // LiteMCP) que les autres tests, parallèles dans le même binaire, modifient
+        // sans arrêt : un 200 peut donc être légitime (« left: 200, right: 304 »
+        // intermittent en CI). On ne valide que des FENÊTRES STABLES : deux lectures
+        // directes de l'ETag, avant/après le seul changement volatil, doivent être
+        // identiques (une fuite de latency_ms/last_seen_ts les ferait différer à
+        // chaque essai), et le 304 HTTP est ensuite exigé dans cette fenêtre.
+        let mut r2 = None;
+        for _ in 0..200 {
+            {
+                let mut srvs = lockv(&state.servers);
+                srvs[0].latency_ms = Some(5);
+                srvs[0].last_seen_ts = Some(100);
+            }
+            let e1 = manage::state_etag(&state);
+            {
+                let mut srvs = lockv(&state.servers);
+                srvs[0].latency_ms = Some(42);
+                srvs[0].last_seen_ts = Some(999);
+            }
+            let e2 = manage::state_etag(&state);
+            if e1 != e2 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue; // la partie globale a bougé : fenêtre invalide, on recommence
+            }
+            let r = route_peer_session_cond(
+                &state,
+                "GET",
+                "/api/state",
+                b"",
+                loopback,
+                None,
+                Some(&e2),
+            );
+            if r.status == 304 {
+                r2 = Some(r);
+                break;
+            }
+            assert_eq!(r.status, 200, "état inchangé : 200 ou 304 attendus");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let r2 = r2.expect(
+            "aucune fenêtre stable obtenue : soit latency_ms/last_seen_ts fuient dans \
+             l'ETag, soit les compteurs globaux n'ont pas cessé de changer pendant le test",
+        );
         assert!(r2.body.is_empty(), "304 ne doit porter aucun corps");
+        let baseline = manage::state_etag(&state);
 
         // 3. Changement réel (state → Down) → 200 + nouvel ETag
         {
@@ -3452,7 +3488,7 @@ mod tests {
             b"",
             loopback,
             None,
-            Some(&etag1),
+            Some(&baseline),
         );
         assert_eq!(r3.status, 200);
         let etag3 = r3
@@ -3461,7 +3497,7 @@ mod tests {
             .find(|(k, _)| k == "ETag")
             .map(|(_, v)| v.clone())
             .unwrap();
-        assert_ne!(etag1, etag3);
+        assert_ne!(baseline, etag3);
 
         // 4. /api/detail?id=s1 → 200 + ETag → 304 sur If-None-Match
         let d1 = route_peer_session_cond(
