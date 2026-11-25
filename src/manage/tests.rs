@@ -2027,24 +2027,24 @@ fn reglages_de_decouverte_parses_et_appliques() {
 #[test]
 fn temporaires_orphelins_purges_au_chargement() {
     // Point 4 : un kill pendant l'écriture laissait un `.tmp` complet (secrets
-    // compris). Le boot les supprime avant toute écriture.
+    // compris). Le boot les supprime avant toute écriture (pour un PID mort :
+    // sur Unix/macOS le PID 123 peut être un processus système vivant ; on prend
+    // une sentinelle portable garantie morte `> i32::MAX`).
+    const DEAD_PID: u32 = 4_294_967_294;
+    assert!(!probe::process_alive(DEAD_PID));
     let dir = std::env::temp_dir().join(format!("mcc-tmp-purge-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = dir.join("config.json");
+    let tmp_cfg = dir.join(format!("config.json.{DEAD_PID}.0.tmp"));
+    let tmp_cache = dir.join(format!("state-cache.json.{DEAD_PID}.1.tmp"));
     std::fs::write(&cfg, "{\"servers\":[]}").unwrap();
-    std::fs::write(dir.join("config.json.123.0.tmp"), "secrets").unwrap();
-    std::fs::write(dir.join("state-cache.json.123.1.tmp"), "cache").unwrap();
+    std::fs::write(&tmp_cfg, "secrets").unwrap();
+    std::fs::write(&tmp_cache, "cache").unwrap();
     std::fs::write(dir.join("mcc.log"), "journal").unwrap();
     let (_, _) = load_config(&cfg.to_string_lossy());
-    assert!(
-        !dir.join("config.json.123.0.tmp").exists(),
-        "tmp config purgé"
-    );
-    assert!(
-        !dir.join("state-cache.json.123.1.tmp").exists(),
-        "tmp cache purgé"
-    );
+    assert!(!tmp_cfg.exists(), "tmp config purgé");
+    assert!(!tmp_cache.exists(), "tmp cache purgé");
     assert!(cfg.exists(), "la config elle-même reste intacte");
     let _ = std::fs::remove_dir_all(&dir);
 }
