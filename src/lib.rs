@@ -1584,6 +1584,34 @@ impl ConnStream {
             }
         }
     }
+
+    /// Fermeture propre après un rejet anticipé (RFC 9112 §9.6) : envoie FIN
+    /// côté écriture puis draine brièvement les octets entrants (borné à 200 ms
+    /// et 4 Mio) afin qu'un RST TCP sous Windows n'efface pas la réponse `413`
+    /// avant sa lecture par le client.
+    fn finish_early_reject(&mut self) {
+        let _ = self.flush();
+        match self {
+            ConnStream::Plain(s) => {
+                let _ = s.shutdown(std::net::Shutdown::Write);
+            }
+            #[cfg(feature = "tls")]
+            ConnStream::Tls(s) => {
+                let _ = s.sock.shutdown(std::net::Shutdown::Write);
+            }
+        }
+        let drain_until = Instant::now() + Duration::from_millis(200);
+        let mut drained = 0usize;
+        let mut sink = [0u8; 16384];
+        while drained < 4 * 1024 * 1024 && Instant::now() < drain_until {
+            let rem = drain_until.saturating_duration_since(Instant::now());
+            let _ = self.set_read_timeout(Some(rem.min(Duration::from_millis(50))));
+            match self.read(&mut sink) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => drained += n,
+            }
+        }
+    }
 }
 
 #[cfg(feature = "tls")]
@@ -1756,7 +1784,7 @@ fn handle_conn_stream(
         );
         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
         let _ = stream.write_all(resp.as_bytes());
-        let _ = stream.flush();
+        stream.finish_early_reject();
         return;
     }
     let mut body = buf[head_end + 4..].to_vec();
@@ -1786,7 +1814,7 @@ fn handle_conn_stream(
         );
         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
         let _ = stream.write_all(resp.as_bytes());
-        let _ = stream.flush();
+        stream.finish_early_reject();
         return;
     }
     if body.len() < content_length {
