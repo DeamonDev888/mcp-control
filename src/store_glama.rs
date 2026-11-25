@@ -68,7 +68,7 @@ pub const STORE_GLAMA: &[StoreItem] = &[
         cat: "Recherche",
         kind: "npm",
         program: "npx",
-        args: &["-y", "mcp-remote", "https://worldmonitor.app/mcp"],
+        args: &["-y", "worldmonitor"],
         env_vars: &["WORLDMONITOR_API_KEY"],
     },
 ];

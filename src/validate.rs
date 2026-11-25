@@ -140,11 +140,18 @@ pub fn dedup_decide(
     {
         return DedupDecision::Duplicate;
     }
-    // 2. même machine + même nom, port différent → l'ancien est fantôme
+    // 2. même machine + même nom explicite non vide, port différent → l'ancien est fantôme.
+    //    Deux serveurs sans nom annoncé (`None`) ne doivent JAMAIS se fusionner sur `?@hôte`.
+    if !cand_name.map(str::trim).is_some_and(|n| !n.is_empty()) {
+        return DedupDecision::Add;
+    }
     let weak = identity_key_weak(cand_name, cand_host);
     let mut fallback: Option<usize> = None;
     for (i, (n, h, p)) in known.iter().enumerate() {
-        if identity_key_weak(n.as_deref(), h.as_deref()) == weak && *p != cand_port {
+        if n.as_deref().map(str::trim).is_some_and(|s| !s.is_empty())
+            && identity_key_weak(n.as_deref(), h.as_deref()) == weak
+            && *p != cand_port
+        {
             fallback = Some(i);
             break;
         }

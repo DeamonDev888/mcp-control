@@ -355,16 +355,35 @@ pub fn effect_of(state: &Arc<AppState>, tool: &str, args: &Value) -> Value {
             }
         }
         "install_store_server" => {
+            let sid = s("id");
+            let extra_args = arr("args");
+            let (program, full_args) = match crate::manage::find_store_item(sid) {
+                Some(it) => {
+                    let mut combined: Vec<String> = it.args.iter().map(|a| court(a, 160)).collect();
+                    combined.extend(extra_args);
+                    (it.program.to_string(), combined)
+                }
+                None => ("?".to_string(), extra_args),
+            };
             let env: Vec<String> = args
                 .get("env")
                 .and_then(Value::as_object)
                 .map(|o| o.keys().take(12).cloned().collect())
                 .unwrap_or_default();
+            let cmd_preview = if full_args.is_empty() {
+                program.clone()
+            } else {
+                format!("{program} {}", full_args.join(" "))
+            };
             json!({
                 "kind": "lancement",
-                "label": format!("boutique {}", s("id")),
-                "resume": format!("installation depuis la boutique : {}", court(s("id"), 80)),
-                "args": arr("args"),
+                "label": format!("boutique {}", court(sid, 80)),
+                "resume": court(
+                    &format!("installation boutique {} : {}", court(sid, 64), cmd_preview),
+                    300,
+                ),
+                "program": court(&program, 160),
+                "args": full_args,
                 // NOMS des variables fournies, jamais leurs valeurs (§5)
                 "env": env,
             })
@@ -744,6 +763,14 @@ fn lock_store() -> MutexGuard<'static, Core> {
     store().lock().unwrap_or_else(|p| p.into_inner())
 }
 
+#[cfg(test)]
+pub fn reset_store_for_tests() {
+    let mut c = lock_store();
+    c.entrees.clear();
+    c.decisions.clear();
+    c.rev_seq = 0;
+}
+
 /// Journalise des lignes produites par la machine à états. Aucune de ces lignes
 /// ne porte d'argument d'outil, de valeur d'environnement ni de secret.
 fn journaliser(state: &Arc<AppState>, lignes: &[String]) {
@@ -858,23 +885,29 @@ impl ApprovalPolicy for Policy {
     }
 }
 
-/// Hook C4 : chaque décision d'autorisation de la lib atterrit dans le journal
-/// d'accès (les 100 dernières, écran « Accès ») et, pour les refus, dans
-/// `mcc.log`. C'est le seul chemin par lequel un refus de droit ou
-/// d'authentification devient visible localement.
-pub fn note_decision(state: &Arc<AppState>, ev: &AuthDecisionEvent<'_>) {
-    let (verdict, motif) = match ev.verdict {
+/// Enregistre une décision d'autorisation (gateway `/mcp` ou pont hybride
+/// `/mcp/s/<id>`) dans le journal d'audit chaîné (`auth-audit.log`), l'anneau
+/// des 100 dernières décisions de l'écran « Accès » et `mcc.log` sur refus.
+pub fn note_hybrid_decision(
+    state: &Arc<AppState>,
+    verdict_raw: AuthVerdict,
+    reason: Option<&str>,
+    client: Option<&str>,
+    method: &str,
+    name: Option<&str>,
+) {
+    let (verdict, motif) = match verdict_raw {
         AuthVerdict::Allowed => ("accordé", "-"),
-        AuthVerdict::RightMissing => ("droit insuffisant", "right_missing"),
-        AuthVerdict::ApprovalDenied => ("refusé", ev.reason.unwrap_or("approval_denied")),
-        AuthVerdict::ApprovalPending => ("en attente", "approval_pending"),
-        AuthVerdict::Unauthenticated => ("non authentifié", ev.reason.unwrap_or("unauthenticated")),
-        _ => ("décision", ev.reason.unwrap_or("-")),
+        AuthVerdict::RightMissing => ("droit insuffisant", reason.unwrap_or("right_missing")),
+        AuthVerdict::ApprovalDenied => ("refusé", reason.unwrap_or("approval_denied")),
+        AuthVerdict::ApprovalPending => ("en attente", reason.unwrap_or("approval_pending")),
+        AuthVerdict::Unauthenticated => ("non authentifié", reason.unwrap_or("unauthenticated")),
+        _ => ("décision", reason.unwrap_or("-")),
     };
     // Journal d'audit CHAÎNÉ (lot M5, docs/auth.md §11) : la décision part au
     // transport, seul à connaître l'adresse source et le `keyid` revendiqué.
     // Vocabulaire machine, aligné sur `AuthVerdict`.
-    let jeton = match ev.verdict {
+    let jeton = match verdict_raw {
         AuthVerdict::Allowed => "allowed",
         AuthVerdict::RightMissing => "right_missing",
         AuthVerdict::ApprovalDenied => "approval_denied",
@@ -882,21 +915,29 @@ pub fn note_decision(state: &Arc<AppState>, ev: &AuthDecisionEvent<'_>) {
         AuthVerdict::Unauthenticated => "unauthenticated",
         _ => "decision",
     };
-    crate::audit::note(jeton, motif, ev.client, ev.method, ev.name.unwrap_or("-"));
-    let keyid = ev.client.unwrap_or("-");
-    let outil = ev.name.unwrap_or("-");
+    crate::audit::note(jeton, motif, client, method, name.unwrap_or("-"));
+    let keyid = client.unwrap_or("-");
+    let outil = name.unwrap_or("-");
     let now = now_ts();
     {
         let mut c = lock_store();
         c.note(now, keyid, outil, verdict, motif);
     }
-    if !matches!(ev.verdict, AuthVerdict::Allowed) {
+    if !matches!(verdict_raw, AuthVerdict::Allowed) {
         crate::manage::add_log(
             state,
             "warn",
             &format!("[auth] {verdict} : {keyid} {outil} ({motif})"),
         );
     }
+}
+
+/// Hook C4 : chaque décision d'autorisation de la lib atterrit dans le journal
+/// d'accès (les 100 dernières, écran « Accès ») et, pour les refus, dans
+/// `mcc.log`. C'est le seul chemin par lequel un refus de droit ou
+/// d'authentification devient visible localement.
+pub fn note_decision(state: &Arc<AppState>, ev: &AuthDecisionEvent<'_>) {
+    note_hybrid_decision(state, ev.verdict, ev.reason, ev.client, ev.method, ev.name);
 }
 
 /// Vue de l'écran « Accès » (demandes, permis, décisions). `clients` et

@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Chassis Background -->
+    <linearGradient id="chassis1" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#1b1d24"/>
+      <stop offset="50%" stop-color="#111217"/>
+      <stop offset="100%" stop-color="#090a0d"/>
+    </linearGradient>
+
+    <!-- Subtle Ambient Top Light -->
+    <radialGradient id="ambient1" cx="50%" cy="18%" r="65%">
+      <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.18"/>
+      <stop offset="55%" stop-color="#1e293b" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Inner Bevel Border -->
+    <linearGradient id="rim1" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="30%" stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.02"/>
+    </linearGradient>
+
+    <!-- Sculpted Metal Planes for M -->
+    <linearGradient id="pillarLeft" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#cbd5e1"/>
+      <stop offset="45%" stop-color="#64748b"/>
+      <stop offset="100%" stop-color="#334155"/>
+    </linearGradient>
+
+    <linearGradient id="diagLeft" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="55%" stop-color="#e2e8f0"/>
+      <stop offset="100%" stop-color="#94a3b8"/>
+    </linearGradient>
+
+    <linearGradient id="diagRight" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="50%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#93c5fd"/>
+    </linearGradient>
+
+    <linearGradient id="pillarRight" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#94a3b8"/>
+      <stop offset="55%" stop-color="#475569"/>
+      <stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+
+    <!-- Emerald Status Dot Glow -->
+    <radialGradient id="emeraldHalo" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#34d399" stop-opacity="0.55"/>
+      <stop offset="50%" stop-color="#10b981" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#10b981" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="emeraldCore" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#6ee7b7"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+
+    <filter id="drop1" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#000000" flood-opacity="0.65"/>
+    </filter>
+
+    <filter id="foldShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="4" dy="8" stdDeviation="8" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <!-- App Icon Squircle -->
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#chassis1)"/>
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#ambient1)"/>
+  <rect x="25.5" y="25.5" width="461" height="461" rx="106.5" fill="none" stroke="url(#rim1)" stroke-width="2.5"/>
+
+  <!-- Subtle Hairline Architectural Frame -->
+  <rect x="52" y="52" width="408" height="408" rx="82" fill="none" stroke="#ffffff" stroke-opacity="0.035" stroke-width="1.5"/>
+
+  <!-- Sculpted Architectural M -->
+  <g filter="url(#drop1)">
+    <!-- Back Left Upright Pillar -->
+    <path d="M 124 156 C 124 146 132 138 142 138 L 178 138 L 178 358 C 178 366 171 372 163 372 L 138 372 C 130 372 124 366 124 358 Z"
+          fill="url(#pillarLeft)"/>
+
+    <!-- Back Right Upright Pillar -->
+    <path d="M 334 138 L 370 138 C 380 138 388 146 388 156 L 388 358 C 388 366 382 372 374 372 L 349 372 C 341 372 334 366 334 358 Z"
+          fill="url(#pillarRight)"/>
+
+    <!-- Right Ascending Sapphire Blade -->
+    <path d="M 256 294 L 222 254 L 334 138 L 372 138 C 381 138 388 145 388 154 L 388 164 L 266 294 C 263 297 259 297 256 294 Z"
+          fill="url(#diagRight)"/>
+
+    <!-- Left Descending Platinum Blade (Overlaps center cleanly with fold shadow) -->
+    <path d="M 124 154 C 124 145 131 138 140 138 L 178 138 L 280 250 L 256 294 C 253 298 247 298 244 294 L 124 164 Z"
+          fill="url(#diagLeft)" filter="url(#foldShadow)"/>
+
+    <!-- Crisp Specular Edge Highlight on Top Fold -->
+    <path d="M 140 139.5 L 177.5 139.5 L 278 250" fill="none" stroke="#ffffff" stroke-opacity="0.75" stroke-width="2" stroke-linecap="round"/>
+  </g>
+
+  <!-- Signature MCP Control Status Beacon (UP / Online) -->
+  <circle cx="256" cy="348" r="34" fill="url(#emeraldHalo)"/>
+  <rect x="234" y="340" width="44" height="16" rx="8" fill="url(#emeraldCore)"/>
+  <rect x="235" y="341" width="42" height="6" rx="3" fill="#ffffff" opacity="0.35"/>
+</svg>

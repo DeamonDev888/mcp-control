@@ -264,12 +264,15 @@ pub(super) fn apply_json(srv: &mut Server, s: &Value) {
     if let Some(t) = s.get("transport").and_then(|x| x.as_str()) {
         if t == "http" {
             if let (Some(p), Some(path)) = (
-                s.get("port").and_then(|x| x.as_u64()),
+                s.get("port")
+                    .and_then(|x| x.as_u64())
+                    .and_then(|p| u16::try_from(p).ok())
+                    .filter(|&p| p >= 1),
                 s.get("path").and_then(|x| x.as_str()),
             ) {
                 srv.transport = Transport::Http {
                     host: s.get("host").and_then(|x| x.as_str()).map(String::from),
-                    port: p as u16,
+                    port: p,
                     path: path.to_string(),
                 };
                 if let Some(v) = s.get("via_ssh").and_then(|x| x.as_bool()) {
@@ -357,7 +360,11 @@ pub(super) fn from_json(s: &Value) -> Option<Server> {
         },
         _ => Transport::Http {
             host: s.get("host").and_then(|x| x.as_str()).map(String::from),
-            port: s.get("port").and_then(|x| x.as_u64())? as u16,
+            port: s
+                .get("port")
+                .and_then(|x| x.as_u64())
+                .and_then(|p| u16::try_from(p).ok())
+                .filter(|&p| p >= 1)?,
             path: s
                 .get("path")
                 .and_then(|x| x.as_str())
@@ -430,7 +437,15 @@ pub(super) fn from_json(s: &Value) -> Option<Server> {
         last_seen_ts: None,
         last_error: None,
         start_cmd,
-        tools_disabled: vec![],
+        tools_disabled: s
+            .get("tools_disabled")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|i| i.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -443,14 +458,29 @@ pub(super) fn parse_settings(v: &Value, mut st: crate::types::Settings) -> crate
             // clamp : 0 = busy-loop CPU, trop long = état périmé à l'écran
             st.refresh_secs = x.clamp(5, 3600);
         }
-        if let Some(x) = s.get("scan_from").and_then(|x| x.as_u64()) {
-            st.scan_from = x as u16;
+        if let Some(p) = s
+            .get("scan_from")
+            .and_then(|x| x.as_u64())
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|&p| p >= 1)
+        {
+            st.scan_from = p;
         }
-        if let Some(x) = s.get("scan_to").and_then(|x| x.as_u64()) {
-            st.scan_to = x as u16;
+        if let Some(p) = s
+            .get("scan_to")
+            .and_then(|x| x.as_u64())
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|&p| p >= 1)
+        {
+            st.scan_to = p;
         }
-        if let Some(x) = s.get("ui_port").and_then(|x| x.as_u64()) {
-            st.ui_port = x as u16;
+        if let Some(p) = s
+            .get("ui_port")
+            .and_then(|x| x.as_u64())
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|&p| p >= 1)
+        {
+            st.ui_port = p;
         }
         if let Some(x) = s.get("ui_bind").and_then(|x| x.as_str()) {
             st.ui_bind = x.to_string();

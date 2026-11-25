@@ -2114,17 +2114,50 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             let sid = req.get("id").and_then(|x| x.as_str()).unwrap_or("");
             match find_store_item(sid) {
                 Some(it) => {
-                    // args surchargés depuis la requête (ex. dossier du serveur Filesystem)
-                    let mut args: Vec<String> = match req.get("args").and_then(|x| x.as_array()) {
-                        Some(a) if !a.is_empty() => a
+                    // Les arguments officiels du catalogue (`it.args`) restent un
+                    // préfixe IMMUABLE : `req.args` ne peut qu'ajouter des arguments
+                    // positionnels supplémentaires (ex. URL PostgreSQL) sans jamais
+                    // détourner le paquet ou injecter un drapeau d'exécution (`-c`,
+                    // `--package`, `--from`…).
+                    let extra_args: Vec<String> = match req.get("args").and_then(|x| x.as_array()) {
+                        Some(a) => a
                             .iter()
                             .filter_map(|i| i.as_str().map(String::from))
                             .collect(),
-                        _ => it.args.iter().map(|a| a.to_string()).collect(),
+                        None => Vec::new(),
                     };
-                    if args.is_empty() {
-                        args = it.args.iter().map(|a| a.to_string()).collect();
+                    for arg in &extra_args {
+                        let trimmed = arg.trim();
+                        let low = trimmed.to_ascii_lowercase();
+                        let forbidden = matches!(
+                            low.as_str(),
+                            "-c" | "--call"
+                                | "-e"
+                                | "--eval"
+                                | "-p"
+                                | "--package"
+                                | "--from"
+                                | "--with"
+                                | "--index-url"
+                                | "--extra-index-url"
+                        ) || low.starts_with("--call=")
+                            || low.starts_with("--eval=")
+                            || low.starts_with("--package=")
+                            || low.starts_with("--from=")
+                            || low.starts_with("--with=")
+                            || low.starts_with("--index-url=")
+                            || low.starts_with("--extra-index-url=");
+                        if forbidden {
+                            return json!({
+                                "ok": false,
+                                "error": format!(
+                                    "argument boutique interdit « {trimmed} » : impossible de surcharger le paquet du catalogue"
+                                )
+                            });
+                        }
                     }
+                    let mut args: Vec<String> = it.args.iter().map(|a| a.to_string()).collect();
+                    args.extend(extra_args);
                     // env additionnel optionnel {"CLÉ": "valeur"} (lot A) : des
                     // items du catalogue ont besoin d'un jeton (GITHUB_TOKEN…).
                     // Mêmes garanties que l'import (lot 3) : les valeurs
@@ -2183,10 +2216,16 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                         return json!({"ok": true, "added": 0, "note": "déjà installé"});
                     }
                     if let Err(e) = save_config_checked(state) {
+                        let mut servers = lockv(&state.servers);
+                        servers.retain(|s| s.id != id);
                         return json!({"ok": false, "error": format!("config non écrite : {e}")});
                     }
                     add_log(state, "info", &format!("[boutique] installé : {}", it.name));
-                    poll_one(state, &id);
+                    // Démarrage asynchrone via le pool de workers (ne bloque jamais
+                    // le fil HTTP pendant 300 s sur un premier téléchargement npx/uvx,
+                    // et n'exécute aucun téléchargement externe en test unitaire).
+                    #[cfg(not(test))]
+                    cycle_via_pool(state, std::slice::from_ref(&id));
                     let st = {
                         let servers = lockv(&state.servers);
                         servers

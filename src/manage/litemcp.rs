@@ -290,7 +290,7 @@ fn worker_sondes() {
 /// SONDAGE_EN_COURS). L'ancien cycle attendait l'accusé de réception de
 /// CHAQUE serveur (plafonné à 120 s) : la sonde la plus lente fixait la
 /// période entière (30-48 s mesurés au lot 2 pour refresh 5 s).
-fn cycle_via_pool(state: &Arc<AppState>, ids: &[String]) {
+pub(crate) fn cycle_via_pool(state: &Arc<AppState>, ids: &[String]) {
     if ids.is_empty() {
         return;
     }

@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Deep Obsidian Chassis -->
+    <linearGradient id="chassis2" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#151926"/>
+      <stop offset="50%" stop-color="#0d1018"/>
+      <stop offset="100%" stop-color="#07090e"/>
+    </linearGradient>
+
+    <!-- Core Ambient Glow -->
+    <radialGradient id="coreAura2" cx="50%" cy="50%" r="52%">
+      <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.34"/>
+      <stop offset="48%" stop-color="#1d4ed8" stop-opacity="0.10"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Squircle Rim -->
+    <linearGradient id="rim2" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#93c5fd" stop-opacity="0.28"/>
+      <stop offset="35%" stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.02"/>
+    </linearGradient>
+
+    <!-- Machined Orbital Ring -->
+    <linearGradient id="ringStroke2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#93c5fd" stop-opacity="0.65"/>
+      <stop offset="50%" stop-color="#3b82f6" stop-opacity="0.20"/>
+      <stop offset="100%" stop-color="#60a5fa" stop-opacity="0.55"/>
+    </linearGradient>
+
+    <!-- Center Core Sphere (Glass + Sapphire) -->
+    <radialGradient id="coreOrb" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="32%" stop-color="#dbeafe"/>
+      <stop offset="70%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </radialGradient>
+
+    <!-- Satellite Sphere (Brushed Silver-White) -->
+    <radialGradient id="satOrb" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="55%" stop-color="#e2e8f0"/>
+      <stop offset="100%" stop-color="#64748b"/>
+    </radialGradient>
+
+    <!-- Emerald Live Node -->
+    <radialGradient id="liveOrb" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#a7f3d0"/>
+      <stop offset="50%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </radialGradient>
+
+    <!-- Spoke Gradients -->
+    <linearGradient id="spokeTop" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#93c5fd" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#3b82f6" stop-opacity="0.35"/>
+    </linearGradient>
+
+    <filter id="orbShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#000000" flood-opacity="0.65"/>
+    </filter>
+
+    <filter id="coreBloom" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="0" stdDeviation="16" flood-color="#3b82f6" flood-opacity="0.55"/>
+    </filter>
+  </defs>
+
+  <!-- Squircle Base -->
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#chassis2)"/>
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#coreAura2)"/>
+  <rect x="25.5" y="25.5" width="461" height="461" rx="106.5" fill="none" stroke="url(#rim2)" stroke-width="2.5"/>
+
+  <!-- Outer Precision Ring & Subtle Inner Ring -->
+  <circle cx="256" cy="256" r="144" fill="none" stroke="url(#ringStroke2)" stroke-width="3.5"/>
+  <circle cx="256" cy="256" r="102" fill="none" stroke="#ffffff" stroke-opacity="0.06" stroke-width="1.5"/>
+
+  <!-- Precision Connecting Spokes (3 Primary + 3 Subtle Secondary) -->
+  <g stroke-linecap="round">
+    <!-- Secondary fine filaments (60deg offset) -->
+    <line x1="256" y1="256" x2="380" y2="184" stroke="#60a5fa" stroke-opacity="0.22" stroke-width="2.5"/>
+    <line x1="256" y1="256" x2="132" y2="184" stroke="#60a5fa" stroke-opacity="0.22" stroke-width="2.5"/>
+    <line x1="256" y1="256" x2="256" y2="400" stroke="#60a5fa" stroke-opacity="0.22" stroke-width="2.5"/>
+
+    <!-- Primary structural spokes -->
+    <line x1="256" y1="256" x2="256" y2="112" stroke="url(#spokeTop)" stroke-width="7"/>
+    <line x1="256" y1="256" x2="380" y2="328" stroke="#3b82f6" stroke-opacity="0.65" stroke-width="7"/>
+    <line x1="256" y1="256" x2="132" y2="328" stroke="#3b82f6" stroke-opacity="0.65" stroke-width="7"/>
+  </g>
+
+  <!-- Secondary Micro-Nodes on the Orbital Ring -->
+  <circle cx="380" cy="184" r="11" fill="#0f172a" stroke="#60a5fa" stroke-width="3"/>
+  <circle cx="132" cy="184" r="11" fill="#0f172a" stroke="#60a5fa" stroke-width="3"/>
+  <circle cx="256" cy="400" r="11" fill="#0f172a" stroke="#34d399" stroke-width="3"/>
+  <circle cx="256" cy="400" r="4.5" fill="url(#liveOrb)"/>
+
+  <!-- Primary 3 Satellite Nodes -->
+  <g filter="url(#orbShadow)">
+    <!-- Top Node -->
+    <circle cx="256" cy="112" r="24" fill="#0b101b" stroke="#60a5fa" stroke-width="3.5"/>
+    <circle cx="256" cy="112" r="16" fill="url(#satOrb)"/>
+
+    <!-- Bottom Right Node -->
+    <circle cx="380" cy="328" r="24" fill="#0b101b" stroke="#60a5fa" stroke-width="3.5"/>
+    <circle cx="380" cy="328" r="16" fill="url(#satOrb)"/>
+
+    <!-- Bottom Left Node -->
+    <circle cx="132" cy="328" r="24" fill="#0b101b" stroke="#60a5fa" stroke-width="3.5"/>
+    <circle cx="132" cy="328" r="16" fill="url(#satOrb)"/>
+  </g>
+
+  <!-- Central Master Control Core -->
+  <g filter="url(#coreBloom)">
+    <!-- Machined Collar -->
+    <circle cx="256" cy="256" r="56" fill="#0b1120" stroke="#60a5fa" stroke-width="4.5"/>
+    <!-- Luminous Sapphire-Glass Core -->
+    <circle cx="256" cy="256" r="43" fill="url(#coreOrb)"/>
+    <!-- Crisp Glass Specular Arc -->
+    <path d="M 230 236 A 34 34 0 0 1 278 228" fill="none" stroke="#ffffff" stroke-opacity="0.75" stroke-width="4.5" stroke-linecap="round"/>
+  </g>
+</svg>

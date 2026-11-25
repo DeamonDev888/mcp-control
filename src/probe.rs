@@ -868,17 +868,104 @@ pub fn file_owned_by_current_user(path: &std::path::Path) -> Option<bool> {
     }
 }
 
+/// Sous Windows, termine récursivement tous les descendants de `root_pid` puis
+/// `root_pid` lui-même via l'API Win32 (`CreateToolhelp32Snapshot` +
+/// `TerminateProcess`), sans dépendre de `taskkill.exe` (lent et bloqué dans
+/// certains bacs à sable restreints). Repli `taskkill /F /T` uniquement si le
+/// process survit encore.
+#[cfg(windows)]
+fn kill_tree_windows(root_pid: u32) {
+    if root_pid == 0 || root_pid == std::process::id() {
+        return;
+    }
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; 260],
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> isize;
+        fn Process32FirstW(snapshot: isize, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: isize, entry: *mut ProcessEntry32W) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn TerminateProcess(handle: isize, exit_code: u32) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const PROCESS_TERMINATE: u32 = 0x0001;
+
+    let mut children_of: std::collections::HashMap<u32, Vec<u32>> =
+        std::collections::HashMap::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap != INVALID_HANDLE_VALUE && snap != 0 {
+            let mut entry: ProcessEntry32W = std::mem::zeroed();
+            entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
+            if Process32FirstW(snap, &mut entry) != 0 {
+                loop {
+                    if entry.th32_process_id != 0 {
+                        children_of
+                            .entry(entry.th32_parent_process_id)
+                            .or_default()
+                            .push(entry.th32_process_id);
+                    }
+                    if Process32NextW(snap, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snap);
+        }
+    }
+
+    // Collecte BFS de l'arbre complet (avec garde anti-cycle) puis terminaison
+    // des feuilles vers la racine.
+    let mut order = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(root_pid);
+    seen.insert(root_pid);
+    while let Some(cur) = queue.pop_front() {
+        order.push(cur);
+        if let Some(kids) = children_of.get(&cur) {
+            for &k in kids {
+                if k != std::process::id() && seen.insert(k) {
+                    queue.push_back(k);
+                }
+            }
+        }
+    }
+    let self_pid = std::process::id();
+    for &pid in order.iter().rev() {
+        if pid == 0 || pid == self_pid {
+            continue;
+        }
+        unsafe {
+            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if h != 0 {
+                let _ = TerminateProcess(h, 1);
+                CloseHandle(h);
+            }
+        }
+    }
+}
+
 /// Tue l'arbre complet d'un PID (cmd.exe → node.exe). `Child::kill()` ne tue que
 /// le lanceur .cmd : les serveurs détachés survivent et gardent leur console.
 pub fn kill_tree(pid: u32) {
     #[cfg(windows)]
     {
-        let mut c = std::process::Command::new(system_tool("taskkill"));
-        let _ = hidden(&mut c)
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        kill_tree_windows(pid);
     }
     #[cfg(not(windows))]
     {
@@ -917,12 +1004,7 @@ pub fn kill_port(port: u16) {
     if let Ok(out) = hidden(&mut c).args(["-ano"]).output() {
         let text = String::from_utf8_lossy(&out.stdout);
         for pid in pids_listening_on(&text, port) {
-            let mut t = Command::new(system_tool("taskkill"));
-            let _ = hidden(&mut t)
-                .args(["/F", "/PID", &pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            kill_tree_windows(pid);
         }
     }
 }
@@ -1072,9 +1154,10 @@ pub fn spawn_process(
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS :
-        // l'enfant survit au shell/lanceur et à un Ctrl+C dans la console de l'app.
-        cmd.creation_flags(0x0800_0000 | 0x0000_0200 | 0x0000_0008);
+        // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP : aucune console visible
+        // (contrairement à DETACHED_PROCESS qui fait ignorer CREATE_NO_WINDOW par
+        // Win32 et échoue dans un JobObject sans breakaway) tout en isolant Ctrl+C.
+        cmd.creation_flags(0x0800_0000 | 0x0000_0200);
     }
     if let Some(wd) = workdir {
         cmd.current_dir(wd);
@@ -4872,12 +4955,46 @@ fn read_bounded_line<R: std::io::BufRead>(
     reader: &mut R,
     buf: &mut Vec<u8>,
 ) -> std::io::Result<usize> {
+    read_bounded_line_max(reader, buf, MAX_PROBE_READ)
+}
+
+/// Plafond d'une ligne JSON-RPC sur le stdout d'un serveur MCP stdio. Un
+/// `tools/list` riche tient sur UNE ligne et dépasse couramment 2 Mo
+/// (rea-agents : 229 outils = 3,5 Mo) : au-delà du plafond la réponse était
+/// tronquée, le JSON illisible, et le serveur passait `UP` avec 0 outil.
+const MAX_STDIO_LINE: usize = 32 * 1024 * 1024;
+
+/// Comme `read_bounded_line`, avec un plafond explicite. Si la ligne dépasse
+/// `max`, le reste est consommé jusqu'au `\n` (sans être conservé) pour que la
+/// ligne suivante reparte au bon endroit — sinon la queue tronquée devenait
+/// une « ligne » parasite.
+fn read_bounded_line_max<R: std::io::BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<usize> {
     buf.clear();
-    let n = reader
-        .take((MAX_PROBE_READ as u64) + 1)
+    let mut n = reader
+        .by_ref()
+        .take((max as u64) + 1)
         .read_until(b'\n', buf)?;
-    if buf.len() > MAX_PROBE_READ {
-        buf.truncate(MAX_PROBE_READ);
+    if buf.len() > max {
+        buf.truncate(max);
+        if buf.last() != Some(&b'\n') {
+            // vide le reste de la ligne par blocs bornés
+            let mut sink = Vec::with_capacity(64 * 1024);
+            loop {
+                sink.clear();
+                let k = reader
+                    .by_ref()
+                    .take(64 * 1024)
+                    .read_until(b'\n', &mut sink)?;
+                n += k;
+                if k == 0 || sink.last() == Some(&b'\n') {
+                    break;
+                }
+            }
+        }
     }
     Ok(n)
 }
@@ -4998,18 +5115,34 @@ pub fn probe_stdio(
     }
 
     let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let trunc_tail = stderr_tail.clone();
     std::thread::spawn(move || {
         let mut reader = std::io::BufReader::new(stdout);
         // ROBUSTESSE (audit 2026-10-25) : `BufRead::lines()` et `read_until` nu
         // allouent la ligne ENTIÈRE en mémoire, sans plafond — un serveur stdio
         // qui écrit 300 Mo sur une seule ligne (sans \n) ferait exploser la RAM
-        // du moteur. `read_bounded_line` borne la lecture via `Read::take`
-        // AVANT allocation.
+        // du moteur. `read_bounded_line_max` borne la lecture via `Read::take`
+        // AVANT allocation (plafond MAX_STDIO_LINE, assez large pour un
+        // `tools/list` de plusieurs centaines d'outils).
         let mut buf: Vec<u8> = Vec::new();
         loop {
-            match read_bounded_line(&mut reader, &mut buf) {
+            match read_bounded_line_max(&mut reader, &mut buf, MAX_STDIO_LINE) {
                 Ok(0) => break, // EOF
-                Ok(_) => {
+                Ok(n) => {
+                    if n > MAX_STDIO_LINE {
+                        // jamais silencieux : la cause apparaît dans le diagnostic
+                        if let Ok(mut t) = trunc_tail.lock() {
+                            if t.len() >= STDERR_TAIL_LINES {
+                                t.pop_front();
+                            }
+                            t.push_back(format!(
+                                "Error: réponse JSON-RPC de {} octets > plafond {} Mo, ignorée",
+                                n,
+                                MAX_STDIO_LINE / (1024 * 1024)
+                            ));
+                        }
+                        continue;
+                    }
                     let l = String::from_utf8_lossy(&buf).to_string();
                     if tx.send(l).is_err() {
                         break;
@@ -5153,8 +5286,10 @@ pub fn probe_stdio(
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        kill_tree(pid);
-        let _ = child.wait();
+        if exit.is_none() {
+            kill_tree(pid);
+            let _ = child.wait();
+        }
         let detail = stderr_tail
             .lock()
             .map(|t| stderr_summary(&t))

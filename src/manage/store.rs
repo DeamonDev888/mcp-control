@@ -309,8 +309,8 @@ pub const STORE: &[StoreItem] = &[
     },
 ];
 
-/// Item de boutique par id — principal, puis aitmpl, puis glama.
-pub(super) fn find_store_item(sid: &str) -> Option<&'static StoreItem> {
+/// Item de boutique par id — principal, puis aitmpl, puis glama, puis github.
+pub(crate) fn find_store_item(sid: &str) -> Option<&'static StoreItem> {
     STORE
         .iter()
         .find(|s| s.id == sid)

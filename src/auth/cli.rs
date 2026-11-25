@@ -890,11 +890,46 @@ fn cmd_fingerprint() -> i32 {
 }
 
 /// Garde-fou de `auth fingerprint` : aucun bloc privé ne doit traîner dans
-/// `config.json` (§9). Renvoie le premier motif trouvé, sinon `None`.
+/// `config.json` (§9). Inspecte à la fois les marqueurs PEM explicites et les
+/// noms de clés JSON d'objet (`private_key`, `secret_key`, `seed`, `signing_key`,
+/// `hmac_key`) afin de ne jamais déclencher de faux positif sur `"removed_seeds"`
+/// ou un identifiant serveur `"seed-*"`.
 pub fn premier_secret_du_fichier(texte: &str) -> Option<&'static str> {
-    ["PRIVATE KEY", "BEGIN PRIVATE", "seed", "SEED"]
-        .into_iter()
-        .find(|motif| texte.contains(motif))
+    for motif in ["PRIVATE KEY", "BEGIN PRIVATE", "LITEMCP ED25519 PRIVATE"] {
+        if texte.contains(motif) {
+            return Some(motif);
+        }
+    }
+    fn cle_secrete_json(v: &Value) -> Option<&'static str> {
+        match v {
+            Value::Object(map) => {
+                for (k, val) in map {
+                    let low = k.trim().to_ascii_lowercase();
+                    let hit = match low.as_str() {
+                        "private_key" | "privatekey" => Some("private_key"),
+                        "secret_key" | "secretkey" => Some("secret_key"),
+                        "seed" => Some("seed"),
+                        "signing_key" | "signingkey" => Some("signing_key"),
+                        "hmac_key" | "hmackey" => Some("hmac_key"),
+                        _ => None,
+                    };
+                    if hit.is_some() {
+                        return hit;
+                    }
+                    if let Some(sub) = cle_secrete_json(val) {
+                        return Some(sub);
+                    }
+                }
+                None
+            }
+            Value::Array(arr) => arr.iter().find_map(cle_secrete_json),
+            _ => None,
+        }
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(texte) {
+        return cle_secrete_json(&v);
+    }
+    None
 }
 
 /// `auth verify-log [--path <fichier>]` — recalcule la chaîne du journal
@@ -1107,10 +1142,21 @@ mod tests {
 
     #[test]
     fn garde_fou_config_json() {
-        assert!(premier_secret_du_fichier(r#"{"auth":{"clients":[]}}"#).is_none());
+        assert!(premier_secret_du_fichier(
+            r#"{"servers":[{"id":"seed-news"}],"settings":{"removed_seeds":["seed-old"],"auth":{"clients":[]}}}"#
+        )
+        .is_none());
         assert_eq!(
             premier_secret_du_fichier("-----BEGIN LITEMCP ED25519 PRIVATE KEY-----"),
             Some("PRIVATE KEY")
+        );
+        assert_eq!(
+            premier_secret_du_fichier(r#"{"auth":{"server":{"seed":"001122"}}}"#),
+            Some("seed")
+        );
+        assert_eq!(
+            premier_secret_du_fichier(r#"{"auth":{"private_key":"abcd"}}"#),
+            Some("private_key")
         );
     }
 

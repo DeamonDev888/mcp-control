@@ -28,12 +28,12 @@ pub const STORE_AITMPL: &[StoreItem] = &[
     StoreItem {
         id: "at-neon",
         name: "Neon",
-        desc: "MCP server for interacting with Neon Management API and databases",
+        desc: "MCP server for interacting with Neon Management API and databases — env : NEON_API_KEY",
         cat: "Données",
         kind: "npm",
         program: "npx",
-        args: &["-y", "mcp-remote", "https://mcp.neon.tech/mcp"],
-        env_vars: &[],
+        args: &["-y", "@neondatabase/mcp-server@latest"],
+        env_vars: &["NEON_API_KEY"],
     },
     StoreItem {
         id: "at-redis",
@@ -98,12 +98,12 @@ pub const STORE_AITMPL: &[StoreItem] = &[
     StoreItem {
         id: "at-logfire",
         name: "Logfire",
-        desc: "Provides access to OpenTelemetry traces and metrics through Logfire (serveur MCP distant officiel Pydantic Logfire US via OAuth, ou EU logfire-eu.pydantic.dev/mcp).",
+        desc: "Provides access to OpenTelemetry traces and metrics through Logfire — env : LOGFIRE_TOKEN",
         cat: "Dev",
-        kind: "npm",
-        program: "npx",
-        args: &["-y", "mcp-remote", "https://logfire-us.pydantic.dev/mcp"],
-        env_vars: &[],
+        kind: "python",
+        program: "uvx",
+        args: &["logfire-mcp"],
+        env_vars: &["LOGFIRE_TOKEN"],
     },
     StoreItem {
         id: "at-mermaid",
@@ -232,13 +232,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         cat: "Web",
         kind: "npm",
         program: "npx",
-        args: &[
-            "-y",
-            "mcp-remote",
-            "https://mcp.browseract.com/mcp/",
-            "--header",
-            "Authorization:Bearer ${BROWSERACT_API_KEY}",
-        ],
+        args: &["-y", "browseract-mcp"],
         env_vars: &["BROWSERACT_API_KEY"],
     },
     StoreItem {

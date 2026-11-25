@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MCP Control — Studio Icons v3</title>
+  <style>
+    :root {
+      --bg: #0a0b0f;
+      --surface: #12141b;
+      --border: rgba(255, 255, 255, 0.08);
+      --text: #f8fafc;
+      --muted: #8b94a7;
+    }
+    body.light {
+      --bg: #f1f5f9;
+      --surface: #ffffff;
+      --border: rgba(15, 23, 42, 0.09);
+      --text: #0f172a;
+      --muted: #64748b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 48px 24px 96px;
+      transition: background 0.2s ease, color 0.2s ease;
+    }
+    .wrap {
+      max-width: 1180px;
+      margin: 0 auto;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 20px;
+      margin-bottom: 40px;
+      padding-bottom: 24px;
+      border-bottom: 1px solid var(--border);
+    }
+    .eyebrow {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 1.4px;
+      text-transform: uppercase;
+      color: #34d399;
+      margin-bottom: 8px;
+    }
+    h1 {
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: -0.6px;
+      margin-bottom: 6px;
+    }
+    .lead {
+      color: var(--muted);
+      font-size: 14px;
+      max-width: 600px;
+    }
+    .btn-theme {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 9px 16px;
+      border-radius: 10px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .btn-theme:hover {
+      border-color: rgba(148, 163, 184, 0.4);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(255px, 1fr));
+      gap: 24px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      transition: transform 0.2s ease, border-color 0.2s ease;
+    }
+    .card:hover {
+      transform: translateY(-4px);
+      border-color: rgba(96, 165, 250, 0.35);
+    }
+    .stage {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 28px 0 24px;
+    }
+    .stage img {
+      width: 156px;
+      height: 156px;
+      filter: drop-shadow(0 20px 30px rgba(0, 0, 0, 0.45));
+      transition: transform 0.25s ease;
+    }
+    .card:hover .stage img {
+      transform: scale(1.04);
+    }
+
+    /* Realistic App Topbar Mockup */
+    .app-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: #0c0d10;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 10px;
+      padding: 8px 12px;
+      margin-bottom: 18px;
+    }
+    .app-bar-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .app-bar-left img {
+      width: 20px;
+      height: 20px;
+    }
+    .app-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: #f8fafc;
+      letter-spacing: 0.4px;
+    }
+    .app-title span {
+      font-weight: 400;
+      color: #64748b;
+    }
+    .app-pill {
+      font-size: 10px;
+      font-weight: 600;
+      color: #34d399;
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(16, 185, 129, 0.25);
+      padding: 2px 7px;
+      border-radius: 99px;
+    }
+
+    .sizes {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      padding: 10px;
+      background: rgba(128, 128, 128, 0.06);
+      border-radius: 12px;
+      margin-bottom: 18px;
+    }
+    .sizes span {
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    h2 {
+      font-size: 17px;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+    .desc {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+      margin-bottom: 20px;
+      flex: 1;
+    }
+    .btn {
+      display: block;
+      width: 100%;
+      text-align: center;
+      padding: 10px 14px;
+      border-radius: 10px;
+      background: var(--text);
+      color: var(--bg);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .btn:hover {
+      opacity: 0.9;
+    }
+
+    /* Dock Comparison Bar */
+    .dock-section {
+      margin-top: 44px;
+      text-align: center;
+    }
+    .dock-label {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 14px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      font-weight: 600;
+    }
+    .dock {
+      display: inline-flex;
+      align-items: center;
+      gap: 18px;
+      padding: 12px 22px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 22px;
+      backdrop-filter: blur(18px);
+    }
+    body.light .dock {
+      background: rgba(255, 255, 255, 0.78);
+      border-color: rgba(15, 23, 42, 0.1);
+      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.12);
+    }
+    .dock img {
+      width: 52px;
+      height: 52px;
+      transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+      cursor: pointer;
+    }
+    .dock img:hover {
+      transform: translateY(-8px) scale(1.16);
+    }
+    .dock-sep {
+      width: 1px;
+      height: 36px;
+      background: var(--border);
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <div class="eyebrow">Édition Studio • Assortie à l'UI MCP Control</div>
+        <h1>4 Icônes Professionnelles pour MCP Control</h1>
+        <p class="lead">
+          Calibrées sur la palette exacte de ton application (obsidienne #0c0d10, bleu saphir #3b82f6, émeraude UP #34d399) avec finitions biseautées et lecture nette de 16px à 512px.
+        </p>
+      </div>
+      <button class="btn-theme" onclick="document.body.classList.toggle('light')">Mode Clair / Sombre</button>
+    </header>
+
+    <div class="grid">
+      <!-- 1 -->
+      <div class="card">
+        <div class="stage">
+          <img src="logo-v3-1-monolith.svg" alt="Obsidian Monolith">
+        </div>
+        <div class="app-bar">
+          <div class="app-bar-left">
+            <img src="logo-v3-1-monolith.svg" alt="">
+            <div class="app-title">MCP <span>CONTROL</span></div>
+          </div>
+          <div class="app-pill">UP 7/10</div>
+        </div>
+        <div class="sizes">
+          <span>Échelles</span>
+          <img src="logo-v3-1-monolith.svg" width="40" height="40" alt="40px">
+          <img src="logo-v3-1-monolith.svg" width="24" height="24" alt="24px">
+          <img src="logo-v3-1-monolith.svg" width="16" height="16" alt="16px">
+        </div>
+        <h2>01. Obsidian Monolith</h2>
+        <p class="desc">
+          Un <strong>M</strong> architectural sculpté en facettes titane et saphir avec ombres de pliure réalistes et témoin d'état émeraude en base. Esprit Cursor / Linear.
+        </p>
+        <a class="btn" href="logo-v3-1-monolith.svg" download="mcp-control-monolith.svg">Télécharger SVG</a>
+      </div>
+
+      <!-- 2 -->
+      <div class="card">
+        <div class="stage">
+          <img src="logo-v3-2-orbital.svg" alt="Orbital Nexus">
+        </div>
+        <div class="app-bar">
+          <div class="app-bar-left">
+            <img src="logo-v3-2-orbital.svg" alt="">
+            <div class="app-title">MCP <span>CONTROL</span></div>
+          </div>
+          <div class="app-pill">UP 7/10</div>
+        </div>
+        <div class="sizes">
+          <span>Échelles</span>
+          <img src="logo-v3-2-orbital.svg" width="40" height="40" alt="40px">
+          <img src="logo-v3-2-orbital.svg" width="24" height="24" alt="24px">
+          <img src="logo-v3-2-orbital.svg" width="16" height="16" alt="16px">
+        </div>
+        <h2>02. Orbital Nexus</h2>
+        <p class="desc">
+          L'évolution haut de gamme de ton icône actuelle : noyau verre &amp; saphir usiné, anneau orbital finement gravé, 3 nœuds majeurs et point de vie émeraude.
+        </p>
+        <a class="btn" href="logo-v3-2-orbital.svg" download="mcp-control-orbital.svg">Télécharger SVG</a>
+      </div>
+
+      <!-- 3 -->
+      <div class="card">
+        <div class="stage">
+          <img src="logo-v3-3-switchboard.svg" alt="Tactile Switchboard">
+        </div>
+        <div class="app-bar">
+          <div class="app-bar-left">
+            <img src="logo-v3-3-switchboard.svg" alt="">
+            <div class="app-title">MCP <span>CONTROL</span></div>
+          </div>
+          <div class="app-pill">UP 7/10</div>
+        </div>
+        <div class="sizes">
+          <span>Échelles</span>
+          <img src="logo-v3-3-switchboard.svg" width="40" height="40" alt="40px">
+          <img src="logo-v3-3-switchboard.svg" width="24" height="24" alt="24px">
+          <img src="logo-v3-3-switchboard.svg" width="16" height="16" alt="16px">
+        </div>
+        <h2>03. Tactile Switchboard</h2>
+        <p class="desc">
+          Inspiré du Centre de Contrôle macOS et du design industriel Braun : double commutateur usiné (ON émeraude + pont MCP saphir). Immédiatement compréhensible.
+        </p>
+        <a class="btn" href="logo-v3-3-switchboard.svg" download="mcp-control-switchboard.svg">Télécharger SVG</a>
+      </div>
+
+      <!-- 4 -->
+      <div class="card">
+        <div class="stage">
+          <img src="logo-v3-4-aperture.svg" alt="Precision Aperture">
+        </div>
+        <div class="app-bar">
+          <div class="app-bar-left">
+            <img src="logo-v3-4-aperture.svg" alt="">
+            <div class="app-title">MCP <span>CONTROL</span></div>
+          </div>
+          <div class="app-pill">UP 7/10</div>
+        </div>
+        <div class="sizes">
+          <span>Échelles</span>
+          <img src="logo-v3-4-aperture.svg" width="40" height="40" alt="40px">
+          <img src="logo-v3-4-aperture.svg" width="24" height="24" alt="24px">
+          <img src="logo-v3-4-aperture.svg" width="16" height="16" alt="16px">
+        </div>
+        <h2>04. Precision Aperture</h2>
+        <p class="desc">
+          Un emblème intemporel : anneau <strong>C</strong> (Control) en platine brossé, chevron pont/terminal saphir imbriqué et noyau actif émeraude au centre.
+        </p>
+        <a class="btn" href="logo-v3-4-aperture.svg" download="mcp-control-aperture.svg">Télécharger SVG</a>
+      </div>
+    </div>
+
+    <!-- Dock Preview -->
+    <div class="dock-section">
+      <div class="dock-label">Rendu comparatif dans un Dock (survole pour zoomer)</div>
+      <div class="dock">
+        <img src="../../desktop/icons/icon.png" title="Icône actuelle" alt="Actuelle">
+        <div class="dock-sep"></div>
+        <img src="logo-v3-1-monolith.svg" title="01. Obsidian Monolith" alt="Monolith">
+        <img src="logo-v3-2-orbital.svg" title="02. Orbital Nexus" alt="Orbital">
+        <img src="logo-v3-3-switchboard.svg" title="03. Tactile Switchboard" alt="Switchboard">
+        <img src="logo-v3-4-aperture.svg" title="04. Precision Aperture" alt="Aperture">
+      </div>
+    </div>
+  </div>
+</body>
+</html>

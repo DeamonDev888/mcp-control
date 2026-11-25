@@ -2004,114 +2004,131 @@ pub fn scan_network_range(
                         found.fetch_add(1, Ordering::Relaxed);
                         let label = p.name.clone().unwrap_or_else(|| format!("{}:{}", ip, port));
                         let mut servers = lockv(&state.servers);
-                        // DÉ-DUPLICATION : un serveur déjà connu (même hôte+port) est
-                        // ignoré ; un serveur qui a CHANGÉ DE PORT (même nom, même
-                        // hôte) remplace l'entrée fantôme au lieu de créer un doublon.
-                        let known_srv: Vec<(Option<String>, Option<String>, u16)> = servers
-                            .iter()
-                            .filter_map(|s| match &s.transport {
-                                Transport::Http { host, port, .. } => {
-                                    Some((s.server_name.clone(), host.clone(), *port))
-                                }
-                                _ => None,
-                            })
-                            .collect();
+                        // 1. Déjà connu sur ce même hôte+port (manuel, seed ou découvert) :
+                        //    mise à jour des métadonnées sans recréer ni écraser l'origine.
+                        if let Some(s) = servers.iter_mut().find(|s| {
+                            matches!(
+                                &s.transport,
+                                Transport::Http { host: Some(h), port: sp, .. } if h == ip && sp == port
+                            )
+                        }) {
+                            if p.name.is_some() {
+                                s.server_name = p.name.clone();
+                            }
+                            if p.version.is_some() {
+                                s.version = p.version.clone();
+                            }
+                            s.framework = p.framework.clone();
+                            s.lang = p.lang.clone();
+                            s.in_container = p.in_container;
+                            s.container_name = p.container_name.clone();
+                            s.tools = p.tools;
+                            s.latency_ms = Some(p.latency_ms);
+                            s.last_seen_ts = Some(crate::types::now_ts());
+                            drop(servers);
+                            continue;
+                        }
+                        // 2. Remplacement d'un port fantôme : UNIQUEMENT parmi les entrées
+                        //    `Origin::Discovered` portant un `server_name` non vide, et en
+                        //    conservant l'indice RÉEL dans `servers` (jamais un indice filtré
+                        //    qui supprimerait un serveur Stdio ou Manuel par décalage).
+                        let replaceable: Vec<_> = servers
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(real_idx, s)| {
+                                    if s.origin != Origin::Discovered
+                                        || !s
+                                            .server_name
+                                            .as_deref()
+                                            .is_some_and(|n| !n.trim().is_empty())
+                                    {
+                                        return None;
+                                    }
+                                    match &s.transport {
+                                        Transport::Http { host, port, .. } => Some((
+                                            real_idx,
+                                            (s.server_name.clone(), host.clone(), *port),
+                                        )),
+                                        _ => None,
+                                    }
+                                })
+                                .collect();
+                        let known_srv: Vec<(Option<String>, Option<String>, u16)> =
+                            replaceable.iter().map(|(_, entry)| entry.clone()).collect();
                         let decision = crate::validate::dedup_decide(
                             &known_srv,
                             p.name.as_deref(),
                             Some(ip.as_str()),
                             *port,
                         );
+                        let mut replace_log: Option<String> = None;
                         let target_id = match decision {
                             crate::validate::DedupDecision::Duplicate => {
-                                // déjà connu : on met à jour ses métadonnées (framework,
-                                // tools) sans créer d'entrée
-                                if let Some(s) = servers.iter_mut().find(|s| {
-                                    matches!(&s.transport,
-                                        Transport::Http { host: Some(h), port: sp, .. } if h == ip && sp == port)
-                                }) {
-                                    s.server_name = p.name.clone();
-                                    s.version = p.version.clone();
-                                    s.framework = p.framework.clone();
-                                    s.lang = p.lang.clone();
-                                    s.in_container = p.in_container;
-                                    s.container_name = p.container_name.clone();
-                                    s.tools = p.tools;
-                                    s.latency_ms = Some(p.latency_ms);
-                                    s.last_seen_ts = Some(crate::types::now_ts());
-                                }
                                 drop(servers);
                                 continue;
                             }
-                            crate::validate::DedupDecision::Replace(idx) => {
-                                // l'ancien port est fantôme : on le remplace
-                                let old = servers.remove(idx);
-                                let id = old.id;
-                                add_log(
-                                    state,
-                                    "info",
-                                    &format!(
-                                        "[réseau] {} a changé de port ({} → {}) — entrée fantôme remplacée",
-                                        label,
-                                        known_srv.get(idx).map(|(_, _, p)| *p).unwrap_or(0),
-                                        port
-                                    ),
-                                );
-                                id
+                            crate::validate::DedupDecision::Replace(sub_idx) => {
+                                let (real_idx, (_, _, old_port)) = replaceable[sub_idx];
+                                let old = servers.remove(real_idx);
+                                replace_log = Some(format!(
+                                    "[réseau] {} a changé de port ({} → {}) — entrée fantôme remplacée",
+                                    label, old_port, port
+                                ));
+                                old.id
                             }
                             crate::validate::DedupDecision::Add => format!("net-{}.{}", ip, port),
                         };
-                        if !servers.iter().any(|s| {
-                            matches!(&s.transport,
-                            Transport::Http { host: Some(h), port: sp, .. } if h == ip && sp == port)
-                        }) {
-                            servers.push(Server {
-                                id: target_id,
-                                label,
-                                transport: Transport::Http {
-                                    host: Some(ip.clone()),
-                                    port: *port,
-                                    path: "/mcp".into(),
-                                },
-                                origin: Origin::Discovered,
-                                enabled: true,
-                                state: SState::Up,
-                                auto_restart: true,
-                                favorite: false,
-                                pid: None,
-                                bound_host: Some(ip.clone()),
-                                server_name: p.name.clone(),
-                                version: p.version.clone(),
-                                protocol: p.protocol.clone(),
-                                sse: p.sse,
-                                sse_endpoint: p.sse_endpoint,
-                                ws: p.ws,
-                                lang: p.lang.clone(),
-                                framework: p.framework.clone(),
-                                in_container: p.in_container,
-                                container_name: p.container_name.clone(),
-                                via_ssh: false,
-                                tools: p.tools,
-                                latency_ms: Some(p.latency_ms),
-                                last_seen_ts: Some(crate::types::now_ts()),
-                                last_error: None,
-                                start_cmd: None,
-                                tools_disabled: vec![],
-                            });
-                            drop(servers);
-                            crate::gateway::notify_change();
-                            add_log(
-                                state,
-                                "info",
-                                &format!(
-                                    "[réseau] serveur MCP distant découvert : {}:{} — {} v{}",
-                                    ip,
-                                    port,
-                                    p.name.as_deref().unwrap_or("?"),
-                                    p.version.as_deref().unwrap_or("?")
-                                ),
-                            );
+                        let name_log = p.name.clone();
+                        let ver_log = p.version.clone();
+                        servers.push(Server {
+                            id: target_id,
+                            label,
+                            transport: Transport::Http {
+                                host: Some(ip.clone()),
+                                port: *port,
+                                path: "/mcp".into(),
+                            },
+                            origin: Origin::Discovered,
+                            enabled: true,
+                            state: SState::Up,
+                            auto_restart: true,
+                            favorite: false,
+                            pid: None,
+                            bound_host: Some(ip.clone()),
+                            server_name: p.name.clone(),
+                            version: p.version.clone(),
+                            protocol: p.protocol.clone(),
+                            sse: p.sse,
+                            sse_endpoint: p.sse_endpoint,
+                            ws: p.ws,
+                            lang: p.lang.clone(),
+                            framework: p.framework.clone(),
+                            in_container: p.in_container,
+                            container_name: p.container_name.clone(),
+                            via_ssh: false,
+                            tools: p.tools,
+                            latency_ms: Some(p.latency_ms),
+                            last_seen_ts: Some(crate::types::now_ts()),
+                            last_error: None,
+                            start_cmd: None,
+                            tools_disabled: vec![],
+                        });
+                        drop(servers);
+                        crate::gateway::notify_change();
+                        if let Some(msg) = replace_log {
+                            add_log(state, "info", &msg);
                         }
+                        add_log(
+                            state,
+                            "info",
+                            &format!(
+                                "[réseau] serveur MCP distant découvert : {}:{} — {} v{}",
+                                ip,
+                                port,
+                                name_log.as_deref().unwrap_or("?"),
+                                ver_log.as_deref().unwrap_or("?")
+                            ),
+                        );
                     }
                 }
                 if hit {
@@ -2357,13 +2374,12 @@ mod tests {
         #[cfg(windows)]
         {
             (
-                "cmd.exe".to_string(),
+                probe::system_tool("powershell").to_string_lossy().to_string(),
                 vec![
-                    "/C".to_string(),
-                    "ping".to_string(),
-                    "-n".to_string(),
-                    "15".to_string(),
-                    "127.0.0.1".to_string(),
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-Command".to_string(),
+                    "Start-Sleep -Seconds 15".to_string(),
                 ],
             )
         }

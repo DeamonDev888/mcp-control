@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgPro3" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1c1917"/>
+      <stop offset="100%" stop-color="#0c0a09"/>
+    </linearGradient>
+    <linearGradient id="switchActive" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+  </defs>
+
+  <!-- App Squircle -->
+  <rect x="32" y="32" width="448" height="448" rx="100" fill="url(#bgPro3)" stroke="#292524" stroke-width="2"/>
+
+  <!-- Command Control Grid / Sliders forming M -->
+  <g transform="translate(0, 0)">
+    <!-- Left Track (Inactive/Neutral) -->
+    <rect x="136" y="160" width="44" height="192" rx="22" fill="#292524"/>
+    <circle cx="158" cy="300" r="16" fill="#78716c"/>
+
+    <!-- Right Track (Inactive/Neutral) -->
+    <rect x="332" y="160" width="44" height="192" rx="22" fill="#292524"/>
+    <circle cx="354" cy="300" r="16" fill="#78716c"/>
+
+    <!-- Central Chevron / Command Bridge -->
+    <path d="M 158 200 L 256 280 L 354 200" fill="none" stroke="#44403c" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- Center Active Track (Control Active: 100% UP) -->
+    <rect x="234" y="140" width="44" height="232" rx="22" fill="#1c1917" stroke="#44403c" stroke-width="3"/>
+    
+    <!-- Active Green Control Knob (System Online) -->
+    <circle cx="256" cy="180" r="26" fill="url(#switchActive)"/>
+    <circle cx="256" cy="180" r="9" fill="#ffffff"/>
+  </g>
+</svg>

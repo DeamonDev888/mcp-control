@@ -49,7 +49,7 @@ use crate::probe;
 use crate::types::{lockv, AppState, SState, Transport};
 use crate::Reply;
 use litemcp::auth::sign::{NonceCache, SignatureVerifier};
-use litemcp::auth::{AuthContext, ProofMethod, VerifiedRequest};
+use litemcp::auth::{AuthContext, AuthVerdict, ProofMethod, VerifiedRequest};
 use litemcp::error::ToolError;
 use litemcp::jsonrpc::ErrorObject;
 use litemcp::protocol::{ResourceContents, ToolAnnotations};
@@ -1740,8 +1740,24 @@ fn respond_auth(
         }
         // R-2 : refuser en 401 uniforme toute signature créée strictement avant
         // le démarrage courant du serveur (ferme le rejeu après redémarrage).
+        // Vérification fantôme Ed25519 + trace `before_boot` pour conserver un
+        // coût constant et le motif précis au journal d'audit.
         if let Some(min_ts) = min_created {
             if signature_created(headers).is_some_and(|c| c < min_ts) {
+                crate::auth::registry::verification_fantome();
+                crate::audit::note(
+                    "unauthenticated",
+                    "before_boot",
+                    None,
+                    headers_mcp
+                        .as_ref()
+                        .and_then(|h| h.method.as_deref())
+                        .unwrap_or("-"),
+                    headers_mcp
+                        .as_ref()
+                        .and_then(|h| h.name.as_deref())
+                        .unwrap_or("-"),
+                );
                 return Reply::new(
                     401,
                     "application/json",
@@ -1853,6 +1869,33 @@ pub fn serve_hybrid_stdio(
             json!({"ok": false, "error": "not acceptable: serve application/json or text/event-stream"}),
         );
     }
+    // En-têtes de routage MCP (SEP-2243) : unicité exigée (400 sur doublon) et
+    // cohérence exacte vérifiée contre le corps JSON-RPC plus bas (-32020).
+    let mut mcp_method_hdr: Option<String> = None;
+    let mut mcp_name_hdr: Option<String> = None;
+    for (name, value) in headers {
+        match name.as_str() {
+            "mcp-method" => {
+                if mcp_method_hdr.is_some() {
+                    return err_json(
+                        400,
+                        json!({"ok": false, "error": "duplicate Mcp-Method header"}),
+                    );
+                }
+                mcp_method_hdr = Some(value.clone());
+            }
+            "mcp-name" => {
+                if mcp_name_hdr.is_some() {
+                    return err_json(
+                        400,
+                        json!({"ok": false, "error": "duplicate Mcp-Name header"}),
+                    );
+                }
+                mcp_name_hdr = Some(value.clone());
+            }
+            _ => {}
+        }
+    }
     let signed = headers
         .iter()
         .any(|(n, _)| n == "signature" || n == "signature-input");
@@ -1878,6 +1921,15 @@ pub fn serve_hybrid_stdio(
         .with_right("lecture")
     } else {
         if signature_created(headers).is_some_and(|c| c < boot_ts()) {
+            crate::auth::registry::verification_fantome();
+            crate::auth::confirm::note_hybrid_decision(
+                state,
+                AuthVerdict::Unauthenticated,
+                Some("before_boot"),
+                None,
+                mcp_method_hdr.as_deref().unwrap_or("-"),
+                mcp_name_hdr.as_deref().or(Some(server_id)),
+            );
             return unauth();
         }
         let refs: Vec<(&str, &str)> = headers
@@ -1892,7 +1944,17 @@ pub fn serve_hybrid_stdio(
         let req = VerifiedRequest::new(method, path, authority, &refs, body);
         match verifier_for(state).verify(&req) {
             Ok(ctx) => ctx,
-            Err(_) => return unauth(),
+            Err(_) => {
+                crate::auth::confirm::note_hybrid_decision(
+                    state,
+                    AuthVerdict::Unauthenticated,
+                    Some("unauthorized"),
+                    None,
+                    mcp_method_hdr.as_deref().unwrap_or("-"),
+                    mcp_name_hdr.as_deref().or(Some(server_id)),
+                );
+                return unauth();
+            }
         }
     };
     let Ok(rpc_req) = serde_json::from_slice::<Value>(body) else {
@@ -1901,21 +1963,139 @@ pub fn serve_hybrid_stdio(
             json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}),
         );
     };
+    if !rpc_req.is_object() {
+        return Reply::json(
+            400,
+            json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"invalid request: JSON-RPC object expected"}}),
+        );
+    }
+    let has_id = rpc_req.get("id").is_some();
     let rpc_id = rpc_req.get("id").cloned().unwrap_or(Value::Null);
-    let rpc_method = rpc_req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-    if rpc_method.starts_with("notifications/") || (rpc_id.is_null() && rpc_method == "initialized")
-    {
+    let Some(rpc_method) = rpc_req
+        .get("method")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.trim().is_empty())
+    else {
+        return Reply::json(
+            400,
+            json!({"jsonrpc":"2.0","id":rpc_id,"error":{"code":-32600,"message":"invalid request: method required"}}),
+        );
+    };
+    let body_target_name = match rpc_method {
+        "tools/call" | "prompts/get" => rpc_req.pointer("/params/name").and_then(Value::as_str),
+        "resources/read" => rpc_req.pointer("/params/uri").and_then(Value::as_str),
+        _ => None,
+    };
+    // Contrôle SEP-2243 : si Mcp-Method ou Mcp-Name est présent (exigé par le
+    // profil signé), il doit correspondre exactement au corps JSON-RPC (-32020).
+    if let Some(ref hm) = mcp_method_hdr {
+        if hm != rpc_method {
+            crate::auth::confirm::note_hybrid_decision(
+                state,
+                AuthVerdict::ApprovalDenied,
+                Some("header_mismatch"),
+                Some(auth_ctx.client()),
+                rpc_method,
+                Some(server_id),
+            );
+            return Reply::json(
+                200,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "error": { "code": -32020, "message": "Mcp-Method header does not match JSON-RPC method" }
+                }),
+            );
+        }
+    }
+    if let Some(ref hn) = mcp_name_hdr {
+        let name_ok = if matches!(rpc_method, "tools/call" | "prompts/get" | "resources/read") {
+            body_target_name == Some(hn.as_str())
+        } else {
+            hn.is_empty()
+        };
+        if !name_ok {
+            crate::auth::confirm::note_hybrid_decision(
+                state,
+                AuthVerdict::ApprovalDenied,
+                Some("header_mismatch"),
+                Some(auth_ctx.client()),
+                rpc_method,
+                Some(server_id),
+            );
+            return Reply::json(
+                200,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "error": { "code": -32020, "message": "Mcp-Name header does not match JSON-RPC target" }
+                }),
+            );
+        }
+    }
+    let audit_target = match body_target_name.filter(|s| !s.trim().is_empty()) {
+        Some(t) => format!("{server_id}:{t}"),
+        None => server_id.to_string(),
+    };
+    let can_read = auth_ctx.has_right("lecture")
+        || auth_ctx.has_right("pilotage")
+        || auth_ctx.has_right("execution");
+    // Toute notification JSON-RPC (absence de `id`, ou `notifications/*`) ne
+    // produit jamais d'appel synchrone bloquant sur stdin : `202` sans corps.
+    if !has_id || rpc_method.starts_with("notifications/") {
+        if !can_read {
+            crate::auth::confirm::note_hybrid_decision(
+                state,
+                AuthVerdict::RightMissing,
+                Some("right_missing"),
+                Some(auth_ctx.client()),
+                rpc_method,
+                Some(&audit_target),
+            );
+            return Reply::json(
+                403,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": { "code": -32023, "message": "forbidden: lecture right required" }
+                }),
+            );
+        }
+        crate::auth::confirm::note_hybrid_decision(
+            state,
+            AuthVerdict::Allowed,
+            None,
+            Some(auth_ctx.client()),
+            rpc_method,
+            Some(&audit_target),
+        );
         return Reply::new(202, "application/json", Vec::new());
     }
-    let is_exec = rpc_method == "tools/call";
+    let is_exec = matches!(rpc_method, "tools/call" | "resources/read" | "prompts/get");
+    let is_allowed_read = matches!(
+        rpc_method,
+        "initialize"
+            | "ping"
+            | "tools/list"
+            | "resources/list"
+            | "resources/templates/list"
+            | "prompts/list"
+            | "completion/complete"
+    );
     let has_right = if is_exec {
         auth_ctx.has_right("execution")
     } else {
-        auth_ctx.has_right("lecture")
-            || auth_ctx.has_right("pilotage")
-            || auth_ctx.has_right("execution")
+        can_read
     };
     if !has_right {
+        crate::auth::confirm::note_hybrid_decision(
+            state,
+            AuthVerdict::RightMissing,
+            Some("right_missing"),
+            Some(auth_ctx.client()),
+            rpc_method,
+            Some(&audit_target),
+        );
         return Reply::json(
             403,
             json!({
@@ -1925,6 +2105,24 @@ pub fn serve_hybrid_stdio(
                     "code": -32023,
                     "message": if is_exec { "forbidden: execution right required" } else { "forbidden: lecture right required" }
                 }
+            }),
+        );
+    }
+    if !is_exec && !is_allowed_read {
+        crate::auth::confirm::note_hybrid_decision(
+            state,
+            AuthVerdict::ApprovalDenied,
+            Some("method_not_allowed"),
+            Some(auth_ctx.client()),
+            rpc_method,
+            Some(&audit_target),
+        );
+        return Reply::json(
+            200,
+            json!({
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "error": { "code": -32601, "message": format!("method not found: {rpc_method}") }
             }),
         );
     }
@@ -2201,6 +2399,18 @@ pub fn serve_hybrid_stdio(
                     "id": rpc_id,
                     "error": { "code": -32023, "message": disabled_msg }
                 })
+            } else if st != SState::Up {
+                let msg = match last_error {
+                    Some(e) if !e.trim().is_empty() => {
+                        format!("{offline_prefix} ({}) — {e}", st.as_str())
+                    }
+                    _ => format!("{offline_prefix} ({})", st.as_str()),
+                };
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "error": { "code": -32000, "message": msg }
+                })
             } else if is_stdio {
                 let params = rpc_req.get("params").cloned().unwrap_or_else(|| json!({}));
                 match live_rpc(state) {
@@ -2227,6 +2437,32 @@ pub fn serve_hybrid_stdio(
             }
         }
     };
+    // Trace d'audit chaînée (`auth-audit.log`) et anneau « Accès » pour toute
+    // décision prise par le pont hybride : refus politique (-32023) ou accord.
+    if resp_val.pointer("/error/code") == Some(&json!(-32023)) {
+        let reason = if !enabled {
+            "server_disabled"
+        } else {
+            "tool_disabled"
+        };
+        crate::auth::confirm::note_hybrid_decision(
+            state,
+            AuthVerdict::ApprovalDenied,
+            Some(reason),
+            Some(auth_ctx.client()),
+            rpc_method,
+            Some(&audit_target),
+        );
+    } else {
+        crate::auth::confirm::note_hybrid_decision(
+            state,
+            AuthVerdict::Allowed,
+            None,
+            Some(auth_ctx.client()),
+            rpc_method,
+            Some(&audit_target),
+        );
+    }
     let reply = Reply::json(200, resp_val);
     if accept_sse && !accept_json && !reply.body.is_empty() {
         return Reply::new(200, "text/event-stream", sse_event(&reply.body));
@@ -4248,5 +4484,251 @@ mod tests {
                 .contains("machine SSH non enregistrée"),
             "{v}"
         );
+    }
+
+    #[test]
+    fn pont_hybride_sep2243_whitelist_et_journal_audit() {
+        use litemcp::auth::sign::{RequestToSign, Signer, SigningKey};
+
+        let _ = boot_ts();
+        let dir = std::env::temp_dir().join(format!(
+            "mcc-hyb-audit-{}-{}",
+            std::process::id(),
+            crate::types::now_ts()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("config.json").to_string_lossy().to_string();
+        std::fs::write(&cfg_path, r#"{"servers":[]}"#).unwrap();
+
+        let mut base = match Arc::try_unwrap(test_state()) {
+            Ok(s) => s,
+            Err(_) => panic!("test_state unique attendu"),
+        };
+        base.config_path = cfg_path;
+        let state = Arc::new(base);
+
+        let sk_read = SigningKey::generate();
+        let keyid_read = "mcc-aud1-0000000000000001";
+        let sk_exec = SigningKey::generate();
+        let keyid_exec = "mcc-aud2-0000000000000002";
+        {
+            let mut st = lockv(&state.settings);
+            st.auth
+                .insert(crate::auth::registry::ClientRecord::new(
+                    keyid_read.to_string(),
+                    "aud-read".to_string(),
+                    crate::crypto::hex(&sk_read.verifying_key().to_bytes()),
+                    vec!["lecture".to_string()],
+                    "127.0.0.1".to_string(),
+                ))
+                .unwrap();
+            st.auth
+                .insert(crate::auth::registry::ClientRecord::new(
+                    keyid_exec.to_string(),
+                    "aud-exec".to_string(),
+                    crate::crypto::hex(&sk_exec.verifying_key().to_bytes()),
+                    vec!["lecture".to_string(), "execution".to_string()],
+                    "127.0.0.1".to_string(),
+                ))
+                .unwrap();
+        }
+        {
+            let mut servers = lockv(&state.servers);
+            servers.push(Server {
+                id: "store-fs".to_string(),
+                label: "FS".to_string(),
+                transport: Transport::Stdio {
+                    program: "npx".to_string(),
+                    args: vec!["-y".to_string(), "fs".to_string()],
+                    workdir: None,
+                    env: Vec::new(),
+                },
+                origin: Origin::Manual,
+                enabled: true,
+                auto_restart: true,
+                favorite: false,
+                state: SState::Up,
+                pid: Some(1234),
+                bound_host: None,
+                server_name: Some("fs".to_string()),
+                version: Some("1.0.0".to_string()),
+                protocol: Some("2024-11-05".to_string()),
+                sse: false,
+                sse_endpoint: false,
+                ws: false,
+                lang: None,
+                framework: None,
+                in_container: false,
+                container_name: None,
+                via_ssh: false,
+                tools: vec![crate::types::ToolInfo {
+                    name: "read_file".to_string(),
+                    desc: "lit".to_string(),
+                    input_schema: None,
+                }],
+                latency_ms: Some(2),
+                last_seen_ts: Some(crate::types::now_ts()),
+                last_error: None,
+                start_cmd: None,
+                tools_disabled: Vec::new(),
+            });
+        }
+
+        let authority = "127.0.0.1:5090";
+        let path = "/mcp/s/store-fs";
+        let ident_read = crate::bridge::Identite {
+            keyid: keyid_read.to_string(),
+            signer: Signer::new(sk_read).with_keyid(keyid_read),
+        };
+        let ident_exec = crate::bridge::Identite {
+            keyid: keyid_exec.to_string(),
+            signer: Signer::new(sk_exec).with_keyid(keyid_exec),
+        };
+
+        // 1a. Requête signée avec Mcp-Method = ping mais corps JSON = tools/call → 401 (rejetée dès le vérificateur)
+        let forged_body =
+            br#"{"jsonrpc":"2.0","id":77,"method":"tools/call","params":{"name":"read_file"}}"#;
+        let base_hdrs = [("Content-Type", "application/json"), ("Mcp-Method", "ping")];
+        let rts = RequestToSign::new("POST", path, authority, &base_hdrs, forged_body);
+        let mut hdrs = vec![
+            ("host".to_string(), authority.to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+            ("mcp-method".to_string(), "ping".to_string()),
+        ];
+        for (n, v) in ident_exec.signer.headers(&rts).iter() {
+            hdrs.push((n.to_ascii_lowercase(), v.to_string()));
+        }
+        let rep_forged = serve_hybrid_stdio(
+            &state,
+            "store-fs",
+            "POST",
+            path,
+            &hdrs,
+            forged_body,
+            false,
+            None,
+        );
+        assert!(
+            rep_forged.status == 401 || rep_forged.status == 200,
+            "statut attendu 401 ou 200/-32020 : {}",
+            rep_forged.status
+        );
+        if rep_forged.status == 200 {
+            let v_sep: Value = serde_json::from_slice(&rep_forged.body).unwrap();
+            assert_eq!(v_sep["error"]["code"], json!(-32020));
+        }
+
+        // 1b. Mode legacy (non signé) avec Mcp-Method incohérent → -32020 par serve_hybrid_stdio
+        crate::audit::begin_mcp_request();
+        let legacy_hdrs = vec![
+            ("host".to_string(), authority.to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+            ("mcp-method".to_string(), "ping".to_string()),
+        ];
+        let rep_sep = serve_hybrid_stdio(
+            &state,
+            "store-fs",
+            "POST",
+            path,
+            &legacy_hdrs,
+            forged_body,
+            true,
+            None,
+        );
+        assert_eq!(rep_sep.status, 200);
+        let v_sep: Value = serde_json::from_slice(&rep_sep.body).unwrap();
+        assert_eq!(
+            v_sep["error"]["code"],
+            json!(-32020),
+            "SEP-2243 attendu : {v_sep}"
+        );
+        let d_sep = crate::audit::take().expect("décision audit attendue sur refus SEP-2243");
+        assert_eq!(d_sep.verdict, "approval_denied");
+        assert_eq!(d_sep.reason, "header_mismatch");
+
+        // 2. resources/read par un client `lecture` seul → 403 right_missing
+        crate::audit::begin_mcp_request();
+        let res_rpc = json!({
+            "jsonrpc": "2.0",
+            "id": 78,
+            "method": "resources/read",
+            "params": { "uri": "file:///secret" }
+        });
+        let raw_res = crate::bridge::construire_requete(
+            &ident_read,
+            authority,
+            path,
+            &res_rpc,
+            "resources/read",
+        )
+        .unwrap();
+        let (hdrs_res, body_res) = parse_signed_http(&raw_res);
+        let rep_res = serve_hybrid_stdio(
+            &state, "store-fs", "POST", path, &hdrs_res, &body_res, false, None,
+        );
+        assert_eq!(rep_res.status, 403, "resources/read doit exiger execution");
+        let d_res = crate::audit::take().expect("décision audit attendue sur right_missing");
+        assert_eq!(d_res.verdict, "right_missing");
+        assert_eq!(d_res.keyid.as_deref(), Some(keyid_read));
+
+        // 3. Méthode RPC hors whitelist (logging/setLevel) → -32601
+        crate::audit::begin_mcp_request();
+        let unk_body =
+            br#"{"jsonrpc":"2.0","id":79,"method":"logging/setLevel","params":{"level":"debug"}}"#;
+        let unk_hdrs_legacy = vec![
+            ("host".to_string(), authority.to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+        ];
+        let rep_unk = serve_hybrid_stdio(
+            &state,
+            "store-fs",
+            "POST",
+            path,
+            &unk_hdrs_legacy,
+            unk_body,
+            true,
+            None,
+        );
+        assert_eq!(rep_unk.status, 200);
+        let v_unk: Value = serde_json::from_slice(&rep_unk.body).unwrap();
+        assert_eq!(
+            v_unk["error"]["code"],
+            json!(-32601),
+            "whitelist attendue : {v_unk}"
+        );
+        let d_unk =
+            crate::audit::take().expect("décision audit attendue sur méthode hors whitelist");
+        assert_eq!(d_unk.reason, "method_not_allowed");
+
+        // 4. Notification JSON-RPC arbitraire sans `id` → 202 sans corps
+        crate::audit::begin_mcp_request();
+        let notif_custom = json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}});
+        let raw_notif = crate::bridge::construire_requete(
+            &ident_exec,
+            authority,
+            path,
+            &notif_custom,
+            "notifications/cancelled",
+        )
+        .unwrap();
+        let (hdrs_notif, body_notif) = parse_signed_http(&raw_notif);
+        let rep_notif = serve_hybrid_stdio(
+            &state,
+            "store-fs",
+            "POST",
+            path,
+            &hdrs_notif,
+            &body_notif,
+            false,
+            None,
+        );
+        assert_eq!(rep_notif.status, 202);
+        assert!(rep_notif.body.is_empty());
+        let d_notif = crate::audit::take().expect("décision audit attendue sur notification 202");
+        assert_eq!(d_notif.verdict, "allowed");
+        assert_eq!(d_notif.keyid.as_deref(), Some(keyid_exec));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

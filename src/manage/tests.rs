@@ -1304,6 +1304,7 @@ fn auto_restart_par_serveur_action_et_persistance() {
     // persistance dans config.json, et remise à zéro des échecs de spawn.
     let path = tmp_config("cfg_autorestart.json", Some("{\"servers\":[]}"));
     // état partagé avec un vrai chemin de config pour tester l'écriture
+    crate::auth::confirm::reset_store_for_tests();
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
         Err(_) => panic!("test_state doit être unique"),
@@ -1400,6 +1401,7 @@ fn set_host_refuse_seed_et_rehost_manuel() {
     // réimposerait son host au boot —, un serveur manuel est re-hosté et
     // persisté, un stdio est refusé (pas de host), erreurs propres sinon.
     let path = tmp_config("cfg_sethost.json", Some("{\"servers\":[]}"));
+    crate::auth::confirm::reset_store_for_tests();
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
         Err(_) => panic!("test_state doit être unique"),
@@ -1581,6 +1583,7 @@ fn set_start_cmd_refuse_seed_et_distant_persiste_le_local() {
     // (la config par défaut réécraserait), distants refusés (le process
     // appartient à sa machine hôte), locaux OK + persisté.
     let path = tmp_config("cfg_setstartcmd.json", Some("{\"servers\":[]}"));
+    crate::auth::confirm::reset_store_for_tests();
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
         Err(_) => panic!("test_state doit être unique"),
@@ -1803,6 +1806,7 @@ fn annonces_litemcp_listees_sans_adoption_ni_ecriture() {
     // un dossier nommé *.json n'est pas une annonce
     std::fs::create_dir_all(dir.join("dossier.json")).unwrap();
     let path = tmp_config("cfg_annonces.json", None);
+    crate::auth::confirm::reset_store_for_tests();
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
         Err(_) => panic!("test_state doit être unique"),
@@ -2069,6 +2073,7 @@ fn echec_d_ecriture_remonte_et_ne_laisse_pas_de_tmp() {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
     }
 
+    crate::auth::confirm::reset_store_for_tests();
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
         Err(_) => panic!("test_state doit être unique"),
@@ -2144,6 +2149,7 @@ fn ecriture_atomique_disque_plein_laisse_config_intacte_et_aucun_tmp() {
     );
 
     // save_config_checked vers un dossier inexistant → Err, aucun .tmp créé
+    crate::auth::confirm::reset_store_for_tests();
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
         Err(_) => panic!("test_state doit être unique"),
@@ -2221,6 +2227,7 @@ fn set_settings_valide_borne_et_persiste() {
     // (sinon loopback forcé), ports réseau 1-65535 uniquement, et
     // persistance dans config.json.
     let path = tmp_config("cfg_settings_dialog.json", Some("{\"servers\":[]}"));
+    crate::auth::confirm::reset_store_for_tests();
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
         Err(_) => panic!("test_state doit être unique"),
@@ -2278,6 +2285,7 @@ fn set_notify_valide_et_persiste() {
     // invalide refusée AVANT tout, méthode normalisée, min_interval
     // clampé, config persistée, et état exposé à l'UI (/api/state).
     let path = tmp_config("cfg_set_notify.json", Some("{\"servers\":[]}"));
+    crate::auth::confirm::reset_store_for_tests();
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
         Err(_) => panic!("test_state doit être unique"),
@@ -2529,6 +2537,7 @@ fn set_favorite_epingle_persiste_et_se_relit() {
     // dans config.json (seulement quand actif — défaut false), survit à la
     // relecture, est exposé à l'UI, et se retire proprement.
     let path = tmp_config("cfg_set_favorite.json", Some("{\"servers\":[]}"));
+    crate::auth::confirm::reset_store_for_tests();
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
         Err(_) => panic!("test_state doit être unique"),
@@ -2613,6 +2622,7 @@ fn reset_state_placements_detection_et_oublis() {
     // + imports natifs + pairs), oublis (seeds retirés réinjectés + machines
     // SSH) — et « what » inconnu refuse proprement.
     let path = tmp_config("cfg_reset.json", Some("{\"servers\":[]}"));
+    crate::auth::confirm::reset_store_for_tests();
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
         Err(_) => panic!("test_state doit être unique"),
@@ -3921,6 +3931,7 @@ fn kill_et_toggle_ne_tuent_pas_un_pid_recycle_a_date_differente() {
 #[test]
 fn set_start_cmd_program_null_retire_commande_et_autoboot() {
     let path = tmp_config("cfg_setstartcmd_null.json", Some("{\"servers\":[]}"));
+    crate::auth::confirm::reset_store_for_tests();
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
         Err(_) => panic!("test_state doit être unique"),
@@ -4237,6 +4248,7 @@ fn ui_api_state_json_expose_decouverte_annonces_sessions_et_revision() {
     std::fs::create_dir_all(&cfg_dir).unwrap();
     let cfg_path = cfg_dir.join("config.json");
 
+    crate::auth::confirm::reset_store_for_tests();
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
         Err(_) => panic!("test_state doit être unique"),
@@ -4367,6 +4379,7 @@ fn ui_api_access_list_expose_identite_sessions_tls_url_et_stale_180d() {
     let srv_pub_hex = crate::crypto::hex(&loaded.key.verifying_key().to_bytes());
     let srv_block = loaded.key.export();
 
+    crate::auth::confirm::reset_store_for_tests();
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
         Err(_) => panic!("test_state doit être unique"),
@@ -4575,6 +4588,7 @@ fn ui_api_aucun_secret_ni_fuite_gateway() {
         .join("mcc-out-0000000000000001.key");
     std::fs::write(&client_key_path, &client_priv_key).unwrap();
 
+    crate::auth::confirm::reset_store_for_tests();
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
         Err(_) => panic!("test_state doit être unique"),
@@ -5176,6 +5190,7 @@ fn ssh_host_config_persistence_compat_et_champs_complets() {
         "cfg_ssh_hosts.json",
         Some(r#"{"servers":[],"settings":{"ssh_hosts":[{"ip":"192.0.2.10","user":"ubuntu"}]}}"#),
     );
+    crate::auth::confirm::reset_store_for_tests();
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
         Err(_) => panic!("test_state doit être unique"),
@@ -5234,6 +5249,7 @@ fn ssh_host_config_persistence_compat_et_champs_complets() {
 #[test]
 fn set_start_cmd_accepte_via_ssh_si_machine_enregistree() {
     let path = tmp_config("cfg_ssh_start_cmd.json", Some(r#"{"servers":[]}"#));
+    crate::auth::confirm::reset_store_for_tests();
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
         Err(_) => panic!("test_state doit être unique"),
@@ -5318,6 +5334,7 @@ fn should_skip_peer_port_saute_loopback_mais_sonde_ip_distante() {
 #[test]
 fn import_peer_via_ssh_reecrit_loopback_et_marque_ssh() {
     let path = tmp_config("cfg_import_peer_ssh.json", Some(r#"{"servers":[]}"#));
+    crate::auth::confirm::reset_store_for_tests();
     let mut base = match Arc::try_unwrap(test_state()) {
         Ok(s) => s,
         Err(_) => panic!("test_state doit être unique"),
@@ -5487,4 +5504,153 @@ fn container_json_etag_et_cache_roundtrip() {
     assert_eq!(restored[0].container_name.as_deref(), Some("mcp-pg"));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn roundtrip_config_conserve_tools_disabled_et_rejette_ports_hors_bornes() {
+    let dir = std::env::temp_dir().join(format!(
+        "mcc-cfg-toolsdis-{}-{}",
+        std::process::id(),
+        crate::types::now_ts()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg_path = dir.join("config.json").to_string_lossy().to_string();
+    std::fs::write(&cfg_path, r#"{"servers":[]}"#).unwrap();
+
+    crate::auth::confirm::reset_store_for_tests();
+    let mut base = match Arc::try_unwrap(test_state()) {
+        Ok(s) => s,
+        Err(_) => panic!("test_state unique attendu"),
+    };
+    base.config_path = cfg_path.clone();
+    let state = Arc::new(base);
+
+    // Serveur Manual (recréé via config::from_json au redémarrage !) avec tools_disabled
+    let add = handle_action(
+        &state,
+        r#"{"action":"add","transport":"stdio","label":"LocalFS","program":"npx","args":["-y","fs"]}"#,
+    );
+    assert_eq!(add["ok"], serde_json::json!(true), "{add}");
+    let id = add["id"].as_str().unwrap().to_string();
+    {
+        let mut servers = lockv(&state.servers);
+        let srv = servers.iter_mut().find(|s| s.id == id).unwrap();
+        srv.tools.push(crate::types::ToolInfo {
+            name: "delete_file".to_string(),
+            desc: "dangereux".to_string(),
+            input_schema: None,
+        });
+    }
+    let tog = handle_action(
+        &state,
+        &serde_json::json!({"action":"toggle_tool","id":id,"tool":"delete_file"}).to_string(),
+    );
+    assert_eq!(tog["ok"], serde_json::json!(true));
+    assert_eq!(tog["disabled"], serde_json::json!(true));
+
+    // Rechargement complet via load_config : le serveur Manual doit conserver tools_disabled
+    let (servers, _) = load_config(&cfg_path);
+    let restored = servers
+        .iter()
+        .find(|s| s.id == id)
+        .expect("serveur Manual restauré");
+    assert_eq!(
+        restored.tools_disabled,
+        vec!["delete_file".to_string()],
+        "tools_disabled doit survivre à un redémarrage complet"
+    );
+
+    // Ports hors bornes (0 ou > 65535) dans config.json ignorés par from_json et parse_settings
+    let bad_cfg = serde_json::json!({
+        "settings": { "ui_port": 0, "scan_from": 70000, "scan_to": 0 },
+        "servers": [
+            { "id": "bad-0", "label": "Zero", "transport": "http", "port": 0 },
+            { "id": "bad-big", "label": "Big", "transport": "http", "port": 99999 }
+        ]
+    });
+    std::fs::write(&cfg_path, bad_cfg.to_string()).unwrap();
+    let (bad_srvs, s) = load_config(&cfg_path);
+    assert!(
+        !bad_srvs
+            .iter()
+            .any(|s| s.id == "bad-0" || s.id == "bad-big"),
+        "les serveurs avec port 0 ou > 65535 doivent être rejetés"
+    );
+    assert_ne!(s.ui_port, 0);
+    assert!(s.scan_from >= 1);
+    assert!(s.scan_to >= 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn install_store_conserve_prefixe_immuable_et_rejette_flags_dangereux() {
+    let state = test_state();
+
+    // 1. Flag d'exécution arbitraire refusé
+    for bad in [
+        "-c",
+        "--call=id",
+        "-p",
+        "--package=evil",
+        "--index-url=http://evil",
+    ] {
+        let j = handle_action(
+            &state,
+            &serde_json::json!({
+                "action": "install_store",
+                "id": "drawio",
+                "args": [bad, "/tmp"]
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            j["ok"],
+            serde_json::json!(false),
+            "flag dangereux {bad} doit être rejeté : {j}"
+        );
+    }
+    assert!(lockv(&state.servers).is_empty());
+
+    // 2. Arguments légitimes ajoutés APRÈS le paquet officiel immuable
+    let ok = handle_action(
+        &state,
+        &serde_json::json!({
+            "action": "install_store",
+            "id": "drawio",
+            "args": ["--port", "8899"]
+        })
+        .to_string(),
+    );
+    assert_eq!(ok["ok"], serde_json::json!(true), "{ok}");
+    let servers = lockv(&state.servers);
+    assert_eq!(servers.len(), 1);
+    match &servers[0].transport {
+        Transport::Stdio { program, args, .. } => {
+            assert_eq!(program, "npx");
+            assert_eq!(
+                args,
+                &vec![
+                    "-y".to_string(),
+                    "@drawio/mcp".to_string(),
+                    "--port".to_string(),
+                    "8899".to_string()
+                ],
+                "it.args doit rester en préfixe immuable"
+            );
+        }
+        other => panic!("Stdio attendu, reçu {other:?}"),
+    }
+}
+
+#[test]
+fn dedup_ne_fusionne_jamais_serveurs_sans_nom_annonce() {
+    let known = vec![(None, Some("10.0.0.1".to_string()), 3001u16)];
+    let decision = crate::validate::dedup_decide(&known, None, Some("10.0.0.1"), 3002);
+    assert_eq!(
+        decision,
+        crate::validate::DedupDecision::Add,
+        "deux ports sans server_name annoncé ne doivent jamais fusionner sur ?@host"
+    );
 }

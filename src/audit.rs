@@ -478,7 +478,7 @@ pub fn note(verdict: &'static str, reason: &str, keyid: Option<&str>, method: &s
     });
 }
 
-fn take() -> Option<Decision> {
+pub(crate) fn take() -> Option<Decision> {
     COURANTE.with(|c| c.borrow_mut().take())
 }
 

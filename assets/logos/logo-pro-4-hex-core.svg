@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgPro4" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#111827"/>
+      <stop offset="100%" stop-color="#030712"/>
+    </linearGradient>
+    <linearGradient id="hexGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f8fafc"/>
+      <stop offset="100%" stop-color="#cbd5e1"/>
+    </linearGradient>
+    <linearGradient id="mGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- App Squircle -->
+  <rect x="32" y="32" width="448" height="448" rx="100" fill="url(#bgPro4)" stroke="#1f2937" stroke-width="2"/>
+
+  <!-- Solid Clean Modern Hexagon Structure -->
+  <g transform="translate(256, 256)">
+    <!-- Base Hexagon Frame -->
+    <polygon points="0,-150 130,-75 130,75 0,150 -130,75 -130,-75" 
+             fill="#1e293b" 
+             stroke="#334155" 
+             stroke-width="6" 
+             stroke-linejoin="round"/>
+
+    <!-- Sharp Bold Geometric "M" carved with surgical precision -->
+    <!-- Left Pillar -->
+    <path d="M -80,60 L -80,-50 L -45,-50 L -45,60 Z" fill="url(#hexGrad)"/>
+    
+    <!-- Right Pillar -->
+    <path d="M 45,60 L 45,-50 L 80,-50 L 80,60 Z" fill="url(#hexGrad)"/>
+
+    <!-- Central MCP Bridge Wedge -->
+    <polygon points="-45,-50 0,0 45,-50 20,-50 0,-25 -20,-50" fill="url(#mGrad)"/>
+
+    <!-- Center Status Diamond (The Control Ping) -->
+    <polygon points="0,15 15,35 0,55 -15,35" fill="url(#mGrad)"/>
+  </g>
+</svg>

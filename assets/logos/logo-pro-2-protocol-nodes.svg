@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgPro2" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#020617"/>
+    </linearGradient>
+    <linearGradient id="blueAccent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#60a5fa"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Clean Canvas Squircle -->
+  <rect x="32" y="32" width="448" height="448" rx="100" fill="url(#bgPro2)" stroke="#1e293b" stroke-width="2"/>
+
+  <!-- Minimal Protocol Bridge M -->
+  <g>
+    <!-- Solid Connective Bars -->
+    <path d="M 148 340 L 148 200 L 256 296 L 364 200 L 364 340" 
+          fill="none" 
+          stroke="#f8fafc" 
+          stroke-width="32" 
+          stroke-linecap="round" 
+          stroke-linejoin="round"/>
+
+    <!-- Central Control Node (The MCP Bridge Hub) -->
+    <circle cx="256" cy="296" r="28" fill="url(#blueAccent)"/>
+    <circle cx="256" cy="296" r="10" fill="#ffffff"/>
+
+    <!-- Left & Right Satellite Hubs (Client & Tools) -->
+    <circle cx="148" cy="200" r="22" fill="#38bdf8"/>
+    <circle cx="364" cy="200" r="22" fill="#38bdf8"/>
+
+    <!-- Base Terminals -->
+    <circle cx="148" cy="340" r="16" fill="#f8fafc"/>
+    <circle cx="364" cy="340" r="16" fill="#f8fafc"/>
+  </g>
+</svg>

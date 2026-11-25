@@ -507,7 +507,7 @@ fn verification_fantome_octets(bytes: &[u8; 32]) {
     let _ = cle.verify_message(b"", &SIGNATURE_FANTOME);
 }
 
-fn verification_fantome() {
+pub(crate) fn verification_fantome() {
     let Some(bytes) = decode_public_key(CLE_FANTOME) else {
         return;
     };

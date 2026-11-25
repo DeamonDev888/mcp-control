@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Background Gradient (Deep Carbon & Warm Amber Aura) -->
+    <radialGradient id="bgGlow4" cx="50%" cy="50%" r="70%">
+      <stop offset="0%" stop-color="#261608"/>
+      <stop offset="55%" stop-color="#140b04"/>
+      <stop offset="100%" stop-color="#080402"/>
+    </radialGradient>
+
+    <!-- Amber Fire & Tactical Gradients -->
+    <linearGradient id="amberGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fde047"/>
+      <stop offset="50%" stop-color="#f59e0b"/>
+      <stop offset="100%" stop-color="#ea580c"/>
+    </linearGradient>
+
+    <linearGradient id="flameGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fb923c"/>
+      <stop offset="100%" stop-color="#dc2626"/>
+    </linearGradient>
+
+    <linearGradient id="radarSweepGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f59e0b" stop-opacity="0.45"/>
+      <stop offset="70%" stop-color="#f59e0b" stop-opacity="0.05"/>
+      <stop offset="100%" stop-color="#f59e0b" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- Outer Frame Metal -->
+    <linearGradient id="metalRim4" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#78350f"/>
+      <stop offset="50%" stop-color="#451a03"/>
+      <stop offset="100%" stop-color="#1c0902"/>
+    </linearGradient>
+
+    <filter id="amberGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+
+    <filter id="hudShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="14" stdDeviation="20" flood-color="#ea580c" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+
+  <!-- Container Squircle -->
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#bgGlow4)" stroke="url(#metalRim4)" stroke-width="4"/>
+
+  <!-- Radar Grid & HUD Circles -->
+  <g opacity="0.25" stroke="#f59e0b">
+    <circle cx="256" cy="256" r="180" fill="none" stroke-width="1.5" stroke-dasharray="6 6"/>
+    <circle cx="256" cy="256" r="140" fill="none" stroke-width="1"/>
+    <circle cx="256" cy="256" r="100" fill="none" stroke-width="1.5" stroke-dasharray="4 8"/>
+    <!-- Crosshairs -->
+    <line x1="256" y1="56" x2="256" y2="456" stroke-width="1.5" stroke-dasharray="12 8"/>
+    <line x1="56" y1="256" x2="456" y2="256" stroke-width="1.5" stroke-dasharray="12 8"/>
+    <line x1="114" y1="114" x2="134" y2="134" stroke-width="2"/>
+    <line x1="398" y1="114" x2="378" y2="134" stroke-width="2"/>
+    <line x1="114" y1="398" x2="134" y2="378" stroke-width="2"/>
+    <line x1="398" y1="398" x2="378" y2="378" stroke-width="2"/>
+  </g>
+
+  <!-- Radar Sweep Sector (Scan beam scanning active servers) -->
+  <path d="M 256 256 L 398 152 A 175 175 0 0 0 256 81 Z" fill="url(#radarSweepGrad)"/>
+  <line x1="256" y1="256" x2="398" y2="152" stroke="#fde047" stroke-width="2" filter="url(#amberGlow)"/>
+
+  <!-- Detected Server Targets on Radar HUD (Live Servers) -->
+  <!-- Server 1 (Active) -->
+  <circle cx="340" cy="180" r="6" fill="#10b981" filter="url(#amberGlow)"/>
+  <circle cx="340" cy="180" r="12" fill="none" stroke="#10b981" stroke-width="1.5" opacity="0.8"/>
+  <!-- Server 2 (Active) -->
+  <circle cx="160" cy="190" r="5" fill="#f59e0b"/>
+  <!-- Server 3 (Active) -->
+  <circle cx="360" cy="310" r="5" fill="#f59e0b"/>
+
+  <!-- Tactical HUD Outer Brackets (Targeting Corners) -->
+  <g stroke="url(#amberGrad)" stroke-width="4.5" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Top-Left Bracket -->
+    <path d="M 120 160 L 120 120 L 160 120"/>
+    <!-- Top-Right Bracket -->
+    <path d="M 352 120 L 392 120 L 392 160"/>
+    <!-- Bottom-Left Bracket -->
+    <path d="M 120 352 L 120 392 L 160 392"/>
+    <!-- Bottom-Right Bracket -->
+    <path d="M 352 392 L 392 392 L 392 352"/>
+  </g>
+
+  <!-- Central Sentinel Emblem: Shield / Cockpit Command Node -->
+  <g filter="url(#hudShadow)">
+    <!-- Armored Shield Hexagon -->
+    <polygon points="256,168 334,212 334,300 256,344 178,300 178,212" 
+             fill="#180e07" stroke="url(#amberGrad)" stroke-width="5" stroke-linejoin="round"/>
+    
+    <!-- Inner High-Tech "M - C" Wings & Cockpit Chevron -->
+    <!-- Left Wing (M left) -->
+    <polygon points="196,284 196,224 226,224 226,268 212,284" fill="url(#flameGrad)"/>
+    <!-- Right Wing (M right) -->
+    <polygon points="316,284 316,224 286,224 286,268 300,284" fill="url(#flameGrad)"/>
+    
+    <!-- Central Control Needle / Reticle Center (C-Apex) -->
+    <polygon points="256,204 274,250 256,242 238,250" fill="#fde047" filter="url(#amberGlow)"/>
+
+    <!-- Horizon / Bridge Line connecting the wings -->
+    <line x1="210" y1="274" x2="302" y2="274" stroke="#fde047" stroke-width="3.5" stroke-linecap="round" filter="url(#amberGlow)"/>
+    
+    <!-- Center Core Dot -->
+    <circle cx="256" cy="288" r="5" fill="#ffffff" filter="url(#amberGlow)"/>
+  </g>
+
+  <!-- Status HUD Tape / Compass Readings at Top & Bottom -->
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="800" font-size="11" letter-spacing="2" text-anchor="middle" fill="#f59e0b">
+    <text x="256" y="96" opacity="0.9">SYS.SCAN // 38 PORTS</text>
+    <text x="256" y="430" fill="#fde047" opacity="0.95">CONTROL ACTIVE</text>
+  </g>
+</svg>
