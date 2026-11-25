@@ -2245,8 +2245,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(stdio_start_timeout_ms("node", &v(&["x.js"])), 30_000);
         assert_eq!(stdio_start_timeout_ms("bunx", &v(&["mcp-x"])), 180_000);
+        // Chemin complet classé par file_stem : séparateurs natifs par OS
+        // (Path::file_stem ne découpe pas les `\` sous unix).
+        #[cfg(windows)]
         assert_eq!(
             stdio_start_timeout_ms(r"C:\x\uvx.exe", &v(&["paquet-uv-inexistant-mcc-zz9"])),
+            300_000
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            stdio_start_timeout_ms("/usr/local/bin/uvx", &v(&["paquet-uv-inexistant-mcc-zz9"])),
             300_000
         );
         assert_eq!(
@@ -2289,9 +2297,20 @@ mod tests {
             ),
             300_000
         );
+        // Chemin complet classé par file_stem : séparateurs natifs par OS
+        // (Path::file_stem ne découpe pas les `\` sous unix).
+        #[cfg(windows)]
         assert_eq!(
             stdio_start_timeout_ms(
                 r"C:\tools\uvx.exe",
+                &v(&["--from", "git+https://github.com/org/repo.git", "mcp-repo"])
+            ),
+            300_000
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            stdio_start_timeout_ms(
+                "/usr/local/bin/uvx",
                 &v(&["--from", "git+https://github.com/org/repo.git", "mcp-repo"])
             ),
             300_000
