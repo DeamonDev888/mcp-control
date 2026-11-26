@@ -255,10 +255,19 @@ pub fn fingerprint(state: &Arc<AppState>) -> u64 {
     for i in idxs {
         let s = &servers[i];
         s.id.hash(&mut h);
+        s.label.hash(&mut h);
         s.state.as_str().hash(&mut h);
         s.enabled.hash(&mut h);
+        // GW-C05 : hasher le contenu réel (noms + descriptions d'outils et
+        // liste triée des outils désactivés), pas uniquement les longueurs.
         s.tools.len().hash(&mut h);
-        s.tools_disabled.len().hash(&mut h);
+        for t in &s.tools {
+            t.name.hash(&mut h);
+            t.desc.hash(&mut h);
+        }
+        let mut dis: Vec<&str> = s.tools_disabled.iter().map(String::as_str).collect();
+        dis.sort_unstable();
+        dis.hash(&mut h);
     }
     h.finish()
 }
@@ -1974,52 +1983,63 @@ pub fn serve_hybrid_stdio(
         "resources/read" => rpc_req.pointer("/params/uri").and_then(Value::as_str),
         _ => None,
     };
-    // Contrôle SEP-2243 : si Mcp-Method ou Mcp-Name est présent (exigé par le
-    // profil signé), il doit correspondre exactement au corps JSON-RPC (-32020).
-    if let Some(ref hm) = mcp_method_hdr {
-        if hm != rpc_method {
-            crate::auth::confirm::note_hybrid_decision(
-                state,
-                AuthVerdict::ApprovalDenied,
-                Some("header_mismatch"),
-                Some(auth_ctx.client()),
-                rpc_method,
-                Some(server_id),
-            );
-            return Reply::json(
-                200,
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": rpc_id,
-                    "error": { "code": -32020, "message": "Mcp-Method header does not match JSON-RPC method" }
-                }),
-            );
-        }
+    // Contrôle SEP-2243 (GW-C02) : en mode signé (!legacy_loopback), Mcp-Method
+    // est OBLIGATOIRE et Mcp-Name est OBLIGATOIRE dès que la méthode vise un
+    // outil/prompt/ressource, et doivent correspondre exactement au corps JSON-RPC.
+    let method_ok = match mcp_method_hdr.as_deref() {
+        Some(hm) => hm == rpc_method,
+        None => legacy && !signed,
+    };
+    if !method_ok {
+        crate::auth::confirm::note_hybrid_decision(
+            state,
+            AuthVerdict::ApprovalDenied,
+            Some("header_mismatch"),
+            Some(auth_ctx.client()),
+            rpc_method,
+            Some(server_id),
+        );
+        return Reply::json(
+            200,
+            json!({
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "error": { "code": -32020, "message": "Mcp-Method header missing or does not match JSON-RPC method" }
+            }),
+        );
     }
-    if let Some(ref hn) = mcp_name_hdr {
-        let name_ok = if matches!(rpc_method, "tools/call" | "prompts/get" | "resources/read") {
-            body_target_name == Some(hn.as_str())
-        } else {
-            hn.is_empty()
-        };
-        if !name_ok {
-            crate::auth::confirm::note_hybrid_decision(
-                state,
-                AuthVerdict::ApprovalDenied,
-                Some("header_mismatch"),
-                Some(auth_ctx.client()),
-                rpc_method,
-                Some(server_id),
-            );
-            return Reply::json(
-                200,
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": rpc_id,
-                    "error": { "code": -32020, "message": "Mcp-Name header does not match JSON-RPC target" }
-                }),
-            );
+    let needs_target_name = matches!(rpc_method, "tools/call" | "prompts/get" | "resources/read");
+    let name_ok = match mcp_name_hdr.as_deref() {
+        Some(hn) => {
+            if needs_target_name {
+                body_target_name == Some(hn)
+            } else {
+                hn.is_empty()
+            }
         }
+        None => {
+            (legacy && !signed)
+                || !needs_target_name
+                || body_target_name.map(str::trim).unwrap_or("").is_empty()
+        }
+    };
+    if !name_ok {
+        crate::auth::confirm::note_hybrid_decision(
+            state,
+            AuthVerdict::ApprovalDenied,
+            Some("header_mismatch"),
+            Some(auth_ctx.client()),
+            rpc_method,
+            Some(server_id),
+        );
+        return Reply::json(
+            200,
+            json!({
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "error": { "code": -32020, "message": "Mcp-Name header missing or does not match JSON-RPC target" }
+            }),
+        );
     }
     let audit_target = match body_target_name.filter(|s| !s.trim().is_empty()) {
         Some(t) => format!("{server_id}:{t}"),
@@ -2304,6 +2324,76 @@ pub fn serve_hybrid_stdio(
                     "error": { "code": -32000, "message": msg }
                 })
             } else {
+                let arguments = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let confirm_args = json!({
+                    "server": server_id,
+                    "tool": tool_name,
+                    "arguments": &arguments,
+                });
+                let decision = crate::auth::confirm::decide(
+                    state,
+                    auth_ctx.client(),
+                    "call_server_tool",
+                    &confirm_args,
+                    &rpc_id,
+                );
+                match decision.verdict {
+                    crate::auth::confirm::Verdict::Pending => {
+                        crate::auth::confirm::note_hybrid_decision(
+                            state,
+                            AuthVerdict::ApprovalPending,
+                            Some("approval_pending"),
+                            Some(auth_ctx.client()),
+                            rpc_method,
+                            Some(&audit_target),
+                        );
+                        return Reply::json(
+                            403,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": rpc_id,
+                                "error": {
+                                    "code": -32023,
+                                    "message": "forbidden: human approval pending",
+                                    "data": {
+                                        "reason": "approval_pending",
+                                        "retryable": true,
+                                        "retryAfterMs": 2000
+                                    }
+                                }
+                            }),
+                        );
+                    }
+                    crate::auth::confirm::Verdict::Deny => {
+                        crate::auth::confirm::note_hybrid_decision(
+                            state,
+                            AuthVerdict::ApprovalDenied,
+                            Some("approval_denied"),
+                            Some(auth_ctx.client()),
+                            rpc_method,
+                            Some(&audit_target),
+                        );
+                        return Reply::json(
+                            403,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": rpc_id,
+                                "error": {
+                                    "code": -32023,
+                                    "message": "forbidden: human approval denied",
+                                    "data": {
+                                        "reason": "approval_denied",
+                                        "retryable": false
+                                    }
+                                }
+                            }),
+                        );
+                    }
+                    crate::auth::confirm::Verdict::Allow => {}
+                }
                 manage::add_log(
                     state,
                     "info",
@@ -2312,10 +2402,6 @@ pub fn serve_hybrid_stdio(
                         auth_ctx.client()
                     ),
                 );
-                let arguments = params
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
                 if is_stdio {
                     match live_rpc(state) {
                         Ok(rpc) => {
@@ -2401,6 +2487,74 @@ pub fn serve_hybrid_stdio(
                 })
             } else if is_stdio {
                 let params = rpc_req.get("params").cloned().unwrap_or_else(|| json!({}));
+                if is_exec {
+                    let confirm_args = json!({
+                        "server": server_id,
+                        "tool": other,
+                        "arguments": &params,
+                    });
+                    let decision = crate::auth::confirm::decide(
+                        state,
+                        auth_ctx.client(),
+                        "call_server_tool",
+                        &confirm_args,
+                        &rpc_id,
+                    );
+                    match decision.verdict {
+                        crate::auth::confirm::Verdict::Pending => {
+                            crate::auth::confirm::note_hybrid_decision(
+                                state,
+                                AuthVerdict::ApprovalPending,
+                                Some("approval_pending"),
+                                Some(auth_ctx.client()),
+                                rpc_method,
+                                Some(&audit_target),
+                            );
+                            return Reply::json(
+                                403,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": rpc_id,
+                                    "error": {
+                                        "code": -32023,
+                                        "message": "forbidden: human approval pending",
+                                        "data": {
+                                            "reason": "approval_pending",
+                                            "retryable": true,
+                                            "retryAfterMs": 2000
+                                        }
+                                    }
+                                }),
+                            );
+                        }
+                        crate::auth::confirm::Verdict::Deny => {
+                            crate::auth::confirm::note_hybrid_decision(
+                                state,
+                                AuthVerdict::ApprovalDenied,
+                                Some("approval_denied"),
+                                Some(auth_ctx.client()),
+                                rpc_method,
+                                Some(&audit_target),
+                            );
+                            return Reply::json(
+                                403,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": rpc_id,
+                                    "error": {
+                                        "code": -32023,
+                                        "message": "forbidden: human approval denied",
+                                        "data": {
+                                            "reason": "approval_denied",
+                                            "retryable": false
+                                        }
+                                    }
+                                }),
+                            );
+                        }
+                        crate::auth::confirm::Verdict::Allow => {}
+                    }
+                }
                 match live_rpc(state) {
                     Ok(rpc) => match crate::probe::call_stdio_rpc(&rpc, other, params, 60_000) {
                         Ok((res, _ms)) => json!({ "jsonrpc": "2.0", "id": rpc_id, "result": res }),
@@ -4215,12 +4369,54 @@ mod tests {
         lockv(&state.children).insert("store-github".to_string(), handle);
 
         // 1. Exécution via POST /mcp/s/store-github (pont hybride signé Ed25519)
+        // GW-C01 : le premier appel crée une demande d'approbation humaine (403) ;
+        // après approbation locale (`once`), la reprise s'exécute en 200.
         let call_ok = json!({
             "jsonrpc": "2.0",
             "id": 10,
             "method": "tools/call",
             "params": { "name": "search_repositories", "arguments": { "query": "litemcp" } }
         });
+        let raw_pending = crate::bridge::construire_requete(
+            &ident,
+            "127.0.0.1:5090",
+            "/mcp/s/store-github",
+            &call_ok,
+            "tools/call",
+        )
+        .unwrap();
+        let (hdrs_p, body_p) = parse_signed_http(&raw_pending);
+        let rep_p = serve_hybrid_stdio(
+            &state,
+            "store-github",
+            "POST",
+            "/mcp/s/store-github",
+            &hdrs_p,
+            &body_p,
+            false,
+            None,
+        );
+        assert_eq!(
+            rep_p.status, 403,
+            "confirmation humaine attendue avant exécution"
+        );
+        let snap = crate::auth::confirm::list(&state, crate::auth::confirm::Actor::LocalAdmin);
+        let req_id = snap["pending"]
+            .as_array()
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|e| e["keyid"] == ident.keyid)
+                    .and_then(|e| e["id"].as_str())
+            })
+            .expect("demande en attente attendue")
+            .to_string();
+        crate::auth::confirm::approve(
+            &state,
+            &req_id,
+            "once",
+            crate::auth::confirm::Actor::LocalAdmin,
+        )
+        .unwrap();
         let raw = crate::bridge::construire_requete(
             &ident,
             "127.0.0.1:5090",
@@ -4450,13 +4646,48 @@ mod tests {
         let v: Value = serde_json::from_slice(&rep.body).unwrap();
         assert_eq!(v["error"]["code"], json!(-32023), "{v}");
 
-        // machine SSH non enregistrée → erreur explicite -32000 sans lancer ssh
+        // machine SSH non enregistrée → après confirmation humaine, erreur explicite -32000 sans lancer ssh
         let call_on = json!({
             "jsonrpc": "2.0",
             "id": 5,
             "method": "tools/call",
             "params": { "name": "echo", "arguments": {"msg": "hi"} }
         });
+        let raw_p =
+            crate::bridge::construire_requete(&ident, authority, path, &call_on, "tools/call")
+                .unwrap();
+        let (hdrs_p, body_p) = parse_signed_http(&raw_p);
+        let rep_p = serve_hybrid_stdio(
+            &state,
+            "ssh-srv-1",
+            "POST",
+            path,
+            &hdrs_p,
+            &body_p,
+            false,
+            None,
+        );
+        assert_eq!(
+            rep_p.status, 403,
+            "confirmation humaine attendue sur pont SSH"
+        );
+        let snap = crate::auth::confirm::list(&state, crate::auth::confirm::Actor::LocalAdmin);
+        let req_id = snap["pending"]
+            .as_array()
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|e| e["keyid"] == ident.keyid)
+                    .and_then(|e| e["id"].as_str())
+            })
+            .expect("demande en attente attendue")
+            .to_string();
+        crate::auth::confirm::approve(
+            &state,
+            &req_id,
+            "once",
+            crate::auth::confirm::Actor::LocalAdmin,
+        )
+        .unwrap();
         let raw =
             crate::bridge::construire_requete(&ident, authority, path, &call_on, "tools/call")
                 .unwrap();
@@ -4716,6 +4947,44 @@ mod tests {
         let d_notif = crate::audit::take().expect("décision audit attendue sur notification 202");
         assert_eq!(d_notif.verdict, "allowed");
         assert_eq!(d_notif.keyid.as_deref(), Some(keyid_exec));
+
+        // 5. GW-C01 : `tools/call` sur `/mcp/s/<id>` avec droit `execution`
+        // DOIT passer par la confirmation humaine (403 -32023 approval_pending)
+        // et ne jamais exécuter directement sans approbation locale.
+        crate::auth::confirm::reset_store_for_tests();
+        crate::audit::begin_mcp_request();
+        let call_body_json = json!({
+            "jsonrpc": "2.0",
+            "id": 80,
+            "method": "tools/call",
+            "params": { "name": "read_file", "arguments": { "path": "test.txt" } }
+        });
+        let raw_call = crate::bridge::construire_requete(
+            &ident_exec,
+            authority,
+            path,
+            &call_body_json,
+            "tools/call",
+        )
+        .unwrap();
+        let (hdrs_call, body_call) = parse_signed_http(&raw_call);
+        let rep_call = serve_hybrid_stdio(
+            &state, "store-fs", "POST", path, &hdrs_call, &body_call, false, None,
+        );
+        assert_eq!(
+            rep_call.status,
+            403,
+            "tools/call sur /mcp/s/<id> doit exiger confirmation humaine : {}",
+            String::from_utf8_lossy(&rep_call.body)
+        );
+        let v_call: Value = serde_json::from_slice(&rep_call.body).unwrap();
+        assert_eq!(v_call["error"]["code"], json!(-32023));
+        assert_eq!(v_call["error"]["data"]["reason"], json!("approval_pending"));
+        let d_call =
+            crate::audit::take().expect("décision audit attendue sur approval_pending hybride");
+        assert_eq!(d_call.verdict, "approval_pending");
+        assert_eq!(d_call.reason, "approval_pending");
+        assert_eq!(d_call.keyid.as_deref(), Some(keyid_exec));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

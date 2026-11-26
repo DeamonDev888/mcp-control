@@ -694,47 +694,50 @@ pub fn replace_binary_file(
 /// binaire autonome puis relance automatiquement la nouvelle version.
 fn launch_verified_update(downloaded: &std::path::Path, asset: &str) -> Result<(), String> {
     let is_nsis = cfg!(windows) && asset.ends_with("-setup.exe");
-    if is_nsis {
-        let mut cmd = std::process::Command::new(downloaded);
-        // Mode silencieux NSIS : aucun clic de wizard requis ; le hook
-        // `NSIS_HOOK_POSTINSTALL` relance automatiquement l'application qui
-        // hérite de `MCC_UPDATE_WAIT_PID` pour attendre notre sortie réelle.
-        cmd.arg("/S")
-            .env(UPDATE_WAIT_ENV, std::process::id().to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0000_0200);
+    let pid = std::process::id().to_string();
+    let spawn_target = if is_nsis {
+        if !downloaded.is_file() {
+            return Err(format!(
+                "installateur téléchargé introuvable : {}",
+                downloaded.display()
+            ));
         }
-        cmd.spawn()
-            .map_err(|e| format!("lancement de l'installateur impossible : {e}"))?;
+        downloaded.to_path_buf()
     } else {
         let current_exe = std::env::current_exe()
             .map_err(|e| format!("chemin de l'exécutable courant introuvable : {e}"))?;
         replace_binary_file(downloaded, &current_exe)?;
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        let mut cmd = std::process::Command::new(&current_exe);
-        cmd.args(&args)
-            .env(UPDATE_WAIT_ENV, std::process::id().to_string())
+        current_exe
+    };
+    let forward_args: Vec<String> = if is_nsis {
+        vec!["/S".to_string()]
+    } else {
+        std::env::args().skip(1).collect()
+    };
+    // MC-C03 : laisser 1500 ms à l'interface (polling 350 ms) pour observer
+    // `phase: "restarting"`, arrêter proprement le moteur (libération ports +
+    // enfants), puis lancer NSIS / la nouvelle version juste avant `exit(0)`
+    // pour éviter que NSIS tente d'écraser le binaire encore verrouillé.
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        crate::shutdown_engine();
+        let mut cmd = std::process::Command::new(&spawn_target);
+        cmd.args(&forward_args)
+            .env(UPDATE_WAIT_ENV, &pid)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000 | 0x0000_0200);
+            let flags = if is_nsis {
+                0x0000_0200
+            } else {
+                0x0800_0000 | 0x0000_0200
+            };
+            cmd.creation_flags(flags);
         }
-        cmd.spawn()
-            .map_err(|e| format!("relance de la nouvelle version impossible : {e}"))?;
-    }
-    // Laisse 1500 ms à l'interface (polling 350 ms) pour observer
-    // `phase: "restarting"`, puis arrête proprement le moteur avant de sortir.
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        crate::shutdown_engine();
+        let _ = cmd.spawn();
         std::process::exit(0);
     });
     Ok(())

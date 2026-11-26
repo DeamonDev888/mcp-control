@@ -3,10 +3,14 @@
 use super::*;
 
 pub(super) fn now_compact() -> u64 {
-    std::time::SystemTime::now()
+    // MC-C14 : compteur monotone anti-collision sur imports rapides dans la même ms.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let base = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64 % 100_000_000)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 1000;
+    base.saturating_mul(1000).saturating_add(seq)
 }
 
 pub fn start_cmd_for(srv: &Server) -> Option<StartCmd> {

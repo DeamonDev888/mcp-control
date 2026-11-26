@@ -157,7 +157,7 @@ pub fn run(args: &[String]) -> i32 {
         );
         return 2;
     }
-    let (identite, tls_fp) = match identite_locale(is_https, &host, port, &target_path) {
+    let (mut identite, mut tls_fp) = match identite_locale(is_https, &host, port, &target_path) {
         Ok(v) => v,
         Err(message) => {
             eprintln!("{message}");
@@ -180,17 +180,49 @@ pub fn run(args: &[String]) -> i32 {
         "bridge : stdio → {scheme}://{authority}{target_path} (keyid {})",
         identite.keyid
     );
+    const MAX_BRIDGE_LINE: usize = 32 * 1024 * 1024;
     let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
     let mut sortie = std::io::stdout().lock();
-    for ligne in stdin.lock().lines() {
-        let ligne = match ligne {
-            Ok(l) => l,
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        buf.clear();
+        let n = match reader
+            .by_ref()
+            .take((MAX_BRIDGE_LINE + 1) as u64)
+            .read_until(b'\n', &mut buf)
+        {
+            Ok(0) => break,
+            Ok(n) => n,
             Err(_) => break,
         };
+        if n > MAX_BRIDGE_LINE {
+            // GW-C04 : purger le reste de la ligne surdimensionnée sans OOM.
+            let mut drain = [0u8; 4096];
+            loop {
+                match reader.read(&mut drain) {
+                    Ok(0) | Err(_) => break,
+                    Ok(k) if drain[..k].contains(&b'\n') => break,
+                    Ok(_) => {}
+                }
+            }
+            let err = erreur_json(
+                &Value::Null,
+                -32700,
+                "message JSON-RPC trop volumineux (> 32 Mio)",
+                None,
+            );
+            if writeln!(sortie, "{err}").is_err() {
+                return 0;
+            }
+            let _ = sortie.flush();
+            continue;
+        }
+        let ligne = String::from_utf8_lossy(&buf);
         if ligne.trim().is_empty() {
             continue;
         }
-        let reponse = traiter_ligne(
+        let (reponse, got_401) = traiter_ligne_avec_statut(
             &ligne,
             &identite,
             is_https,
@@ -201,6 +233,40 @@ pub fn run(args: &[String]) -> i32 {
             &target_path,
             &pair_url,
         );
+        let reponse = if got_401 {
+            // GW-C04 : si la clé a été tournée/ré-appairée sur disque, recharger
+            // une fois et retenter la requête avant de remonter 401.
+            if let Ok((new_id, new_fp)) = identite_locale(is_https, &host, port, &target_path) {
+                if new_id.keyid != identite.keyid {
+                    eprintln!(
+                        "bridge : identité rechargée après 401 ({} → {})",
+                        identite.keyid, new_id.keyid
+                    );
+                    identite = new_id;
+                    if !new_fp.is_empty() {
+                        tls_fp = new_fp;
+                    }
+                    traiter_ligne_avec_statut(
+                        &ligne,
+                        &identite,
+                        is_https,
+                        tls_fp.as_str(),
+                        &host,
+                        port,
+                        &authority,
+                        &target_path,
+                        &pair_url,
+                    )
+                    .0
+                } else {
+                    reponse
+                }
+            } else {
+                reponse
+            }
+        } else {
+            reponse
+        };
         if let Some(texte) = reponse {
             if writeln!(sortie, "{texte}").is_err() {
                 return 0;
@@ -417,7 +483,7 @@ pub(crate) fn construire_requete(
     Ok(requete)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 fn traiter_ligne(
     ligne: &str,
     identite: &Identite,
@@ -429,25 +495,59 @@ fn traiter_ligne(
     target_path: &str,
     url: &str,
 ) -> Option<String> {
+    traiter_ligne_avec_statut(
+        ligne,
+        identite,
+        is_https,
+        tls_fp,
+        host,
+        port,
+        authority,
+        target_path,
+        url,
+    )
+    .0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn traiter_ligne_avec_statut(
+    ligne: &str,
+    identite: &Identite,
+    is_https: bool,
+    tls_fp: &str,
+    host: &str,
+    port: u16,
+    authority: &str,
+    target_path: &str,
+    url: &str,
+) -> (Option<String>, bool) {
     let v: Value = match serde_json::from_str(ligne) {
         Ok(v) => v,
         Err(_) => {
             eprintln!("bridge : ligne d'entrée illisible (JSON attendu) — erreur -32700 rendue");
-            return Some(erreur_json(&Value::Null, -32700, "parse error", None));
+            return (
+                Some(erreur_json(&Value::Null, -32700, "parse error", None)),
+                false,
+            );
         }
     };
     let est_notification = v.get("id").is_none();
     let id = v.get("id").cloned().unwrap_or(Value::Null);
     let Some(methode) = v.get("method").and_then(|m| m.as_str()) else {
         eprintln!("bridge : message sans méthode — erreur -32600 rendue");
-        return (!est_notification)
-            .then(|| erreur_json(&id, -32600, "invalid request: method", None));
+        return (
+            (!est_notification).then(|| erreur_json(&id, -32600, "invalid request: method", None)),
+            false,
+        );
     };
     let requete = match construire_requete(identite, authority, target_path, &v, methode) {
         Ok(r) => r,
         Err(msg) => {
             eprintln!("bridge : requête non signable ({msg})");
-            return (!est_notification).then(|| erreur_json(&id, -32600, msg, None));
+            return (
+                (!est_notification).then(|| erreur_json(&id, -32600, msg, None)),
+                false,
+            );
         }
     };
 
@@ -456,30 +556,38 @@ fn traiter_ligne(
             Ok(v) => v,
             Err(e) => {
                 eprintln!("bridge : {e}");
-                return (!est_notification).then(|| {
-                    erreur_json(
-                        &id,
-                        -32603,
-                        &format!("moteur injoignable ({e}) — MCP Control est-il lancé ?"),
-                        None,
-                    )
-                });
+                return (
+                    (!est_notification).then(|| {
+                        erreur_json(
+                            &id,
+                            -32603,
+                            &format!("moteur injoignable ({e}) — MCP Control est-il lancé ?"),
+                            None,
+                        )
+                    }),
+                    false,
+                );
             }
         };
     match statut {
         // Notification (pas d'id) : 202 sans corps, rien à rendre.
-        202 if corps_reponse.trim().is_empty() => None,
-        200 => (!est_notification).then(|| compact(&corps_reponse)),
+        202 if corps_reponse.trim().is_empty() => (None, false),
+        200 => ((!est_notification).then(|| compact(&corps_reponse)), false),
         401 => {
             eprintln!("bridge : identité refusée par le moteur (401)");
-            (!est_notification).then(|| {
-                erreur_json(
-                    &id,
-                    -32023,
-                    &format!("non autorisé — ré-appaire ce poste : mcp-control auth pair {url}"),
-                    Some("unauthenticated"),
-                )
-            })
+            (
+                (!est_notification).then(|| {
+                    erreur_json(
+                        &id,
+                        -32023,
+                        &format!(
+                            "non autorisé — ré-appaire ce poste : mcp-control auth pair {url}"
+                        ),
+                        Some("unauthenticated"),
+                    )
+                }),
+                true,
+            )
         }
         429 => {
             let delai = entete_reponse
@@ -491,19 +599,22 @@ fn traiter_ligne(
                 })
                 .unwrap_or_else(|| "?".to_string());
             eprintln!("bridge : moteur limité en débit (429, Retry-After {delai})");
-            (!est_notification).then(|| {
-                erreur_json(
-                    &id,
-                    -32023,
-                    &format!("trop d'échecs d'authentification — réessayez dans {delai} s"),
-                    Some("rate_limited"),
-                )
-            })
+            (
+                (!est_notification).then(|| {
+                    erreur_json(
+                        &id,
+                        -32023,
+                        &format!("trop d'échecs d'authentification — réessayez dans {delai} s"),
+                        Some("rate_limited"),
+                    )
+                }),
+                false,
+            )
         }
         autre => {
             // 403 (-32023), 400, 415, 500… : le corps du moteur est déjà une
             // enveloppe JSON-RPC, on la rend telle quelle.
-            if est_notification {
+            let resp = if est_notification {
                 eprintln!("bridge : moteur a répondu {autre} à une notification");
                 None
             } else if serde_json::from_str::<Value>(&corps_reponse).is_ok() {
@@ -516,7 +627,8 @@ fn traiter_ligne(
                     &format!("moteur : HTTP {autre}"),
                     None,
                 ))
-            }
+            };
+            (resp, false)
         }
     }
 }

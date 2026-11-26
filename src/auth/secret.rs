@@ -143,12 +143,13 @@ pub fn write_secret_file(path: &Path, secret: &str) -> Result<(), String> {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("écriture {} impossible : {}", tmp.display(), e));
     }
-    // 4. Renommage atomique vers la destination finale.
+    // 4. Renommage atomique vers la destination finale (AU-O01 : la DACL/mode
+    // posée sur `.tmp` avant écriture est préservée sur le même volume NTFS/POSIX,
+    // évitant un second spawn `icacls.exe`).
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("renommage {} impossible : {}", path.display(), e)
     })?;
-    let _ = crate::manage::restrict_permissions(&path.to_string_lossy());
     Ok(())
 }
 

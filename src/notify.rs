@@ -367,18 +367,30 @@ fn split_url(url: &str) -> Result<(String, u16, String), String> {
         None => (rest, "/"),
     };
     let authority = authority.split('@').next_back().unwrap_or(authority);
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => (
-            h.to_string(),
-            p.parse::<u16>().map_err(|_| "port invalide".to_string())?,
-        ),
-        _ => (
-            authority.to_string(),
-            if u.starts_with("https://") { 443 } else { 80 },
-        ),
+    let default_port = if u.starts_with("https://") { 443 } else { 80 };
+    let (host, port) = if let Some(rest_v6) = authority.strip_prefix('[') {
+        let Some((h, after)) = rest_v6.split_once(']') else {
+            return Err("adresse IPv6 invalide dans l'URL".to_string());
+        };
+        let p = if let Some(ps) = after.strip_prefix(':') {
+            ps.parse::<u16>().map_err(|_| "port invalide".to_string())?
+        } else if after.is_empty() {
+            default_port
+        } else {
+            return Err("autorité IPv6 invalide dans l'URL".to_string());
+        };
+        (h.to_string(), p)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => (
+                h.to_string(),
+                p.parse::<u16>().map_err(|_| "port invalide".to_string())?,
+            ),
+            _ => (authority.to_string(), default_port),
+        }
     };
-    if host.is_empty() {
-        return Err("hôte vide dans l'URL".to_string());
+    if host.is_empty() || port == 0 {
+        return Err("hôte ou port invalide dans l'URL".to_string());
     }
     Ok((host, port, path.to_string()))
 }

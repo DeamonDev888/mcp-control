@@ -5644,13 +5644,26 @@ fn install_store_conserve_prefixe_immuable_et_rejette_flags_dangereux() {
     }
     assert!(lockv(&state.servers).is_empty());
 
-    // 2. Arguments légitimes ajoutés APRÈS le paquet officiel immuable
-    let ok = handle_action(
+    // 2. Argument positionnel légitime ajouté APRÈS le paquet officiel immuable
+    // (BT-C01 + BT-C02 : seuls les arguments positionnels sont acceptés ;
+    // tout drapeau `-*` dont `--python`, `-f`, `--config-file`, `--port` est refusé).
+    let flag_rej = handle_action(
         &state,
         &serde_json::json!({
             "action": "install_store",
             "id": "drawio",
-            "args": ["--port", "8899"]
+            "args": ["--python=evil.exe"]
+        })
+        .to_string(),
+    );
+    assert_eq!(flag_rej["ok"], serde_json::json!(false), "{flag_rej}");
+
+    let ok = handle_action(
+        &state,
+        &serde_json::json!({
+            "action": "install_store",
+            "id": "postgres",
+            "args": ["postgresql://localhost:5432/mydb"]
         })
         .to_string(),
     );
@@ -5664,9 +5677,8 @@ fn install_store_conserve_prefixe_immuable_et_rejette_flags_dangereux() {
                 args,
                 &vec![
                     "-y".to_string(),
-                    "@drawio/mcp".to_string(),
-                    "--port".to_string(),
-                    "8899".to_string()
+                    "@modelcontextprotocol/server-postgres".to_string(),
+                    "postgresql://localhost:5432/mydb".to_string()
                 ],
                 "it.args doit rester en préfixe immuable"
             );

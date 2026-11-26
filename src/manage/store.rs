@@ -455,14 +455,20 @@ pub(super) fn all_store_items() -> impl Iterator<Item = &'static StoreItem> {
 }
 
 pub fn store_json() -> Value {
-    json!(all_store_items()
-        .map(|s| json!({
-            "id": s.id, "name": s.name, "desc": s.desc,
-            "cat": s.cat, "kind": s.kind,
-            "program": s.program, "args": s.args,
-            "env_vars": s.env_vars,
-        }))
-        .collect::<Vec<_>>())
+    // BT-O01 : catalogue statique compilé — construit une seule fois en mémoire.
+    static CACHE: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            json!(all_store_items()
+                .map(|s| json!({
+                    "id": s.id, "name": s.name, "desc": s.desc,
+                    "cat": s.cat, "kind": s.kind,
+                    "program": s.program, "args": s.args,
+                    "env_vars": s.env_vars,
+                }))
+                .collect::<Vec<_>>())
+        })
+        .clone()
 }
 
 /// Porté de mcp-import.ts : "@modelcontextprotocol/server-filesystem" → "filesystem".

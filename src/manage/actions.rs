@@ -28,6 +28,8 @@ pub const ACTIONS: &[&str] = &[
     // LECTURE SEULE (« détecté, non suivi »). Jamais exposée au gateway.
     "litemcp_announcements",
     "toggle_tool",
+    "set_all_tools",
+    "refresh_all",
     "set_start_cmd",
     "set_host",
     "set_auto_restart",
@@ -1015,6 +1017,46 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
             add_log(state, "info", "[machines] machine enregistrée");
             json!({"ok": true})
         }
+        "set_all_tools" => {
+            // UI-C02 : active ou coupe tous les outils d'un serveur en UNE
+            // requête HTTP et UNE écriture `config.json` (évite 200+ `toggle_tool`
+            // simultanés dépassant `MAX_CONNS_PER_IP = 16`).
+            let id = match id {
+                Some(i) => i,
+                None => return json!({"ok": false, "error": "id manquant"}),
+            };
+            let enable = req.get("enable").and_then(|x| x.as_bool()).unwrap_or(true);
+            let updated = {
+                let mut servers = lockv(&state.servers);
+                if let Some(s) = servers.iter_mut().find(|s| s.id == id) {
+                    if enable {
+                        s.tools_disabled.clear();
+                    } else {
+                        s.tools_disabled = s.tools.iter().map(|t| t.name.clone()).collect();
+                    }
+                    Some(s.tools_disabled.len())
+                } else {
+                    None
+                }
+            };
+            match updated {
+                Some(n_disabled) => {
+                    if let Err(e) = save_config_checked(state) {
+                        return json!({"ok": false, "error": format!("config non écrite : {e}")});
+                    }
+                    crate::gateway::notify_change();
+                    json!({"ok": true, "disabled_count": n_disabled})
+                }
+                None => json!({"ok": false, "error": "serveur inconnu"}),
+            }
+        }
+        "refresh_all" => {
+            // UI-C02 : rafraîchissement global (re-sonde tous les serveurs actifs
+            // + découverte locale) en une seule requête HTTP côté moteur.
+            poll_all(state);
+            scan_listening(state);
+            json!({"ok": true})
+        }
         "set_start_cmd" => {
             // Un serveur local sans commande de lancement (découvert par scan de
             // ports) n'a ni Start/Stop ni autoboot : l'utilisateur peut poser la
@@ -1254,9 +1296,10 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 .unwrap_or("")
                 .trim()
                 .to_string();
+            let path_norm = path.replace('/', "\\");
             if path.is_empty()
-                || path.starts_with("\\\\")
-                || path.starts_with("//")
+                || path_norm.starts_with("\\\\")
+                || path_norm.starts_with("\\??\\")
                 || path.chars().any(|c| c.is_control())
             {
                 return json!({"ok": false, "error": "chemin invalide"});
@@ -2203,38 +2246,46 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                             .collect(),
                         None => Vec::new(),
                     };
-                    for arg in &extra_args {
+                    let mut args: Vec<String> = it.args.iter().map(|a| a.to_string()).collect();
+                    // BT-C01 : déduplication défensive si un appelant renvoie le préfixe `it.args`.
+                    let extra_slice = if extra_args.len() >= args.len()
+                        && extra_args.iter().zip(args.iter()).all(|(a, b)| a == b)
+                    {
+                        &extra_args[args.len()..]
+                    } else {
+                        &extra_args[..]
+                    };
+                    // BT-C02 : rejeter TOUT flag `-*` dans `extra_args` (uniquement des
+                    // arguments positionnels tels qu'une URL PostgreSQL sont autorisés,
+                    // bloquant `--python=...`, `-f`, `--find-links`, `--config-file`, etc.).
+                    for arg in extra_slice {
                         let trimmed = arg.trim();
-                        let low = trimmed.to_ascii_lowercase();
-                        let forbidden = matches!(
-                            low.as_str(),
-                            "-c" | "--call"
-                                | "-e"
-                                | "--eval"
-                                | "-p"
-                                | "--package"
-                                | "--from"
-                                | "--with"
-                                | "--index-url"
-                                | "--extra-index-url"
-                        ) || low.starts_with("--call=")
-                            || low.starts_with("--eval=")
-                            || low.starts_with("--package=")
-                            || low.starts_with("--from=")
-                            || low.starts_with("--with=")
-                            || low.starts_with("--index-url=")
-                            || low.starts_with("--extra-index-url=");
-                        if forbidden {
+                        if trimmed.starts_with('-') {
                             return json!({
                                 "ok": false,
                                 "error": format!(
-                                    "argument boutique interdit « {trimmed} » : impossible de surcharger le paquet du catalogue"
+                                    "argument boutique interdit « {trimmed} » : seuls les arguments positionnels sont autorisés"
                                 )
                             });
                         }
                     }
-                    let mut args: Vec<String> = it.args.iter().map(|a| a.to_string()).collect();
-                    args.extend(extra_args);
+                    args.extend(extra_slice.iter().cloned());
+                    // BT-C04 : attribuer un dossier de travail dédié `<config_dir>/data/<id>`
+                    // pour que les serveurs utilisant un chemin relatif (`sqlite` → `test.db`,
+                    // `at-memex` → `--repo .`) ne plantent jamais sous autostart (`System32`).
+                    let id = format!("store-{}", it.id);
+                    let store_workdir = if !state.config_path.trim().is_empty() {
+                        std::path::Path::new(&state.config_path)
+                            .parent()
+                            .filter(|p| !p.as_os_str().is_empty())
+                            .map(|p| {
+                                let d = p.join("data").join(&id);
+                                let _ = std::fs::create_dir_all(&d);
+                                d.to_string_lossy().to_string()
+                            })
+                    } else {
+                        None
+                    };
                     // env additionnel optionnel {"CLÉ": "valeur"} (lot A) : des
                     // items du catalogue ont besoin d'un jeton (GITHUB_TOKEN…).
                     // Mêmes garanties que l'import (lot 3) : les valeurs
@@ -2242,7 +2293,6 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     // jamais l'API (noms seuls via server_json), le gateway
                     // (résultat sans env) ni le journal.
                     let env = env_from_json(&req);
-                    let id = format!("store-{}", it.id);
                     let already = {
                         let mut servers = lockv(&state.servers);
                         let already = servers.iter().any(|s| s.id == id);
@@ -2253,7 +2303,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                                 transport: Transport::Stdio {
                                     program: it.program.to_string(),
                                     args: args.clone(),
-                                    workdir: None,
+                                    workdir: store_workdir.clone(),
                                     env: env.clone(),
                                 },
                                 origin: Origin::Manual,
@@ -2281,7 +2331,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                                 start_cmd: Some(StartCmd {
                                     program: it.program.to_string(),
                                     args,
-                                    workdir: None,
+                                    workdir: store_workdir,
                                     env,
                                 }),
                                 tools_disabled: vec![],

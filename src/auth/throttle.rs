@@ -65,6 +65,9 @@ impl Compteur {
     fn elaguer(&mut self, now: u64) {
         self.echecs
             .retain(|t| now.saturating_sub(*t) <= FENETRE_SECS);
+        if self.bloque_jusqua > 0 && now >= self.bloque_jusqua {
+            self.bloque_jusqua = 0;
+        }
     }
 
     fn echec(&mut self, now: u64) {
@@ -133,6 +136,7 @@ impl Table {
             return Verdict::Allow;
         }
         let par_ip = peer
+            .map(normalize_peer_ip)
             .and_then(|ip| self.ips.get_mut(&ip))
             .map(|c| c.verdict(now))
             .unwrap_or(Verdict::Allow);
@@ -162,16 +166,35 @@ impl Table {
                 c.succes(now);
             }
         }
-        if let Some(ip) = peer {
-            let c = self.ips.entry(ip).or_default();
-            if echec {
+        // AU-C03 : ne jamais réinitialiser le compteur d'échecs IP sur une
+        // requête valide (évite qu'une clé secondaire/inerte efface 39 essais
+        // de force brute depuis la même IP ou le même sous-réseau /64).
+        if echec {
+            if let Some(ip) = peer.map(normalize_peer_ip) {
+                let c = self.ips.entry(ip).or_default();
                 c.echec(now);
-            } else {
-                c.succes(now);
             }
         }
-        borner(&mut self.cles);
-        borner(&mut self.ips);
+        borner(&mut self.cles, now);
+        borner(&mut self.ips, now);
+    }
+}
+
+/// Normalise une IP distante pour les limiteurs : IPv4-mapped → IPv4, et
+/// IPv6 non-loopback → préfixe `/64` (empêche le contournement SLAAC, AU-C03).
+fn normalize_peer_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return IpAddr::V4(v4);
+            }
+            if v6.is_loopback() {
+                return IpAddr::V6(v6);
+            }
+            let s = v6.segments();
+            IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
     }
 }
 
@@ -193,12 +216,13 @@ fn exempte(peer: Option<IpAddr>) -> bool {
 
 /// Éviction de la plus ancienne entrée quand la table dépasse sa borne : une
 /// clé inventée ne fait pas grossir la mémoire indéfiniment.
-fn borner<V: Clone + Eq + std::hash::Hash>(map: &mut HashMap<V, Compteur>) {
+fn borner<V: Clone + Eq + std::hash::Hash>(map: &mut HashMap<V, Compteur>, now: u64) {
     while map.len() > MAX_ENTREES {
-        // Ne jamais évincer une entrée activement bloquée avant une entrée non bloquée [M-04].
+        // Ne jamais évincer une entrée ACTIVEMENT bloquée (`bloque_jusqua > now`)
+        // avant une entrée expirée ou non bloquée (AU-C03 / [M-04]).
         let Some(plus_vieux) = map
             .iter()
-            .min_by_key(|(_, c)| (c.bloque_jusqua > 0, c.dernier))
+            .min_by_key(|(_, c)| (c.bloque_jusqua > now, c.dernier))
             .map(|(k, _)| k.clone())
         else {
             break;
@@ -342,10 +366,44 @@ mod tests {
         for _ in 0..30 {
             t.record(Some(ip(LAN)), Some("mcc-ai-3f9a1c07b2d84e51"), true, now);
         }
+        // AU-C03 : un succès réinitialise le compteur de la CLÉ (`cles`), mais
+        // ne remet PAS à zéro la fenêtre d'échecs de l'IP (`ips`) pour éviter
+        // qu'une clé secondaire ne contourne l'anti-force brute IP.
         t.record(Some(ip(LAN)), Some("mcc-ai-3f9a1c07b2d84e51"), false, now);
         assert_eq!(
-            t.check(Some(ip(LAN)), Some("mcc-ai-3f9a1c07b2d84e51"), now),
-            Verdict::Allow
+            t.check(None, Some("mcc-ai-3f9a1c07b2d84e51"), now),
+            Verdict::Allow,
+            "le compteur de la clé doit être remis à zéro"
+        );
+        assert!(
+            matches!(
+                t.check(Some(ip(LAN)), Some("mcc-ai-3f9a1c07b2d84e51"), now),
+                Verdict::Delay(_)
+            ),
+            "les 30 échecs IP restent actifs jusqu'à expiration de la fenêtre"
+        );
+    }
+
+    #[test]
+    fn eviction_apres_1024_blocages_expires_ne_desactive_pas_la_table() {
+        let mut t = Table::default();
+        let t0 = 1_000_000;
+        for i in 0..MAX_ENTREES {
+            let k = format!("mcc-ai-{:016x}", i as u64);
+            for _ in 0..BLOCAGE_A_PARTIR_DE {
+                t.record(None, Some(&k), true, t0);
+            }
+        }
+        // Après expiration des 1024 blocages historiques, la 1025e clé doit
+        // pouvoir être suivie et bloquée (elle ne doit plus être évincée dès son 1er échec).
+        let t1 = t0 + BLOCAGE_MAX_SECS + 60;
+        let nouvelle = "mcc-ai-ffffffffffffffff";
+        for _ in 0..BLOCAGE_A_PARTIR_DE {
+            t.record(None, Some(nouvelle), true, t1);
+        }
+        assert!(
+            matches!(t.check(None, Some(nouvelle), t1), Verdict::Block(_)),
+            "la 1025e clé doit être bloquée après expiration des anciens blocages"
         );
     }
 

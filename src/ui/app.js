@@ -200,6 +200,30 @@ async function exchangeSession() {
    son issue (le cookie doit exister avant la première lecture d'état). */
 const sessionReady = exchangeSession();
 
+/* MC-C01 : récupération transparente de session appelée par le wrapper Desktop
+   (Tauri) au retour du tray, après mise en veille prolongée (> 12h/24h) ou F5.
+   Ne fait rien si la session courante est déjà active. */
+window.__mccRecoverSession = async function(token) {
+  if (!token || (!sessionLost && sessionSecret)) return false;
+  try {
+    const r = await _mccFetch('/api/session', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token: String(token)})
+    });
+    const j = await r.json().catch(() => null);
+    if (r.ok && j && typeof j.secret === 'string' && j.secret) {
+      sessionSecret = j.secret;
+      sessionLost = false;
+      _updateSessionClosed = false;
+      setDead(false);
+      await load();
+      return true;
+    }
+  } catch (e) {}
+  return false;
+};
+
 window.fetch = async (url, opts = {}) => {
   const isApi = typeof url === 'string' && url.startsWith('/api/');
   // Hors /api/* : requête transmise TELLE QUELLE. Indispensable pour l'IPC
@@ -1053,13 +1077,20 @@ function frameworkBadge(s) {
   return `<span class="tag fw fw-${lk}" title="${tip}">${esc(f.label)}</span>`;
 }
 
-// Détecte si les variables d'environnement d'identité MCP Control sont injectées.
+// Détecte si les variables d'environnement d'identité MCP Control sont injectées (UI-C01).
+// `json.rs` sérialise `env` en tableau de noms (`["LITEMCP_TRUSTED_KEYS", ...]`).
 function hasAuthEnv(s) {
   const envs = [
     s && s.start_cmd && s.start_cmd.env,
     s && s.transport_info && s.transport_info.env,
   ];
-  return envs.some(e => e && typeof e === 'object' && ('LITEMCP_TRUSTED_KEYS' in e || 'MCC_AUTH_PUBKEY' in e));
+  return envs.some(e => {
+    if (!e || typeof e !== 'object') return false;
+    if (Array.isArray(e)) {
+      return e.includes('LITEMCP_TRUSTED_KEYS') || e.includes('MCC_AUTH_PUBKEY');
+    }
+    return 'LITEMCP_TRUSTED_KEYS' in e || 'MCC_AUTH_PUBKEY' in e;
+  });
 }
 
 // Badge cadenas + badge AUTH : serveur verrouillé / appairé RFC 9421 ou env d'auth injecté.
@@ -2031,7 +2062,8 @@ async function setAllTools(id, enableAll) {
   const btns = [...document.querySelectorAll('.tools-bar button[data-act="tools-all-on"], .tools-bar button[data-act="tools-all-off"]')];
   btns.forEach(b => { b.disabled = true; });
   try {
-    await Promise.all(list.map(t => postAction({action: 'toggle_tool', id, tool: t.name}, {quiet: true})));
+    // UI-C02 : 1 seule action atomique côté moteur au lieu de N requêtes parallèles.
+    await postAction({action: 'set_all_tools', id, enable: !!enableAll}, {quiet: true});
     const r = await fetch('/api/detail?id=' + encodeURIComponent(id));
     if (r.ok) { detailCache = await r.json(); renderDetail(); }
     await load();
@@ -3037,7 +3069,14 @@ async function doScanNet() {
   if (btn) btn.disabled = true;
   try {
     const j = await postAction({action: 'scan_network'});
-    if (j && j.ok) toast('Scan r\u00e9seau termin\u00e9', 'ok');
+    if (j && j.ok) {
+      toast(
+        j.started
+          ? 'Scan r\u00e9seau lanc\u00e9 en arri\u00e8re-plan \u2014 suivi dans le journal'
+          : 'Scan r\u00e9seau termin\u00e9',
+        'ok'
+      );
+    }
     await load();
   } finally {
     if (btn) btn.disabled = false;
@@ -3045,18 +3084,13 @@ async function doScanNet() {
 }
 
 async function refreshAll() {
-  // Re-sonde les serveurs connus ET découvre les nouveaux (tous ports en
-  // écoute — action discover) en parallèle, un seul rechargement d'état à la
-  // fin. Sans toast par serveur (bruit) : un échec GLOBAL est signalé
-  // (lot C #1) ; une panne réseau arme de toute façon le bandeau via postAction.
+  // UI-C02 : 1 seule action `refresh_all` côté moteur au lieu d'une rafale N+1
+  // qui dépassait `MAX_CONNS_PER_IP = 16` dès 16 serveurs actifs.
   const btn = document.querySelector('[data-act="refresh-all"]');
   if (btn) { btn.disabled = true; btn.setAttribute('aria-busy', 'true'); }
   try {
-    const ids = (state && state.servers ? state.servers : []).filter(s => s.enabled).map(s => s.id);
-    const jobs = ids.map(id => postAction({action: 'refresh', id}, {quiet: true}));
-    jobs.push(postAction({action: 'discover'}, {quiet: true}));
-    const res = await Promise.all(jobs);
-    if (res.some(j => !j.ok)) toast('rafraîchissement global : au moins un appel a échoué', 'err');
+    const j = await postAction({action: 'refresh_all'}, {quiet: true});
+    if (!j || !j.ok) toast('rafra\u00eechissement global : ' + ((j && j.error) || '\u00e9chec'), 'err');
     await load();
   } finally {
     if (btn) { btn.disabled = false; btn.removeAttribute('aria-busy'); }
@@ -3894,7 +3928,18 @@ async function sshBootstrap(ip, user) {
       if (f.identity_file) payload.identity_file = f.identity_file;
     }
     const j = await postAction(payload, {quiet: true});
-    if (j.ok) {
+    if (j.ok && j.started) {
+      msg.textContent = '\u2713 D\u00e9ploiement CLI lanc\u00e9 sur ' + ip + ' \u2014 suivi en direct dans le journal\u2026';
+      let ticks = 0;
+      const poll = setInterval(async () => {
+        ticks++;
+        await load();
+        if (document.getElementById('machineDlg') && document.getElementById('machineDlg').open) {
+          renderMachines();
+        }
+        if (ticks >= 10) clearInterval(poll);
+      }, 3000);
+    } else if (j.ok) {
       const osArch = [j.os, j.arch].filter(Boolean).join('/');
       const cliTxt = j.cli_running ? ('CLI actif :' + (j.cli_port || 5090)) : (j.cli_installed ? 'CLI install\u00e9' : 'CLI absent');
       msg.textContent = '\u2713 ' + ip + (osArch ? ' (' + osArch + ')' : '') + ' \u2014 ' + cliTxt + (j.error ? ' (' + j.error + ')' : '');
@@ -4118,8 +4163,8 @@ function storeLogoSvg(inner) {
 }
 function storeLogo(i) {
   if (!storeLogos) return storeLogoSvg(PKG_GLYPH);
-  // glyphe officiel par id, préfixes de catalogues additionnels retirés
-  const inner = storeLogos[i.id] || storeLogos[i.id.replace(/^(at|gl)-/, '')];
+  // glyphe officiel par id, préfixes de catalogues additionnels retirés (BT-C06)
+  const inner = storeLogos[i.id] || storeLogos[i.id.replace(/^(at|gl|gh)-/, '')];
   if (inner) return storeLogoSvg(inner);
   // items de catalogues additionnels : marque reconnue dans la commande
   if (/^(at|gl|gh)-/.test(i.id)) {
@@ -4205,10 +4250,20 @@ function renderStoreItems() {
   const q = rawQ.toLowerCase();
   const sort = document.getElementById('storeSort').value;
   const installed = new Set((state && state.servers ? state.servers : []).map(s => s.id));
-  const baseList = storeItems.filter(i =>
-    (!q || i.name.toLowerCase().includes(q) || i.desc.toLowerCase().includes(q))
-    && (!storeHideInst || !installed.has(storeSrvId(i)))
-  );
+  const baseList = storeItems.filter(i => {
+    if (storeHideInst && installed.has(storeSrvId(i))) return false;
+    if (!q) return true;
+    return (
+      i.name.toLowerCase().includes(q)
+      || i.desc.toLowerCase().includes(q)
+      || i.id.toLowerCase().includes(q)
+      || (i.cat && i.cat.toLowerCase().includes(q))
+      || (i.kind && i.kind.toLowerCase().includes(q))
+      || (i.program && i.program.toLowerCase().includes(q))
+      || (Array.isArray(i.args) && i.args.join(' ').toLowerCase().includes(q))
+      || (Array.isArray(i.env_vars) && i.env_vars.join(' ').toLowerCase().includes(q))
+    );
+  });
   renderStoreCats(baseList);
   let list = storeCat === 'Tout' ? baseList : baseList.filter(i => i.cat === storeCat);
   if (sort === 'az') list = [...list].sort((a, b) => a.name.localeCompare(b.name, 'fr', {sensitivity: 'base'}));
@@ -4231,11 +4286,15 @@ function renderStoreItems() {
   grid.innerHTML = list.map(i => {
     const isInst = installed.has(storeSrvId(i));
     const envKeys = !isInst ? storeEnvKeys(i) : [];
-    const envHtml = envKeys.length ? `<div class="scard-env">${envKeys.map(k =>
-      `<div class="scard-env-row">
-        <input type="password" class="store-env-inp" data-env="${esc(k)}" placeholder="${esc(k)}" aria-label="Variable ${esc(k)}" autocomplete="off">
-        <button type="button" class="eye-btn" data-act="toggle-env-eye" aria-pressed="false" aria-label="Afficher ou masquer ${esc(k)}" title="Afficher / masquer">${ic('eye')}</button>
-      </div>`).join('')}</div>` : '';
+    const envHtml = envKeys.length > 2
+      ? `<div class="scard-env-hint" title="${esc(envKeys.join(', '))}">${ic('lock')} ${esc(envKeys.length)} variables demand\u00e9es \u00e0 l\u2019installation</div>`
+      : envKeys.length
+        ? `<div class="scard-env">${envKeys.map(k =>
+            `<div class="scard-env-row">
+              <input type="password" class="store-env-inp" data-env="${esc(k)}" placeholder="${esc(k)}" aria-label="Variable ${esc(k)}" autocomplete="off">
+              <button type="button" class="eye-btn" data-act="toggle-env-eye" aria-pressed="false" aria-label="Afficher ou masquer ${esc(k)}" title="Afficher / masquer">${ic('eye')}</button>
+            </div>`).join('')}</div>`
+        : '';
     return `<div class="scard" data-store-id="${esc(i.id)}">
       <div class="scard-top">
         ${storeLogo(i)}
@@ -4271,6 +4330,8 @@ function renderStoreItems() {
   }
 }
 async function installStore(id, btn) {
+  const item = storeItems && storeItems.find(x => x.id === id);
+  const envKeys = item ? storeEnvKeys(item) : [];
   const card = btn && btn.closest ? btn.closest('.scard') : null;
   const envInps = card ? [...card.querySelectorAll('input.store-env-inp')] : [];
   const envMap = {};
@@ -4280,6 +4341,19 @@ async function installStore(id, btn) {
     const v = (inp.value || '').trim();
     if (k && v) { envMap[k] = v; hasEnv = true; }
   });
+  if (envKeys.length > 2) {
+    const res = await askConfirm({
+      title: 'Configuration \u2014 ' + ((item && item.name) || id),
+      msg: 'Renseignez les variables d\u2019environnement requises pour ce serveur (les champs laiss\u00e9s vides seront ignor\u00e9s) :',
+      inputs: envKeys.map(k => ({id: k, label: k, type: 'password', placeholder: k})),
+      okLabel: 'Installer',
+    });
+    if (!res || typeof res !== 'object') return;
+    envKeys.forEach(k => {
+      const v = (res[k] || '').trim();
+      if (v) { envMap[k] = v; hasEnv = true; }
+    });
+  }
   btn.disabled = true;
   btn.innerHTML = '<span class="spin">' + ic('refresh') + '</span> Installation\u2026';
   const body = {action: 'install_store', id};
@@ -4296,7 +4370,8 @@ async function installStore(id, btn) {
       btn.disabled = false; btn.innerHTML = ic('download') + ' Installer';
       return;
     }
-    body.args = ['-y', '@modelcontextprotocol/server-postgres', url.trim()];
+    // BT-C01 : le backend concatène déjà `it.args` (`-y`, `@modelcontextprotocol/server-postgres`).
+    body.args = [url.trim()];
   }
   const j = await postAction(body, {quiet: true});
   if (j.ok) {

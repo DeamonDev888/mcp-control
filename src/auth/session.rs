@@ -60,8 +60,13 @@ pub const COOKIE_NAME: &str = "mcc_session";
 /// cookie `SameSite=Strict` et les contrôles Host/Origin.
 pub const SESSION_HEADER: &str = "x-mcc-session";
 
-/// Nombre maximal de sessions simultanées (une par fenêtre, borné).
+/// Nombre maximal de sessions UI durables simultanées (une par fenêtre, borné).
 pub const MAX_SESSIONS: usize = 8;
+
+/// Réserve dédiée aux sessions CLI éphémères (`auth revoke`, `auth list`, …)
+/// afin que la révocation d'urgence reste toujours possible même si 8 fenêtres
+/// UI sont ouvertes (AU-C07).
+pub const MAX_EPHEMERAL_SESSIONS: usize = 4;
 
 /// Expiration à l'inactivité : une session sans requête autorisée pendant 12 h
 /// est morte (une fenêtre oubliée ne vit pas indéfiniment).
@@ -283,18 +288,29 @@ pub fn exchange_with_mode(token: &str, ephemeral: bool) -> Option<Issued> {
             .bootstraps
             .iter()
             .position(|b| crate::crypto::ct_eq(b.token.as_bytes(), token.as_bytes()))?;
-        let boot = s.bootstraps.remove(idx);
-        if boot.issued.elapsed() >= boot.ttl {
+        if s.bootstraps[idx].issued.elapsed() >= s.bootstraps[idx].ttl {
+            s.bootstraps.remove(idx);
             return None;
         }
-        if s.sessions.len() >= MAX_SESSIONS {
-            drop(s);
-            journal(
-                "warn",
-                "session refusée : le plafond de 8 sessions simultanées est atteint (fermer une fenêtre ou « fermer les autres sessions »)",
-            );
-            return None;
+        // AU-C07 : vérifier le plafond AVANT de consommer le jeton d'amorçage ;
+        // les sessions CLI éphémères disposent d'une réserve séparée pour que
+        // `mcp-control auth revoke` ne soit jamais bloqué par 8 onglets UI.
+        if !ephemeral {
+            let durable_count = s
+                .sessions
+                .iter()
+                .filter(|x| x.idle_ttl != EPHEMERAL_IDLE_TTL)
+                .count();
+            if durable_count >= MAX_SESSIONS {
+                drop(s);
+                journal(
+                    "warn",
+                    "session refusée : le plafond de 8 sessions simultanées est atteint (fermer une fenêtre ou « fermer les autres sessions »)",
+                );
+                return None;
+            }
         }
+        s.bootstraps.remove(idx);
     }
     // Usage unique : le jeton est consommé AVANT de tirer les secrets, hors du
     // verrou `SLOT` afin qu'aucune E/S de `journal()` ne soit exécutée verrou tenu.
@@ -302,13 +318,35 @@ pub fn exchange_with_mode(token: &str, ephemeral: bool) -> Option<Issued> {
     let secret = fresh_token(32)?;
     let mut s = slot();
     prune(&mut s);
-    if s.sessions.len() >= MAX_SESSIONS {
-        drop(s);
-        journal(
-            "warn",
-            "session refusée : le plafond de 8 sessions simultanées est atteint (fermer une fenêtre ou « fermer les autres sessions »)",
-        );
-        return None;
+    if ephemeral {
+        let eph_count = s
+            .sessions
+            .iter()
+            .filter(|x| x.idle_ttl == EPHEMERAL_IDLE_TTL)
+            .count();
+        if eph_count >= MAX_EPHEMERAL_SESSIONS {
+            if let Some(pos) = s
+                .sessions
+                .iter()
+                .position(|x| x.idle_ttl == EPHEMERAL_IDLE_TTL)
+            {
+                s.sessions.remove(pos);
+            }
+        }
+    } else {
+        let durable_count = s
+            .sessions
+            .iter()
+            .filter(|x| x.idle_ttl != EPHEMERAL_IDLE_TTL)
+            .count();
+        if durable_count >= MAX_SESSIONS {
+            drop(s);
+            journal(
+                "warn",
+                "session refusée : le plafond de 8 sessions simultanées est atteint (fermer une fenêtre ou « fermer les autres sessions »)",
+            );
+            return None;
+        }
     }
     let now = Instant::now();
     s.sessions.push(Session {
@@ -521,6 +559,12 @@ fn remove_stale(path: &Path) {
 /// (zéro course entre plusieurs CLI simultanées) ; la forme héritée
 /// `mcc-session.req` / `.grant` reste également servie.
 pub fn serve_session_requests(config_path: &str) {
+    serve_session_requests_on_port(config_path, 0);
+}
+
+/// Variante scellant le port HTTP loopback réellement écouté (`ui_port > 0`)
+/// sur la 3ᵉ ligne de `.grant` (protection anti-squat / repli `+1..+9`, AU-C02).
+pub fn serve_session_requests_on_port(config_path: &str, ui_port: u16) {
     let config_path = config_path.to_string();
     std::thread::spawn(move || {
         let dir = Path::new(&config_path)
@@ -583,7 +627,11 @@ pub fn serve_session_requests(config_path: &str) {
                 }
                 match mint_bootstrap_with_ttl(BOOTSTRAP_FILE_TTL) {
                     Some(token) => {
-                        let corps = format!("{nonce}\n{token}\n");
+                        let corps = if ui_port > 0 {
+                            format!("{nonce}\n{token}\n{ui_port}\n")
+                        } else {
+                            format!("{nonce}\n{token}\n")
+                        };
                         match write_private(&grant_path, corps.as_bytes()) {
                             Ok(()) => journal(
                                 "info",
@@ -606,8 +654,12 @@ pub fn serve_session_requests(config_path: &str) {
 }
 
 /// Côté SHELL / CLI : demande un jeton d'amorçage au moteur par un couple
-/// dédié `mcc-session-<id>.req` / `.grant` (sans course entre appels concurrents).
-pub fn request_bootstrap(config_path: &str, timeout: Duration) -> Result<String, String> {
+/// dédié `mcc-session-<id>.req` / `.grant` (sans course entre appels concurrents),
+/// en retournant aussi le port loopback authentifié si le moteur l'a scellé.
+pub fn request_bootstrap_with_port(
+    config_path: &str,
+    timeout: Duration,
+) -> Result<(String, Option<u16>), String> {
     let nonce = fresh_token(32)
         .ok_or_else(|| "entropie OS indisponible : aucun jeton de session".to_string())?;
     let req_id = crate::random_hex(1)
@@ -622,9 +674,13 @@ pub fn request_bootstrap(config_path: &str, timeout: Duration) -> Result<String,
             let mut lignes = texte.lines().map(str::trim);
             if lignes.next() == Some(nonce.as_str()) {
                 if let Some(token) = lignes.next() {
+                    let port = lignes
+                        .next()
+                        .and_then(|s| s.parse::<u16>().ok())
+                        .filter(|&p| p > 0);
                     let _ = std::fs::remove_file(&grant);
                     if is_token(token) {
-                        return Ok(token.to_string());
+                        return Ok((token.to_string(), port));
                     }
                 }
             }
@@ -639,6 +695,12 @@ pub fn request_bootstrap(config_path: &str, timeout: Duration) -> Result<String,
         }
         std::thread::sleep(Duration::from_millis(80));
     }
+}
+
+/// Côté SHELL / CLI : demande un jeton d'amorçage au moteur par un couple
+/// dédié `mcc-session-<id>.req` / `.grant` (sans course entre appels concurrents).
+pub fn request_bootstrap(config_path: &str, timeout: Duration) -> Result<String, String> {
+    request_bootstrap_with_port(config_path, timeout).map(|(tok, _)| tok)
 }
 
 /// Réinitialise l'état (tests unitaires uniquement : un process de test ne doit
@@ -887,6 +949,25 @@ mod tests {
         // le jeton s'échange normalement, une seule fois
         assert!(exchange(&token).is_some());
         assert!(exchange(&token).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn canal_fichier_scelle_le_port_authentifie() {
+        let _g = guard();
+        let dir = std::env::temp_dir().join(format!(
+            "mcc-session-port-{}-{}",
+            std::process::id(),
+            crate::types::now_ts()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json").to_string_lossy().to_string();
+        serve_session_requests_on_port(&config, 5094);
+        let (token, port) =
+            request_bootstrap_with_port(&config, Duration::from_secs(10)).expect("grant avec port");
+        assert_eq!(token.len(), 43);
+        assert_eq!(port, Some(5094));
+        assert!(exchange(&token).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

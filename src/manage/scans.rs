@@ -77,7 +77,7 @@ fn take_confirmed_up(state: &Arc<AppState>, id: &str) -> bool {
 
 fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
     crate::auth::net::set_config_path(&state.config_path);
-    let (transport, enabled, via_ssh, was_up, has_tools, prev_name, prev_version) = {
+    let (transport, enabled, via_ssh, was_up, _has_tools, prev_name, prev_version) = {
         let servers = lockv(&state.servers);
         match servers.iter().find(|s| s.id == id) {
             Some(s) => (
@@ -106,11 +106,10 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
             {
                 probe::begin_port_owner_cycle();
             }
-            let can_reuse = !force_full
-                && was_up
-                && has_tools
-                && prev_name.is_some()
-                && tools_cache_fresh(state, id);
+            // MC-O02 : autoriser le fast-path `ProbeHint` même pour les
+            // serveurs MCP valides à 0 outil (ex. resources/prompts uniquement).
+            let can_reuse =
+                !force_full && was_up && prev_name.is_some() && tools_cache_fresh(state, id);
             let hint = probe::ProbeHint {
                 reuse_metadata_if_unchanged: can_reuse,
                 prev_name: prev_name.as_deref(),

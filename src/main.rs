@@ -38,11 +38,14 @@ fn main() {
         // En mode `--hidden` (autostart sans console visible), personne ne lira
         // le lien de session : inutile de consommer un jeton d'amorçage.
         if !args.iter().any(|a| a == "--hidden") {
-            match mcp_control::auth::session::request_bootstrap(
+            match mcp_control::auth::session::request_bootstrap_with_port(
                 &outcome.config_path,
                 std::time::Duration::from_secs(5),
             ) {
-                Ok(jeton) => println!(
+                Ok((jeton, Some(port))) => {
+                    println!("[session] http://127.0.0.1:{port}/#t={jeton}");
+                }
+                Ok((jeton, None)) => println!(
                     "[session] {}/#t={}",
                     outcome.url.trim_end_matches('/'),
                     jeton

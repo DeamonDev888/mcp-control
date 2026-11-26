@@ -8,6 +8,13 @@
 ; existe encore. ExecShell n'est jamais fatale : un verbe refusé par une
 ; stratégie de parquet ne bloque pas l'installation.
 
+!macro NSIS_HOOK_PREINSTALL
+  ; MC-C03 : en mode silencieux (/S, auto-mise à jour), laisser le temps au
+  ; processus parent qui vient d'appeler exit(0) de libérer son handle binaire.
+  IfSilent 0 +2
+    Sleep 600
+!macroend
+
 !macro NSIS_HOOK_POSTINSTALL
   ; Épingler le raccourci du menu Démarrer à la barre des tâches.
   ExecShell "taskbarpin" "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk"

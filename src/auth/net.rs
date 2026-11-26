@@ -288,6 +288,12 @@ pub fn load_or_create_server_tls(
         rcgen::KeyPair::generate().map_err(|_| "génération clé TLS impossible".to_string())?;
     let mut params = rcgen::CertificateParams::new(sans)
         .map_err(|_| "paramètres SAN du certificat TLS invalides".to_string())?;
+    // AU-C09 : borner la validité à 365 jours (≤ 398 j exigés par Chrome/Edge/Safari).
+    let now_sys = std::time::SystemTime::now();
+    if let Some(nb) = now_sys.checked_sub(Duration::from_secs(86_400)) {
+        params.not_before = nb.into();
+    }
+    params.not_after = (now_sys + Duration::from_secs(365 * 86_400)).into();
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "mcp-control");
@@ -609,6 +615,22 @@ pub fn https_exchange_raw(
                     return Err(format!("{host}:{port} read TLS : {e}"));
                 }
                 break;
+            }
+        }
+    }
+    if let Some(hl) = header_len {
+        let head = String::from_utf8_lossy(&data[..hl]).to_lowercase();
+        let body_bytes = &data[hl..];
+        if let Some(cl) = head.lines().find_map(|l| {
+            l.strip_prefix("content-length:")
+                .and_then(|v| v.trim().parse::<usize>().ok())
+        }) {
+            if body_bytes.len() < cl {
+                return Err(format!(
+                    "{host}:{port} réponse HTTPS tronquée ({}/{} octets)",
+                    body_bytes.len(),
+                    cl
+                ));
             }
         }
     }
@@ -1091,7 +1113,10 @@ pub fn handle_server_unpair(state: &Arc<AppState>, body: &str) -> Value {
                 .map(String::from)
                 .unwrap_or_else(|| name.trim_end_matches(".pin.json").to_string());
             let _ = std::fs::remove_file(entry.path());
-            let _ = std::fs::remove_file(dir.join(format!("{kid}.key")));
+            // AU-C05 : valider la grammaire `keyid` avant suppression de `{kid}.key`.
+            if crate::auth::registry::valid_keyid(&kid) {
+                let _ = std::fs::remove_file(dir.join(format!("{kid}.key")));
+            }
             removed_keyids.push(kid);
         }
     }
@@ -1232,6 +1257,12 @@ pub fn handle_server_pair(state: &Arc<AppState>, body: &str) -> Value {
         .unwrap_or("")
         .trim()
         .to_string();
+    if tls_fp.is_empty() && !crate::is_loopback_bind(&host) {
+        return json!({
+            "ok": false,
+            "error": "DA5 : empreinte tls_fp requise hors loopback (HTTP clair interdit sur le réseau)"
+        });
+    }
     if !tls_fp.is_empty() && !valid_tls_fp(&tls_fp) {
         return json!({
             "ok": false,
@@ -1337,6 +1368,31 @@ pub fn handle_server_pair(state: &Arc<AppState>, body: &str) -> Value {
             "ok": false,
             "error": format!("écriture de l'épinglage impossible : {e}")
         });
+    }
+    // AU-C08 : purger les anciens `.pin.json` / `.key` du même `(host, port)`
+    // pour éviter toute désynchronisation avec la nouvelle clé du trousseau.
+    if let Ok(entries) = std::fs::read_dir(&dir_clients) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if !fname.ends_with(".pin.json") || entry.path() == pin_path {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if !pin_matches_host_port(&v, &host, port) {
+                continue;
+            }
+            let _ = std::fs::remove_file(entry.path());
+            if let Some(old_kid) = v.get("keyid").and_then(|x| x.as_str()) {
+                if old_kid != keyid && crate::auth::registry::valid_keyid(old_kid) {
+                    let _ = std::fs::remove_file(dir_clients.join(format!("{old_kid}.key")));
+                }
+            }
+        }
     }
 
     crate::manage::add_log(

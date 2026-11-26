@@ -1154,22 +1154,30 @@ fn listening_pids_unix(port: u16) -> Vec<u32> {
 }
 
 /// Parse la sortie `ss -tlnp` : PIDs (notre propre PID exclu) des listeners sur
-/// `port` EXACT. Format : `LISTEN 0 128 0.0.0.0:8080 0.0.0.0:* users:(("node",pid=1234,fd=20))`
+/// `port` EXACT (colonne d'adresse locale uniquement, MC-C08).
+/// Format : `LISTEN 0 128 0.0.0.0:8080 0.0.0.0:* users:(("node",pid=1234,fd=20))`
 pub fn pids_listening_on_ss(text: &str, port: u16) -> Vec<u32> {
     let mut out: Vec<u32> = Vec::new();
     for line in text.lines() {
-        if !line.contains("LISTEN") {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        if !toks.contains(&"LISTEN") {
             continue;
         }
-        let on_port = line.split_whitespace().any(|t| {
-            t.rsplit_once(':')
-                .map(|(_, p)| p.parse::<u16>() == Ok(port))
-                .unwrap_or(false)
-        });
+        // Colonne d'adresse locale : index 3 (`LISTEN 0 128 <local> <peer>`),
+        // ou index 4 si colonne Netid (`tcp LISTEN 0 128 <local> <peer>`).
+        let local_idx = if toks.first().copied() == Some("LISTEN") {
+            3
+        } else {
+            4
+        };
+        let on_port = toks
+            .get(local_idx)
+            .and_then(|t| t.rsplit_once(':'))
+            .is_some_and(|(_, p)| p.parse::<u16>() == Ok(port));
         if !on_port {
             continue;
         }
-        for tok in line.split_whitespace() {
+        for tok in toks {
             for seg in tok.split(',') {
                 if let Some(pid) = seg.strip_prefix("pid=") {
                     if let Ok(pid) = pid.trim_end_matches(')').parse::<u32>() {
@@ -2311,12 +2319,14 @@ pub fn port_open(host: &str, port: u16, timeout: Duration) -> bool {
     }
 }
 
-/// En-tête `Host` conforme RFC 7230 §5.4 : crochets obligatoires sur un littéral IPv6.
+/// En-tête `Host` conforme RFC 7230 §5.4 : crochets obligatoires sur un littéral
+/// IPv6, idempotent si déjà entre crochets (MC-C10).
 fn http_host_header(host: &str, port: u16) -> String {
-    if host.contains(':') {
-        format!("[{}]:{}", host, port)
+    let clean = host.trim_start_matches('[').trim_end_matches(']');
+    if clean.contains(':') {
+        format!("[{}]:{}", clean, port)
     } else {
-        format!("{}:{}", host, port)
+        format!("{}:{}", clean, port)
     }
 }
 
@@ -2772,14 +2782,15 @@ impl<'a> SshTarget<'a> {
 }
 
 /// Sanitize un chemin local passé à `ssh -i` (non vide, <= 512, aucun caractère
-/// de contrôle ni `-` en tête qui serait interprété comme un drapeau).
+/// de contrôle, `-` en tête ni préfixe UNC/périphérique Win32 même à slashs mixtes, MC-C12).
 pub fn ssh_path_safe(s: &str) -> Option<String> {
     let t = s.trim();
+    let norm = t.replace('/', "\\");
     if t.is_empty()
         || t.len() > 512
         || t.starts_with('-')
-        || t.starts_with("\\\\")
-        || t.starts_with("//")
+        || norm.starts_with("\\\\")
+        || norm.starts_with("\\??\\")
         || t.chars().any(|c| c.is_control() || c == '\0')
     {
         return None;
@@ -3903,19 +3914,38 @@ fn parse_remote_pid(out: &str) -> Option<u32> {
     digits.trim().parse::<u32>().ok().filter(|&p| p > 0)
 }
 
+/// Vérifie qu'un jeton d'adresse locale (`0.0.0.0:3000`, `[::]:3000`, `*:3000`,
+/// `127.0.0.1.3000` macOS) porte le port `u16` EXACT (MC-C08).
+fn token_has_exact_port(tok: &str, port: u16) -> bool {
+    if let Some((_, p)) = tok.rsplit_once(':') {
+        if p.parse::<u16>() == Ok(port) {
+            return true;
+        }
+    }
+    // Format macOS `netstat`: `127.0.0.1.8080` ou `*.8080` (au moins 1 point, et
+    // si c'est une IPv4 pure `a.b.c.d` = 4 octets, ne PAS confondre le 4e octet avec un port).
+    if let Some((prefix, p)) = tok.rsplit_once('.') {
+        if p.parse::<u16>() == Ok(port) {
+            let dots = prefix.bytes().filter(|&b| b == b'.').count();
+            if prefix == "*" || dots >= 3 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Parse les PID et noms de processus écoutant sur `port` depuis `ss -tlnp`,
 /// `lsof`, `netstat -tlnp` ou `netstat -ano`.
 pub fn parse_remote_port_listeners(text: &str, port: u16) -> Vec<(u32, String)> {
     let mut out: Vec<(u32, String)> = Vec::new();
-    let suffix_colon = format!(":{port}");
-    let suffix_dot = format!(".{port}");
     for line in text.lines() {
         let toks: Vec<&str> = line.split_whitespace().collect();
         if toks.is_empty() {
             continue;
         }
         // Windows netstat -ano : TCP 0.0.0.0:3000 0.0.0.0:0 LISTENING 1234
-        if toks.len() >= 5 && toks.contains(&"LISTENING") && toks[1].ends_with(&suffix_colon) {
+        if toks.len() >= 5 && toks.contains(&"LISTENING") && token_has_exact_port(toks[1], port) {
             if let Ok(pid) = toks.last().unwrap_or(&"").parse::<u32>() {
                 if pid > 0 && !out.iter().any(|(p, _)| *p == pid) {
                     out.push((pid, "remote".to_string()));
@@ -3924,7 +3954,10 @@ pub fn parse_remote_port_listeners(text: &str, port: u16) -> Vec<(u32, String)> 
             continue;
         }
         // lsof -nP -iTCP:<port> -sTCP:LISTEN : node 1234 user ... TCP *:3000 (LISTEN)
-        if toks.len() >= 9 && line.contains("(LISTEN)") && line.contains(&suffix_colon) {
+        if toks.len() >= 9
+            && line.contains("(LISTEN)")
+            && toks.iter().any(|t| token_has_exact_port(t, port))
+        {
             if let Ok(pid) = toks[1].parse::<u32>() {
                 if pid > 0 && !out.iter().any(|(p, _)| *p == pid) {
                     out.push((pid, toks[0].to_string()));
@@ -3933,9 +3966,7 @@ pub fn parse_remote_port_listeners(text: &str, port: u16) -> Vec<(u32, String)> 
             continue;
         }
         // ss -tlnp : LISTEN 0 128 0.0.0.0:3000 ... users:(("node",pid=1234,fd=18))
-        let matches_port = toks
-            .iter()
-            .any(|t| t.ends_with(&suffix_colon) || t.ends_with(&suffix_dot));
+        let matches_port = toks.iter().any(|t| token_has_exact_port(t, port));
         if !matches_port {
             continue;
         }
@@ -4472,6 +4503,11 @@ fn http_request(
             let head = String::from_utf8_lossy(&data[..p]).to_lowercase();
             status_ok = head.starts_with("http/1.1 2") || head.starts_with("http/1.0 2");
         }
+    } else if outbound.is_some() && !crate::is_loopback_bind(host) {
+        // AU-C05 (DA5) : jamais d'appel signé en HTTP clair hors loopback.
+        return Err(format!(
+            "{host}:{port} connexion signée en clair hors loopback refusée (DA5)"
+        ));
     } else {
         let addr: SocketAddr = match socket_addr(host, port) {
             Ok(a) => a,
@@ -5336,6 +5372,7 @@ pub fn probe_stdio(
     });
     if let Err(e) = writeln!(stdin, "{}", init) {
         kill_tree(pid);
+        let _ = child.wait();
         return Err(format!("write init: {}", e));
     }
     let _ = stdin.flush();

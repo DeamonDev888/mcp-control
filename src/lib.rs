@@ -131,7 +131,7 @@ pub(crate) fn conn_admission(
 /// à mesure, avec annulation propre des réservations déjà prises en cas de
 /// refus. La réservation totale est atomique (pas de course entre threads).
 fn admit_conn(peer_ip: Option<IpAddr>) -> Result<ConnGuard, &'static str> {
-    let peer_loopback = peer_ip.is_none_or(|ip| ip.is_loopback());
+    let peer_loopback = peer_ip.is_some_and(|ip| ip.to_canonical().is_loopback());
     let total = OPEN_CONNS.fetch_add(1, Ordering::SeqCst) + 1;
     if let Err(r) = conn_admission(total, 0, 0, peer_loopback) {
         OPEN_CONNS.fetch_sub(1, Ordering::SeqCst);
@@ -1117,18 +1117,17 @@ pub fn run_headless() -> RunOutcome {
                 // une URL que si elle répond DEUX fois de suite, espacées de
                 // 300 ms. Un moteur moribond ne survivra pas à la seconde
                 // mesure — sinon la fenêtre s'ouvre sur un port mort.
-                // Le moteur à détecter écoute sur le bind de la config : on
-                // interroge CETTE adresse (un bind 0.0.0.0 ou une IP LAN
-                // précise n'est pas joignable par défaut sur 127.0.0.1).
+                // MC-C02 : toujours tester le loopback (`127.0.0.1` / `::1`) EN
+                // PREMIER, car `local_aux_listener` écoute en HTTP loopback même
+                // lorsque `ui_bind` est une IP LAN précise (évite de renvoyer
+                // `https://<ip-lan>` qui bloque WebView2, `/api/session` et les
+                // capacités Tauri).
                 let bind_host: Option<&str> = match ui_bind.as_str() {
                     "" | "0.0.0.0" | "*" => None,
                     h => Some(h),
                 };
-                let mut probe_hosts: Vec<&str> = Vec::new();
+                let mut probe_hosts: Vec<&str> = vec!["127.0.0.1", "::1"];
                 if let Some(h) = bind_host {
-                    probe_hosts.push(h);
-                }
-                for h in ["127.0.0.1", "::1"] {
                     if !probe_hosts.contains(&h) {
                         probe_hosts.push(h);
                     }
@@ -1253,15 +1252,14 @@ pub fn run_headless() -> RunOutcome {
     } else {
         ui_bind.clone()
     };
-    // Si le bind est une IP LAN précise (hors loopback et hors wildcard 0.0.0.0 / ::),
-    // ouvrir un écouteur auxiliaire local sur 127.0.0.1:<ui_port> afin que la
-    // webview Tauri et la CLI `auth` joignent toujours l'UI en loopback HTTP.
-    let local_aux_listener =
-        if !is_loopback_bind(&ui_bind) && ui_bind != "0.0.0.0" && ui_bind != "::" {
-            TcpListener::bind(("127.0.0.1", ui_port)).ok()
-        } else {
-            None
-        };
+    // MC-C05 : ouvrir aussi `local_aux_listener` sur `127.0.0.1` lorsque
+    // `ui_bind == "::"` (Windows active IPV6_V6ONLY=1 par défaut ; sous Linux
+    // dual-stack, `AddrInUse` est ignoré proprement par `.ok()`).
+    let local_aux_listener = if !is_loopback_bind(&ui_bind) && ui_bind != "0.0.0.0" {
+        TcpListener::bind(("127.0.0.1", ui_port)).ok()
+    } else {
+        None
+    };
     let ui_url_host = if !is_loopback_bind(&ui_bind)
         && (ui_bind == "0.0.0.0" || ui_bind == "::" || local_aux_listener.is_some())
     {
@@ -1299,7 +1297,7 @@ pub fn run_headless() -> RunOutcome {
     // une demande dans le dossier de config, ce thread y répond par un jeton
     // à usage unique de 2 min. Fichiers restreints à l'utilisateur, supprimés
     // dès lecture, jamais journalisés.
-    crate::auth::session::serve_session_requests(&state.config_path);
+    crate::auth::session::serve_session_requests_on_port(&state.config_path, ui_port);
     manage::add_log(
         &state,
         "info",

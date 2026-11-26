@@ -130,10 +130,20 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= std::hint::black_box(x ^ y);
     }
-    diff == 0
+    std::hint::black_box(diff) == 0
+}
+
+/// Effacement déterministe d'un tampon secret en mémoire (anti-optimisation).
+pub fn zeroize_slice(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        unsafe {
+            std::ptr::write_volatile(b, 0);
+        }
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 /// HMAC-SHA256 en hexadécimal — la forme échangée dans l'en-tête X-MCC-Proof.

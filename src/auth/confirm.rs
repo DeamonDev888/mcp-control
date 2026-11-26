@@ -180,66 +180,69 @@ pub fn masked_arguments(v: &Value) -> Value {
     walk(v, 0)
 }
 
-/// Extrait les programmes d'une configuration MCP importée (bloc
-/// `mcpServers` / `mcp_servers` / `servers` / objet direct, `claude mcp add`,
-/// URL HTTP ou ligne CLI `npx`/`uvx`/`docker`/`node`/`python`). Le TEXTE
+/// Extrait les programmes d'une configuration MCP importée en utilisant
+/// exactement le même parseur JSON que `import::parse_servers_doc` (bloc
+/// `mcpServers` / `mcp_servers` / objet racine), puis `claude mcp add`,
+/// URL HTTP ou ligne CLI `npx`/`uvx`/`docker`/`node`/`python`. Le TEXTE
 /// importé n'est jamais recopié brut : ni à l'écran, ni au journal — il peut
 /// porter des jetons `[H-07]`.
 fn programmes_importes(texte: &str) -> Vec<Value> {
-    if let Ok(v) = serde_json::from_str::<Value>(texte) {
-        let bloc = v
-            .get("mcpServers")
-            .or_else(|| v.get("mcp_servers"))
-            .or_else(|| v.get("servers"))
-            .or_else(|| v.get("mcp"))
-            .unwrap_or(&v);
+    if let Ok(entries) = crate::manage::parse_servers_doc(texte) {
         let mut out = Vec::new();
-        if let Some(o) = bloc.as_object() {
-            for (nom, entree) in o.iter().take(10) {
-                match entree.get("command").and_then(Value::as_str) {
-                    Some(cmd) => {
-                        let args: Vec<String> = entree
-                            .get("args")
-                            .and_then(Value::as_array)
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(Value::as_str)
-                                    .take(8)
-                                    .map(|s| court(s, 80))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        out.push(json!({
-                            "label": court(nom, 64),
-                            "program": court(cmd, 120),
-                            "args": args,
-                            // noms des env du bloc importé — jamais les valeurs
-                            "env": entree.get("env").and_then(Value::as_object)
-                                .map(|e| e.keys().take(12).cloned().collect::<Vec<_>>())
-                                .unwrap_or_default(),
-                        }));
+        for (nom, entree) in entries.iter().take(10) {
+            match entree.get("command").and_then(Value::as_str) {
+                Some(cmd) => {
+                    let all_args: Vec<&str> = entree
+                        .get("args")
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    let mut args: Vec<String> =
+                        all_args.iter().take(8).map(|s| court(s, 80)).collect();
+                    if all_args.len() > 8 {
+                        args.push(format!(
+                            "(+{} argument(s) supplémentaire(s))",
+                            all_args.len() - 8
+                        ));
                     }
-                    None => {
-                        let url = entree
-                            .get("url")
-                            .or_else(|| entree.get("serverUrl"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("?");
-                        out.push(json!({
-                            "label": court(nom, 64),
-                            "program": court(url, 120),
-                            "args": [],
-                        }));
+                    let mut item = json!({
+                        "label": court(nom, 64),
+                        "program": court(cmd, 120),
+                        "args": args,
+                        // noms des env du bloc importé — jamais les valeurs
+                        "env": entree.get("env").and_then(Value::as_object)
+                            .map(|e| e.keys().take(12).cloned().collect::<Vec<_>>())
+                            .unwrap_or_default(),
+                    });
+                    if let Some(cwd) = entree
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                    {
+                        item["workdir"] = json!(court(cwd, 160));
                     }
+                    out.push(item);
+                }
+                None => {
+                    let url = entree
+                        .get("url")
+                        .or_else(|| entree.get("serverUrl"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("?");
+                    out.push(json!({
+                        "label": court(nom, 64),
+                        "program": court(url, 120),
+                        "args": [],
+                    }));
                 }
             }
-            if o.len() > 10 {
-                out.push(json!({
-                    "label": format!("(+{} autre(s) serveur(s))", o.len() - 10),
-                    "program": "…",
-                    "args": [],
-                }));
-            }
+        }
+        if entries.len() > 10 {
+            out.push(json!({
+                "label": format!("(+{} autre(s) serveur(s))", entries.len() - 10),
+                "program": "…",
+                "args": [],
+            }));
         }
         if !out.is_empty() {
             return out;
@@ -411,20 +414,40 @@ pub fn effect_of(state: &Arc<AppState>, tool: &str, args: &Value) -> Value {
                 }
             }
         }
-        "add_server" => match s("transport") {
-            "stdio" => lancement(
-                "nouveau serveur stdio",
-                s("program"),
-                arr("args"),
-                s("workdir"),
-            ),
-            _ => json!({
-                "kind": "ajout",
-                "label": court(s("label"), 64),
-                "resume": format!("HTTP {}:{}{}", s("host"), s("port"), s("path")),
-                "target": format!("{}:{}", s("host"), s("port")),
-            }),
-        },
+        "add_server" => {
+            let transport = s("transport");
+            let program = s("program").trim();
+            let port_str = args
+                .get("port")
+                .and_then(|v| {
+                    v.as_u64()
+                        .map(|n| n.to_string())
+                        .or_else(|| v.as_str().map(String::from))
+                })
+                .unwrap_or_default();
+            if transport == "stdio" || !program.is_empty() {
+                let lbl = if transport == "stdio" {
+                    "nouveau serveur stdio".to_string()
+                } else {
+                    format!(
+                        "nouveau serveur HTTP avec lancement ({})",
+                        court(s("label"), 48)
+                    )
+                };
+                let mut v = lancement(&lbl, program, arr("args"), s("workdir"));
+                if transport != "stdio" {
+                    v["target"] = json!(format!("{}:{}", s("host"), port_str));
+                }
+                v
+            } else {
+                json!({
+                    "kind": "ajout",
+                    "label": court(s("label"), 64),
+                    "resume": format!("HTTP {}:{}{}", s("host"), port_str, s("path")),
+                    "target": format!("{}:{}", s("host"), port_str),
+                })
+            }
+        }
         "set_start_command" => {
             if args.get("program").map(Value::is_null).unwrap_or(true) {
                 json!({
@@ -491,15 +514,40 @@ pub fn effect_of(state: &Arc<AppState>, tool: &str, args: &Value) -> Value {
                 "servers": progs,
             })
         }
-        "call_server_tool" => json!({
-            "kind": "outil",
-            "target": court(s("server"), 96),
-            "tool": court(s("tool"), 96),
-            "resume": format!("appel de l'outil {} sur le serveur {}", court(s("tool"), 96), court(s("server"), 96)),
-            // arguments de l'outil distant : clés sensibles masquées
-            "arguments": masked_arguments(args.get("arguments").unwrap_or(&Value::Null)),
-            "note": "un outil distant peut exécuter n'importe quoi",
-        }),
+        "call_server_tool" => {
+            let sid = s("server");
+            // AU-C04 : résoudre l'endpoint effectif du serveur (transport +
+            // host:port/path ou programme stdio) pour qu'un changement via
+            // `set_host` / `set_start_command` invalide tout permis `window`.
+            let endpoint = {
+                let servers = lockv(&state.servers);
+                servers
+                    .iter()
+                    .find(|srv| srv.id == sid)
+                    .map(|srv| match &srv.transport {
+                        crate::types::Transport::Http { host, port, path } => format!(
+                            "http://{}:{}{}",
+                            host.as_deref().unwrap_or("127.0.0.1"),
+                            port,
+                            path
+                        ),
+                        crate::types::Transport::Stdio { program, args, .. } => {
+                            format!("stdio:{} {}", program, args.join(" "))
+                        }
+                    })
+                    .unwrap_or_default()
+            };
+            json!({
+                "kind": "outil",
+                "target": court(sid, 96),
+                "endpoint": court(&endpoint, 200),
+                "tool": court(s("tool"), 96),
+                "resume": format!("appel de l'outil {} sur le serveur {}", court(s("tool"), 96), court(sid, 96)),
+                // arguments de l'outil distant : clés sensibles masquées
+                "arguments": masked_arguments(args.get("arguments").unwrap_or(&Value::Null)),
+                "note": "un outil distant peut exécuter n'importe quoi",
+            })
+        }
         "ssh_save" | "ssh_discover" => {
             let port_sfx = args
                 .get("port")
@@ -920,7 +968,11 @@ pub fn decide(
     let adresse = request_peer();
     let (label, empreinte) = identite(state, client);
     let effet = effect_of(state, tool, args);
-    let digest = arguments_digest(args);
+    // AU-C04 : lier le digest du permis à la fois aux arguments ET à l'effet
+    // résolu (endpoint, commande) pour empêcher tout TOCTOU via `set_host`.
+    let digest = crate::crypto::hex(&crate::crypto::sha256(
+        format!("{}\0{}", args, effet).as_bytes(),
+    ));
     let rid = match request_id {
         Value::String(s) => court(s, 64),
         Value::Number(n) => n.to_string(),
@@ -1015,6 +1067,33 @@ pub fn note_hybrid_decision(
         AuthVerdict::Unauthenticated => ("non authentifié", reason.unwrap_or("unauthenticated")),
         _ => ("décision", reason.unwrap_or("-")),
     };
+    // AU-C06 : mettre à jour `last_used_at` UNIQUEMENT après vérification
+    // cryptographique réussie (jamais sur `Unauthenticated`), avec persistance
+    // disque throttled (au plus 1 fois/heure par clé).
+    if !matches!(verdict_raw, AuthVerdict::Unauthenticated) {
+        if let Some(kid) = client.filter(|k| crate::auth::registry::valid_keyid(k)) {
+            let now = now_ts();
+            let mut should_save = false;
+            {
+                let mut settings = lockv(&state.settings);
+                if let Some(c) = settings.auth.clients.iter_mut().find(|c| c.keyid == kid) {
+                    let prev = c
+                        .last_used_at
+                        .as_deref()
+                        .and_then(crate::auth::registry::parse_iso_utc);
+                    if prev.map(|p| now.saturating_sub(p) >= 60).unwrap_or(true) {
+                        c.last_used_at = Some(crate::types::iso_utc(now));
+                        if prev.map(|p| now.saturating_sub(p) >= 3600).unwrap_or(true) {
+                            should_save = true;
+                        }
+                    }
+                }
+            }
+            if should_save && !state.config_path.trim().is_empty() {
+                crate::manage::save_config(state);
+            }
+        }
+    }
     // Journal d'audit CHAÎNÉ (lot M5, docs/auth.md §11) : la décision part au
     // transport, seul à connaître l'adresse source et le `keyid` revendiqué.
     // Vocabulaire machine, aligné sur `AuthVerdict`.
@@ -1748,5 +1827,58 @@ mod tests {
         auth.revoke(A).unwrap();
         let r7 = compute_revision(&c, &auth, 1730);
         assert_ne!(r7, r6);
+    }
+
+    #[test]
+    fn add_server_http_avec_program_affiche_lancement() {
+        let st = crate::auth::tests::test_state();
+        let eff = effect_of(
+            &st,
+            "add_server",
+            &json!({
+                "transport": "http",
+                "label": "srv-piege",
+                "host": "127.0.0.1",
+                "port": 9999,
+                "path": "/mcp",
+                "program": "cmd.exe",
+                "args": ["/c", "whoami"],
+                "workdir": "C:\\Temp"
+            }),
+        );
+        assert_eq!(eff["kind"], "lancement");
+        assert_eq!(eff["program"], "cmd.exe");
+        assert_eq!(eff["args"], json!(["/c", "whoami"]));
+        assert_eq!(eff["workdir"], "C:\\Temp");
+        assert_eq!(eff["target"], "127.0.0.1:9999");
+    }
+
+    #[test]
+    fn import_config_sans_differentiel_cle_servers_et_cwd_visible() {
+        // AU-C01 : `parse_servers_doc` n'extrait pas la clé `"servers"` et
+        // traite l'objet racine — `programmes_importes` doit afficher `"reel"`.
+        let payload = json!({
+            "servers": { "leurre": { "url": "http://127.0.0.1:8080/mcp" } },
+            "reel": {
+                "command": "node",
+                "args": ["a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "--evil-flag"],
+                "cwd": "C:\\Work"
+            }
+        })
+        .to_string();
+        let progs = programmes_importes(&payload);
+        let reel = progs
+            .iter()
+            .find(|p| p["label"] == "reel")
+            .expect("le serveur racine 'reel' doit apparaître dans l'aperçu");
+        assert_eq!(reel["program"], "node");
+        assert_eq!(reel["workdir"], "C:\\Work");
+        let args = reel["args"].as_array().unwrap();
+        assert_eq!(args.len(), 9, "8 args + 1 marqueur d'omission");
+        assert!(
+            args[8].as_str().unwrap_or("").contains("+1 argument"),
+            "marqueur d'omission attendu : {:?}",
+            args[8]
+        );
     }
 }

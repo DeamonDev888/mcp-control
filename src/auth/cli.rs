@@ -142,8 +142,13 @@ fn http_with_headers(
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .map_err(|e| format!("connexion {host}:{port} impossible : {e}"))?;
     let _ = s.set_read_timeout(Some(Duration::from_secs(15)));
+    let host_hdr = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
     let mut req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: application/json\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {host_hdr}\r\nConnection: close\r\nAccept: application/json\r\n"
     );
     for (name, value) in extra_headers {
         req.push_str(&format!("{name}: {value}\r\n"));
@@ -224,8 +229,13 @@ fn pair_http_json(
         return Ok((status, v, String::new()));
     }
     let texte = body.map(|b| b.to_string());
+    let host_hdr = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
     let mut req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: application/json\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {host_hdr}\r\nConnection: close\r\nAccept: application/json\r\n"
     );
     if let Some(ref b) = texte {
         req.push_str(&format!(
@@ -330,9 +340,13 @@ impl Drop for CliSession {
 }
 
 /// Ouvre une session locale S1 éphémère via le canal fichier utilisateur puis
-/// l'échange sur `POST /api/session` (R-5). Aucun jeton, cookie ni secret n'est affiché.
-fn local_session(port: u16) -> Result<CliSession, String> {
-    let token = crate::auth::session::request_bootstrap(&config_path(), Duration::from_secs(5))?;
+/// l'échange sur `POST /api/session` (R-5). Utilise en priorité le port scellé
+/// dans `.grant` par notre moteur (AU-C02 : protège contre le vol de jeton en
+/// cas de repli de port `+1..+9` ou de squat multi-utilisateurs).
+fn local_session(fallback_port: u16) -> Result<CliSession, String> {
+    let (token, granted_port) =
+        crate::auth::session::request_bootstrap_with_port(&config_path(), Duration::from_secs(5))?;
+    let port = granted_port.unwrap_or(fallback_port);
     let body = json!({ "token": token, "ephemeral": true }).to_string();
     let (status, head, corps) =
         http_with_headers("127.0.0.1", port, "POST", "/api/session", &[], Some(&body))?;
@@ -359,12 +373,12 @@ fn local_session(port: u16) -> Result<CliSession, String> {
 }
 
 fn action(v: Value) -> Result<Value, String> {
-    let port = local_port()?;
-    let sess = local_session(port)?;
+    let fallback_port = local_port()?;
+    let sess = local_session(fallback_port)?;
     let body = v.to_string();
     let (status, _, corps) = http_with_headers(
         "127.0.0.1",
-        port,
+        sess.port,
         "POST",
         "/api/action",
         &[
@@ -632,6 +646,7 @@ fn cmd_pair(url: &str) -> i32 {
         "server_pub": server_pub,
         "tls_fp": tls_fp,
         "keyid": keyid,
+        "public_key": cle_pub,
         "paired_at": crate::types::iso_utc(crate::types::now_ts()),
     });
     let pin_path = cfg_dir
@@ -984,7 +999,16 @@ fn cmd_verify_log(chemin: Option<&str>) -> i32 {
     };
     let has_artifacts = crate::audit::has_audit_artifacts(&path);
     if !has_artifacts {
-        if crate::auth::secret::audit_key_path(&key_dir).exists() {
+        // AU-C09 : interroger aussi le trousseau OS (`load_audit_key`), pas
+        // uniquement le fichier de repli `audit.key` sur disque.
+        let has_key = crate::auth::secret::load_audit_key(
+            &key_dir,
+            crate::auth::secret::service().as_deref(),
+        )
+        .ok()
+        .flatten()
+        .is_some();
+        if has_key {
             eprintln!(
                 "verify-log : journal d'audit absent ({}) alors qu'une clé HMAC existe — suppression probable !",
                 path.display()

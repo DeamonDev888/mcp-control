@@ -29,7 +29,7 @@ pub const STALE_180D_SECS: u64 = 180 * 86_400;
 
 /// Analyse un horodatage UTC `"YYYY-MM-DD HH:MM:SS"` ou `"YYYY-MM-DDTHH:MM:SSZ"`
 /// en secondes Unix. Inverse exact de [`crate::types::iso_utc`].
-fn parse_iso_utc(s: &str) -> Option<u64> {
+pub(crate) fn parse_iso_utc(s: &str) -> Option<u64> {
     let s = s.trim().strip_suffix('Z').unwrap_or(s.trim());
     let (date, time) = s.split_once(' ').or_else(|| s.split_once('T'))?;
     let mut dp = date.split('-');
@@ -548,23 +548,9 @@ impl litemcp::auth::sign::KeyStore for RegistryStore {
             // exactement une seconde décompression + une vérification Ed25519,
             // comme `SignatureVerifier` sur `signature_invalid`.
             verification_fantome_octets(&public_key);
-        } else {
-            // Mettre à jour `last_used_at` au plus une fois par minute [M-03]
-            // pour que `stale_180d` et l'écran « Accès » reflètent l'activité réelle.
-            let now = crate::types::now_ts();
-            let needs_touch = rec
-                .last_used_at
-                .as_deref()
-                .and_then(parse_iso_utc)
-                .map(|prev| now.saturating_sub(prev) >= 60)
-                .unwrap_or(true);
-            if needs_touch {
-                let mut settings = lockv(&self.state.settings);
-                if let Some(c) = settings.auth.clients.iter_mut().find(|c| c.keyid == keyid) {
-                    c.last_used_at = Some(crate::types::iso_utc(now));
-                }
-            }
         }
+        // AU-C06 : `lookup` reste strictement en lecture seule — `last_used_at`
+        // n'est mis à jour qu'APRÈS vérification réussie de la signature Ed25519.
         let mut key = litemcp::auth::sign::ClientKey::new(rec.keyid.clone(), public_key);
         if !rec.label.is_empty() {
             key = key.with_label(rec.label.clone());

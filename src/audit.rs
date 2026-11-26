@@ -304,34 +304,16 @@ impl Journal {
     /// Rotation : le fichier courant passe en `.1`, les segments glissent, et
     /// le nouveau fichier s'ouvre sur une ligne `segment` qui prolonge la
     /// chaîne (son `prev` est le `mac` de la dernière ligne de l'ancien).
+    ///
+    /// MC-C04 : le nouveau segment est d'abord écrit, restreint (ACL) et
+    /// synchronisé (`sync_all`) dans un fichier `.rotate.tmp` AVANT de toucher
+    /// à `auth-audit.log` ou aux archives `.1..5` — un disque plein (`ENOSPC`)
+    /// laisse le journal intact sans déclencher le verrouillage `[H-05]`.
     fn rotate(&mut self, max_bytes: u64, now: u64) -> Result<(), String> {
         let taille = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
         if taille < max_bytes {
             return Ok(());
         }
-        let evince = segment_path(&self.path, ROTATE_KEEP);
-        if evince.exists() {
-            if let Some((seq_evince, mac_evince)) = derniere_ligne(&evince, Some(&self.cle))? {
-                write_head(&head_path(&self.path), seq_evince, &mac_evince, &self.cle)?;
-            }
-        }
-        for i in (1..ROTATE_KEEP).rev() {
-            let from = segment_path(&self.path, i);
-            if from.exists() {
-                let to = segment_path(&self.path, i + 1);
-                // `.5` est écrasé : cinq segments au plus (§11).
-                let _ = std::fs::remove_file(&to);
-                std::fs::rename(&from, &to).map_err(|e| {
-                    format!(
-                        "rotation {} -> {} impossible : {e}",
-                        from.display(),
-                        to.display()
-                    )
-                })?;
-            }
-        }
-        std::fs::rename(&self.path, segment_path(&self.path, 1))
-            .map_err(|e| format!("rotation {} impossible : {e}", self.path.display()))?;
         let entete = Entry {
             ts: now,
             keyid: "-",
@@ -344,9 +326,69 @@ impl Journal {
         };
         let seq = self.seq + 1;
         let (ligne, mac) = ligne_complete(seq, &entete, &self.last, &self.cle);
-        std::fs::write(&self.path, format!("{ligne}\n"))
-            .map_err(|e| format!("écriture {} impossible : {e}", self.path.display()))?;
-        let _ = crate::manage::restrict_permissions(&self.path.to_string_lossy());
+        let new_tmp = PathBuf::from(format!(
+            "{}.{}.rotate.tmp",
+            self.path.display(),
+            std::process::id()
+        ));
+        let stage_res = (|| -> Result<(), String> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&new_tmp)
+                .map_err(|e| format!("ouverture {} impossible : {e}", new_tmp.display()))?;
+            let _ = crate::manage::restrict_permissions(&new_tmp.to_string_lossy());
+            writeln!(f, "{ligne}")
+                .map_err(|e| format!("écriture {} impossible : {e}", new_tmp.display()))?;
+            f.sync_all()
+                .map_err(|e| format!("sync {} impossible : {e}", new_tmp.display()))?;
+            Ok(())
+        })();
+        if let Err(e) = stage_res {
+            let _ = std::fs::remove_file(&new_tmp);
+            return Err(e);
+        }
+        let evince = segment_path(&self.path, ROTATE_KEEP);
+        if evince.exists() {
+            if let Some((seq_evince, mac_evince)) = derniere_ligne(&evince, Some(&self.cle))? {
+                if let Err(e) =
+                    write_head(&head_path(&self.path), seq_evince, &mac_evince, &self.cle)
+                {
+                    let _ = std::fs::remove_file(&new_tmp);
+                    return Err(e);
+                }
+            }
+        }
+        for i in (1..ROTATE_KEEP).rev() {
+            let from = segment_path(&self.path, i);
+            if from.exists() {
+                let to = segment_path(&self.path, i + 1);
+                // `.5` est écrasé : cinq segments au plus (§11).
+                let _ = std::fs::remove_file(&to);
+                if let Err(e) = std::fs::rename(&from, &to) {
+                    let _ = std::fs::remove_file(&new_tmp);
+                    return Err(format!(
+                        "rotation {} -> {} impossible : {e}",
+                        from.display(),
+                        to.display()
+                    ));
+                }
+            }
+        }
+        let seg1 = segment_path(&self.path, 1);
+        if let Err(e) = std::fs::rename(&self.path, &seg1) {
+            let _ = std::fs::remove_file(&new_tmp);
+            return Err(format!("rotation {} impossible : {e}", self.path.display()));
+        }
+        if let Err(e) = std::fs::rename(&new_tmp, &self.path) {
+            let _ = std::fs::rename(&seg1, &self.path);
+            let _ = std::fs::remove_file(&new_tmp);
+            return Err(format!(
+                "activation {} impossible : {e}",
+                self.path.display()
+            ));
+        }
         self.seq = seq;
         self.last = mac;
         Ok(())

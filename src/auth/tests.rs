@@ -13,7 +13,7 @@ use std::sync::Arc;
 /// Clé PUBLIQUE du premier vecteur RFC 8032 §7.1 — rien de secret.
 const CLE_PUB: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
 
-fn test_state() -> Arc<AppState> {
+pub(super) fn test_state() -> Arc<AppState> {
     Arc::new(AppState {
         servers: std::sync::Mutex::new(vec![]),
         log: std::sync::Mutex::new(std::collections::VecDeque::new()),
