@@ -4,7 +4,7 @@ members = [".", "desktop"]
 
 [package]
 name = "mcp-control"
-version = "0.8.9"
+version = "0.8.10"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -47,3 +47,5 @@ path = "src/lib.rs"
 
 [profile.release]
 opt-level = 2
+lto = "thin"
+strip = "symbols"
