@@ -258,8 +258,7 @@ jobs:
       # Signature keyless (pas de clé privée à stocker) : le certificat éphémère
       # porte l'identité du workflow et le tag, et la signature entre dans le
       # journal de transparence Sigstore. Vérification :
-      #   cosign verify-blob --certificate SHA256SUMS.txt.pem \
-      #     --signature SHA256SUMS.txt.sig \
+      #   cosign verify-blob --bundle SHA256SUMS.txt.sigstore.json \
       #     --certificate-identity-regexp '^https://github.com/DeamonDev888/mcp-control/.github/workflows/release.yml@refs/tags/' \
       #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
       #     SHA256SUMS.txt
@@ -267,8 +266,7 @@ jobs:
       - name: Signer SHA256SUMS.txt
         run: |
           cosign sign-blob --yes \
-            --output-signature dist/SHA256SUMS.txt.sig \
-            --output-certificate dist/SHA256SUMS.txt.pem \
+            --bundle dist/SHA256SUMS.txt.sigstore.json \
             dist/SHA256SUMS.txt
 
       - name: Extraire les notes du CHANGELOG
@@ -310,8 +308,7 @@ jobs:
 
           ```sh
           # 1. signature des sommes (identité = ce workflow, ce tag)
-          cosign verify-blob --certificate SHA256SUMS.txt.pem \
-            --signature SHA256SUMS.txt.sig \
+          cosign verify-blob --bundle SHA256SUMS.txt.sigstore.json \
             --certificate-identity-regexp '^https://github.com/DeamonDev888/mcp-control/.github/workflows/release.yml@refs/tags/' \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             SHA256SUMS.txt
