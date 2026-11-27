@@ -43,7 +43,7 @@ pub use registry::{
 /// les sept actions d'appairage et de registre du lot M1.
 /// Lot M4 : `server_pair` (appairage sortant de MCP Control avec un serveur
 /// LiteMCP verrouillé, point 5).
-pub const ADMIN_ACTIONS: [&str; 31] = [
+pub const ADMIN_ACTIONS: [&str; 46] = [
     "pair_list",
     "pair_approve",
     "pair_reject",
@@ -75,6 +75,21 @@ pub const ADMIN_ACTIONS: [&str; 31] = [
     "litemcp_announcements",
     "import_peer",
     "set_favorite",
+    "swarm_overview",
+    "swarm_create_agent",
+    "swarm_delete_agent",
+    "swarm_get_configs",
+    "swarm_update_config",
+    "swarm_agent_start",
+    "swarm_agent_stop",
+    "swarm_resident_status",
+    "swarm_resident_stop",
+    "swarm_resident_ask",
+    "swarm_run_agent",
+    "swarm_run_parallel",
+    "swarm_agent_control",
+    "swarm_bridge_action",
+    "swarm_job_status",
 ];
 
 /// Cette action est-elle réservée à la session locale (`admin`) ?

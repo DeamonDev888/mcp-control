@@ -133,7 +133,7 @@ node -e "require('http').createServer((q,s)=>s.end('ok')).listen(32100)"
 
 ## Brancher ton assistant IA (pont stdio `mcp-control bridge`)
 
-L'app expose un serveur MCP complet sur `POST /mcp` (propulsé par [LiteMCP](https://github.com/DeamonDev888/litemcp) 0.12.0). Depuis la **0.8.0**, chaque requête sur `/mcp` est signée en **Ed25519** (RFC 9421 + RFC 9530) — y compris en local.
+L'app expose un serveur MCP complet sur `POST /mcp` (propulsé par [LiteMCP](https://github.com/DeamonDev888/litemcp) 0.12.2). Depuis la **0.8.0**, chaque requête sur `/mcp` est signée en **Ed25519** (RFC 9421 + RFC 9530) — y compris en local.
 
 Pour brancher un assistant IA sans écrire de code de signature, utilise l'appairage puis le pont stdio **`mcp-control bridge`** :
 

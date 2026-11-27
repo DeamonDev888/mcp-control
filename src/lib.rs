@@ -12,6 +12,7 @@ pub mod runtime;
 pub mod store_aitmpl;
 pub mod store_github;
 pub mod store_glama;
+pub mod swarm;
 pub mod types;
 pub mod ui;
 pub mod validate;
@@ -2169,6 +2170,16 @@ fn asset_app_js() -> &'static StaticAsset {
     ASSET.get_or_init(|| build_static_asset(ui::APP_JS))
 }
 
+fn asset_swarm_css() -> &'static StaticAsset {
+    static ASSET: std::sync::OnceLock<StaticAsset> = std::sync::OnceLock::new();
+    ASSET.get_or_init(|| build_static_asset(ui::SWARM_CSS))
+}
+
+fn asset_swarm_js() -> &'static StaticAsset {
+    static ASSET: std::sync::OnceLock<StaticAsset> = std::sync::OnceLock::new();
+    ASSET.get_or_init(|| build_static_asset(ui::SWARM_JS))
+}
+
 fn asset_favicon_svg() -> &'static StaticAsset {
     static ASSET: std::sync::OnceLock<StaticAsset> = std::sync::OnceLock::new();
     ASSET.get_or_init(|| build_static_asset(ui::FAVICON_SVG))
@@ -2355,6 +2366,16 @@ pub fn route_peer_session_cond(
             if_none_match,
         );
     }
+    if method == "GET" && bare_path == "/swarm.css" {
+        return serve_static_asset(asset_swarm_css(), "text/css; charset=utf-8", if_none_match);
+    }
+    if method == "GET" && bare_path == "/swarm.js" {
+        return serve_static_asset(
+            asset_swarm_js(),
+            "text/javascript; charset=utf-8",
+            if_none_match,
+        );
+    }
     if method == "GET" && bare_path == "/favicon.svg" {
         return serve_static_asset(
             asset_favicon_svg(),
@@ -2415,6 +2436,9 @@ pub fn route_peer_session_cond(
             "application/json",
             logos::LOGOS_JSON.as_bytes().to_vec(),
         );
+    }
+    if method == "GET" && bare_path == "/api/store-versions" {
+        return Reply::json(200, manage::store_versions_json());
     }
     // Table des frameworks MCP connus (id, label, langage) — l'UI en dérive
     // les badges sans dupliquer la liste côté JavaScript.

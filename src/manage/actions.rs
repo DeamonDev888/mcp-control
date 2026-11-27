@@ -71,6 +71,22 @@ pub const ACTIONS: &[&str] = &[
     "call_tool",
     "server_unpair",
     "server_auth_env",
+    // Swarm-control (instances admin + agents résidents persistants, local admin uniquement)
+    "swarm_overview",
+    "swarm_create_agent",
+    "swarm_delete_agent",
+    "swarm_get_configs",
+    "swarm_update_config",
+    "swarm_agent_start",
+    "swarm_agent_stop",
+    "swarm_resident_status",
+    "swarm_resident_stop",
+    "swarm_resident_ask",
+    "swarm_run_agent",
+    "swarm_run_parallel",
+    "swarm_agent_control",
+    "swarm_bridge_action",
+    "swarm_job_status",
 ];
 
 /// Port HTTP LOCAL d'un serveur (None : stdio, ou serveur distant). Un hôte
@@ -2293,6 +2309,133 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                     // jamais l'API (noms seuls via server_json), le gateway
                     // (résultat sans env) ni le journal.
                     let env = env_from_json(&req);
+                    // Serveur distribué en binaire natif via GitHub Releases (ex. swarm-control) :
+                    // télécharge la dernière release pour l'OS courant, vérifie le SHA-256 et
+                    // enregistre le serveur en HTTP local géré par MCP Control.
+                    if let Some(rel_spec) = find_github_release(it.id) {
+                        {
+                            let servers = lockv(&state.servers);
+                            if servers.iter().any(|s| s.id == id) {
+                                return json!({"ok": true, "added": 0, "note": "déjà installé"});
+                            }
+                        }
+                        let bin_dir = store_workdir
+                            .as_deref()
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| std::env::temp_dir().join("mcp-control").join(&id));
+                        #[cfg(not(test))]
+                        let (bin_path, downloaded_version) = match download_store_release_binary(
+                            rel_spec, &bin_dir,
+                        ) {
+                            Ok((p, v)) => (p, Some(v)),
+                            Err(e) => {
+                                return json!({
+                                    "ok": false,
+                                    "error": format!("téléchargement {} impossible : {e}", it.name)
+                                });
+                            }
+                        };
+                        #[cfg(test)]
+                        let (bin_path, downloaded_version): (
+                            std::path::PathBuf,
+                            Option<String>,
+                        ) = (
+                            bin_dir.join(release_local_bin_name(rel_spec, std::env::consts::OS)),
+                            None,
+                        );
+                        let port = {
+                            let servers = lockv(&state.servers);
+                            (rel_spec.default_port..=rel_spec.port_end)
+                                .find(|&p| {
+                                    !servers.iter().any(|s| {
+                                        matches!(s.transport, Transport::Http { port: sp, .. } if sp == p)
+                                    })
+                                })
+                                .unwrap_or(rel_spec.default_port)
+                        };
+                        let mut rel_args = vec!["--port".to_string(), port.to_string()];
+                        rel_args.extend(extra_slice.iter().cloned());
+                        let program_str = bin_path.to_string_lossy().to_string();
+                        let already = {
+                            let mut servers = lockv(&state.servers);
+                            let already = servers.iter().any(|s| s.id == id);
+                            if !already {
+                                servers.push(Server {
+                                    id: id.clone(),
+                                    label: it.name.to_string(),
+                                    transport: Transport::Http {
+                                        host: None,
+                                        port,
+                                        path: rel_spec.mcp_path.to_string(),
+                                    },
+                                    origin: Origin::Manual,
+                                    enabled: true,
+                                    state: SState::Down,
+                                    auto_restart: true,
+                                    favorite: false,
+                                    pid: None,
+                                    bound_host: None,
+                                    server_name: None,
+                                    version: downloaded_version.clone(),
+                                    protocol: None,
+                                    sse: false,
+                                    sse_endpoint: false,
+                                    ws: false,
+                                    lang: Some("Rust".to_string()),
+                                    framework: Some("litemcp".to_string()),
+                                    in_container: false,
+                                    container_name: None,
+                                    via_ssh: false,
+                                    tools: vec![],
+                                    latency_ms: None,
+                                    last_seen_ts: None,
+                                    last_error: None,
+                                    start_cmd: Some(StartCmd {
+                                        program: program_str,
+                                        args: rel_args,
+                                        workdir: store_workdir,
+                                        env,
+                                    }),
+                                    tools_disabled: vec![],
+                                });
+                            }
+                            already
+                        };
+                        if already {
+                            return json!({"ok": true, "added": 0, "note": "déjà installé"});
+                        }
+                        if let Err(e) = save_config_checked(state) {
+                            let mut servers = lockv(&state.servers);
+                            servers.retain(|s| s.id != id);
+                            return json!({"ok": false, "error": format!("config non écrite : {e}")});
+                        }
+                        let ver_log = downloaded_version
+                            .as_deref()
+                            .map(|v| format!(" (v{v})"))
+                            .unwrap_or_default();
+                        add_log(
+                            state,
+                            "info",
+                            &format!("[boutique] installé : {}{ver_log}", it.name),
+                        );
+                        #[cfg(not(test))]
+                        cycle_via_pool(state, std::slice::from_ref(&id));
+                        let st = {
+                            let servers = lockv(&state.servers);
+                            servers
+                                .iter()
+                                .find(|s| s.id == id)
+                                .map(|s| s.state.as_str().to_string())
+                                .unwrap_or_default()
+                        };
+                        return json!({
+                            "ok": true,
+                            "added": 1,
+                            "id": id,
+                            "state": st,
+                            "version": downloaded_version,
+                        });
+                    }
                     let already = {
                         let mut servers = lockv(&state.servers);
                         let already = servers.iter().any(|s| s.id == id);
@@ -2442,10 +2585,31 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 return json!({"ok": false, "error": format!("config non écrite : {e}")});
             }
             save_cache(state);
-            let report = match (cache_shared, cmd_info) {
-                (false, Some((prog, args))) => purge_store_package_files(&prog, &args),
+            let mut report = match (cache_shared, &cmd_info) {
+                (false, Some((prog, args))) => purge_store_package_files(prog, args),
                 _ => PurgeReport::default(),
             };
+            // Supprimer aussi le binaire téléchargé pour les items GitHub Releases (ex. swarm-control).
+            if let Some(rel_spec) = find_github_release(sid.strip_prefix("store-").unwrap_or(&sid))
+            {
+                if let Some((prog, _)) = &cmd_info {
+                    let bin_path = std::path::Path::new(prog);
+                    let expected_name = release_local_bin_name(rel_spec, std::env::consts::OS);
+                    if bin_path.is_file()
+                        && bin_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.eq_ignore_ascii_case(&expected_name))
+                    {
+                        match std::fs::remove_file(bin_path) {
+                            Ok(()) => report.removed_paths.push(prog.clone()),
+                            Err(e) => report
+                                .warnings
+                                .push(format!("suppression binaire {prog} impossible : {e}")),
+                        }
+                    }
+                }
+            }
             add_log(
                 state,
                 "info",
@@ -2732,7 +2896,13 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 Err(e) => json!({"ok": false, "error": e}),
             }
         }
-        _ => json!({"ok": false, "error": format!("action inconnue: {}", action)}),
+        other => {
+            if let Some(res) = crate::swarm::handle_swarm_action(state, other, &req) {
+                res
+            } else {
+                json!({"ok": false, "error": format!("action inconnue: {}", other)})
+            }
+        }
     }
 }
 

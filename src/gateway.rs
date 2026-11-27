@@ -1385,7 +1385,37 @@ fn dynamic_resources(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                 }
             },
         )
-        .require_resource_right("mcp-control://settings", "lecture");
+        .require_resource_right("mcp-control://settings", "lecture")
+        .resource(
+            "mcp-control://swarm",
+            "Swarm-control",
+            "Instances Swarm-control et agents MCP résidents détectés dans MCP Control.",
+            {
+                let st = Arc::clone(state);
+                move || {
+                    let full = manage::state_json(&st);
+                    let swarm_servers: Vec<Value> = full["servers"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter(|s| s.get("swarm_kind").and_then(Value::as_str).is_some())
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let doc = json!({
+                        "swarm_stats": full["swarm_stats"],
+                        "servers": swarm_servers,
+                    });
+                    Ok(ResourceContents {
+                        uri: "mcp-control://swarm".to_string(),
+                        mime_type: Some("application/json".to_string()),
+                        text: serde_json::to_string(&doc).unwrap_or_default(),
+                    })
+                }
+            },
+        )
+        .require_resource_right("mcp-control://swarm", "lecture");
     // une ressource par serveur DÉTECTÉ : le snapshot est reconstruit quand
     // l'empreinte de détection change (cf. fingerprint/refresh)
     let ids: Vec<(String, String)> = {
@@ -4069,7 +4099,7 @@ mod tests {
             .chain(crate::store_glama::STORE_GLAMA.iter())
             .chain(crate::store_github::STORE_GITHUB.iter())
             .collect();
-        assert_eq!(items.len(), 95, "la boutique doit contenir 95 serveurs");
+        assert_eq!(items.len(), 96, "la boutique doit contenir 96 serveurs");
         {
             let mut servers = lockv(&state.servers);
             for it in &items {

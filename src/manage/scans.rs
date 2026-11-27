@@ -1449,23 +1449,27 @@ pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) -> u32 {
     // (~313 s pour 1 000 ports) et figeait le handler HTTP. Chaque thread sonde
     // son segment, les résultats arrivent par canal — même approche std que le
     // reste du dépôt, sans toucher au pool persistant du cycle.
-    let total = (to - from + 1) as usize;
+    let mut scan_list: Vec<u16> = (from..=to).collect();
+    if range.is_none() {
+        // Plage native Swarm-control (instances admin & agents résidents)
+        for p in 23080u16..=23099u16 {
+            if !scan_list.contains(&p) {
+                scan_list.push(p);
+            }
+        }
+    }
+    let total = scan_list.len();
     let workers = SCAN_WORKERS.min(total).max(1);
     let chunk = total.div_ceil(workers);
     let (rtx, rrx) = std::sync::mpsc::channel::<(u16, String)>();
     std::thread::scope(|scope| {
-        let mut start = from as u32;
-        let mut rest = total;
-        for _ in 0..workers {
-            let count = chunk.min(rest);
-            if count == 0 {
+        for slice in scan_list.chunks(chunk) {
+            if slice.is_empty() {
                 break;
             }
-            let seg_start = start as u16;
-            let seg_end = (start + count as u32 - 1) as u16;
             let rtx = rtx.clone();
             scope.spawn(move || {
-                for port in seg_start..=seg_end {
+                for &port in slice {
                     if probe::port_open("::1", port, std::time::Duration::from_millis(150)) {
                         let _ = rtx.send((port, "::1".into()));
                     } else if probe::port_open(
@@ -1477,8 +1481,6 @@ pub fn scan_ports(state: &Arc<AppState>, range: Option<(u16, u16)>) -> u32 {
                     }
                 }
             });
-            start += count as u32;
-            rest -= count;
         }
     });
     drop(rtx);

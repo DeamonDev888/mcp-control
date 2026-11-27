@@ -1,3 +1,11 @@
+## [0.8.11] — 2026-11-27
+
+### Support complet Swarm-control, Essaim & A2A
+- **Module Rust dédié `src/swarm/` (`detect.rs`, `rpc.rs`, `jobs.rs`, `actions.rs`)** : détection native des instances `swarm-control(-N)` et agents MCP persistants/résidents `swarm-<agent>` tout en conservant `framework = "litemcp"` (appairage Ed25519 RFC 9421 intact), 15 actions locales `swarm_*` réservées à `ADMIN_ACTIONS` (`swarm_overview`, `swarm_create_agent`, `swarm_delete_agent`, `swarm_get_configs`, `swarm_update_config`, `swarm_agent_start`/`stop`, `swarm_resident_ask`/`status`/`stop`, `swarm_run_agent`, `swarm_run_parallel`, `swarm_agent_control`, `swarm_bridge_action`, `swarm_job_status`), suivi asynchrone borné des tâches longues, et client loopback `--bridge`.
+- **Découverte & Gateway (`src/manage/litemcp.rs`, `src/manage/scans.rs`, `src/manage/json.rs`, `src/gateway.rs`)** : balayage automatique de la plage native Swarm `23080..=23099` lors du scan local, classification `swarm_kind` sur les annonces `%TEMP%/litemcp-registry/` (lecture seule), métadonnées Swarm + `swarm_stats` dans `/api/state` et `/api/detail`, et nouvelle ressource gateway en lecture seule `mcp-control://swarm`.
+- **Serveur « Essaim Swarm », vue Orchestration & A2A et onglet dédié (`src/ui/swarm.js`, `src/ui/swarm.css`, `src/ui/app.js`, `src/ui.rs`, `src/lib.rs`)** : entrée **Essaim Swarm** épinglée en premier dans l'Explorateur, bouton `#tbSwarm` dans la barre de titre, logo frelon cybernétique animé et agrandi partout (Explorateur, Détail, Essaim), topologie temps réel 3 colonnes (Orchestrateurs / Agents résidents / Liens A2A & MCP), déclencheur A2A direct (`ask` + `via`), chronologie unifiée filtrable (`LIVE 3s`), gestion des agents persistants, runs parallèles (`run_agents_parallel`) et stream/kill (`agent_control`).
+- **Fiche serveur Swarm enrichie (`src/ui/app.js`, `src/ui/swarm.js`)** : onglets **Conversation** (fil dédié par agent, statut FIFO/session/bridge, envoi `ask`), **Outils**, **Config agent** (`prompt.md`, `settings.json`, `.mcp.json`, `skill.md` + câblage 1-clic des serveurs MCP Control dans `mcpServers`) et **Conf MCP**, avec tests E2E dédiés (`tests/e2e/scenarios_swarm.rs`).
+
 ## [0.8.10] — 2026-11-25
 
 ### Sécurité & authentification (Audit complet v0.8.9 — Lots 1 & 2)

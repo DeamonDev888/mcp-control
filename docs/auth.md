@@ -1,10 +1,10 @@
 # Authentification de MCP Control — spécification
 
-Statut : **livré en 0.8.0**, aligné sur l'implémentation réelle (`M1`–`M5`, `S1`–`S4`, `R-fix`, `litemcp = "0.12.0"` publié sur crates.io).
+Statut : **livré en 0.8.0**, aligné sur l'implémentation réelle (`M1`–`M5`, `S1`–`S4`, `R-fix`, `litemcp = "0.12.2"` publié sur crates.io).
 Décisions appliquées : **DA1 à DA7 = option a**.
 
 **Autorité.** La requête signée, les identités, les droits, la confirmation externe et TLS sont définis par le
-`docs/auth.md` de `litemcp` 0.12.0, qui fait foi. Ce document ne les redéfinit pas : il fixe ce que MCP Control
+`docs/auth.md` de `litemcp` 0.12.2, qui fait foi. Ce document ne les redéfinit pas : il fixe ce que MCP Control
 choisit par-dessus, et rien de plus. Un lecteur qui n'a que ce fichier doit pouvoir écrire un client compatible ;
 chaque « DOIT » est testable ; chaque choix cite sa décision.
 
@@ -85,7 +85,7 @@ Aucune évaluation par un tiers n'est revendiquée.
 
 ### 2.1 Ce que MCP Control ne redéfinit pas
 
-Renvoi : `docs/auth.md` de `litemcp` 0.12.0, §2 en entier. Résumé en dix lignes :
+Renvoi : `docs/auth.md` de `litemcp` 0.12.2, §2 en entier. Résumé en dix lignes :
 
 1. `POST` seul ; `Signature-Input` et `Signature` (RFC 9421 §4.1/§4.2), exactement un membre chacun, même label.
 2. Composants couverts, ordre imposé : `("@method" "@path" "@authority" "content-digest" "content-type" "mcp-method" "mcp-name")` ou la même liste moins `mcp-name`.
@@ -330,7 +330,7 @@ tableau n'existe pas ; tout ajout DOIT modifier ce tableau dans la même révisi
 
 ### 8.3 Features et crates propres à MCP Control
 
-- `litemcp = "0.12.0"` (publié sur crates.io) : `auth-sign` **obligatoire** (sans lui, aucun vérificateur) ; `tls` pour
+- `litemcp = "0.12.2"` (publié sur crates.io) : `auth-sign` **obligatoire** (sans lui, aucun vérificateur) ; `tls` pour
   DA5. Sans `tls`, le moteur compile et reste en loopback (§7).
 - `keyring = "=4.2.0"` (licence MIT OR Apache-2.0, `default-features = false, features = ["v1"]`), derrière la feature
   par défaut `keyring`. Taille mesurée sous Windows release (lot S3) : **+1,63 Mo** (3,57 Mo sans feature → 5,20 Mo avec

@@ -28,3 +28,4 @@ mod scenarios_gateway;
 mod scenarios_lifecycle;
 mod scenarios_scan;
 mod scenarios_security;
+mod scenarios_swarm;

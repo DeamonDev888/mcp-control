@@ -106,8 +106,29 @@ pub(super) fn server_json(s: &Server, managed: bool) -> Value {
         Value::Object(m) => m,
         _ => Map::new(),
     };
+    let swarm = crate::swarm::detect_server(s);
     obj.insert("in_container".into(), json!(in_container));
     obj.insert("container_name".into(), json!(container_name));
+    obj.insert(
+        "swarm_kind".into(),
+        json!(swarm.as_ref().map(|m| m.kind.as_str())),
+    );
+    obj.insert(
+        "swarm_agent".into(),
+        json!(swarm.as_ref().and_then(|m| m.agent.as_deref())),
+    );
+    obj.insert(
+        "swarm_instance".into(),
+        json!(swarm.as_ref().and_then(|m| m.instance.as_deref())),
+    );
+    obj.insert(
+        "swarm_bridge_port".into(),
+        json!(swarm.as_ref().and_then(|m| m.bridge_port)),
+    );
+    obj.insert(
+        "swarm_workspace".into(),
+        json!(swarm.as_ref().and_then(|m| m.workspace.as_deref())),
+    );
     Value::Object(obj)
 }
 
@@ -243,7 +264,7 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
             }),
         )
     };
-    let (list, up, total, tools) = {
+    let (list, up, total, tools, swarm_instances, swarm_residents, swarm_up) = {
         let servers = lockv(&state.servers);
         // affichage : ordre préféré (glisser-déposer), non listés en dernier (stable)
         let mut list: Vec<(usize, Value)> = servers
@@ -265,7 +286,21 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
             .filter(|s| s.state == SState::Up)
             .map(tools_actifs)
             .sum();
-        (list, up, total, tools)
+        let mut sw_inst = 0usize;
+        let mut sw_res = 0usize;
+        let mut sw_up = 0usize;
+        for s in servers.iter() {
+            if let Some(m) = crate::swarm::detect_server(s) {
+                match m.kind {
+                    crate::swarm::SwarmKind::Instance => sw_inst += 1,
+                    crate::swarm::SwarmKind::Resident => sw_res += 1,
+                }
+                if s.state == SState::Up {
+                    sw_up += 1;
+                }
+            }
+        }
+        (list, up, total, tools, sw_inst, sw_res, sw_up)
     };
     let logarr: Vec<Value> = {
         let log = lockv(&state.log);
@@ -333,6 +368,7 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
         // None = pas encore mesuré ; false = réseau local coupé (VPN le plus souvent)
         "lan_ok": lan,
         "stats": {"up": up, "total": total, "tools": tools},
+        "swarm_stats": {"instances": swarm_instances, "residents": swarm_residents, "up": swarm_up},
         "settings": settings_val,
         "peers": peers_arr,
         "access": access,
@@ -465,6 +501,7 @@ fn hash_server_visible<H: std::hash::Hasher>(
     s.ws.hash(h);
     s.lang.hash(h);
     s.framework.hash(h);
+    crate::swarm::detect_server(s).hash(h);
     let (in_container, container_name) = effective_container(s);
     in_container.hash(h);
     container_name.hash(h);

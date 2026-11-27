@@ -6,6 +6,8 @@
    un 401 rouvre le dialogue (code tourné ou faux). */
 const accessCode = () => { try { return localStorage.getItem('mcc.access') || ''; } catch (e) { return ''; } };
 const MCC_VERSION = '__MCC_VERSION__';
+let activeView = 'dashboard';
+const SWARM_LOGO = "<g class='sc-hornet'><path class='sc-wing-l' fill='#38BDF8' stroke='#FF5A1F' stroke-width='.9' stroke-linejoin='round' d='M10.5 9.5 2.5 3.5c.8 3.2 2.4 5.3 5 6.4l3-.4Z'/><path class='sc-wing-r' fill='#38BDF8' stroke='#FF5A1F' stroke-width='.9' stroke-linejoin='round' d='M13.5 9.5 21.5 3.5c-.8 3.2-2.4 5.3-5 6.4l-3-.4Z'/><path fill='none' stroke='#F97316' stroke-width='1.1' stroke-linecap='round' d='M10.5 7.2 8.2 4.5M13.5 7.2 15.8 4.5'/><path fill='#1E293B' stroke='#FF5A1F' stroke-width='.9' d='M8.8 10.2c0-2 1.4-3.4 3.2-3.4s3.2 1.4 3.2 3.4c0 1.7-1.2 2.9-3.2 2.9s-3.2-1.2-3.2-2.9Z'/><path class='sc-eye' fill='#FF4500' d='M9.7 9.6 11.4 10.6 9.8 11.1Z'/><path class='sc-eye' fill='#FF4500' d='M14.3 9.6 12.6 10.6 14.2 11.1Z'/><path fill='#F97316' stroke='#1E293B' stroke-width='.8' d='M14.8 12.6c1.5 1.8 1.2 4.7-1 6.5-1.3 1-2.8 1.5-4.3 1.4l1.1-2.5c1.2-.6 1.8-1.9 1.3-3.4l2.9-2Z'/><path fill='#1E293B' d='M12.2 15.2h3.4l-.6 1.6h-3.2Z'/><path class='sc-stinger' fill='#38BDF8' stroke='#E0F2FE' stroke-width='.4' d='M9.8 18.8 6.4 22.2l4.7-1.6Z'/></g>";
 
 /* ===== Thème sombre/clair (⚙ Réglages) =====
    Préférence locale (mcc.theme) appliquée AVANT le premier rendu par le
@@ -620,7 +622,9 @@ function render() {
   syncAnnouncements();
   renderLog();
   accessBadge();
-  if (!selectedId) renderOverview();
+  if (typeof updateSwarmBadge === 'function') updateSwarmBadge();
+  if (typeof updateSwarmTopbarActive === 'function') updateSwarmTopbarActive();
+  if (!selectedId && activeView !== 'swarm') renderOverview();
 }
 
 /* ===== Annonces LiteMCP détectées, non suivies (lot S4 pt 2) =====
@@ -741,8 +745,24 @@ function logoContrastCls(inner) {
   if (maxChroma <= 0.15 && maxLum <= 0.26) return ' logo-on-light';
   return '';
 }
+function swarmBadge(s) {
+  if (!s || !s.swarm_kind) return '';
+  if (s.swarm_kind === 'resident') {
+    const ag = s.swarm_agent ? ' : ' + s.swarm_agent : '';
+    return `<span class="tag swarm-res" title="Agent MCP r&eacute;sident persistant Swarm-control${esc(ag)}">R&Eacute;SIDENT</span>`;
+  }
+  return '<span class="tag swarm" title="Instance d&#39;orchestration Swarm-control (LiteMCP)">SWARM</span>';
+}
 function srvStoreLogo(s, lg) {
-  if (!s || !s.id || !s.id.startsWith('store-')) return '';
+  if (!s) return '';
+  if (s.swarm_kind) {
+    const isRes = s.swarm_kind === 'resident';
+    const tip = isRes
+      ? ('Swarm-control — Agent MCP r\u00e9sident' + (s.swarm_agent ? ' (' + s.swarm_agent + ')' : ''))
+      : 'Swarm-control — Instance d\u2019orchestration MCP';
+    return `<span class="srv-logo swarm-logo${isRes ? ' swarm-res' : ''}${lg ? ' lg' : ''}" title="${esc(tip)}"><svg viewBox="0 0 24 24" aria-hidden="true">${SWARM_LOGO}</svg></span>`;
+  }
+  if (!s.id || !s.id.startsWith('store-')) return '';
   let inner = PKG_GLYPH;
   if (storeLogos) {
     const raw = s.id.slice(6);
@@ -775,6 +795,36 @@ function loadStoreLogos() {
   }).catch(() => {});
 }
 
+function swarmHiveRow() {
+  const st = (state && state.swarm_stats) || {instances: 0, residents: 0, up: 0};
+  const tot = (st.instances || 0) + (st.residents || 0);
+  const up = st.up || 0;
+  const stCls = up > 0 ? 'UP' : (tot > 0 ? 'DOWN' : 'PORT-ONLY');
+  const isSel = activeView === 'swarm';
+  const summary = tot > 0
+    ? `${st.instances || 0} inst \u00b7 ${st.residents || 0} r\u00e9sid.`
+    : 'orchestration \u00b7 A2A';
+  return `<div class="srow srow-hive ${isSel ? 'sel' : ''}" draggable="false"
+    role="listitem" tabindex="0"${isSel ? ' aria-current="true"' : ''}
+    aria-label="Essaim Swarm Control — orchestration, agents persistants et interactions A2A"
+    data-act="swarm-open">
+    <div class="l1">
+      <span class="dot ${esc(stCls)}"></span>
+      <span class="srv-logo swarm-logo" title="Essaim Swarm-control — Orchestration &amp; A2A"><svg viewBox="0 0 24 24" aria-hidden="true">${SWARM_LOGO}</svg></span>
+      <span class="nm" title="Essaim Swarm — Interactions entre agents, orchestration et A2A">Essaim Swarm</span>
+      <div class="l1-right">
+        <span class="cnt" title="${esc(String(up))} actif(s) sur ${esc(String(tot))}">${esc(String(tot))}</span>
+      </div>
+    </div>
+    <div class="l2">
+      <div class="srow-meta">
+        <span class="tag swarm">ESSAIM</span>
+        <span class="tag sw-a2a">A2A</span>
+        <span class="srow-pill">${esc(summary)}</span>
+      </div>
+    </div>
+  </div>`;
+}
 function srvRow(s) {
   const endpoint = s.transport === 'http'
     ? (s.transport_info.host && !isLoopbackHost(s.transport_info.host)
@@ -794,11 +844,12 @@ function srvRow(s) {
   const toolsTip = `${s.tools_count} outil${s.tools_count > 1 ? 's' : ''}`
     + (offCount ? ` (${offCount} coup\u00e9s)` : '');
   const isSel = selectedId === s.id;
+  const isMulti = selectedServers.size > 1 && selectedServers.has(s.id);
   /* Ligne 1 : état + logo boutique éventuel + nom + compteur d'outils + switch ON/OFF.
      Ligne 2 : métadonnées (état si hors-ligne, port/programme, latence, badges)
      à gauche, actions rapides (favori, autoboot, play/stop) séparées à droite. */
-  return `<div class="srow ${isSel?'sel':''} ${s.enabled?'':'off'}" draggable="true"
-    role="listitem" tabindex="0"${isSel ? ' aria-current="true"' : ''} aria-label="Serveur ${esc(s.label)} (${esc(s.state)})"
+  return `<div class="srow ${isSel?'sel':''} ${isMulti?'multi-sel':''} ${s.enabled?'':'off'}" draggable="true"
+    role="listitem" tabindex="0"${isSel ? ' aria-current="true"' : ''}${isMulti ? ' aria-selected="true"' : ''} aria-label="Serveur ${esc(s.label)} (${esc(s.state)})"
     data-act="select" data-id="${esc(s.id)}">
     <div class="l1">
       <span class="dot ${esc(s.state)}"></span>${srvStoreLogo(s, false)}
@@ -809,7 +860,7 @@ function srvRow(s) {
     </div>
     <div class="l2">
       <div class="srow-meta">
-        ${stPill}<span class="srow-pill" title="${esc(endpoint)}">${endpoint}</span>${latPill}${langChip(s)}${dockerBadge(s, false)}${frameworkBadge(s)}${lockBadge(s)}${s.transport==='stdio'?'<span class="tag hybrid" title="Pont hybride natif : Streamable HTTP (/mcp/s/...) + auth Ed25519 LiteMCP">HTTP+AUTH</span>':''}
+        ${stPill}<span class="srow-pill" title="${esc(endpoint)}">${endpoint}</span>${latPill}${langChip(s)}${dockerBadge(s, false)}${swarmBadge(s)}${frameworkBadge(s)}${lockBadge(s)}${s.transport==='stdio'?'<span class="tag hybrid" title="Pont hybride natif : Streamable HTTP (/mcp/s/...) + auth Ed25519 LiteMCP">HTTP+AUTH</span>':''}
       </div>
       <div class="srow-acts">${rowFav(s)}${rowAuto(s)}${rowCtl(s)}</div>
     </div>
@@ -839,7 +890,91 @@ function groupHeadHtml(key, label, up, total, machine, bodyId) {
    ni config.json ni localStorage. Fermer l'app (ou recharger la page) les fait
    réapparaître, comme demandé. La supervision moteur continue de les sonder. */
 const hiddenServers = new Set();
+const selectedServers = new Set();
+let lastExpAnchorId = null;
+const selectedTools = new Set();
+let lastToolAnchor = null;
 let expStateFilter = 'all';
+
+function visibleServerIds() {
+  return [...document.querySelectorAll('#explorer .grpbody:not(.closed) .srow[data-id]')]
+    .map(r => r.dataset.id)
+    .filter(Boolean);
+}
+function handleServerClick(id, ev) {
+  if (!id) return;
+  const ctrl = !!(ev && (ev.ctrlKey || ev.metaKey));
+  const shift = !!(ev && ev.shiftKey);
+  if (shift) {
+    if (ev && ev.preventDefault) ev.preventDefault();
+    try { const sel = window.getSelection && window.getSelection(); if (sel) sel.removeAllRanges(); } catch (e) {}
+    const vis = visibleServerIds();
+    const anchor = lastExpAnchorId || selectedId || id;
+    const i1 = vis.indexOf(anchor);
+    const i2 = vis.indexOf(id);
+    if (!ctrl) selectedServers.clear();
+    if (i1 >= 0 && i2 >= 0) {
+      const a = Math.min(i1, i2), b = Math.max(i1, i2);
+      for (let i = a; i <= b; i++) selectedServers.add(vis[i]);
+    } else {
+      selectedServers.add(id);
+    }
+    renderServers();
+    return;
+  }
+  if (ctrl) {
+    if (ev && ev.preventDefault) ev.preventDefault();
+    if (selectedServers.size === 0 && selectedId) selectedServers.add(selectedId);
+    if (selectedServers.has(id)) selectedServers.delete(id);
+    else selectedServers.add(id);
+    lastExpAnchorId = id;
+    renderServers();
+    return;
+  }
+  selectedServers.clear();
+  selectedServers.add(id);
+  lastExpAnchorId = id;
+  select(id);
+}
+function visibleToolNames() {
+  return [...document.querySelectorAll('#toolsRowsBox .tool[data-tool]')]
+    .map(r => r.dataset.tool)
+    .filter(Boolean);
+}
+function handleToolClick(el, ev) {
+  if (!detailCache || !el || !el.dataset.tool) return;
+  const name = el.dataset.tool;
+  const ctrl = !!(ev && (ev.ctrlKey || ev.metaKey));
+  const shift = !!(ev && ev.shiftKey);
+  if (shift) {
+    if (ev && ev.preventDefault) ev.preventDefault();
+    try { const sel = window.getSelection && window.getSelection(); if (sel) sel.removeAllRanges(); } catch (e) {}
+    const vis = visibleToolNames();
+    const anchor = lastToolAnchor || name;
+    const i1 = vis.indexOf(anchor);
+    const i2 = vis.indexOf(name);
+    if (!ctrl) selectedTools.clear();
+    if (i1 >= 0 && i2 >= 0) {
+      const a = Math.min(i1, i2), b = Math.max(i1, i2);
+      for (let i = a; i <= b; i++) selectedTools.add(vis[i]);
+    } else {
+      selectedTools.add(name);
+    }
+    refreshToolsBox();
+    return;
+  }
+  if (ctrl) {
+    if (ev && ev.preventDefault) ev.preventDefault();
+    if (selectedTools.has(name)) selectedTools.delete(name);
+    else selectedTools.add(name);
+    lastToolAnchor = name;
+    refreshToolsBox();
+    return;
+  }
+  selectedTools.clear();
+  lastToolAnchor = name;
+  toggleToolExpand(el);
+}
 
 function setExpStateFilter(mode) {
   expStateFilter = mode || 'all';
@@ -860,8 +995,10 @@ function srvVisible(s, q) {
   if (expStateFilter === 'down' && !(s.enabled && (s.state === 'DOWN' || s.state === 'PORT-ONLY') && !(s.locked && !s.paired))) return false;
   if (expStateFilter === 'locked' && !(s.locked && !s.paired)) return false;
   if (expStateFilter === 'paused' && (s.enabled && s.state !== 'DISABLED')) return false;
+  if (expStateFilter === 'swarm' && !s.swarm_kind) return false;
   if (q) {
     const hay = (s.label + ' ' + s.id + ' ' + (s.framework || '') + ' '
+      + (s.swarm_kind ? ('swarm swarm-control ' + s.swarm_kind + ' ' + (s.swarm_agent || '') + ' resident ') : '')
       + (s.in_container ? ('docker conteneur container ' + (s.container_name || '') + ' ') : '')
       + (s.transport === 'http' ? (s.transport_info.port ?? '') : '') + ' ' + (s.state || '')).toLowerCase();
     if (!hay.includes(q)) return false;
@@ -882,8 +1019,11 @@ function renderServers() {
   const keys = groupKeys();
   const sig = JSON.stringify([
     state.servers,
+    state.swarm_stats,
     state.settings && state.settings.ssh_hosts,
     selectedId,
+    activeView,
+    [...selectedServers],
     overviewFilter,
     expStateFilter,
     q,
@@ -906,9 +1046,12 @@ function renderServers() {
       focusSpec = {kind: 'grp', key: active.dataset.key};
     }
   }
+  const hiveMatchesFilter = (!q || 'essaim swarm a2a orchestration agents'.includes(q))
+    && (expStateFilter === 'all' || expStateFilter === 'swarm' || (expStateFilter === 'up' && state.swarm_stats && state.swarm_stats.up > 0));
+  const hiveHtml = hiveMatchesFilter ? swarmHiveRow() : '';
   if (!state.servers.length) {
-    setHidden(localHead, true); setText(count, '');
-    localBox.innerHTML = '<div class="empty-sec" role="listitem">aucun serveur \u2014 lance un scan</div>';
+    setHidden(localHead, false); setText(count, '0/0');
+    localBox.innerHTML = hiveHtml + '<div class="empty-sec" role="listitem">aucun serveur \u2014 lance un scan</div>';
     setHidden(label, true); groupsBox.innerHTML = '';
     const hb = document.getElementById('hiddenBar');
     if (hb) setHidden(hb, true);
@@ -937,8 +1080,8 @@ function renderServers() {
   if (localToggle) localToggle.setAttribute('aria-expanded', locClosed ? 'false' : 'true');
   localBox.classList.toggle('closed', locClosed);
   setText(count, upOf(localAll) + '/' + localAll.length);
-  localBox.innerHTML = local.length ? favFirst(local).map(srvRow).join('')
-    : (localAll.length ? noneMatch : '<div class="empty-sec" role="listitem">aucun serveur \u2014 lance un scan</div>');
+  localBox.innerHTML = hiveHtml + (local.length ? favFirst(local).map(srvRow).join('')
+    : (localAll.length ? (hiveHtml ? '' : noneMatch) : '<div class="empty-sec" role="listitem">aucun serveur \u2014 lance un scan</div>'));
   setHidden(label, !keys.length);
   groupsBox.innerHTML = keys.map((k, idx) => {
     const all = byKey[k] || [];
@@ -1904,13 +2047,14 @@ function renderToolsRowsHtml(s) {
   return filtered.map((t, idx) => {
     const expKey = s.id + '::' + t.name;
     const isExp = expandedTools.has(expKey);
+    const isToolSel = selectedTools.has(t.name);
     const panelId = 'toolPanel_' + idx;
     const propsCount = t.input_schema && t.input_schema.properties && typeof t.input_schema.properties === 'object'
       ? Object.keys(t.input_schema.properties).length : 0;
     const pBadge = propsCount > 0 ? `<span class="tool-pbadge">${esc(propsCount)} param.</span>` : '';
-    return `<div class="tool ${t.disabled?'off':''} ${isExp?'expanded':''}" data-tool="${esc(t.name)}">
+    return `<div class="tool ${t.disabled?'off':''} ${isExp?'expanded':''} ${isToolSel?'multi-sel':''}" data-tool="${esc(t.name)}"${isToolSel ? ' aria-selected="true"' : ''}>
        <div class="tool-head">
-         <button type="button" class="tool-head-btn" data-act="tool-expand" data-tool="${esc(t.name)}" aria-expanded="${isExp ? 'true' : 'false'}" aria-controls="${esc(panelId)}" title="Cliquer pour inspecter le sch&eacute;ma et tester l'outil">
+         <button type="button" class="tool-head-btn" data-act="tool-expand" data-tool="${esc(t.name)}" aria-expanded="${isExp ? 'true' : 'false'}" aria-controls="${esc(panelId)}" title="Cliquer pour inspecter · Ctrl+clic ou Shift+clic pour multi-s\u00e9lectionner">
            <span class="tool-chev" aria-hidden="true">&#9656;</span>
            <code>${esc(t.name)}</code>
            <span class="desc">${t.desc ? mdInline(t.desc) : '&mdash;'}</span>
@@ -2077,6 +2221,7 @@ function renderDetail() {
   if (!s || s.id !== selectedId) return;
   const aEl = document.activeElement;
   if (aEl && (aEl.id === 'scProgram' || aEl.id === 'scArgs' || aEl.id === 'scWorkdir' || aEl.id === 'toolSearch'
+    || aEl.id === 'swAskPrompt' || aEl.id === 'swAskFrom' || aEl.id === 'swAskModel' || aEl.id === 'swCfgEditor'
     || (aEl.classList && aEl.classList.contains('tool-args-ta')))) return;
   const sig = JSON.stringify([s, detailTab, toolSearchQuery, Object.keys(FRAMEWORKS).length]);
   const contentEl = document.getElementById('content');
@@ -2174,6 +2319,7 @@ function renderDetail() {
         ${langChip(s)}
         ${dockerBadge(s, true)}
         ${typeBadge(s)}
+        ${swarmBadge(s)}
         ${frameworkBadge(s)}
         ${lockBadge(s, true)}
         ${s.transport === 'stdio' ? '<span class="tag hybrid" title="Pont hybride natif MCP Control : Streamable HTTP POST ' + esc(s.hybrid_path || '') + ' prot&eacute;g&eacute; par signature Ed25519 LiteMCP">HYBRIDE &middot; HTTP + AUTH</span>' : ''}
@@ -2213,11 +2359,16 @@ function renderDetail() {
     ${fold('demarrage', 'D&eacute;marrage', `<div class="kv">${kvd}</div>${startCmdForm(s)}`)}
     ${fold('infos', 'Informations', `<div class="kv">${kv}</div>`)}
     <div class="tabs" role="tablist" aria-label="Vues du serveur">
+      ${s.swarm_kind ? `<button type="button" class="tab ${detailTab === 'swarm-chat' ? 'sel' : ''}" role="tab" id="dtab-swarm-chat" aria-selected="${detailTab === 'swarm-chat' ? 'true' : 'false'}" aria-controls="dpanel-main" tabindex="${detailTab === 'swarm-chat' ? '0' : '-1'}" data-act="detail-tab" data-tab="swarm-chat">Conversation</button>` : ''}
       <button type="button" class="tab ${detailTab === 'outils' ? 'sel' : ''}" role="tab" id="dtab-outils" aria-selected="${detailTab === 'outils' ? 'true' : 'false'}" aria-controls="dpanel-main" tabindex="${detailTab === 'outils' ? '0' : '-1'}" data-act="detail-tab" data-tab="outils">Outils (${esc(nTot)})</button>
-      <button type="button" class="tab ${detailTab === 'conf' ? 'sel' : ''}" role="tab" id="dtab-conf" aria-selected="${detailTab === 'conf' ? 'true' : 'false'}" aria-controls="dpanel-main" tabindex="${detailTab === 'conf' ? '0' : '-1'}" data-act="detail-tab" data-tab="conf">Conf agent</button>
+      ${s.swarm_kind ? `<button type="button" class="tab ${detailTab === 'swarm-cfg' ? 'sel' : ''}" role="tab" id="dtab-swarm-cfg" aria-selected="${detailTab === 'swarm-cfg' ? 'true' : 'false'}" aria-controls="dpanel-main" tabindex="${detailTab === 'swarm-cfg' ? '0' : '-1'}" data-act="detail-tab" data-tab="swarm-cfg">Config agent</button>` : ''}
+      <button type="button" class="tab ${detailTab === 'conf' ? 'sel' : ''}" role="tab" id="dtab-conf" aria-selected="${detailTab === 'conf' ? 'true' : 'false'}" aria-controls="dpanel-main" tabindex="${detailTab === 'conf' ? '0' : '-1'}" data-act="detail-tab" data-tab="conf">Conf MCP</button>
     </div>
     <div id="dpanel-main" role="tabpanel" aria-labelledby="dtab-${esc(detailTab)}">
-      ${detailTab === 'conf' ? confAgent(s) : toolsHtml}
+      ${detailTab === 'conf' ? confAgent(s)
+        : (detailTab === 'swarm-chat' && s.swarm_kind && typeof renderSwarmDetailChat === 'function' ? renderSwarmDetailChat(s)
+        : (detailTab === 'swarm-cfg' && s.swarm_kind && typeof renderSwarmDetailCfg === 'function' ? renderSwarmDetailCfg(s)
+        : toolsHtml))}
     </div>`;
   if (sameSrv) {
     for (const idOld in typed) {
@@ -2238,6 +2389,9 @@ function goHome() {
     }
   }
   selectedId = null;
+  activeView = 'dashboard';
+  if (typeof swarmStopPoll === 'function') swarmStopPoll();
+  if (typeof updateSwarmTopbarActive === 'function') updateSwarmTopbarActive();
   detailCache = null;
   _lastSelectedSrvSig = '';
   _detailEtag = null;
@@ -2268,6 +2422,9 @@ function goHome() {
 
 function select(id) {
   if (!id) { goHome(); return; }
+  activeView = 'dashboard';
+  if (typeof swarmStopPoll === 'function') swarmStopPoll();
+  if (typeof updateSwarmTopbarActive === 'function') updateSwarmTopbarActive();
   const switched = selectedId !== id;
   selectedId = id;
   detailCache = null;
@@ -2278,6 +2435,8 @@ function select(id) {
   _sigOverview = '';
   if (switched) {
     toolSearchQuery = '';
+    selectedTools.clear();
+    lastToolAnchor = null;
     detailTab = 'outils';
   }
   renderServers();
@@ -2483,9 +2642,131 @@ async function openInExplorer(path) {
   const j = await postAction({action: 'open_path', path: path}, {quiet: true});
   toast(j.ok ? 'explorateur ouvert' : ('échec : ' + (j.error || 'inconnu')), j.ok ? 'ok' : 'err');
 }
+async function fetchServerDetailsBatch(ids) {
+  const out = [];
+  for (const sid of ids) {
+    const base = (state && state.servers ? state.servers : []).find(x => x.id === sid);
+    if (!base) continue;
+    try {
+      const r = await fetch('/api/detail?id=' + encodeURIComponent(sid));
+      if (r.ok) {
+        out.push(await r.json());
+        continue;
+      }
+    } catch (e) {}
+    out.push(base);
+  }
+  return out;
+}
+function formatDetailedServerInfo(s) {
+  const lines = [srvInfoText(s)];
+  const tools = Array.isArray(s.tools_list) ? s.tools_list : [];
+  if (tools.length) {
+    lines.push('outils (' + tools.length + ') :');
+    tools.forEach(t => {
+      const st = t.disabled ? ' [OFF]' : '';
+      const d = t.desc ? ' — ' + String(t.desc).replace(/\s+/g, ' ').trim() : '';
+      lines.push('  - ' + t.name + st + d);
+    });
+  }
+  return lines.join('\n');
+}
+async function copyMultiServersInfo(ids, asJson) {
+  const details = await fetchServerDetailsBatch(ids);
+  if (!details.length) return;
+  if (asJson) {
+    copyText(JSON.stringify(details, null, 2));
+    toast('Infos JSON de ' + details.length + ' serveurs copi\u00e9es', 'ok', 2200);
+  } else {
+    const txt = details.map(formatDetailedServerInfo).join('\n\n' + '='.repeat(48) + '\n\n');
+    copyText(txt);
+    toast('Infos compl\u00e8tes de ' + details.length + ' serveurs copi\u00e9es', 'ok', 2200);
+  }
+}
+function copyMultiServersMcpConfig(srvs) {
+  const mcpServers = {};
+  srvs.forEach(s => {
+    try {
+      const parsed = JSON.parse(mcpJson(s));
+      if (parsed && parsed.mcpServers) {
+        Object.assign(mcpServers, parsed.mcpServers);
+      }
+    } catch (e) {}
+  });
+  copyText(JSON.stringify({mcpServers}, null, 2));
+  toast('Config MCP combin\u00e9e (' + srvs.length + ' serveurs) copi\u00e9e', 'ok', 2200);
+}
+function multiRowCtx(ev, ids) {
+  const allSrvs = (state && state.servers ? state.servers : []);
+  const srvs = ids.map(id => allSrvs.find(x => x.id === id)).filter(Boolean);
+  if (srvs.length <= 1) {
+    rowCtxSingle(ev, srvs[0] ? srvs[0].id : ids[0]);
+    return;
+  }
+  const n = srvs.length;
+  const items = [];
+  const add = (lbl, fn, dis) => items.push({lbl: lbl, fn: fn, dis: !!dis});
+  items.push({lbl: ic('activity') + ' ' + esc(n) + ' serveurs s\u00e9lectionn\u00e9s', fn: () => {}, dis: true, hdr: true});
+  add('—', null, false);
+  add(ic('copy') + ' Copier toutes les infos (' + n + ' serveurs)', () => copyMultiServersInfo(srvs.map(s => s.id), false));
+  add(ic('copy') + ' Copier toutes les infos en JSON (' + n + ')', () => copyMultiServersInfo(srvs.map(s => s.id), true));
+  add(ic('terminal') + ' Copier la config MCP combin\u00e9e (JSON)', () => copyMultiServersMcpConfig(srvs));
+  add(ic('link') + ' Copier les URLs / commandes', () => {
+    const lines = srvs.map(s => (s.label || s.id) + ' : ' + (ctxUrl(s) || srvCmd(s) || s.id));
+    copyText(lines.join('\n'));
+    toast(n + ' endpoints copi\u00e9s', 'ok', 2000);
+  });
+  add('—', null, false);
+  add(ic('refresh') + ' Sonder les ' + n + ' serveurs', async () => {
+    for (const s of srvs) await postAction({action: 'refresh', id: s.id}, {quiet: true});
+    await load();
+    toast(n + ' serveurs sond\u00e9s', 'ok', 2000);
+  });
+  const startable = srvs.filter(s => s.can_start && s.state !== 'UP');
+  if (startable.length) {
+    add(ic('play') + ' D\u00e9marrer (' + startable.length + ')', async () => {
+      for (const s of startable) await postAction({action: 'start', id: s.id}, {quiet: true});
+      await load();
+    });
+  }
+  const enabledSrvs = srvs.filter(s => s.enabled);
+  if (enabledSrvs.length) {
+    add(ic('pause') + ' Mettre en pause (' + enabledSrvs.length + ')', async () => {
+      for (const s of enabledSrvs) await postAction({action: 'toggle', id: s.id}, {quiet: true});
+      await load();
+    });
+  }
+  const pausedSrvs = srvs.filter(s => !s.enabled);
+  if (pausedSrvs.length) {
+    add(ic('play') + ' Reprendre la supervision (' + pausedSrvs.length + ')', async () => {
+      for (const s of pausedSrvs) await postAction({action: 'toggle', id: s.id}, {quiet: true});
+      await load();
+    });
+  }
+  add('—', null, false);
+  add(ic('check') + ' Tout s\u00e9lectionner (affich\u00e9s)', () => {
+    visibleServerIds().forEach(x => selectedServers.add(x));
+    renderServers();
+  });
+  add(ic('x') + ' Effacer la s\u00e9lection', () => {
+    selectedServers.clear();
+    renderServers();
+  });
+  showMenu(ev, items);
+}
 function rowCtx(ev, id) {
   ev.preventDefault();
   ev.stopPropagation();
+  if (selectedServers.size > 1 && selectedServers.has(id)) {
+    const vis = visibleServerIds();
+    const ordered = vis.filter(x => selectedServers.has(x));
+    const rest = [...selectedServers].filter(x => !ordered.includes(x));
+    multiRowCtx(ev, [...ordered, ...rest]);
+    return;
+  }
+  rowCtxSingle(ev, id);
+}
+function rowCtxSingle(ev, id) {
   const s = (state && state.servers ? state.servers : []).find(x => x.id === id);
   if (!s) return;
   const p = srvPaths(s);
@@ -2561,7 +2842,7 @@ function showMenu(ev, items) {
   ctxItems = items;
   m.innerHTML = items.map((it, i) => it.lbl === '—'
     ? '<div class="ctxsep" role="separator"></div>'
-    : '<div class="ctxitem' + (it.dis ? ' dis' : '') + '" role="menuitem" tabindex="-1" data-act="ctx-item" data-i="' + i + '"' + (it.dis ? ' aria-disabled="true"' : '') + '>' + it.lbl + '</div>').join('');
+    : '<div class="ctxitem' + (it.dis ? ' dis' : '') + (it.hdr ? ' ctx-hdr' : '') + '" role="menuitem" tabindex="-1" data-act="ctx-item" data-i="' + i + '"' + (it.dis ? ' aria-disabled="true"' : '') + '>' + it.lbl + '</div>').join('');
   m.hidden = false;
   const w = m.offsetWidth || 260, h = m.offsetHeight || 220;
   let cx = ev.clientX || 0, cy = ev.clientY || 0;
@@ -2579,10 +2860,94 @@ function showMenu(ev, items) {
   const first = m.querySelector('.ctxitem:not(.dis)');
   if (first) first.focus();
 }
-// Clic droit sur un OUTIL du panneau de détail.
+// Clic droit sur un ou plusieurs OUTILS du panneau de détail.
+function formatToolInfoText(srvLabel, t) {
+  const lines = [
+    'outil       : ' + t.name + (t.disabled ? ' [OFF]' : ' [ON]'),
+    'serveur     : ' + srvLabel,
+  ];
+  if (t.desc) lines.push('description : ' + String(t.desc).replace(/\s+/g, ' ').trim());
+  if (t.input_schema) {
+    lines.push('inputSchema :\n' + JSON.stringify(t.input_schema, null, 2));
+  }
+  return lines.join('\n');
+}
+function multiToolCtx(ev, id, names) {
+  const s = (state && state.servers ? state.servers : []).find(x => x.id === id) || {};
+  const d = (detailCache && detailCache.id === id) ? detailCache : {};
+  const srvLabel = d.label || s.label || id;
+  const all = d.tools_list || [];
+  const tools = names.map(nm => all.find(x => x.name === nm) || {name: nm, desc: ''});
+  const n = tools.length;
+  const items = [];
+  const add = (lbl, fn, dis) => items.push({lbl: lbl, fn: fn, dis: !!dis});
+  items.push({lbl: ic('terminal') + ' ' + esc(n) + ' outils s\u00e9lectionn\u00e9s', fn: () => {}, dis: true, hdr: true});
+  add('—', null, false);
+  add(ic('copy') + ' Copier toutes les infos (' + n + ' outils)', () => {
+    const txt = tools.map(t => formatToolInfoText(srvLabel, t)).join('\n\n' + '-'.repeat(40) + '\n\n');
+    copyText(txt);
+    toast('Infos de ' + n + ' outils copi\u00e9es', 'ok', 2200);
+  });
+  add(ic('copy') + ' Copier les sch\u00e9mas JSON (' + n + ' outils)', () => {
+    const arr = tools.map(t => ({
+      name: t.name,
+      description: t.desc || '',
+      disabled: !!t.disabled,
+      inputSchema: t.input_schema || {type: 'object', properties: {}},
+    }));
+    copyText(JSON.stringify(arr, null, 2));
+    toast('Sch\u00e9mas JSON de ' + n + ' outils copi\u00e9s', 'ok', 2200);
+  });
+  add(ic('copy') + ' Copier les noms (' + n + ')', () => {
+    copyText(tools.map(t => t.name).join('\n'));
+    toast(n + ' noms d\u2019outils copi\u00e9s', 'ok', 2000);
+  });
+  add(ic('copy') + ' Copier \u00ab serveur.outil \u00bb (' + n + ')', () => {
+    copyText(tools.map(t => srvLabel + '.' + t.name).join('\n'));
+    toast(n + ' r\u00e9f\u00e9rences copi\u00e9es', 'ok', 2000);
+  });
+  add('—', null, false);
+  const offTools = tools.filter(t => t.disabled);
+  if (offTools.length) {
+    add(ic('check') + ' R\u00e9activer la s\u00e9lection (' + offTools.length + ')', async () => {
+      for (const t of offTools) await postAction({action: 'toggle_tool', id, tool: t.name}, {quiet: true});
+      const r = await fetch('/api/detail?id=' + encodeURIComponent(id));
+      if (r.ok) { detailCache = await r.json(); renderDetail(); }
+      await load();
+      toast(offTools.length + ' outil(s) r\u00e9activ\u00e9(s)', 'ok', 2000);
+    });
+  }
+  const onTools = tools.filter(t => !t.disabled);
+  if (onTools.length) {
+    add(ic('x') + ' D\u00e9sactiver la s\u00e9lection (' + onTools.length + ')', async () => {
+      for (const t of onTools) await postAction({action: 'toggle_tool', id, tool: t.name}, {quiet: true});
+      const r = await fetch('/api/detail?id=' + encodeURIComponent(id));
+      if (r.ok) { detailCache = await r.json(); renderDetail(); }
+      await load();
+      toast(onTools.length + ' outil(s) d\u00e9sactiv\u00e9(s)', 'ok', 2000);
+    });
+  }
+  add('—', null, false);
+  add(ic('check') + ' Tout s\u00e9lectionner (affich\u00e9s)', () => {
+    visibleToolNames().forEach(x => selectedTools.add(x));
+    refreshToolsBox();
+  });
+  add(ic('x') + ' Effacer la s\u00e9lection', () => {
+    selectedTools.clear();
+    refreshToolsBox();
+  });
+  showMenu(ev, items);
+}
 function toolCtx(ev, id, name) {
   ev.preventDefault();
   ev.stopPropagation();
+  if (selectedTools.size > 1 && selectedTools.has(name)) {
+    const vis = visibleToolNames();
+    const ordered = vis.filter(x => selectedTools.has(x));
+    const rest = [...selectedTools].filter(x => !ordered.includes(x));
+    multiToolCtx(ev, id, [...ordered, ...rest]);
+    return;
+  }
   // state.servers ne porte PAS tools_list : seul detailCache l'expose.
   const s = (state && state.servers ? state.servers : []).find(x => x.id === id) || {};
   const d = (detailCache && detailCache.id === id) ? detailCache : {};
@@ -2831,6 +3196,11 @@ document.addEventListener('keydown', (e) => {
   }
   if (e.key === 'Escape') {
     if (document.querySelector('dialog[open]')) return;
+    if (selectedServers.size > 1 || selectedTools.size > 0) {
+      if (selectedServers.size > 1) { selectedServers.clear(); renderServers(); }
+      if (selectedTools.size > 0) { selectedTools.clear(); refreshToolsBox(); }
+      return;
+    }
     const f = document.getElementById('srvFilter');
     if (f && (f.value || document.activeElement === f)) {
       f.value = '';
@@ -4113,7 +4483,13 @@ async function addServer(ev) {
 /* ===== Boutique MCP (porté de Hermes mcp-import.ts / connectors-directory) ===== */
 let storeItems = null;
 let storeLogos = null;
+let storeVersions = null;
 let storeCat = 'Tout';
+function fmtStoreVer(v) {
+  const s = String(v || '').trim();
+  if (!s) return '';
+  return /^v/i.test(s) ? s : 'v' + s;
+}
 async function openStore() {
   const d = document.getElementById('storeDlg');
   if (!d) return;
@@ -4138,6 +4514,13 @@ async function openStore() {
       if (grid) grid.innerHTML = '<div class="empty-sec">Impossible de charger la boutique MCP.<div class="empty-acts"><button type="button" data-act="store">R\u00e9essayer</button></div></div>';
       return;
     }
+  }
+  if (!storeVersions) {
+    fetch('/api/store-versions').then(r3 => r3.ok ? r3.json() : null).then(v => {
+      if (!v) return;
+      storeVersions = v;
+      renderStoreItems();
+    }).catch(() => {});
   }
   renderStoreItems();
 }
@@ -4249,9 +4632,9 @@ function renderStoreItems() {
   if (clr) clr.hidden = !rawQ;
   const q = rawQ.toLowerCase();
   const sort = document.getElementById('storeSort').value;
-  const installed = new Set((state && state.servers ? state.servers : []).map(s => s.id));
+  const instMap = new Map((state && state.servers ? state.servers : []).map(s => [s.id, s]));
   const baseList = storeItems.filter(i => {
-    if (storeHideInst && installed.has(storeSrvId(i))) return false;
+    if (storeHideInst && instMap.has(storeSrvId(i))) return false;
     if (!q) return true;
     return (
       i.name.toLowerCase().includes(q)
@@ -4284,7 +4667,16 @@ function renderStoreItems() {
     });
   }
   grid.innerHTML = list.map(i => {
-    const isInst = installed.has(storeSrvId(i));
+    const instSrv = instMap.get(storeSrvId(i));
+    const isInst = Boolean(instSrv);
+    const remoteVer = (storeVersions && storeVersions[i.id]) || i.version || '';
+    const instVer = (instSrv && instSrv.version) || '';
+    const verHtml = (instVer && remoteVer && instVer.replace(/^v/i, '') !== remoteVer.replace(/^v/i, ''))
+      ? `<span class="scard-ver scard-ver-upd" title="Install\u00e9e : ${esc(fmtStoreVer(instVer))} \u2014 Derni\u00e8re release : ${esc(fmtStoreVer(remoteVer))}">${esc(fmtStoreVer(instVer))} \u2192 ${esc(fmtStoreVer(remoteVer))}</span>`
+      : (remoteVer || instVer)
+        ? `<span class="scard-ver" title="Version du serveur MCP">${esc(fmtStoreVer(remoteVer || instVer))}</span>`
+        : '';
+    const kindCls = i.kind === 'npm' ? 'npm' : i.kind === 'rust' ? 'rust' : 'py';
     const envKeys = !isInst ? storeEnvKeys(i) : [];
     const envHtml = envKeys.length > 2
       ? `<div class="scard-env-hint" title="${esc(envKeys.join(', '))}">${ic('lock')} ${esc(envKeys.length)} variables demand\u00e9es \u00e0 l\u2019installation</div>`
@@ -4300,9 +4692,9 @@ function renderStoreItems() {
         ${storeLogo(i)}
         <div class="scard-title">
           <b>${esc(i.name)}</b>
-          <span class="scard-cat">${esc(i.cat)}</span>
+          <span class="scard-meta"><span class="scard-cat">${esc(i.cat)}</span>${verHtml}</span>
         </div>
-        <span class="tag ${i.kind==='npm'?'npm':'py'}">${esc(i.kind)}</span>
+        <span class="tag ${kindCls}">${esc(i.kind)}</span>
       </div>
       <div class="scard-desc">${esc(i.desc)}</div>
       ${envHtml}
@@ -4376,8 +4768,12 @@ async function installStore(id, btn) {
   const j = await postAction(body, {quiet: true});
   if (j.ok) {
     envInps.forEach(inp => { inp.value = ''; inp.type = 'password'; });
+    if (j.version) {
+      if (!storeVersions) storeVersions = {};
+      storeVersions[id] = j.version;
+    }
     const nm = (storeItems && storeItems.find(x => x.id === id) || {}).name || id;
-    toast(nm + ' install\u00e9 avec succ\u00e8s', 'ok');
+    toast(nm + (j.version ? ' ' + fmtStoreVer(j.version) : '') + ' install\u00e9 avec succ\u00e8s', 'ok');
     await load();
     renderStoreItems();
   } else {
@@ -5203,6 +5599,37 @@ const ACT = {
   'scan': () => { closeDiscoverMenu(); doScan(); },
   'scan-net': () => { closeDiscoverMenu(); doScanNet(); },
   'machines': () => { closeDiscoverMenu(); openMachineDlg(); },
+  'swarm-open': () => openSwarmView(),
+  'swarm-refresh': () => swarmRefresh(true),
+  'swarm-live-toggle': () => swarmToggleLive(),
+  'swarm-a2a-filter': el => swarmSetA2aFilter(el.dataset.mode),
+  'swarm-a2a-send': () => swarmSendA2a(),
+  'swarm-tab': el => swarmSetTab(el.dataset.tab),
+  'swarm-open-agents': el => swarmOpenAgents(el.dataset.id),
+  'swarm-open-console': el => swarmOpenConsole(el.dataset.target, el.dataset.agent, el.dataset.inst),
+  'swarm-inst-change': el => swarmInstChange(el),
+  'swarm-filter-change': () => swarmFilterChange(),
+  'swarm-toggle-create': () => swarmToggleCreate(),
+  'swarm-create-submit': () => swarmCreateSubmit(),
+  'swarm-agent-start': el => swarmAgentStart(el.dataset.inst, el.dataset.name, el.dataset.runner),
+  'swarm-agent-stop': el => swarmAgentStop(el.dataset.inst, el.dataset.name, el.dataset.runner),
+  'swarm-agent-delete': el => swarmAgentDelete(el.dataset.inst, el.dataset.name, el.dataset.runner),
+  'swarm-res-status': el => swarmResStatus(el.dataset.id),
+  'swarm-res-stop': el => swarmResStop(el.dataset.id, el.dataset.clear === '1'),
+  'swarm-bridge-op': el => swarmBridgeOp(el.dataset.port, el.dataset.op),
+  'swarm-console-target': el => swarmConsoleTargetChange(el),
+  'swarm-send-ask': () => swarmSendAsk(),
+  'swarm-clear-feed': () => swarmClearFeed(),
+  'swarm-load-cfg': el => swarmLoadConfig(el.dataset.inst, el.dataset.name, el.dataset.runner),
+  'swarm-cfg-pick': el => swarmCfgPick(el),
+  'swarm-cfg-file': el => swarmCfgFileSwitch(el.dataset.file),
+  'swarm-cfg-save': () => swarmCfgSave(),
+  'swarm-cfg-wire-mcp': () => swarmCfgWireMcp(),
+  'swarm-par-add': () => swarmParAdd(),
+  'swarm-par-del': el => swarmParDel(el.dataset.idx),
+  'swarm-par-run': () => swarmParRun(),
+  'swarm-run-ctrl': el => swarmRunCtrl(el.dataset.inst, el.dataset.op, el.dataset.runid, el.dataset.agent),
+  'swarm-stream-close': () => swarmStreamClose(),
   'store': () => openStore(),
   'access-open': el => openAccessDlg(el.dataset.pending === '1'),
   'settings-open': () => openSettingsDlg(),
@@ -5228,7 +5655,7 @@ const ACT = {
   'show-hidden': () => showHiddenServers(),
   'group-toggle': el => toggleGroup(el.dataset.key),
   'add-server': () => toggleAdd(),
-  'select': el => select(el.dataset.id),
+  'select': (el, ev) => handleServerClick(el.dataset.id, ev),
   'row-act': el => act(el.dataset.op, el.dataset.id),
   'set-auto': el => setAuto(el.dataset.id, el.dataset.on === '1'),
   'set-fav': el => setFavorite(el.dataset.id, el.dataset.on === '1'),
@@ -5242,12 +5669,12 @@ const ACT = {
   'go-home': () => goHome(),
   'tile': el => tileFilter(el.dataset.mode),
   'tile-tools': () => tileSortTools(),
-  'detail-tab': el => { detailTab = el.dataset.tab; renderDetail(); },
+  'detail-tab': el => { detailTab = el.dataset.tab; renderDetail(); if (typeof swarmOnDetailTab === 'function') swarmOnDetailTab(detailTab, detailCache); },
   'tool-search': el => setToolSearch(el),
   'tool-search-clear': () => clearToolSearch(),
   'tools-all-on': el => setAllTools(el.dataset.id, true),
   'tools-all-off': el => setAllTools(el.dataset.id, false),
-  'tool-expand': el => toggleToolExpand(el),
+  'tool-expand': (el, ev) => handleToolClick(el, ev),
   'tool-toggle': el => toggleTool(el.dataset.id, el.dataset.tool),
   'copy-tool-schema': el => copyToolSchema(el.dataset.tool),
   'copy-tool-rpc': el => copyToolRpc(el.dataset.tool),

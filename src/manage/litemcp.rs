@@ -166,10 +166,12 @@ pub fn litemcp_announcements(state: &Arc<AppState>) -> Value {
     let arr: Vec<Value> = annonces
         .iter()
         .map(|a| {
+            let swarm_kind = crate::swarm::detect_announcement(&a.name).map(|k| k.as_str());
             json!({
                 "name": a.name,
                 "port": a.port,
                 "version": a.version,
+                "swarm_kind": swarm_kind,
                 // jamais « adoptée » : l'interface l'affiche « détecté, non suivi »
                 "detected": true,
                 "followed": a.suivi,

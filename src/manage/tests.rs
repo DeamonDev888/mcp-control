@@ -25,13 +25,16 @@ fn store_catalogue_sain() {
             );
         }
         assert!(
-            it.kind == "npm" || it.kind == "python",
+            it.kind == "npm" || it.kind == "python" || it.kind == "rust",
             "{}: kind inconnu {}",
             it.id,
             it.kind
         );
         assert!(
-            it.program == "npx" || it.program == "uvx" || it.program == "uv",
+            it.program == "npx"
+                || it.program == "uvx"
+                || it.program == "uv"
+                || find_github_release(it.id).is_some(),
             "{}: programme inconnu {}",
             it.id,
             it.program
@@ -157,6 +160,137 @@ fn store_principal_logos_et_drawio_nominaux() {
 }
 
 #[test]
+fn store_swarm_control_release_os_et_versions() {
+    let sc = find_store_item("swarm-control").expect("swarm-control présent dans la boutique");
+    assert_eq!(sc.name, "Swarm Control");
+    assert_eq!(sc.kind, "rust");
+    let spec =
+        find_github_release("swarm-control").expect("spec GitHub Release pour swarm-control");
+    assert_eq!(spec.repo, "DeamonDev888/swarm-control");
+
+    let rel_json = json!({
+        "tag_name": "v0.1.2",
+        "assets": [
+            {
+                "name": "swarm-control-v0.1.2-x86_64-pc-windows-msvc.zip",
+                "browser_download_url": "https://github.com/DeamonDev888/swarm-control/releases/download/v0.1.2/swarm-control-v0.1.2-x86_64-pc-windows-msvc.zip",
+                "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+                "name": "swarm-control-windows-x86_64.exe",
+                "browser_download_url": "https://github.com/DeamonDev888/swarm-control/releases/download/v0.1.2/swarm-control-windows-x86_64.exe",
+                "digest": "sha256:d08e5fdb9e3fa6a75bf9c08c2d09ccd88c8f03fc32c353fb2e11e589c8e035e1"
+            },
+            {
+                "name": "swarm-control-linux-x86_64",
+                "browser_download_url": "https://github.com/DeamonDev888/swarm-control/releases/download/v0.1.2/swarm-control-linux-x86_64",
+                "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            },
+            {
+                "name": "swarm-control-macos-aarch64",
+                "browser_download_url": "https://github.com/DeamonDev888/swarm-control/releases/download/v0.1.2/swarm-control-macos-aarch64",
+                "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            {
+                "name": "swarm-control-windows-x86_64.exe.sha256",
+                "browser_download_url": "https://github.com/DeamonDev888/swarm-control/releases/download/v0.1.2/swarm-control-windows-x86_64.exe.sha256"
+            }
+        ]
+    });
+    let (tag, assets) = parse_github_release_json(&rel_json).expect("release JSON valide");
+    assert_eq!(tag, "v0.1.2");
+
+    let win = select_release_asset(spec, "windows", "x86_64", &assets).expect("asset Windows");
+    assert_eq!(win.name, "swarm-control-windows-x86_64.exe");
+    assert_eq!(
+        win.sha256.as_deref(),
+        Some("d08e5fdb9e3fa6a75bf9c08c2d09ccd88c8f03fc32c353fb2e11e589c8e035e1")
+    );
+    let lin = select_release_asset(spec, "linux", "x86_64", &assets).expect("asset Linux");
+    assert_eq!(lin.name, "swarm-control-linux-x86_64");
+    let mac = select_release_asset(spec, "macos", "aarch64", &assets).expect("asset macOS");
+    assert_eq!(mac.name, "swarm-control-macos-aarch64");
+    assert!(select_release_asset(spec, "freebsd", "x86_64", &assets).is_none());
+
+    // URL hors dépôt officiel refusée
+    let evil = vec![ReleaseAsset {
+        name: "swarm-control-windows-x86_64.exe".into(),
+        download_url: "https://evil.example/swarm-control-windows-x86_64.exe".into(),
+        sha256: None,
+    }];
+    assert!(select_release_asset(spec, "windows", "x86_64", &evil).is_none());
+
+    // Extraction de versions épinglées + cache versions boutique
+    assert_eq!(
+        extract_pinned_version(&["--with", "mcp>=1,<2", "blender-mcp==1.6.4"]),
+        Some("1.6.4".to_string())
+    );
+    assert_eq!(
+        extract_pinned_version(&["-y", "@playwright/mcp@latest"]),
+        None
+    );
+    assert_eq!(
+        extract_pinned_version(&["-y", "@scope/pkg@2.3.4"]),
+        Some("2.3.4".to_string())
+    );
+    cache_store_version("swarm-control", "0.1.2".to_string());
+    let versions = store_versions_json();
+    assert_eq!(versions["swarm-control"], json!("0.1.2"));
+    assert_eq!(versions["blender"], json!("1.6.4"));
+
+    // Installation et désinstallation (transport HTTP géré + suppression du binaire)
+    let path = tmp_config("cfg_store_swarm_control.json", Some("{\"servers\":[]}"));
+    let state = Arc::new(AppState {
+        servers: Mutex::new(Vec::new()),
+        log: Mutex::new(VecDeque::new()),
+        settings: Mutex::new(Settings::default()),
+        children: Mutex::new(std::collections::HashMap::new()),
+        config_path: path.clone(),
+        peers: Mutex::new(std::collections::HashMap::new()),
+        allowed_origins: Mutex::new(Vec::new()),
+        allowed_hosts: Mutex::new(Vec::new()),
+        spawn_fails: Mutex::new(std::collections::HashMap::new()),
+        runtime: Mutex::new(crate::runtime::RuntimeLog::new()),
+        spawning: Mutex::new(std::collections::HashSet::new()),
+        update_latest: Mutex::new(None),
+        lan_ok: Mutex::new(None),
+    });
+    let res = handle_action(&state, r#"{"action":"install_store","id":"swarm-control"}"#);
+    assert_eq!(res["ok"], json!(true));
+    assert_eq!(res["id"], json!("store-swarm-control"));
+    let bin_path = {
+        let servers = lockv(&state.servers);
+        let srv = servers
+            .iter()
+            .find(|s| s.id == "store-swarm-control")
+            .expect("serveur store-swarm-control enregistré");
+        assert!(matches!(
+            srv.transport,
+            Transport::Http {
+                host: None,
+                port: 23080,
+                ..
+            }
+        ));
+        srv.start_cmd
+            .as_ref()
+            .expect("start_cmd présent")
+            .program
+            .clone()
+    };
+    // Simule la présence du binaire téléchargé puis vérifie qu'uninstall_store le supprime.
+    std::fs::write(&bin_path, b"fake-binary").expect("écriture faux binaire");
+    assert!(std::path::Path::new(&bin_path).is_file());
+    let uninst = handle_action(
+        &state,
+        r#"{"action":"uninstall_store","id":"swarm-control"}"#,
+    );
+    assert_eq!(uninst["ok"], json!(true));
+    assert!(!std::path::Path::new(&bin_path).exists());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn store_tous_les_serveurs_eligibles_mode_hybride_et_persistants() {
     let path = tmp_config("cfg_store_89_hybrid.json", Some("{\"servers\":[]}"));
     let state = Arc::new(AppState {
@@ -176,7 +310,7 @@ fn store_tous_les_serveurs_eligibles_mode_hybride_et_persistants() {
     });
 
     let items: Vec<&StoreItem> = all_store_items().collect();
-    assert_eq!(items.len(), 95, "la boutique doit exposer 95 serveurs");
+    assert_eq!(items.len(), 96, "la boutique doit exposer 96 serveurs");
     let secret_val = "secret-boutique-ne-doit-jamais-fuiter";
     {
         let mut servers = lockv(&state.servers);

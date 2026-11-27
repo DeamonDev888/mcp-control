@@ -425,7 +425,396 @@ pub const STORE: &[StoreItem] = &[
         args: &["-y", "airtable-mcp-server"],
         env_vars: &["AIRTABLE_API_KEY"],
     },
+    StoreItem {
+        id: "swarm-control",
+        name: "Swarm Control",
+        desc: "Orchestrateur multi-agents MCP natif en Rust : pilote Claude Code, Hermes et Antigravity, agents résidents et sessions persistantes (DeamonDev888/swarm-control)",
+        cat: "Automatisation",
+        kind: "rust",
+        program: "swarm-control",
+        args: &["--port", "23080"],
+        env_vars: &[],
+    },
 ];
+
+/// Spécification d'un serveur MCP distribué en binaire natif via GitHub Releases.
+pub struct GitHubReleaseSpec {
+    pub id: &'static str,
+    pub repo: &'static str,
+    pub bin_name: &'static str,
+    pub default_port: u16,
+    pub port_end: u16,
+    pub mcp_path: &'static str,
+}
+
+pub const STORE_GITHUB_RELEASES: &[GitHubReleaseSpec] = &[GitHubReleaseSpec {
+    id: "swarm-control",
+    repo: "DeamonDev888/swarm-control",
+    bin_name: "swarm-control",
+    default_port: 23080,
+    port_end: 23099,
+    mcp_path: "/mcp",
+}];
+
+pub(crate) fn find_github_release(sid: &str) -> Option<&'static GitHubReleaseSpec> {
+    STORE_GITHUB_RELEASES.iter().find(|r| r.id == sid)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseAsset {
+    pub name: String,
+    pub download_url: String,
+    pub sha256: Option<String>,
+}
+
+/// Nom du fichier binaire installé localement pour l'OS courant.
+pub(crate) fn release_local_bin_name(spec: &GitHubReleaseSpec, os: &str) -> String {
+    if os == "windows" {
+        format!("{}.exe", spec.bin_name)
+    } else {
+        spec.bin_name.to_string()
+    }
+}
+
+/// Sélectionne l'actif binaire direct correspondant à `(os, arch)` dans une release GitHub.
+/// Ignore les archives (`.zip`, `.tar.gz`) et fichiers de sommes/signatures (`.sha256`, `.sig`).
+pub(crate) fn select_release_asset(
+    spec: &GitHubReleaseSpec,
+    os: &str,
+    arch: &str,
+    assets: &[ReleaseAsset],
+) -> Option<ReleaseAsset> {
+    let os_norm = os.trim().to_ascii_lowercase();
+    let arch_norm = arch.trim().to_ascii_lowercase();
+    let b = spec.bin_name;
+    let candidates: Vec<String> = match (os_norm.as_str(), arch_norm.as_str()) {
+        ("windows", "x86_64" | "amd64") => vec![
+            format!("{b}-windows-x86_64.exe"),
+            format!("{b}-windows-amd64.exe"),
+        ],
+        ("windows", "aarch64" | "arm64") => vec![
+            format!("{b}-windows-aarch64.exe"),
+            format!("{b}-windows-arm64.exe"),
+            format!("{b}-windows-x86_64.exe"),
+        ],
+        ("linux", "x86_64" | "amd64") => {
+            vec![format!("{b}-linux-x86_64"), format!("{b}-linux-amd64")]
+        }
+        ("linux", "aarch64" | "arm64") => {
+            vec![format!("{b}-linux-aarch64"), format!("{b}-linux-arm64")]
+        }
+        ("macos" | "darwin", "aarch64" | "arm64") => vec![
+            format!("{b}-macos-aarch64"),
+            format!("{b}-macos-arm64"),
+            format!("{b}-macos-universal"),
+        ],
+        ("macos" | "darwin", "x86_64" | "amd64") => {
+            vec![format!("{b}-macos-x86_64"), format!("{b}-macos-universal")]
+        }
+        _ => return None,
+    };
+    let expected_prefix = format!("https://github.com/{}/releases/download/", spec.repo);
+    let is_direct_binary = |a: &ReleaseAsset| -> bool {
+        let low = a.name.to_ascii_lowercase();
+        !low.ends_with(".sha256")
+            && !low.ends_with(".sig")
+            && !low.ends_with(".asc")
+            && !low.ends_with(".txt")
+            && !low.ends_with(".zip")
+            && !low.ends_with(".tar.gz")
+            && !low.ends_with(".tgz")
+            && a.download_url.starts_with(&expected_prefix)
+    };
+    for want in &candidates {
+        if let Some(a) = assets
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(want) && is_direct_binary(a))
+        {
+            return Some(a.clone());
+        }
+    }
+    None
+}
+
+/// Parse un objet JSON de l'API GitHub `/releases/latest` en `(tag_name, assets)`.
+pub(crate) fn parse_github_release_json(v: &Value) -> Option<(String, Vec<ReleaseAsset>)> {
+    let tag = v
+        .get("tag_name")
+        .and_then(|x| x.as_str())?
+        .trim()
+        .to_string();
+    if tag.is_empty() || tag.len() > 64 {
+        return None;
+    }
+    let assets = v
+        .get("assets")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let name = item.get("name")?.as_str()?.trim().to_string();
+                    let download_url = item
+                        .get("browser_download_url")?
+                        .as_str()?
+                        .trim()
+                        .to_string();
+                    let sha256 = item
+                        .get("digest")
+                        .and_then(|d| d.as_str())
+                        .and_then(|d| d.strip_prefix("sha256:"))
+                        .map(|h| h.trim().to_ascii_lowercase())
+                        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+                    Some(ReleaseAsset {
+                        name,
+                        download_url,
+                        sha256,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((tag, assets))
+}
+
+/// Interroge `https://api.github.com/repos/<repo>/releases/latest` (curl puis repli PowerShell).
+pub(crate) fn fetch_github_latest_release(
+    repo: &str,
+) -> Result<(String, Vec<ReleaseAsset>), String> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let mut c = crate::probe::system_command("curl");
+    probe::probe_hidden_cmd(&mut c);
+    if let Ok(out) = c
+        .args([
+            "-fsSL",
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "-m",
+            "10",
+            "-H",
+            "User-Agent: mcp-control",
+            "-H",
+            "Accept: application/vnd.github+json",
+            &url,
+        ])
+        .output()
+    {
+        if out.status.success() {
+            if let Ok(v) = serde_json::from_slice::<Value>(&out.stdout) {
+                if let Some(parsed) = parse_github_release_json(&v) {
+                    return Ok(parsed);
+                }
+            }
+        }
+    }
+    let mut cmd = crate::probe::system_command("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &format!(
+            "(Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 -Headers @{{ 'User-Agent' = 'mcp-control'; 'Accept' = 'application/vnd.github+json' }} '{url}').Content"
+        ),
+    ]);
+    probe::probe_hidden_cmd(&mut cmd);
+    let out = cmd
+        .output()
+        .map_err(|e| format!("API GitHub injoignable pour {repo} : {e}"))?;
+    if !out.status.success() {
+        return Err(format!("API GitHub injoignable pour {repo}"));
+    }
+    let v: Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("réponse GitHub invalide pour {repo} : {e}"))?;
+    parse_github_release_json(&v)
+        .ok_or_else(|| format!("aucune release publiée trouvée pour {repo}"))
+}
+
+/// Télécharge le binaire de la dernière release GitHub pour l'OS courant dans `dest_dir`,
+/// vérifie son empreinte SHA-256 lorsqu'elle est publiée par GitHub, puis retourne
+/// `(chemin_binaire, version_sans_v)`.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn download_store_release_binary(
+    spec: &GitHubReleaseSpec,
+    dest_dir: &std::path::Path,
+) -> Result<(std::path::PathBuf, String), String> {
+    const MAX_BYTES: u64 = 150 * 1024 * 1024;
+    let (tag, assets) = fetch_github_latest_release(spec.repo)?;
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let asset = select_release_asset(spec, os, arch, &assets).ok_or_else(|| {
+        format!(
+            "aucun binaire publié pour {os}/{arch} dans {} ({tag})",
+            spec.repo
+        )
+    })?;
+    std::fs::create_dir_all(dest_dir)
+        .map_err(|e| format!("impossible de créer le dossier d'installation : {e}"))?;
+    let bin_name = release_local_bin_name(spec, os);
+    let final_path = dest_dir.join(&bin_name);
+    let tmp_path = dest_dir.join(format!("{bin_name}.tmp"));
+    let _ = std::fs::remove_file(&tmp_path);
+
+    let mut downloaded = false;
+    let mut c = crate::probe::system_command("curl");
+    probe::probe_hidden_cmd(&mut c);
+    if let Ok(out) = c
+        .args([
+            "-fsSL",
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "--max-time",
+            "180",
+            "--max-filesize",
+            &MAX_BYTES.to_string(),
+            "-H",
+            "User-Agent: mcp-control",
+            "-o",
+        ])
+        .arg(&tmp_path)
+        .arg(&asset.download_url)
+        .output()
+    {
+        if out.status.success() {
+            downloaded = true;
+        }
+    }
+    if !downloaded {
+        let mut ps = crate::probe::system_command("powershell");
+        let tmp_str = tmp_path.to_string_lossy().replace('\'', "''");
+        let url_str = asset.download_url.replace('\'', "''");
+        ps.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "Invoke-WebRequest -UseBasicParsing -TimeoutSec 180 -Headers @{{ 'User-Agent' = 'mcp-control' }} -Uri '{url_str}' -OutFile '{tmp_str}'"
+            ),
+        ]);
+        probe::probe_hidden_cmd(&mut ps);
+        let out = ps
+            .output()
+            .map_err(|e| format!("téléchargement impossible ({}) : {e}", asset.name))?;
+        if !out.status.success() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("téléchargement échoué pour {} ({tag})", asset.name));
+        }
+    }
+
+    if let Some(ref expected_sha) = asset.sha256 {
+        crate::manage::update::verify_file_sha256(&tmp_path, expected_sha)?;
+    } else {
+        let meta = std::fs::metadata(&tmp_path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            format!("binaire téléchargé illisible : {e}")
+        })?;
+        if meta.len() == 0 || meta.len() > MAX_BYTES {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!(
+                "taille du binaire hors bornes ({} octets)",
+                meta.len()
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod +x impossible : {e}"))?;
+    }
+    if final_path.exists() {
+        let _ = std::fs::remove_file(&final_path);
+    }
+    std::fs::rename(&tmp_path, &final_path)
+        .or_else(|_| {
+            std::fs::copy(&tmp_path, &final_path).map(|_| {
+                let _ = std::fs::remove_file(&tmp_path);
+            })
+        })
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            format!("installation du binaire impossible : {e}")
+        })?;
+
+    let version = tag.strip_prefix('v').unwrap_or(&tag).to_string();
+    cache_store_version(spec.id, version.clone());
+    Ok((final_path, version))
+}
+
+/// Extrait une version épinglée statiquement dans `args` (ex. `blender-mcp==1.6.4` → `"1.6.4"`,
+/// `pkg@1.2.3` → `"1.2.3"`). Ignore `@latest`, les scopes `@org/pkg` et les plages `>=1,<2`.
+pub(crate) fn extract_pinned_version(args: &[&str]) -> Option<String> {
+    for arg in args {
+        let a = arg.trim();
+        if let Some((_, ver)) = a.split_once("==") {
+            let v = ver.trim().trim_start_matches('v');
+            if !v.is_empty() && v.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                return Some(v.to_string());
+            }
+        }
+        // Format npm `pkg@1.2.3` ou `@scope/pkg@1.2.3` : on cherche le `@` après le dernier `/`.
+        let after_slash = a.rfind('/').map(|i| i + 1).unwrap_or(0);
+        if let Some(rel_at) = a[after_slash..].find('@') {
+            let at = after_slash + rel_at;
+            if at > 0 {
+                let v = a[at + 1..].trim().trim_start_matches('v');
+                if !v.is_empty()
+                    && !v.eq_ignore_ascii_case("latest")
+                    && v.chars().next().is_some_and(|c| c.is_ascii_digit())
+                {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+type VersionCache =
+    std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>;
+
+fn version_cache() -> &'static VersionCache {
+    static CACHE: std::sync::OnceLock<VersionCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(crate) fn cache_store_version(id: &str, version: String) {
+    if let Ok(mut map) = version_cache().lock() {
+        map.insert(id.to_string(), (version, std::time::Instant::now()));
+    }
+}
+
+/// Renvoie un objet JSON `{ "<store_id>": "<version>" }` pour les serveurs de la boutique
+/// dont la version est connue (releases GitHub mises en cache 15 min + versions épinglées).
+pub fn store_versions_json() -> Value {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+    let mut out = serde_json::Map::new();
+    for it in all_store_items() {
+        if let Some(v) = extract_pinned_version(it.args) {
+            out.insert(it.id.to_string(), json!(v));
+        }
+    }
+    for spec in STORE_GITHUB_RELEASES {
+        let cached = version_cache()
+            .lock()
+            .ok()
+            .and_then(|m| m.get(spec.id).cloned());
+        if let Some((ver, at)) = cached {
+            if at.elapsed() < TTL {
+                out.insert(spec.id.to_string(), json!(ver));
+                continue;
+            }
+        }
+        #[cfg(not(test))]
+        if let Ok((tag, _)) = fetch_github_latest_release(spec.repo) {
+            let ver = tag.strip_prefix('v').unwrap_or(&tag).to_string();
+            cache_store_version(spec.id, ver.clone());
+            out.insert(spec.id.to_string(), json!(ver));
+        }
+    }
+    Value::Object(out)
+}
 
 /// Item de boutique par id — principal, puis aitmpl, puis glama, puis github.
 pub(crate) fn find_store_item(sid: &str) -> Option<&'static StoreItem> {
@@ -460,12 +849,18 @@ pub fn store_json() -> Value {
     CACHE
         .get_or_init(|| {
             json!(all_store_items()
-                .map(|s| json!({
-                    "id": s.id, "name": s.name, "desc": s.desc,
-                    "cat": s.cat, "kind": s.kind,
-                    "program": s.program, "args": s.args,
-                    "env_vars": s.env_vars,
-                }))
+                .map(|s| {
+                    let version = extract_pinned_version(s.args);
+                    let repo = find_github_release(s.id).map(|r| r.repo);
+                    json!({
+                        "id": s.id, "name": s.name, "desc": s.desc,
+                        "cat": s.cat, "kind": s.kind,
+                        "program": s.program, "args": s.args,
+                        "env_vars": s.env_vars,
+                        "version": version,
+                        "repo": repo,
+                    })
+                })
                 .collect::<Vec<_>>())
         })
         .clone()
