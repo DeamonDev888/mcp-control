@@ -1,3 +1,9 @@
+## [0.8.12] — 2026-11-27
+
+### Swarm Control — Logos SVG animés officiels & Onglet Explorateur
+- **Logos SVG animés officiels de `DeamonDev888/swarm-control` (`src/ui/swarm-logos/`, `src/ui.rs`, `src/lib.rs`, `src/ui/app.js`, `src/ui/swarm.js`, `src/ui/swarm.css`)** : embarquement des 12 SVG animés officiels (`logo`, `coordinator`, `coder`, `explorer`, `verifier`, `monitor`, `browser`, `discord`, `google`, `whatsapp`, `x`, `custom`) servis en `image/svg+xml` avec `ETag`/`304` sur `GET /swarm-logo/<nom>.svg` et sélection automatique par classe d'agent.
+- **Onglet `Serveurs MCP` | `Swarm` dans l'Explorateur (`src/ui.rs`, `src/ui/app.js`, `src/ui/swarm.js`, `src/ui/swarm.css`)** : suppression du bouton `#tbSwarm` de la barre de titre au profit d'un onglet **Swarm** placé juste à droite de **Serveurs MCP** (`#explTabMcp` / `#explTabSwarm`) avec logo animé officiel et compteur live, filtrant l'Explorateur sur **Essaim Swarm** et les agents/instances Swarm.
+
 ## [0.8.11] — 2026-11-27
 
 ### Support complet Swarm-control, Essaim & A2A

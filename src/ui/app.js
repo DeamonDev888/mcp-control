@@ -7,7 +7,27 @@
 const accessCode = () => { try { return localStorage.getItem('mcc.access') || ''; } catch (e) { return ''; } };
 const MCC_VERSION = '__MCC_VERSION__';
 let activeView = 'dashboard';
-const SWARM_LOGO = "<g class='sc-hornet'><path class='sc-wing-l' fill='#38BDF8' stroke='#FF5A1F' stroke-width='.9' stroke-linejoin='round' d='M10.5 9.5 2.5 3.5c.8 3.2 2.4 5.3 5 6.4l3-.4Z'/><path class='sc-wing-r' fill='#38BDF8' stroke='#FF5A1F' stroke-width='.9' stroke-linejoin='round' d='M13.5 9.5 21.5 3.5c-.8 3.2-2.4 5.3-5 6.4l-3-.4Z'/><path fill='none' stroke='#F97316' stroke-width='1.1' stroke-linecap='round' d='M10.5 7.2 8.2 4.5M13.5 7.2 15.8 4.5'/><path fill='#1E293B' stroke='#FF5A1F' stroke-width='.9' d='M8.8 10.2c0-2 1.4-3.4 3.2-3.4s3.2 1.4 3.2 3.4c0 1.7-1.2 2.9-3.2 2.9s-3.2-1.2-3.2-2.9Z'/><path class='sc-eye' fill='#FF4500' d='M9.7 9.6 11.4 10.6 9.8 11.1Z'/><path class='sc-eye' fill='#FF4500' d='M14.3 9.6 12.6 10.6 14.2 11.1Z'/><path fill='#F97316' stroke='#1E293B' stroke-width='.8' d='M14.8 12.6c1.5 1.8 1.2 4.7-1 6.5-1.3 1-2.8 1.5-4.3 1.4l1.1-2.5c1.2-.6 1.8-1.9 1.3-3.4l2.9-2Z'/><path fill='#1E293B' d='M12.2 15.2h3.4l-.6 1.6h-3.2Z'/><path class='sc-stinger' fill='#38BDF8' stroke='#E0F2FE' stroke-width='.4' d='M9.8 18.8 6.4 22.2l4.7-1.6Z'/></g>";
+let explorerTab = 'mcp'; // 'mcp' | 'swarm'
+function swarmLogoClassFor(name, kind) {
+  if (kind === 'hive') return 'logo';
+  if (kind === 'instance') return 'coordinator';
+  const n = String(name || '').toLowerCase();
+  if (/coord|orch|lead|boss|hive|swarm-control/.test(n)) return 'coordinator';
+  if (/cod|dev|eng|build|rust|front|back|full/.test(n)) return 'coder';
+  if (/explor|research|scout|search|analy/.test(n)) return 'explorer';
+  if (/verif|review|audit|test|qa|sec/.test(n)) return 'verifier';
+  if (/monit|ops|watch|health|alert/.test(n)) return 'monitor';
+  if (/brows|web|chrome|play/.test(n)) return 'browser';
+  if (/discord/.test(n)) return 'discord';
+  if (/google|gmail|drive|cal|gws/.test(n)) return 'google';
+  if (/whatsapp|wa/.test(n)) return 'whatsapp';
+  if (/(^|[-_])x($|[-_])|twitter/.test(n)) return 'x';
+  return 'custom';
+}
+function swarmLogoUrl(name, kind) {
+  const slug = swarmLogoClassFor(name, kind);
+  return `/swarm-logo/${slug}.svg?v=${encodeURIComponent(MCC_VERSION)}`;
+}
 
 /* ===== Thème sombre/clair (⚙ Réglages) =====
    Préférence locale (mcc.theme) appliquée AVANT le premier rendu par le
@@ -760,7 +780,8 @@ function srvStoreLogo(s, lg) {
     const tip = isRes
       ? ('Swarm-control — Agent MCP r\u00e9sident' + (s.swarm_agent ? ' (' + s.swarm_agent + ')' : ''))
       : 'Swarm-control — Instance d\u2019orchestration MCP';
-    return `<span class="srv-logo swarm-logo${isRes ? ' swarm-res' : ''}${lg ? ' lg' : ''}" title="${esc(tip)}"><svg viewBox="0 0 24 24" aria-hidden="true">${SWARM_LOGO}</svg></span>`;
+    const src = swarmLogoUrl(s.swarm_agent || s.label, s.swarm_kind);
+    return `<span class="srv-logo swarm-logo${isRes ? ' swarm-res' : ''}${lg ? ' lg' : ''}" title="${esc(tip)}"><img class="swarm-img" src="${esc(src)}" alt="" aria-hidden="true"></span>`;
   }
   if (!s.id || !s.id.startsWith('store-')) return '';
   let inner = PKG_GLYPH;
@@ -810,7 +831,7 @@ function swarmHiveRow() {
     data-act="swarm-open">
     <div class="l1">
       <span class="dot ${esc(stCls)}"></span>
-      <span class="srv-logo swarm-logo" title="Essaim Swarm-control — Orchestration &amp; A2A"><svg viewBox="0 0 24 24" aria-hidden="true">${SWARM_LOGO}</svg></span>
+      <span class="srv-logo swarm-logo" title="Essaim Swarm-control — Orchestration &amp; A2A"><img class="swarm-img" src="${esc(swarmLogoUrl('logo', 'hive'))}" alt="" aria-hidden="true"></span>
       <span class="nm" title="Essaim Swarm — Interactions entre agents, orchestration et A2A">Essaim Swarm</span>
       <div class="l1-right">
         <span class="cnt" title="${esc(String(up))} actif(s) sur ${esc(String(tot))}">${esc(String(tot))}</span>
@@ -988,8 +1009,29 @@ function setExpStateFilter(mode) {
   if (!selectedId) renderOverview();
 }
 
+function setExplorerTab(tab) {
+  const next = tab === 'swarm' ? 'swarm' : 'mcp';
+  explorerTab = next;
+  const bMcp = document.getElementById('explTabMcp');
+  const bSw = document.getElementById('explTabSwarm');
+  if (bMcp) { bMcp.classList.toggle('sel', next === 'mcp'); bMcp.setAttribute('aria-selected', next === 'mcp' ? 'true' : 'false'); }
+  if (bSw) { bSw.classList.toggle('sel', next === 'swarm'); bSw.setAttribute('aria-selected', next === 'swarm' ? 'true' : 'false'); }
+  _sigServers = '';
+  if (next === 'swarm') {
+    openSwarmView();
+  } else {
+    if (activeView === 'swarm') {
+      activeView = 'dashboard';
+      if (typeof swarmStopPoll === 'function') swarmStopPoll();
+      render();
+    } else {
+      renderServers();
+    }
+  }
+}
 function srvVisible(s, q) {
   if (hiddenServers.has(s.id)) return false;
+  if (explorerTab === 'swarm' && !s.swarm_kind) return false;
   if (overviewFilter === 'up' && s.state !== 'UP') return false;
   if (expStateFilter === 'up' && s.state !== 'UP') return false;
   if (expStateFilter === 'down' && !(s.enabled && (s.state === 'DOWN' || s.state === 'PORT-ONLY') && !(s.locked && !s.paired))) return false;
@@ -1023,6 +1065,7 @@ function renderServers() {
     state.settings && state.settings.ssh_hosts,
     selectedId,
     activeView,
+    explorerTab,
     [...selectedServers],
     overviewFilter,
     expStateFilter,
@@ -1046,8 +1089,8 @@ function renderServers() {
       focusSpec = {kind: 'grp', key: active.dataset.key};
     }
   }
-  const hiveMatchesFilter = (!q || 'essaim swarm a2a orchestration agents'.includes(q))
-    && (expStateFilter === 'all' || expStateFilter === 'swarm' || (expStateFilter === 'up' && state.swarm_stats && state.swarm_stats.up > 0));
+  const hiveMatchesFilter = (explorerTab === 'swarm' || expStateFilter === 'swarm')
+    && (!q || 'essaim swarm a2a orchestration agents'.includes(q));
   const hiveHtml = hiveMatchesFilter ? swarmHiveRow() : '';
   if (!state.servers.length) {
     setHidden(localHead, false); setText(count, '0/0');
@@ -2390,6 +2433,11 @@ function goHome() {
   }
   selectedId = null;
   activeView = 'dashboard';
+  explorerTab = 'mcp';
+  const bMcp = document.getElementById('explTabMcp');
+  const bSw = document.getElementById('explTabSwarm');
+  if (bMcp) { bMcp.classList.toggle('sel', true); bMcp.setAttribute('aria-selected', 'true'); }
+  if (bSw) { bSw.classList.toggle('sel', false); bSw.setAttribute('aria-selected', 'false'); }
   if (typeof swarmStopPoll === 'function') swarmStopPoll();
   if (typeof updateSwarmTopbarActive === 'function') updateSwarmTopbarActive();
   detailCache = null;
@@ -5599,6 +5647,7 @@ const ACT = {
   'scan': () => { closeDiscoverMenu(); doScan(); },
   'scan-net': () => { closeDiscoverMenu(); doScanNet(); },
   'machines': () => { closeDiscoverMenu(); openMachineDlg(); },
+  'expl-tab': el => setExplorerTab(el.dataset.tab),
   'swarm-open': () => openSwarmView(),
   'swarm-refresh': () => swarmRefresh(true),
   'swarm-live-toggle': () => swarmToggleLive(),

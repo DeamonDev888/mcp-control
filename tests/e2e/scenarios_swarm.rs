@@ -215,6 +215,9 @@ fn swarm_e2e_detection_overview_ask_et_assets() {
     // 1. Assets dédiés servis avec 200
     assert_eq!(eng.get("/swarm.js").status, 200);
     assert_eq!(eng.get("/swarm.css").status, 200);
+    assert_eq!(eng.get("/swarm-logo/logo.svg").status, 200);
+    assert_eq!(eng.get("/swarm-logo/coordinator.svg").status, 200);
+    assert_eq!(eng.get("/swarm-logo/coder.svg").status, 200);
 
     // 2. Ajout des deux serveurs Swarm
     let add_admin = eng.action(&json!({

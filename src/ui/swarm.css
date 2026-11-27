@@ -1,24 +1,30 @@
-/* ===== Swarm Control — Logo Frelon animé & Onglet dédié ===== */
-.srv-logo.swarm-logo{width:1.55rem;height:1.55rem;padding:2px;border-radius:6px;background:rgba(249,115,22,.10);border-color:rgba(249,115,22,.34);overflow:visible}
-.srv-logo.swarm-logo.lg{width:2.55rem;height:2.55rem;padding:3px;border-radius:9px;overflow:visible}
-.srv-logo.swarm-logo svg,.ic-hornet{overflow:visible}
-.ic.ic-hornet{fill:initial;stroke:initial;overflow:visible}
-.srv-logo.swarm-logo.swarm-res{background:rgba(56,189,248,.10);border-color:rgba(56,189,248,.38)}
+/* ===== Swarm Control — Logos SVG animés officiels & Onglet dédié ===== */
+.swarm-img{width:100%;height:100%;object-fit:contain;display:block;border-radius:5px}
+.srv-logo.swarm-logo{width:1.7rem;height:1.7rem;padding:0;border-radius:6px;background:transparent;border-color:rgba(249,115,22,.42);overflow:hidden}
+.srv-logo.swarm-logo.lg{width:2.85rem;height:2.85rem;padding:0;border-radius:10px;overflow:hidden}
+.srv-logo.swarm-logo.swarm-res{border-color:rgba(56,189,248,.48)}
 .tag.swarm{background:rgba(249,115,22,.14);color:#fb923c;border:1px solid rgba(249,115,22,.34);font-weight:600}
 .tag.swarm-res{background:rgba(56,189,248,.14);color:#38bdf8;border:1px solid rgba(56,189,248,.36);font-weight:600}
 .tag.sw-runner{background:var(--bg3);color:var(--fg2);border:1px solid var(--bd);font-family:var(--mono);font-size:10px}
 .tag.sw-busy{background:rgba(245,158,11,.18);color:#f59e0b;border:1px solid rgba(245,158,11,.42)}
 .tag.sw-idle{background:rgba(34,197,94,.14);color:#4ade80;border:1px solid rgba(34,197,94,.34)}
 
-#tbSwarm.active{background:rgba(249,115,22,.16);border-color:rgba(249,115,22,.45);color:#fb923c}
-#tbSwarm .ic-hornet{width:21px;height:21px;flex-shrink:0}
+.sec-label-tabs{gap:6px}
+.expl-tabs{display:inline-flex;align-items:center;gap:4px;min-width:0;flex:1}
+.expl-tab{display:inline-flex;align-items:center;gap:5px;padding:4px 8px;border-radius:6px;background:transparent;border:1px solid transparent;color:var(--fg2);font:0.6875rem/1 var(--sans);font-weight:700;text-transform:uppercase;letter-spacing:.07em;cursor:pointer;white-space:nowrap}
+.expl-tab:hover{background:var(--bg2);color:var(--fg)}
+.expl-tab.sel{background:var(--bg2);border-color:var(--bd);color:var(--fg)}
+#explTabSwarm.sel{background:rgba(249,115,22,.14);border-color:rgba(249,115,22,.42);color:#fb923c}
+#explTabSwarm .ic-hornet{width:17px;height:17px;border-radius:4px;flex-shrink:0;display:block}
+#explTabSwarm .tb-count{margin-left:1px}
 
 .sw-wrap{display:flex;flex-direction:column;gap:14px;padding-bottom:28px}
 .sw-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:14px 16px;border-radius:10px;background:var(--bg2);border:1px solid var(--bd)}
 .sw-head-l{display:flex;align-items:center;gap:12px;min-width:0}
-.sw-head-ico{width:46px;height:46px;border-radius:11px;display:grid;place-items:center;background:rgba(249,115,22,.12);border:1px solid rgba(249,115,22,.34);flex-shrink:0;overflow:visible}
-.sw-head-ico svg{width:34px;height:34px;overflow:visible}
-.sw-card-title .ic-hornet{width:22px;height:22px;flex-shrink:0}
+.sw-head-ico{width:48px;height:48px;border-radius:11px;display:grid;place-items:center;background:transparent;border:1px solid rgba(249,115,22,.42);flex-shrink:0;overflow:hidden}
+.sw-head-ico .ic-hornet{width:48px;height:48px;border-radius:10px}
+.sw-card-title .ic-hornet{width:28px;height:28px;border-radius:6px;flex-shrink:0}
+.sw-node-l .ic-hornet{width:26px;height:26px;border-radius:6px;flex-shrink:0}
 .sw-detail-pane{display:flex;flex-direction:column;gap:12px;margin-top:8px}
 
 /* Ligne spéciale « Essaim Swarm » épinglée en 1er dans l'Explorateur */

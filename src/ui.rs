@@ -62,7 +62,6 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
         </button>
       </div>
     </div>
-    <button type="button" id="tbSwarm" data-act="swarm-open" aria-label="Swarm Control — agents MCP persistants et instances" title="Swarm Control — agents MCP persistants et instances"><svg class="ic ic-hornet" viewBox="0 0 24 24" aria-hidden="true"><g class='sc-hornet'><path class='sc-wing-l' fill='#38BDF8' stroke='#FF5A1F' stroke-width='.9' stroke-linejoin='round' d='M10.5 9.5 2.5 3.5c.8 3.2 2.4 5.3 5 6.4l3-.4Z'/><path class='sc-wing-r' fill='#38BDF8' stroke='#FF5A1F' stroke-width='.9' stroke-linejoin='round' d='M13.5 9.5 21.5 3.5c-.8 3.2-2.4 5.3-5 6.4l-3-.4Z'/><path fill='none' stroke='#F97316' stroke-width='1.1' stroke-linecap='round' d='M10.5 7.2 8.2 4.5M13.5 7.2 15.8 4.5'/><path fill='#1E293B' stroke='#FF5A1F' stroke-width='.9' d='M8.8 10.2c0-2 1.4-3.4 3.2-3.4s3.2 1.4 3.2 3.4c0 1.7-1.2 2.9-3.2 2.9s-3.2-1.2-3.2-2.9Z'/><path class='sc-eye' fill='#FF4500' d='M9.7 9.6 11.4 10.6 9.8 11.1Z'/><path class='sc-eye' fill='#FF4500' d='M14.3 9.6 12.6 10.6 14.2 11.1Z'/><path fill='#F97316' stroke='#1E293B' stroke-width='.8' d='M14.8 12.6c1.5 1.8 1.2 4.7-1 6.5-1.3 1-2.8 1.5-4.3 1.4l1.1-2.5c1.2-.6 1.8-1.9 1.3-3.4l2.9-2Z'/><path fill='#1E293B' d='M12.2 15.2h3.4l-.6 1.6h-3.2Z'/><path class='sc-stinger' fill='#38BDF8' stroke='#E0F2FE' stroke-width='.4' d='M9.8 18.8 6.4 22.2l4.7-1.6Z'/></g></svg><span class="tb-lbl">Swarm</span><span id="tbSwarmN" class="tb-count" hidden>0</span></button>
     <button type="button" data-act="store" aria-label="Boutique de serveurs MCP" title="Catalogue de serveurs MCP pr&ecirc;ts &agrave; installer"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='9' cy='20' r='1.4'/><circle cx='17' cy='20' r='1.4'/><path d='M2.5 3.5h2.2l2.5 11.5h10.3l2-8H6'/></svg><span class="tb-lbl">Boutique</span></button>
     <button type="button" id="tbAccess" data-act="access-open" aria-label="Acc&egrave;s et s&eacute;curit&eacute;" title="Acc&egrave;s &mdash; clients appair&eacute;s, demandes d'appairage et confirmations avant ex&eacute;cution"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d='M12 3 4.5 6v5.5c0 4.4 3.1 8.3 7.5 9.5 4.4-1.2 7.5-5.1 7.5-9.5V6L12 3Z'/><path d='m8.8 11.8 2.2 2.2 4.2-4.4'/></svg><span class="tb-lbl">Acc&egrave;s</span><span id="tbAccessN" class="tb-count" hidden>0</span></button>
     <button type="button" data-act="settings-open" aria-label="R&eacute;glages du client" title="R&eacute;glages du client"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx='12' cy='12' r='3.1'/><path d='M12 2.8v2.6M12 18.6v2.6M2.8 12h2.6M18.6 12h2.6M5.5 5.5l1.9 1.9M16.6 16.6l1.9 1.9M18.5 5.5l-1.9 1.9M7.4 16.6l-1.9 1.9'/></svg><span class="tb-lbl">R&eacute;glages</span></button>
@@ -91,8 +90,11 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 
 <div id="main">
   <aside id="explorer" aria-label="Explorateur de serveurs MCP">
-    <div class="sec-label" title="Glisser-déposer une ligne pour r&eacute;ordonner (pr&eacute;f&eacute;rence d'affichage et priorit&eacute; de sondage) — ou reclasser via le menu : l'ordre appliqué est persisté">
-      <label for="sortSel">Serveurs MCP</label>
+    <div class="sec-label sec-label-tabs" title="Glisser-déposer une ligne pour r&eacute;ordonner (pr&eacute;f&eacute;rence d'affichage et priorit&eacute; de sondage) — ou reclasser via le menu : l'ordre appliqué est persisté">
+      <div class="expl-tabs" role="tablist" aria-label="Vue de l'explorateur">
+        <button type="button" id="explTabMcp" class="expl-tab sel" role="tab" aria-selected="true" data-act="expl-tab" data-tab="mcp">Serveurs MCP</button>
+        <button type="button" id="explTabSwarm" class="expl-tab" role="tab" aria-selected="false" data-act="expl-tab" data-tab="swarm" title="Swarm Control — Essaim, agents MCP persistants &amp; A2A"><img class="ic-hornet" src="/swarm-logo/logo.svg?v=__MCC_VERSION__" alt="" aria-hidden="true"><span>Swarm</span><span id="tbSwarmN" class="tb-count" hidden>0</span></button>
+      </div>
       <select id="sortSel" data-act="sort" aria-label="Trier les serveurs MCP" title="Reclasser les serveurs — « manuel » rend l'ordre pos&eacute; au glisser-déposer avant le tri">
         <option value="manuel">⇅ manuel</option>
         <option value="az">A→Z</option>
@@ -647,6 +649,25 @@ pub const SWARM_CSS: &str = include_str!("ui/swarm.css");
 
 /// Logique de l'onglet Swarm Control — servie par GET /swarm.js (defer).
 pub const SWARM_JS: &str = include_str!("ui/swarm.js");
+
+/// Logos SVG animés officiels de Swarm-control (`DeamonDev888/swarm-control`).
+pub fn swarm_logo_svg(name: &str) -> Option<&'static str> {
+    match name {
+        "logo" => Some(include_str!("ui/swarm-logos/logo.svg")),
+        "coordinator" => Some(include_str!("ui/swarm-logos/coordinator.svg")),
+        "coder" => Some(include_str!("ui/swarm-logos/coder.svg")),
+        "explorer" => Some(include_str!("ui/swarm-logos/explorer.svg")),
+        "verifier" => Some(include_str!("ui/swarm-logos/verifier.svg")),
+        "monitor" => Some(include_str!("ui/swarm-logos/monitor.svg")),
+        "browser" => Some(include_str!("ui/swarm-logos/browser.svg")),
+        "discord" => Some(include_str!("ui/swarm-logos/discord.svg")),
+        "google" => Some(include_str!("ui/swarm-logos/google.svg")),
+        "whatsapp" => Some(include_str!("ui/swarm-logos/whatsapp.svg")),
+        "x" => Some(include_str!("ui/swarm-logos/x.svg")),
+        "custom" => Some(include_str!("ui/swarm-logos/custom.svg")),
+        _ => None,
+    }
+}
 
 pub const FAVICON_SVG: &str = include_str!("ui/favicon.svg");
 
@@ -2146,11 +2167,12 @@ mod tests {
         for needle in [
             r#"/swarm.css?v=__MCC_VERSION__"#,
             r#"/swarm.js?v=__MCC_VERSION__"#,
-            r#"id="tbSwarm""#,
-            r#"data-act="swarm-open""#,
+            r#"id="explTabMcp""#,
+            r#"id="explTabSwarm""#,
+            r#"data-act="expl-tab""#,
             r#"id="tbSwarmN""#,
             r#"data-mode="swarm""#,
-            "sc-hornet",
+            r#"/swarm-logo/logo.svg?v=__MCC_VERSION__"#,
         ] {
             assert!(
                 INDEX_HTML.contains(needle),
@@ -2158,10 +2180,14 @@ mod tests {
             );
         }
         assert!(
-            APP_JS.contains("SWARM_LOGO")
+            !INDEX_HTML.contains(r#"id="tbSwarm""#),
+            "Swarm ne doit plus être un bouton dans #titlebar mais un onglet à droite de Serveurs MCP"
+        );
+        assert!(
+            APP_JS.contains("swarmLogoUrl")
                 && APP_JS.contains("swarm_kind")
                 && APP_JS.contains("swarmBadge"),
-            "app.js doit afficher le logo frelon et le badge Swarm dans l'explorateur"
+            "app.js doit afficher les logos officiels animés et le badge Swarm dans l'explorateur"
         );
         assert!(
             !SWARM_JS.contains("style=")
@@ -2172,7 +2198,7 @@ mod tests {
         assert!(
             SWARM_CSS.contains(".srv-logo.swarm-logo")
                 && SWARM_CSS.contains(".tag.swarm-res")
-                && SWARM_CSS.contains("#tbSwarm.active"),
+                && SWARM_CSS.contains(".expl-tab.sel"),
             "swarm.css doit définir les styles du logo frelon et de l'onglet Swarm"
         );
     }

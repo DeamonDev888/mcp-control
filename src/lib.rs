@@ -2376,6 +2376,17 @@ pub fn route_peer_session_cond(
             if_none_match,
         );
     }
+    if method == "GET" {
+        if let Some(slug) = bare_path
+            .strip_prefix("/swarm-logo/")
+            .and_then(|s| s.strip_suffix(".svg"))
+        {
+            if let Some(svg) = ui::swarm_logo_svg(slug) {
+                let asset = build_static_asset(svg);
+                return serve_static_asset(&asset, "image/svg+xml; charset=utf-8", if_none_match);
+            }
+        }
+    }
     if method == "GET" && bare_path == "/favicon.svg" {
         return serve_static_asset(
             asset_favicon_svg(),

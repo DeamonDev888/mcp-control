@@ -41,8 +41,9 @@ let swarmParallelDraft = [
   {runner: 'claude', agentName: '', prompt: ''},
 ];
 
-function swarmIconSvg(cls) {
-  return `<svg class="${cls || 'ic ic-hornet'}" viewBox="0 0 24 24" aria-hidden="true">${SWARM_LOGO}</svg>`;
+function swarmIconSvg(cls, name, kind) {
+  const src = swarmLogoUrl(name || '', kind || 'hive');
+  return `<img class="${cls || 'ic-hornet'} swarm-img" src="${esc(src)}" alt="" aria-hidden="true">`;
 }
 
 function swarmStopPoll() {
@@ -78,6 +79,7 @@ function openSwarmView(subTab, focusTarget) {
   selectedId = null;
   detailCache = null;
   activeView = 'swarm';
+  explorerTab = 'swarm';
   if (subTab) swarmTab = subTab;
   if (focusTarget) swarmConsoleTarget = focusTarget;
   updateSwarmTopbarActive();
@@ -88,12 +90,11 @@ function openSwarmView(subTab, focusTarget) {
 }
 
 function updateSwarmTopbarActive() {
-  const btn = document.getElementById('tbSwarm');
-  if (btn) {
-    const on = activeView === 'swarm';
-    btn.classList.toggle('active', on);
-    btn.setAttribute('aria-current', on ? 'page' : 'false');
-  }
+  const bMcp = document.getElementById('explTabMcp');
+  const bSw = document.getElementById('explTabSwarm');
+  const on = explorerTab === 'swarm' || activeView === 'swarm';
+  if (bMcp) { bMcp.classList.toggle('sel', !on); bMcp.setAttribute('aria-selected', !on ? 'true' : 'false'); }
+  if (bSw) { bSw.classList.toggle('sel', on); bSw.setAttribute('aria-selected', on ? 'true' : 'false'); }
 }
 
 function updateSwarmBadge() {
@@ -398,7 +399,7 @@ function renderSwarmHiveTab(insts, ress, agents, jobs) {
   const colInsts = insts.length
     ? insts.map(i => `<div class="sw-node is-inst">
         <div class="sw-node-top">
-          <div class="sw-node-l"><span class="dot ${esc(i.state)}"></span>${swarmIconSvg('ic ic-hornet')}<span>${esc(i.label)}</span></div>
+          <div class="sw-node-l"><span class="dot ${esc(i.state)}"></span>${swarmIconSvg('ic-hornet', i.label, 'instance')}<span>${esc(i.label)}</span></div>
           <span class="pill ${esc(i.state)}">${esc(i.state)}</span>
         </div>
         <div class="sw-node-meta">
@@ -420,7 +421,7 @@ function renderSwarmHiveTab(insts, ress, agents, jobs) {
         const agName = r.agent || r.label;
         return `<div class="sw-node is-res ${busy ? 'is-busy' : ''}">
           <div class="sw-node-top">
-            <div class="sw-node-l"><span class="dot ${esc(r.state)}"></span>${swarmIconSvg('ic ic-hornet')}<span>${esc(agName)}</span></div>
+            <div class="sw-node-l"><span class="dot ${esc(r.state)}"></span>${swarmIconSvg('ic-hornet', agName, 'resident')}<span>${esc(agName)}</span></div>
             <span class="tag ${busy ? 'sw-busy' : 'sw-idle'}">${esc((st.state || (r.state === 'UP' ? 'idle' : 'off')).toUpperCase())}</span>
           </div>
           <div class="sw-node-meta">
@@ -538,7 +539,7 @@ function renderSwarmOverviewTab(insts, ress, anns) {
       const needsPair = inst.locked && !inst.paired;
       html += `<div class="sw-card">
         <div class="sw-card-head">
-          <div class="sw-card-title"><span class="dot ${esc(inst.state)}"></span>${swarmIconSvg('ic ic-hornet')}<span class="nm">${esc(inst.label)}</span></div>
+          <div class="sw-card-title"><span class="dot ${esc(inst.state)}"></span>${swarmIconSvg('ic-hornet', inst.label, 'instance')}<span class="nm">${esc(inst.label)}</span></div>
           <span class="pill ${esc(inst.state)}">${esc(inst.state)}</span>
         </div>
         <div class="sw-card-meta">
@@ -572,7 +573,7 @@ function renderSwarmOverviewTab(insts, ress, anns) {
       const needsPair = r.locked && !r.paired;
       html += `<div class="sw-card is-resident">
         <div class="sw-card-head">
-          <div class="sw-card-title"><span class="dot ${esc(r.state)}"></span>${swarmIconSvg('ic ic-hornet')}<span class="nm">${esc(r.agent || r.label)}</span></div>
+          <div class="sw-card-title"><span class="dot ${esc(r.state)}"></span>${swarmIconSvg('ic-hornet', r.agent || r.label, 'resident')}<span class="nm">${esc(r.agent || r.label)}</span></div>
           <span class="tag ${rState === 'busy' ? 'sw-busy' : 'sw-idle'}">${esc(rState.toUpperCase())}</span>
         </div>
         <div class="sw-card-meta">
@@ -650,7 +651,7 @@ function renderSwarmAgentsTab(insts, agents) {
         : 'inst:' + a._instanceId + ':' + a.name;
       cardsHtml += `<div class="sw-card ${isRes ? 'is-resident' : ''}">
         <div class="sw-card-head">
-          <div class="sw-card-title">${swarmIconSvg('ic ic-hornet')}<span class="nm">${esc(a.name)}</span></div>
+          <div class="sw-card-title">${swarmIconSvg('ic-hornet', a.name, 'resident')}<span class="nm">${esc(a.name)}</span></div>
           ${isRes ? '<span class="tag swarm-res">R&Eacute;SIDENT ON</span>' : '<span class="d-meta-pill">inactif</span>'}
         </div>
         <div class="sw-card-meta">
@@ -979,7 +980,7 @@ function renderSwarmDetailChat(s) {
   return `<div class="sw-detail-pane">
     <div class="sw-console-box">
       <div class="sw-sec-head">
-        <h2>${swarmIconSvg('ic ic-hornet')} Conversation &mdash; ${esc(s.swarm_agent || s.label)}</h2>
+        <h2>${swarmIconSvg('ic-hornet', s.swarm_agent || s.label, s.swarm_kind)} Conversation &mdash; ${esc(s.swarm_agent || s.label)}</h2>
         <button type="button" data-act="swarm-open-console" data-target="${esc(target)}" data-inst="${esc(s.id)}">Ouvrir l'onglet Swarm complet</button>
       </div>
       ${barHtml}
@@ -1019,7 +1020,7 @@ function renderSwarmDetailCfg(s) {
   return `<div class="sw-detail-pane">
     <div class="sw-console-box">
       <div class="sw-sec-head">
-        <h2>${swarmIconSvg('ic ic-hornet')} Configuration &mdash; ${esc(swarmCfgAgent || s.swarm_agent || s.label)}</h2>
+        <h2>${swarmIconSvg('ic-hornet', swarmCfgAgent || s.swarm_agent || s.label, s.swarm_kind)} Configuration &mdash; ${esc(swarmCfgAgent || s.swarm_agent || s.label)}</h2>
         <div class="sw-toolbar">
           <select id="swCfgAgentSel" aria-label="Agent &agrave; configurer" data-act="swarm-cfg-pick">
             <option value="">Choisir un agent&hellip;</option>
