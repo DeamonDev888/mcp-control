@@ -297,6 +297,7 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
         let mut sw_inst = 0usize;
         let mut sw_res = 0usize;
         let mut sw_up = 0usize;
+        let mut sw_ver: Option<String> = None;
         for s in servers.iter() {
             if let Some(m) = crate::swarm::detect_server(s) {
                 match m.kind {
@@ -305,8 +306,18 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
                 }
                 if s.state == SState::Up {
                     sw_up += 1;
+                    if sw_ver.is_none() {
+                        if let Some(ref v) = s.version {
+                            if !v.trim().is_empty() {
+                                sw_ver = Some(v.clone());
+                            }
+                        }
+                    }
                 }
             }
+        }
+        if let Some(v) = sw_ver {
+            crate::swarm::logos::notify_detected_version(state, &v);
         }
         (list, up, total, tools, sw_inst, sw_res, sw_up)
     };
@@ -377,6 +388,7 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
         "lan_ok": lan,
         "stats": {"up": up, "total": total, "tools": tools},
         "swarm_stats": {"instances": swarm_instances, "residents": swarm_residents, "up": swarm_up},
+        "swarm_logos_rev": crate::swarm::logos::revision(),
         "settings": settings_val,
         "peers": peers_arr,
         "access": access,

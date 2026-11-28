@@ -101,12 +101,17 @@ function updateSwarmBadge() {
   const el = document.getElementById('tbSwarmN');
   if (!el || !state) return;
   const st = state.swarm_stats || {instances: 0, residents: 0, up: 0};
-  const tot = (st.instances || 0) + (st.residents || 0);
+  const tot = st.residents || 0;
   if (tot > 0) {
     el.textContent = String(tot);
     el.hidden = false;
   } else {
     el.hidden = true;
+  }
+  const tabImg = document.querySelector('#explTabSwarm .ic-hornet');
+  if (tabImg) {
+    const want = swarmLogoUrl('logo', 'hive');
+    if (tabImg.getAttribute('src') !== want) tabImg.setAttribute('src', want);
   }
 }
 
@@ -242,10 +247,9 @@ function renderSwarmView() {
 
   const insts = (swarmData && swarmData.instances) || [];
   const ress = (swarmData && swarmData.residents) || [];
-  const anns = ((swarmData && swarmData.announcements) || []).filter(a => !a.followed);
+  const anns = ((swarmData && swarmData.announcements) || []).filter(a => !a.followed && a.swarm_kind === 'resident');
   const agents = swarmAllAgents();
   const jobs = (swarmData && swarmData.jobs) || [];
-  const instUp = insts.filter(i => i.state === 'UP').length;
   const resUp = ress.filter(r => r.state === 'UP').length;
   const runningJobs = jobs.filter(j => j.status === 'running').length;
 
@@ -275,6 +279,7 @@ function renderSwarmView() {
       </div>
       <div class="sw-head-acts">
         <button type="button" data-act="swarm-live-toggle">${swarmLive ? '<span class="tag sw-live">LIVE</span> Pause' : 'Reprendre Live'}</button>
+        <button type="button" data-act="swarm-sync-logos" title="Synchroniser les logos officiels depuis GitHub (auto au changement de version Swarm)">Sync logos</button>
         <button type="button" data-act="swarm-refresh">${ic('refresh')} Actualiser</button>
         <button type="button" data-act="scan">${ic('search')} Scanner ports</button>
         <button type="button" data-act="store">${ic('store')} Installer Swarm</button>
@@ -282,17 +287,12 @@ function renderSwarmView() {
     </div>
 
     <div class="sw-kpis">
-      <div class="sw-kpi accent-orange">
-        <span class="k-lbl">Instances Swarm</span>
-        <span class="k-val">${esc(String(instUp))}/${esc(String(insts.length))}</span>
-        <span class="k-sub">serveurs admin UP</span>
-      </div>
       <div class="sw-kpi accent-cyan">
         <span class="k-lbl">Agents r&eacute;sidents</span>
         <span class="k-val">${esc(String(resUp))}/${esc(String(ress.length))}</span>
         <span class="k-sub">MCP persistants (ask/status/stop)</span>
       </div>
-      <div class="sw-kpi">
+      <div class="sw-kpi accent-orange">
         <span class="k-lbl">Agents configur&eacute;s</span>
         <span class="k-val">${esc(String(agents.length))}</span>
         <span class="k-sub">claude &middot; hermes &middot; antigravity</span>
@@ -300,13 +300,13 @@ function renderSwarmView() {
       <div class="sw-kpi">
         <span class="k-lbl">Annonces / T&acirc;ches</span>
         <span class="k-val">${esc(String(anns.length))} / ${esc(String(runningJobs))}</span>
-        <span class="k-sub">non suivies / en cours</span>
+        <span class="k-sub">agents non suivis / en cours</span>
       </div>
     </div>
 
     <div class="sw-tabs" role="tablist" aria-label="Sections Swarm Control">
       <button type="button" class="sw-tab ${swarmTab==='hive'?'sel':''}" role="tab" aria-selected="${swarmTab==='hive'?'true':'false'}" data-act="swarm-tab" data-tab="hive">Essaim &amp; A2A</button>
-      <button type="button" class="sw-tab ${swarmTab==='overview'?'sel':''}" role="tab" aria-selected="${swarmTab==='overview'?'true':'false'}" data-act="swarm-tab" data-tab="overview">Vue d'ensemble <span class="sw-tab-badge">${esc(String(insts.length + ress.length))}</span></button>
+      <button type="button" class="sw-tab ${swarmTab==='overview'?'sel':''}" role="tab" aria-selected="${swarmTab==='overview'?'true':'false'}" data-act="swarm-tab" data-tab="overview">Vue d'ensemble <span class="sw-tab-badge">${esc(String(ress.length))}</span></button>
       <button type="button" class="sw-tab ${swarmTab==='agents'?'sel':''}" role="tab" aria-selected="${swarmTab==='agents'?'true':'false'}" data-act="swarm-tab" data-tab="agents">Agents persistants <span class="sw-tab-badge">${esc(String(agents.length))}</span></button>
       <button type="button" class="sw-tab ${swarmTab==='console'?'sel':''}" role="tab" aria-selected="${swarmTab==='console'?'true':'false'}" data-act="swarm-tab" data-tab="console">Console ask &amp; Config</button>
       <button type="button" class="sw-tab ${swarmTab==='runs'?'sel':''}" role="tab" aria-selected="${swarmTab==='runs'?'true':'false'}" data-act="swarm-tab" data-tab="runs">Runs &amp; Parall&egrave;le${runningJobs ? ` <span class="sw-tab-badge">${esc(String(runningJobs))}</span>` : ''}</button>
@@ -410,25 +410,7 @@ function renderSwarmHiveTab(insts, ress, agents, jobs) {
     return ev.kind === swarmA2aFilter;
   });
 
-  // 2. Colonnes topologie
-  const colInsts = insts.length
-    ? insts.map(i => `<div class="sw-node is-inst">
-        <div class="sw-node-top">
-          <div class="sw-node-l"><span class="dot ${esc(i.state)}"></span>${swarmIconSvg('ic-hornet', i.label, 'instance')}<span>${esc(i.label)}</span></div>
-          <span class="pill ${esc(i.state)}">${esc(i.state)}</span>
-        </div>
-        <div class="sw-node-meta">
-          <span>${esc(String((i.agents || []).length))} agents</span>
-          <span>${esc(String((i.runs || []).length))} runs</span>
-          ${i.url ? `<span class="srow-pill">${esc(i.url)}</span>` : ''}
-        </div>
-        <div class="sw-toolbar">
-          <button type="button" data-act="select" data-id="${esc(i.id)}">Ouvrir</button>
-          <button type="button" data-act="swarm-open-agents" data-id="${esc(i.id)}">Agents</button>
-        </div>
-      </div>`).join('')
-    : '<div class="sw-empty">Aucune instance <code>swarm-control</code> d&eacute;tect&eacute;e.</div>';
-
+  // 2. Colonnes topologie (uniquement les agents créés par swarm-control et leurs liens)
   const colRes = ress.length
     ? ress.map(r => {
         const st = swarmResidentLive[r.id] || r.status || {};
@@ -491,10 +473,6 @@ function renderSwarmHiveTab(insts, ress, agents, jobs) {
 
   return `<div class="sw-topo">
       <div class="sw-topo-col">
-        <div class="sw-topo-head"><span>Orchestrateurs</span><span>${esc(String(insts.length))}</span></div>
-        ${colInsts}
-      </div>
-      <div class="sw-topo-col">
         <div class="sw-topo-head"><span>Agents r&eacute;sidents</span><span>${esc(String(ress.length))}</span></div>
         ${colRes}
       </div>
@@ -530,50 +508,16 @@ function renderSwarmHiveTab(insts, ress, agents, jobs) {
     <div class="sw-timeline">${timelineHtml}</div>`;
 }
 
-function renderSwarmOverviewTab(insts, ress, anns) {
+function renderSwarmOverviewTab(_insts, ress, anns) {
   let html = '';
   if (anns.length) {
-    html += `<div class="sw-sec-head"><h2>Annonces Swarm d&eacute;tect&eacute;es (litemcp-registry, non suivies)</h2></div>`;
+    html += `<div class="sw-sec-head"><h2>Agents Swarm d&eacute;tect&eacute;s (litemcp-registry, non suivis)</h2></div>`;
     for (const a of anns) {
-      const kindLbl = a.swarm_kind === 'resident' ? 'R\u00c9SIDENT' : 'INSTANCE';
-      const cls = a.swarm_kind === 'resident' ? 'swarm-res' : 'swarm';
       html += `<div class="sw-ann-row">
-        <div><span class="tag ${cls}">${kindLbl}</span> <b>${esc(a.name)}</b> ${a.port ? `<span class="srow-pill">:${esc(String(a.port))}</span>` : ''} ${a.version ? `<span class="d-meta-pill">v${esc(a.version)}</span>` : ''}</div>
+        <div><span class="tag swarm-res">R&Eacute;SIDENT</span> <b>${esc(a.name)}</b> ${a.port ? `<span class="srow-pill">:${esc(String(a.port))}</span>` : ''} ${a.version ? `<span class="d-meta-pill">v${esc(a.version)}</span>` : ''}</div>
         <button type="button" class="primary" data-act="follow-ann" data-name="${esc(a.name)}" data-port="${esc(String(a.port || ''))}">Suivre dans MCP Control</button>
       </div>`;
     }
-  }
-
-  html += `<div class="sw-sec-head"><h2>Instances Swarm-control (${esc(String(insts.length))})</h2></div>`;
-  if (!insts.length) {
-    html += `<div class="sw-empty"><b>Aucune instance Swarm-control d&eacute;tect&eacute;e.</b><br>Installez <b>Swarm Control</b> depuis la Boutique ou lancez <code>swarm-control</code> puis cliquez sur <b>Scanner ports</b>.</div>`;
-  } else {
-    html += '<div class="sw-grid">';
-    for (const inst of insts) {
-      const nAgents = (inst.agents || []).length;
-      const nRuns = (inst.runs || []).length;
-      const needsPair = inst.locked && !inst.paired;
-      html += `<div class="sw-card">
-        <div class="sw-card-head">
-          <div class="sw-card-title"><span class="dot ${esc(inst.state)}"></span>${swarmIconSvg('ic-hornet', inst.label, 'instance')}<span class="nm">${esc(inst.label)}</span></div>
-          <span class="pill ${esc(inst.state)}">${esc(inst.state)}</span>
-        </div>
-        <div class="sw-card-meta">
-          <span class="tag swarm">SWARM</span>
-          ${inst.url ? `<span class="srow-pill">${esc(inst.url)}</span>` : ''}
-          ${inst.version ? `<span class="d-meta-pill">v${esc(inst.version)}</span>` : ''}
-          <span class="d-meta-pill">${esc(String(nAgents))} agent${nAgents>1?'s':''}</span>
-          ${nRuns ? `<span class="d-meta-pill">${esc(String(nRuns))} run${nRuns>1?'s':''}</span>` : ''}
-        </div>
-        ${inst.error ? `<div class="sw-card-err">${esc(inst.error)}</div>` : ''}
-        <div class="sw-card-acts">
-          ${needsPair ? `<button type="button" class="primary" data-act="server-pair" data-id="${esc(inst.id)}">${ic('lock')} Appairer</button>` : ''}
-          <button type="button" data-act="swarm-open-agents" data-id="${esc(inst.id)}">Voir agents</button>
-          <button type="button" data-act="select" data-id="${esc(inst.id)}">D&eacute;tail MCP</button>
-        </div>
-      </div>`;
-    }
-    html += '</div>';
   }
 
   html += `<div class="sw-sec-head"><h2>Agents MCP r&eacute;sidents suivis (${esc(String(ress.length))})</h2></div>`;
@@ -1378,6 +1322,19 @@ function swarmStreamClose() {
 function swarmToggleLive() {
   swarmLive = !swarmLive;
   renderSwarmView();
+}
+
+async function swarmSyncLogos() {
+  toast('Synchronisation des logos Swarm\u2026', 'ok', 1800);
+  const j = await postAction({action: 'swarm_sync_logos'});
+  if (j && j.ok) {
+    const msg = j.updated > 0
+      ? `Logos mis \u00e0 jour : ${j.updated} (${j.unchanged} inchang\u00e9s)`
+      : `Logos d\u00e9j\u00e0 \u00e0 jour (${j.unchanged} v\u00e9rifi\u00e9s)`;
+    toast(msg, 'ok', 2800);
+    await load();
+    swarmRerenderActive();
+  }
 }
 
 function swarmSetA2aFilter(mode) {

@@ -666,6 +666,9 @@ body.dead .tile .n{color:var(--t4)}
   font:0.65625rem/1 var(--mono);color:var(--t2);background:var(--wash);border:1px solid var(--border-soft);
   max-width:9rem;flex-shrink:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .srow-lat{color:var(--t3);font-variant-numeric:tabular-nums}
+.srow-ver{display:inline-flex;align-items:center;height:1.125rem;padding:0 0.3125rem;border-radius:var(--r1);
+  font:500 0.625rem/1 var(--mono);color:var(--t2);background:var(--elevated);border:1px solid var(--border-soft);white-space:nowrap}
+.srow-ver-upd{color:var(--warn-ink);border-color:var(--warn-line);background:var(--warn-soft)}
 .srow .l2 .langchip{height:1.125rem}
 .srow .rustlogo{width:0.9375rem;height:0.9375rem}
 .srow .l2 .st{display:inline-flex;align-items:center;height:1.25rem;padding:0 0.4375rem;border-radius:var(--rpill);

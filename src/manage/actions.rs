@@ -87,6 +87,7 @@ pub const ACTIONS: &[&str] = &[
     "swarm_agent_control",
     "swarm_bridge_action",
     "swarm_job_status",
+    "swarm_sync_logos",
 ];
 
 /// Port HTTP LOCAL d'un serveur (None : stdio, ou serveur distant). Un hôte
@@ -2436,6 +2437,9 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                             "version": downloaded_version,
                         });
                     }
+                    let initial_version = cached_store_version(it.id)
+                        .or_else(|| extract_pinned_version(it.args))
+                        .or_else(|| (!it.version.is_empty()).then(|| it.version.to_string()));
                     let already = {
                         let mut servers = lockv(&state.servers);
                         let already = servers.iter().any(|s| s.id == id);
@@ -2457,7 +2461,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                                 pid: None,
                                 bound_host: None,
                                 server_name: None,
-                                version: None,
+                                version: initial_version.clone(),
                                 protocol: None,
                                 sse: false,
                                 sse_endpoint: false,
@@ -2504,7 +2508,7 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                             .map(|s| s.state.as_str().to_string())
                             .unwrap_or_default()
                     };
-                    json!({"ok": true, "added": 1, "id": id, "state": st})
+                    json!({"ok": true, "added": 1, "id": id, "state": st, "version": initial_version})
                 }
                 None => json!({"ok": false, "error": "item inconnu"}),
             }

@@ -10,10 +10,11 @@ pub struct StoreItem {
     pub name: &'static str,
     pub desc: &'static str,
     pub cat: &'static str,
-    pub kind: &'static str, // npm | python
+    pub kind: &'static str, // npm | python | rust
     pub program: &'static str,
     pub args: &'static [&'static str],
     pub env_vars: &'static [&'static str],
+    pub version: &'static str,
 }
 
 pub const STORE: &[StoreItem] = &[
@@ -26,6 +27,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-gdrive"],
         env_vars: &["GDRIVE_OAUTH_PATH", "GDRIVE_CREDENTIALS_PATH"],
+        version: "2025.1.14",
     },
     StoreItem {
         id: "git",
@@ -36,6 +38,7 @@ pub const STORE: &[StoreItem] = &[
         program: "uvx",
         args: &["mcp-server-git"],
         env_vars: &[],
+        version: "2026.11.27",
     },
     StoreItem {
         id: "github",
@@ -46,6 +49,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-github"],
         env_vars: &["GITHUB_PERSONAL_ACCESS_TOKEN"],
+        version: "2025.4.8",
     },
     StoreItem {
         id: "memory",
@@ -56,6 +60,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-memory"],
         env_vars: &[],
+        version: "2.2.2",
     },
     StoreItem {
         id: "seqthink",
@@ -66,6 +71,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-sequential-thinking"],
         env_vars: &[],
+        version: "2.2.0",
     },
     StoreItem {
         id: "everything",
@@ -76,6 +82,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-everything"],
         env_vars: &[],
+        version: "2.4.0",
     },
     StoreItem {
         id: "time",
@@ -86,6 +93,7 @@ pub const STORE: &[StoreItem] = &[
         program: "uvx",
         args: &["mcp-server-time"],
         env_vars: &[],
+        version: "2026.11.27",
     },
     StoreItem {
         id: "fetch",
@@ -96,6 +104,7 @@ pub const STORE: &[StoreItem] = &[
         program: "uvx",
         args: &["mcp-server-fetch"],
         env_vars: &[],
+        version: "2026.11.27",
     },
     StoreItem {
         id: "puppeteer",
@@ -106,6 +115,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-puppeteer"],
         env_vars: &[],
+        version: "2025.5.12",
     },
     StoreItem {
         id: "brave",
@@ -116,6 +126,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-brave-search"],
         env_vars: &["BRAVE_API_KEY"],
+        version: "0.6.2",
     },
     StoreItem {
         id: "postgres",
@@ -126,6 +137,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-postgres"],
         env_vars: &[],
+        version: "0.6.2",
     },
     StoreItem {
         id: "sqlite",
@@ -136,6 +148,7 @@ pub const STORE: &[StoreItem] = &[
         program: "uvx",
         args: &["--with", "mcp>=1,<2", "mcp-server-sqlite", "--db-path", "test.db"],
         env_vars: &[],
+        version: "2025.4.25",
     },
     StoreItem {
         id: "slack",
@@ -146,6 +159,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-slack"],
         env_vars: &["SLACK_BOT_TOKEN", "SLACK_TEAM_ID"],
+        version: "2025.4.25",
     },
     StoreItem {
         id: "playwright",
@@ -156,6 +170,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@playwright/mcp@latest"],
         env_vars: &[],
+        version: "0.0.86",
     },
     StoreItem {
         id: "context7",
@@ -166,6 +181,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@upstash/context7-mcp"],
         env_vars: &[],
+        version: "4.9.1",
     },
     StoreItem {
         id: "duckduckgo",
@@ -176,6 +192,7 @@ pub const STORE: &[StoreItem] = &[
         program: "uvx",
         args: &["duckduckgo-mcp-server"],
         env_vars: &[],
+        version: "0.7.0",
     },
     StoreItem {
         id: "kubernetes",
@@ -186,6 +203,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "mcp-server-kubernetes"],
         env_vars: &[],
+        version: "4.2.3",
     },
     StoreItem {
         id: "supabase",
@@ -196,6 +214,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@supabase/mcp-server-supabase@latest"],
         env_vars: &["SUPABASE_ACCESS_TOKEN"],
+        version: "0.21.0",
     },
     StoreItem {
         id: "mongodb",
@@ -206,6 +225,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "mongodb-mcp-server"],
         env_vars: &["MDB_MCP_CONNECTION_STRING"],
+        version: "3.4.0",
     },
     StoreItem {
         id: "stripe",
@@ -216,6 +236,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@stripe/mcp", "--tools=all"],
         env_vars: &["STRIPE_SECRET_KEY"],
+        version: "0.3.4",
     },
     StoreItem {
         id: "notion",
@@ -226,6 +247,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@notionhq/notion-mcp-server"],
         env_vars: &["NOTION_TOKEN"],
+        version: "2.6.1",
     },
     StoreItem {
         id: "firecrawl",
@@ -236,6 +258,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "firecrawl-mcp"],
         env_vars: &["FIRECRAWL_API_KEY"],
+        version: "3.42.0",
     },
     StoreItem {
         id: "exa",
@@ -246,6 +269,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "exa-mcp-server"],
         env_vars: &["EXA_API_KEY"],
+        version: "3.5.1",
     },
     StoreItem {
         id: "blender",
@@ -256,6 +280,7 @@ pub const STORE: &[StoreItem] = &[
         program: "uvx",
         args: &["--with", "mcp>=1,<2", "blender-mcp==1.6.4"],
         env_vars: &[],
+        version: "1.6.4",
     },
     StoreItem {
         id: "figma",
@@ -266,6 +291,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "figma-developer-mcp", "--stdio"],
         env_vars: &["FIGMA_API_KEY"],
+        version: "0.13.2",
     },
     StoreItem {
         id: "n8n",
@@ -276,6 +302,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "n8n-mcp"],
         env_vars: &["N8N_API_URL", "N8N_API_KEY"],
+        version: "2.104.2",
     },
     StoreItem {
         id: "todoist",
@@ -286,6 +313,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "-p", "@todoist/mcp", "todoist-mcp"],
         env_vars: &["TODOIST_API_KEY"],
+        version: "19.1.1",
     },
     StoreItem {
         id: "taskmaster",
@@ -296,6 +324,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "--package=task-master-ai", "task-master-ai"],
         env_vars: &["ANTHROPIC_API_KEY"],
+        version: "0.43.1",
     },
     StoreItem {
         id: "drawio",
@@ -306,6 +335,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@drawio/mcp"],
         env_vars: &[],
+        version: "1.13.1",
     },
     // ---- lot 2026-11-24 : 11 serveurs vérifiés sur npm / PyPI + README officiels ----
     StoreItem {
@@ -324,6 +354,7 @@ pub const STORE: &[StoreItem] = &[
             "CONFLUENCE_USERNAME",
             "CONFLUENCE_API_TOKEN",
         ],
+        version: "0.24.8",
     },
     StoreItem {
         id: "obsidian",
@@ -334,6 +365,7 @@ pub const STORE: &[StoreItem] = &[
         program: "uvx",
         args: &["mcp-obsidian"],
         env_vars: &["OBSIDIAN_API_KEY", "OBSIDIAN_HOST"],
+        version: "0.2.3",
     },
     StoreItem {
         id: "desktop-commander",
@@ -344,6 +376,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@wonderwhy-er/desktop-commander"],
         env_vars: &[],
+        version: "0.3.4",
     },
     StoreItem {
         id: "windows-mcp",
@@ -354,6 +387,7 @@ pub const STORE: &[StoreItem] = &[
         program: "uvx",
         args: &["--python", "3.14", "windows-mcp", "serve"],
         env_vars: &[],
+        version: "0.9.0",
     },
     StoreItem {
         id: "youtube-transcript",
@@ -364,6 +398,7 @@ pub const STORE: &[StoreItem] = &[
         program: "uvx",
         args: &["mcp-youtube-transcript"],
         env_vars: &[],
+        version: "0.3.5",
     },
     StoreItem {
         id: "tavily",
@@ -374,6 +409,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "tavily-mcp"],
         env_vars: &["TAVILY_API_KEY"],
+        version: "0.2.22",
     },
     StoreItem {
         id: "semgrep",
@@ -384,6 +420,7 @@ pub const STORE: &[StoreItem] = &[
         program: "uvx",
         args: &["--from", "semgrep", "semgrep", "mcp"],
         env_vars: &["SEMGREP_APP_TOKEN"],
+        version: "1.187.0",
     },
     StoreItem {
         id: "grafana",
@@ -394,6 +431,7 @@ pub const STORE: &[StoreItem] = &[
         program: "uvx",
         args: &["mcp-grafana"],
         env_vars: &["GRAFANA_URL", "GRAFANA_SERVICE_ACCOUNT_TOKEN"],
+        version: "2.2.0",
     },
     StoreItem {
         id: "clickhouse",
@@ -404,6 +442,7 @@ pub const STORE: &[StoreItem] = &[
         program: "uvx",
         args: &["mcp-clickhouse"],
         env_vars: &["CLICKHOUSE_HOST", "CLICKHOUSE_USER", "CLICKHOUSE_PASSWORD"],
+        version: "0.7.0",
     },
     StoreItem {
         id: "qdrant",
@@ -414,6 +453,7 @@ pub const STORE: &[StoreItem] = &[
         program: "uvx",
         args: &["mcp-server-qdrant"],
         env_vars: &["QDRANT_URL", "QDRANT_API_KEY", "COLLECTION_NAME"],
+        version: "0.8.1",
     },
     StoreItem {
         id: "airtable",
@@ -424,6 +464,7 @@ pub const STORE: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "airtable-mcp-server"],
         env_vars: &["AIRTABLE_API_KEY"],
+        version: "1.14.0",
     },
     StoreItem {
         id: "swarm-control",
@@ -434,6 +475,7 @@ pub const STORE: &[StoreItem] = &[
         program: "swarm-control",
         args: &["--port", "23080"],
         env_vars: &[],
+        version: "0.1.2",
     },
 ];
 
@@ -785,26 +827,246 @@ pub(crate) fn cache_store_version(id: &str, version: String) {
     }
 }
 
-/// Renvoie un objet JSON `{ "<store_id>": "<version>" }` pour les serveurs de la boutique
-/// dont la version est connue (releases GitHub mises en cache 15 min + versions épinglées).
+pub(crate) fn cached_store_version(id: &str) -> Option<String> {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+    version_cache()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(id).cloned())
+        .filter(|(_, at)| at.elapsed() < TTL)
+        .map(|(v, _)| v)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorePackageSource {
+    GitHubRelease(&'static str),
+    GitHubRepo(String),
+    Npm(String),
+    PyPi(String),
+}
+
+/// Détermine le registre et le nom du paquet/dépôt d'un item de la boutique
+/// afin de vérifier sa dernière version publiée (npm, PyPI ou GitHub).
+pub(crate) fn extract_store_package(it: &StoreItem) -> Option<StorePackageSource> {
+    if let Some(spec) = find_github_release(it.id) {
+        return Some(StorePackageSource::GitHubRelease(spec.repo));
+    }
+    for arg in it.args {
+        let a = arg.trim();
+        if let Some(rest) = a.strip_prefix("git+https://github.com/") {
+            let repo = rest
+                .trim_matches('/')
+                .strip_suffix(".git")
+                .unwrap_or(rest.trim_matches('/'));
+            let repo = repo.split('@').next().unwrap_or(repo).trim();
+            if repo.contains('/') {
+                return Some(StorePackageSource::GitHubRepo(repo.to_string()));
+            }
+        }
+        if let Some(rest) = a.strip_prefix("github:") {
+            let repo = rest.trim_matches('/');
+            let repo = repo.split('#').next().unwrap_or(repo).trim();
+            if repo.contains('/') {
+                return Some(StorePackageSource::GitHubRepo(repo.to_string()));
+            }
+        }
+    }
+    match it.kind {
+        "npm" => {
+            let mut i = 0;
+            let mut pkg: Option<&str> = None;
+            while i < it.args.len() {
+                let a = it.args[i].trim();
+                if let Some(v) = a.strip_prefix("--package=") {
+                    pkg = Some(v);
+                    break;
+                }
+                if (a == "-p" || a == "--package") && i + 1 < it.args.len() {
+                    pkg = Some(it.args[i + 1].trim());
+                    break;
+                }
+                if a.starts_with('-') {
+                    i += 1;
+                    continue;
+                }
+                pkg = Some(a);
+                break;
+            }
+            let raw = pkg?;
+            let after_slash = raw.rfind('/').map(|x| x + 1).unwrap_or(0);
+            let name = match raw[after_slash..].find('@') {
+                Some(rel) if after_slash + rel > 0 => &raw[..after_slash + rel],
+                _ => raw,
+            };
+            (!name.is_empty()).then(|| StorePackageSource::Npm(name.to_string()))
+        }
+        "python" => {
+            let mut i = 0;
+            let mut pkg: Option<&str> = None;
+            while i < it.args.len() {
+                let a = it.args[i].trim();
+                if a == "--from" && i + 1 < it.args.len() {
+                    pkg = Some(it.args[i + 1].trim());
+                    break;
+                }
+                if matches!(a, "--python" | "--with" | "-p") {
+                    i += 2;
+                    continue;
+                }
+                if a.starts_with('-') {
+                    i += 1;
+                    continue;
+                }
+                pkg = Some(a);
+                break;
+            }
+            let raw = pkg?;
+            let name = raw
+                .split("==")
+                .next()
+                .unwrap_or(raw)
+                .split('@')
+                .next()
+                .unwrap_or(raw)
+                .trim();
+            (!name.is_empty()).then(|| StorePackageSource::PyPi(name.to_string()))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(not(test))]
+fn http_get_text(url: &str, accept: Option<&str>, timeout_secs: u64) -> Option<String> {
+    let mut c = crate::probe::system_command("curl");
+    probe::probe_hidden_cmd(&mut c);
+    let t_str = timeout_secs.to_string();
+    let mut args = vec![
+        "-fsSL",
+        "--proto",
+        "=https",
+        "--tlsv1.2",
+        "-m",
+        &t_str,
+        "-H",
+        "User-Agent: mcp-control",
+    ];
+    if let Some(acc) = accept {
+        args.push("-H");
+        args.push(acc);
+    }
+    args.push(url);
+    if let Ok(out) = c.args(&args).output() {
+        if out.status.success() {
+            if let Ok(s) = String::from_utf8(out.stdout) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(test))]
+fn encode_pkg_segment(pkg: &str) -> String {
+    pkg.replace('@', "%40").replace('/', "%2F")
+}
+
+#[cfg(not(test))]
+fn fetch_live_store_version(src: &StorePackageSource) -> Option<String> {
+    match src {
+        StorePackageSource::GitHubRelease(repo) => fetch_github_latest_release(repo)
+            .ok()
+            .map(|(tag, _)| tag.strip_prefix('v').unwrap_or(&tag).to_string()),
+        StorePackageSource::Npm(pkg) => {
+            let url = format!("https://registry.npmjs.org/{}/latest", encode_pkg_segment(pkg));
+            let body = http_get_text(&url, None, 6)?;
+            let v: Value = serde_json::from_str(&body).ok()?;
+            v.get("version")
+                .and_then(|x| x.as_str())
+                .map(|s| s.trim().trim_start_matches('v').to_string())
+                .filter(|s| !s.is_empty())
+        }
+        StorePackageSource::PyPi(pkg) => {
+            let url = format!("https://pypi.org/pypi/{}/json", encode_pkg_segment(pkg));
+            let body = http_get_text(&url, None, 6)?;
+            let v: Value = serde_json::from_str(&body).ok()?;
+            v.get("info")
+                .and_then(|i| i.get("version"))
+                .and_then(|x| x.as_str())
+                .map(|s| s.trim().trim_start_matches('v').to_string())
+                .filter(|s| !s.is_empty())
+        }
+        StorePackageSource::GitHubRepo(repo) => {
+            if let Ok((tag, _)) = fetch_github_latest_release(repo) {
+                let ver = tag.strip_prefix('v').unwrap_or(&tag).trim().to_string();
+                if !ver.is_empty() {
+                    return Some(ver);
+                }
+            }
+            let pkg_url = format!("https://raw.githubusercontent.com/{repo}/HEAD/package.json");
+            if let Some(body) = http_get_text(&pkg_url, None, 6) {
+                if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                    if let Some(ver) = v.get("version").and_then(|x| x.as_str()) {
+                        let ver = ver.trim().trim_start_matches('v').to_string();
+                        if !ver.is_empty() {
+                            return Some(ver);
+                        }
+                    }
+                }
+            }
+            let py_url = format!("https://raw.githubusercontent.com/{repo}/HEAD/pyproject.toml");
+            if let Some(body) = http_get_text(&py_url, None, 6) {
+                for line in body.lines() {
+                    let t = line.trim();
+                    if let Some(rest) = t.strip_prefix("version") {
+                        let rest = rest.trim_start();
+                        if let Some(rhs) = rest.strip_prefix('=') {
+                            let ver = rhs
+                                .trim()
+                                .trim_matches('"')
+                                .trim_matches('\'')
+                                .trim_start_matches('v')
+                                .to_string();
+                            if !ver.is_empty()
+                                && ver.chars().next().is_some_and(|c| c.is_ascii_digit())
+                            {
+                                return Some(ver);
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Renvoie un objet JSON `{ "<store_id>": "<version>" }` pour tous les serveurs de la boutique
+/// (version du catalogue + cache en ligne 30 min + releases GitHub).
 pub fn store_versions_json() -> Value {
-    const TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+    const TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
     let mut out = serde_json::Map::new();
     for it in all_store_items() {
         if let Some(v) = extract_pinned_version(it.args) {
             out.insert(it.id.to_string(), json!(v));
+        } else if !it.version.is_empty() {
+            out.insert(it.id.to_string(), json!(it.version));
+        }
+    }
+    if let Ok(map) = version_cache().lock() {
+        for (id, (ver, at)) in map.iter() {
+            if at.elapsed() < TTL {
+                out.insert(id.clone(), json!(ver));
+            }
         }
     }
     for spec in STORE_GITHUB_RELEASES {
-        let cached = version_cache()
+        let fresh = version_cache()
             .lock()
             .ok()
-            .and_then(|m| m.get(spec.id).cloned());
-        if let Some((ver, at)) = cached {
-            if at.elapsed() < TTL {
-                out.insert(spec.id.to_string(), json!(ver));
-                continue;
-            }
+            .and_then(|m| m.get(spec.id).map(|(_, at)| at.elapsed() < TTL))
+            .unwrap_or(false);
+        if fresh {
+            continue;
         }
         #[cfg(not(test))]
         if let Ok((tag, _)) = fetch_github_latest_release(spec.repo) {
@@ -814,6 +1076,40 @@ pub fn store_versions_json() -> Value {
         }
     }
     Value::Object(out)
+}
+
+/// Vérifie en ligne (npm, PyPI, GitHub) les dernières versions des serveurs de la boutique
+/// (tous si `ids` est `None`, ou seulement la liste fournie), met en cache les résultats
+/// et renvoie la table `{ "<store_id>": "<version>" }` mise à jour.
+pub fn refresh_store_versions(ids: Option<&[String]>) -> Value {
+    #[cfg(not(test))]
+    {
+        let targets: Vec<(&'static str, StorePackageSource)> = all_store_items()
+            .filter(|it| match ids {
+                Some(list) => list.iter().any(|x| x == it.id),
+                None => true,
+            })
+            .filter_map(|it| extract_store_package(it).map(|src| (it.id, src)))
+            .collect();
+        if !targets.is_empty() {
+            let workers = targets.len().min(8);
+            let chunk_size = targets.len().div_ceil(workers);
+            std::thread::scope(|s| {
+                for chunk in targets.chunks(chunk_size) {
+                    s.spawn(move || {
+                        for (id, src) in chunk {
+                            if let Some(ver) = fetch_live_store_version(src) {
+                                cache_store_version(id, ver);
+                            }
+                        }
+                    });
+                }
+            });
+        }
+    }
+    #[cfg(test)]
+    let _ = ids;
+    store_versions_json()
 }
 
 /// Item de boutique par id — principal, puis aitmpl, puis glama, puis github.
@@ -850,7 +1146,8 @@ pub fn store_json() -> Value {
         .get_or_init(|| {
             json!(all_store_items()
                 .map(|s| {
-                    let version = extract_pinned_version(s.args);
+                    let version = extract_pinned_version(s.args)
+                        .or_else(|| (!s.version.is_empty()).then(|| s.version.to_string()));
                     let repo = find_github_release(s.id).map(|r| r.repo);
                     json!({
                         "id": s.id, "name": s.name, "desc": s.desc,

@@ -14,6 +14,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "uvx",
         args: &["elevenlabs-mcp"],
         env_vars: &["ELEVENLABS_API_KEY"],
+        version: "0.12.2",
     },
     StoreItem {
         id: "at-mysql",
@@ -24,6 +25,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "uvx",
         args: &["--with", "mcp>=1,<2", "mcp-server-mysql"],
         env_vars: &["MYSQL_HOST", "MYSQL_PORT", "MYSQL_USER", "MYSQL_PASSWORD", "MYSQL_DATABASE"],
+        version: "0.1.4",
     },
     StoreItem {
         id: "at-neon",
@@ -32,8 +34,9 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         cat: "Données",
         kind: "npm",
         program: "npx",
-        args: &["-y", "@neondatabase/mcp-server@latest"],
+        args: &["-y", "@neondatabase/mcp-server-neon@latest"],
         env_vars: &["NEON_API_KEY"],
+        version: "0.6.5",
     },
     StoreItem {
         id: "at-redis",
@@ -44,6 +47,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "uvx",
         args: &["--from", "redis-mcp-server@latest", "redis-mcp-server"],
         env_vars: &["REDIS_URL"],
+        version: "0.5.1",
     },
     StoreItem {
         id: "at-deepgraph-next-js-mcp",
@@ -54,6 +58,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "mcp-code-graph@latest", "vercel/next.js"],
         env_vars: &[],
+        version: "1.1.2",
     },
     StoreItem {
         id: "at-android-mcp",
@@ -64,6 +69,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "uvx",
         args: &["--python", "3.13", "android-mcp"],
         env_vars: &[],
+        version: "0.3.0",
     },
     StoreItem {
         id: "at-chrome-devtools",
@@ -74,6 +80,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "chrome-devtools-mcp@latest"],
         env_vars: &[],
+        version: "1.14.0",
     },
     StoreItem {
         id: "at-ios-simulator",
@@ -84,6 +91,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "ios-simulator-mcp"],
         env_vars: &[],
+        version: "2.2.1",
     },
     StoreItem {
         id: "at-jupyter",
@@ -94,6 +102,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "uvx",
         args: &["jupyter-mcp-server@latest"],
         env_vars: &["JUPYTER_URL", "JUPYTER_TOKEN"],
+        version: "2.2.6",
     },
     StoreItem {
         id: "at-logfire",
@@ -104,6 +113,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "uvx",
         args: &["logfire-mcp"],
         env_vars: &["LOGFIRE_TOKEN"],
+        version: "0.9.0",
     },
     StoreItem {
         id: "at-mermaid",
@@ -114,6 +124,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "mcp-mermaid"],
         env_vars: &[],
+        version: "0.4.1",
     },
     StoreItem {
         id: "at-nable",
@@ -124,6 +135,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "uvx",
         args: &["nable"],
         env_vars: &[],
+        version: "0.1.6",
     },
     StoreItem {
         id: "at-orcareplay",
@@ -134,6 +146,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "orcareplay", "mcp"],
         env_vars: &[],
+        version: "0.5.0",
     },
     StoreItem {
         id: "at-trace-mcp",
@@ -144,6 +157,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "trace-mcp@latest"],
         env_vars: &[],
+        version: "3.44.14",
     },
     StoreItem {
         id: "at-alpaca-trading",
@@ -154,6 +168,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "uvx",
         args: &["alpaca-mcp-server"],
         env_vars: &["ALPACA_API_KEY", "ALPACA_SECRET_KEY"],
+        version: "2.4.1",
     },
     StoreItem {
         id: "at-livetennisapi",
@@ -164,6 +179,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "livetennisapi-mcp"],
         env_vars: &["LIVETENNISAPI_KEY"],
+        version: "1.6.5",
     },
     StoreItem {
         id: "at-memex",
@@ -174,6 +190,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "stifler-memex-mcp", "serve", "--repo", "."],
         env_vars: &["NEO4J_URI", "NEO4J_USER", "NEO4J_PASSWORD", "GEMINI_API_KEY"],
+        version: "1.0.3",
     },
     StoreItem {
         id: "at-google-workspace",
@@ -184,6 +201,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "uvx",
         args: &["workspace-mcp"],
         env_vars: &["GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"],
+        version: "2.7.1",
     },
     StoreItem {
         id: "at-humanpen",
@@ -194,6 +212,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "humanpen-mcp"],
         env_vars: &["HUMANPEN_API_KEY"],
+        version: "1.8.0",
     },
     StoreItem {
         id: "at-local-mcp",
@@ -204,6 +223,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "local-mcp@latest"],
         env_vars: &[],
+        version: "3.0.452",
     },
     StoreItem {
         id: "at-arxiv-mcp-server",
@@ -214,6 +234,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "uvx",
         args: &["arxiv-mcp-server"],
         env_vars: &[],
+        version: "0.8.2",
     },
     StoreItem {
         id: "at-searxng",
@@ -224,6 +245,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "mcp-searxng"],
         env_vars: &["SEARXNG_URL"],
+        version: "2.12.0",
     },
     StoreItem {
         id: "at-browseract",
@@ -234,6 +256,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "browseract-mcp"],
         env_vars: &["BROWSERACT_API_KEY"],
+        version: "0.0.1",
     },
     StoreItem {
         id: "at-hikerapi",
@@ -244,6 +267,7 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "hikerapi-mcp"],
         env_vars: &["HIKERAPI_KEY"],
+        version: "1.1.2",
     },
     StoreItem {
         id: "at-lamatok",
@@ -254,5 +278,6 @@ pub const STORE_AITMPL: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "lamatok-mcp"],
         env_vars: &["LAMATOK_KEY"],
+        version: "1.1.2",
     },
 ];

@@ -14,6 +14,7 @@ pub const STORE_GLAMA: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-gitlab"],
         env_vars: &["GITLAB_PERSONAL_ACCESS_TOKEN", "GITLAB_API_URL"],
+        version: "2025.4.25",
     },
     StoreItem {
         id: "gl-sentry",
@@ -24,6 +25,7 @@ pub const STORE_GLAMA: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@sentry/mcp-server"],
         env_vars: &["SENTRY_ACCESS_TOKEN"],
+        version: "0.51.0",
     },
     StoreItem {
         id: "gl-googlemaps",
@@ -34,6 +36,7 @@ pub const STORE_GLAMA: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@modelcontextprotocol/server-google-maps"],
         env_vars: &["GOOGLE_MAPS_API_KEY"],
+        version: "0.6.2",
     },
     StoreItem {
         id: "gl-paddleocr",
@@ -50,6 +53,7 @@ pub const STORE_GLAMA: &[StoreItem] = &[
             "paddleocr_mcp",
         ],
         env_vars: &[],
+        version: "0.8.5",
     },
     StoreItem {
         id: "gl-codegraph",
@@ -60,6 +64,7 @@ pub const STORE_GLAMA: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "@colbymchenry/codegraph", "serve", "--mcp"],
         env_vars: &[],
+        version: "1.6.4",
     },
     StoreItem {
         id: "gl-worldmonitor",
@@ -70,5 +75,6 @@ pub const STORE_GLAMA: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "worldmonitor"],
         env_vars: &["WORLDMONITOR_API_KEY"],
+        version: "0.2.2",
     },
 ];

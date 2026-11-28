@@ -291,6 +291,92 @@ fn store_swarm_control_release_os_et_versions() {
 }
 
 #[test]
+fn store_versions_tous_les_serveurs_ont_version_et_source() {
+    let catalog = store_json();
+    let arr = catalog.as_array().expect("store_json tableau");
+    assert_eq!(arr.len(), 96);
+    let versions = store_versions_json();
+    for item in all_store_items() {
+        assert!(
+            !item.version.is_empty(),
+            "{}: version statique manquante dans StoreItem",
+            item.id
+        );
+        assert!(
+            extract_store_package(item).is_some(),
+            "{}: source de paquet (npm/pypi/github) introuvable",
+            item.id
+        );
+        let v = versions
+            .get(item.id)
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        assert!(
+            !v.is_empty(),
+            "{}: version absente de store_versions_json()",
+            item.id
+        );
+    }
+    for entry in arr {
+        let id = entry["id"].as_str().unwrap_or("");
+        let v = entry["version"].as_str().unwrap_or("");
+        assert!(!v.is_empty(), "{id}: version absente de store_json()");
+    }
+    assert_eq!(
+        extract_store_package(find_store_item("playwright").unwrap()),
+        Some(StorePackageSource::Npm("@playwright/mcp".to_string()))
+    );
+    assert_eq!(
+        extract_store_package(find_store_item("blender").unwrap()),
+        Some(StorePackageSource::PyPi("blender-mcp".to_string()))
+    );
+    assert_eq!(
+        extract_store_package(find_store_item("swarm-control").unwrap()),
+        Some(StorePackageSource::GitHubRelease(
+            "DeamonDev888/swarm-control"
+        ))
+    );
+    assert_eq!(
+        extract_store_package(find_store_item("gh-stealth-browser").unwrap()),
+        Some(StorePackageSource::GitHubRepo(
+            "vibheksoni/stealth-browser-mcp".to_string()
+        ))
+    );
+    assert_eq!(
+        extract_store_package(find_store_item("gh-gridex").unwrap()),
+        Some(StorePackageSource::GitHubRepo("gridex/gridex".to_string()))
+    );
+
+    // install_store sur un serveur npx initialise la version dès l'installation
+    let path = tmp_config("cfg_store_ver_init.json", Some("{\"servers\":[]}"));
+    let state = Arc::new(AppState {
+        servers: Mutex::new(Vec::new()),
+        log: Mutex::new(VecDeque::new()),
+        settings: Mutex::new(Settings::default()),
+        children: Mutex::new(std::collections::HashMap::new()),
+        config_path: path.clone(),
+        peers: Mutex::new(std::collections::HashMap::new()),
+        allowed_origins: Mutex::new(Vec::new()),
+        allowed_hosts: Mutex::new(Vec::new()),
+        spawn_fails: Mutex::new(std::collections::HashMap::new()),
+        runtime: Mutex::new(crate::runtime::RuntimeLog::new()),
+        spawning: Mutex::new(std::collections::HashSet::new()),
+        update_latest: Mutex::new(None),
+        lan_ok: Mutex::new(None),
+    });
+    let res = handle_action(&state, r#"{"action":"install_store","id":"memory"}"#);
+    assert_eq!(res["ok"], json!(true));
+    let expected = find_store_item("memory").unwrap().version;
+    assert_eq!(res["version"], json!(expected));
+    let srv_ver = lockv(&state.servers)
+        .iter()
+        .find(|s| s.id == "store-memory")
+        .and_then(|s| s.version.clone());
+    assert_eq!(srv_ver.as_deref(), Some(expected));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn store_tous_les_serveurs_eligibles_mode_hybride_et_persistants() {
     let path = tmp_config("cfg_store_89_hybrid.json", Some("{\"servers\":[]}"));
     let state = Arc::new(AppState {

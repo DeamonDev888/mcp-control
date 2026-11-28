@@ -32,7 +32,10 @@ function swarmLogoClassFor(name, kind, cls) {
 }
 function swarmLogoUrl(name, kind, cls) {
   const slug = swarmLogoClassFor(name, kind, cls);
-  return `/swarm-logo/${slug}.svg?v=${encodeURIComponent(MCC_VERSION)}`;
+  const rev = (typeof state !== 'undefined' && state && state.swarm_logos_rev)
+    ? (MCC_VERSION + '-' + state.swarm_logos_rev)
+    : MCC_VERSION;
+  return `/swarm-logo/${slug}.svg?v=${encodeURIComponent(rev)}`;
 }
 
 /* ===== Thème sombre/clair (⚙ Réglages) =====
@@ -527,6 +530,18 @@ async function load() {
         selectedId = null; detailCache = null; _lastSelectedSrvSig = ''; _detailEtag = null; _detailEtagId = null; _sigOverview = '';
       }
       render();
+      if (!_storeVersionsFetched) {
+        _storeVersionsFetched = true;
+        const hasStoreSrv = (state.servers || []).some(s => s.id && s.id.startsWith('store-'));
+        const verUrl = hasStoreSrv ? '/api/store-versions?installed=1' : '/api/store-versions';
+        fetch(verUrl).then(rv => rv.ok ? rv.json() : null).then(v => {
+          if (!v) return;
+          storeVersions = Object.assign(storeVersions || {}, v);
+          renderServers();
+          const sd = document.getElementById('storeDlg');
+          if (sd && sd.open) renderStoreItems();
+        }).catch(() => {});
+      }
       if (_updateRestarting && (_updateRestartSawDown || (state && state.update_status && state.update_status.phase === 'idle'))) {
         _updateRestarting = false;
         _updateRestartSawDown = false;
@@ -824,12 +839,12 @@ function loadStoreLogos() {
 
 function swarmHiveRow() {
   const st = (state && state.swarm_stats) || {instances: 0, residents: 0, up: 0};
-  const tot = (st.instances || 0) + (st.residents || 0);
+  const nRes = st.residents || 0;
   const up = st.up || 0;
-  const stCls = up > 0 ? 'UP' : (tot > 0 ? 'DOWN' : 'PORT-ONLY');
+  const stCls = up > 0 ? 'UP' : (nRes > 0 ? 'DOWN' : 'PORT-ONLY');
   const isSel = activeView === 'swarm';
-  const summary = tot > 0
-    ? `${st.instances || 0} inst \u00b7 ${st.residents || 0} r\u00e9sid.`
+  const summary = nRes > 0
+    ? `${nRes} agent${nRes > 1 ? 's' : ''} r\u00e9sid.`
     : 'orchestration \u00b7 A2A';
   return `<div class="srow srow-hive ${isSel ? 'sel' : ''}" draggable="false"
     role="listitem" tabindex="0"${isSel ? ' aria-current="true"' : ''}
@@ -840,7 +855,7 @@ function swarmHiveRow() {
       <span class="srv-logo swarm-logo" title="Essaim Swarm-control — Orchestration &amp; A2A"><img class="swarm-img" src="${esc(swarmLogoUrl('logo', 'hive'))}" alt="" aria-hidden="true"></span>
       <span class="nm" title="Essaim Swarm — Interactions entre agents, orchestration et A2A">Essaim Swarm</span>
       <div class="l1-right">
-        <span class="cnt" title="${esc(String(up))} actif(s) sur ${esc(String(tot))}">${esc(String(tot))}</span>
+        <span class="cnt" title="${esc(String(nRes))} agent(s) r\u00e9sident(s)">${esc(String(nRes))}</span>
       </div>
     </div>
     <div class="l2">
@@ -865,6 +880,14 @@ function srvRow(s) {
   const latPill = (s.state === 'UP' && s.latency_ms != null)
     ? `<span class="srow-lat">${esc(String(s.latency_ms))}ms</span>`
     : '';
+  const storeId = (s.id && s.id.startsWith('store-')) ? s.id.slice(6) : '';
+  const remoteStoreVer = (storeId && storeVersions && storeVersions[storeId]) || '';
+  const srvVer = s.version || '';
+  const verPill = (srvVer && remoteStoreVer && srvVer.replace(/^v/i, '') !== remoteStoreVer.replace(/^v/i, ''))
+    ? `<span class="srow-ver srow-ver-upd" title="Install\u00e9e : ${esc(fmtStoreVer(srvVer))} \u2014 Derni\u00e8re version : ${esc(fmtStoreVer(remoteStoreVer))}">${esc(fmtStoreVer(srvVer))} \u2192 ${esc(fmtStoreVer(remoteStoreVer))}</span>`
+    : srvVer
+      ? `<span class="srow-ver" title="Version du serveur MCP">${esc(fmtStoreVer(srvVer))}</span>`
+      : '';
   const stPill = s.state !== 'UP'
     ? `<span class="st ${esc(s.state)}">${esc(s.state)}</span>`
     : '';
@@ -887,7 +910,7 @@ function srvRow(s) {
     </div>
     <div class="l2">
       <div class="srow-meta">
-        ${stPill}<span class="srow-pill" title="${esc(endpoint)}">${endpoint}</span>${latPill}${langChip(s)}${dockerBadge(s, false)}${swarmBadge(s)}${frameworkBadge(s)}${lockBadge(s)}${s.transport==='stdio'?'<span class="tag hybrid" title="Pont hybride natif : Streamable HTTP (/mcp/s/...) + auth Ed25519 LiteMCP">HTTP+AUTH</span>':''}
+        ${stPill}<span class="srow-pill" title="${esc(endpoint)}">${endpoint}</span>${latPill}${verPill}${langChip(s)}${dockerBadge(s, false)}${swarmBadge(s)}${frameworkBadge(s)}${lockBadge(s)}${s.transport==='stdio'?'<span class="tag hybrid" title="Pont hybride natif : Streamable HTTP (/mcp/s/...) + auth Ed25519 LiteMCP">HTTP+AUTH</span>':''}
       </div>
       <div class="srow-acts">${rowFav(s)}${rowAuto(s)}${rowCtl(s)}</div>
     </div>
@@ -1037,7 +1060,7 @@ function setExplorerTab(tab) {
 }
 function srvVisible(s, q) {
   if (hiddenServers.has(s.id)) return false;
-  if (explorerTab === 'swarm' && !s.swarm_kind) return false;
+  if (explorerTab === 'swarm' && s.swarm_kind !== 'resident') return false;
   if (overviewFilter === 'up' && s.state !== 'UP') return false;
   if (expStateFilter === 'up' && s.state !== 'UP') return false;
   if (expStateFilter === 'down' && !(s.enabled && (s.state === 'DOWN' || s.state === 'PORT-ONLY') && !(s.locked && !s.paired))) return false;
@@ -1068,6 +1091,7 @@ function renderServers() {
   const sig = JSON.stringify([
     state.servers,
     state.swarm_stats,
+    state.swarm_logos_rev,
     state.settings && state.settings.ssh_hosts,
     selectedId,
     activeView,
@@ -1128,12 +1152,23 @@ function renderServers() {
   const localToggle = localHead.querySelector('.grp-toggle');
   if (localToggle) localToggle.setAttribute('aria-expanded', locClosed ? 'false' : 'true');
   localBox.classList.toggle('closed', locClosed);
-  setText(count, upOf(localAll) + '/' + localAll.length);
+  const localScope = explorerTab === 'swarm'
+    ? localAll.filter(s => s.swarm_kind === 'resident')
+    : localAll;
+  setText(count, upOf(localScope) + '/' + localScope.length);
   localBox.innerHTML = hiveHtml + (local.length ? favFirst(local).map(srvRow).join('')
-    : (localAll.length ? (hiveHtml ? '' : noneMatch) : '<div class="empty-sec" role="listitem">aucun serveur \u2014 lance un scan</div>'));
-  setHidden(label, !keys.length);
-  groupsBox.innerHTML = keys.map((k, idx) => {
-    const all = byKey[k] || [];
+    : (localScope.length ? (hiveHtml ? '' : noneMatch)
+      : (explorerTab === 'swarm'
+        ? (hiveHtml ? '' : '<div class="empty-sec" role="listitem">aucun agent Swarm r&eacute;sident</div>')
+        : '<div class="empty-sec" role="listitem">aucun serveur \u2014 lance un scan</div>')));
+  const visibleRemoteKeys = explorerTab === 'swarm'
+    ? keys.filter(k => (byKey[k] || []).some(s => s.swarm_kind === 'resident'))
+    : keys;
+  setHidden(label, !visibleRemoteKeys.length);
+  groupsBox.innerHTML = visibleRemoteKeys.map((k, idx) => {
+    const all = explorerTab === 'swarm'
+      ? (byKey[k] || []).filter(s => s.swarm_kind === 'resident')
+      : (byKey[k] || []);
     const rows = all.filter(s => srvVisible(s, q));
     const bodyId = 'grpBody_' + idx;
     const body = rows.length ? favFirst(rows).map(srvRow).join('')
@@ -4538,11 +4573,37 @@ async function addServer(ev) {
 let storeItems = null;
 let storeLogos = null;
 let storeVersions = null;
+let _storeVersionsFetched = false;
 let storeCat = 'Tout';
 function fmtStoreVer(v) {
   const s = String(v || '').trim();
   if (!s) return '';
   return /^v/i.test(s) ? s : 'v' + s;
+}
+async function checkStoreVersions(btn) {
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spin">' + ic('refresh') + '</span> V\u00e9rification\u2026';
+  }
+  try {
+    const r = await fetch('/api/store-versions?refresh=1');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const v = await r.json();
+    if (v && typeof v === 'object') {
+      storeVersions = Object.assign(storeVersions || {}, v);
+      renderStoreItems();
+      renderServers();
+      const n = Object.keys(storeVersions).length;
+      toast('Versions v\u00e9rifi\u00e9es (' + n + ' serveurs)', 'ok', 2800);
+    }
+  } catch (e) {
+    toast('V\u00e9rification des versions impossible', 'err', 3200);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'V\u00e9rifier versions';
+    }
+  }
 }
 async function openStore() {
   const d = document.getElementById('storeDlg');
@@ -4726,9 +4787,9 @@ function renderStoreItems() {
     const remoteVer = (storeVersions && storeVersions[i.id]) || i.version || '';
     const instVer = (instSrv && instSrv.version) || '';
     const verHtml = (instVer && remoteVer && instVer.replace(/^v/i, '') !== remoteVer.replace(/^v/i, ''))
-      ? `<span class="scard-ver scard-ver-upd" title="Install\u00e9e : ${esc(fmtStoreVer(instVer))} \u2014 Derni\u00e8re release : ${esc(fmtStoreVer(remoteVer))}">${esc(fmtStoreVer(instVer))} \u2192 ${esc(fmtStoreVer(remoteVer))}</span>`
+      ? `<span class="scard-ver scard-ver-upd" title="Install\u00e9e : ${esc(fmtStoreVer(instVer))} \u2014 Derni\u00e8re version : ${esc(fmtStoreVer(remoteVer))}">${esc(fmtStoreVer(instVer))} \u2192 ${esc(fmtStoreVer(remoteVer))}</span>`
       : (remoteVer || instVer)
-        ? `<span class="scard-ver" title="Version du serveur MCP">${esc(fmtStoreVer(remoteVer || instVer))}</span>`
+        ? `<span class="scard-ver" title="${isInst && instVer && remoteVer ? '\u00c0 jour (' + esc(fmtStoreVer(remoteVer)) + ')' : 'Version du serveur MCP'}">${esc(fmtStoreVer(remoteVer || instVer))}</span>`
         : '';
     const kindCls = i.kind === 'npm' ? 'npm' : i.kind === 'rust' ? 'rust' : 'py';
     const envKeys = !isInst ? storeEnvKeys(i) : [];
@@ -5656,11 +5717,11 @@ const ACT = {
   'expl-tab': el => setExplorerTab(el.dataset.tab),
   'swarm-open': () => openSwarmView(),
   'swarm-refresh': () => swarmRefresh(true),
+  'swarm-sync-logos': () => swarmSyncLogos(),
   'swarm-live-toggle': () => swarmToggleLive(),
   'swarm-a2a-filter': el => swarmSetA2aFilter(el.dataset.mode),
   'swarm-a2a-send': () => swarmSendA2a(),
   'swarm-tab': el => swarmSetTab(el.dataset.tab),
-  'swarm-open-agents': el => swarmOpenAgents(el.dataset.id),
   'swarm-open-console': el => swarmOpenConsole(el.dataset.target, el.dataset.agent, el.dataset.inst),
   'swarm-inst-change': el => swarmInstChange(el),
   'swarm-filter-change': () => swarmFilterChange(),
@@ -5751,6 +5812,7 @@ const ACT = {
   'store-reset-filters': () => resetStoreFilters(),
   'store-sort': () => renderStoreItems(),
   'store-hide-inst': () => toggleHideInst(),
+  'store-check-versions': el => checkStoreVersions(el),
   'toggle-env-eye': el => toggleEnvEye(el),
   'install-store': el => installStore(el.dataset.id, el),
   'uninstall-store': el => uninstallStore(el.dataset.id, el),

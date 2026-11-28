@@ -242,6 +242,8 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
         </select>
         <button type="button" id="storeHideInst" class="scat" role="switch" aria-checked="false" data-act="store-hide-inst"
           title="Masquer les serveurs d&eacute;j&agrave; pr&eacute;sents dans ta liste">Masquer les install&eacute;s</button>
+        <button type="button" id="storeCheckVers" class="scat" data-act="store-check-versions"
+          title="V&eacute;rifier en ligne les derni&egrave;res versions (npm, PyPI, GitHub)">V&eacute;rifier versions</button>
       </div>
       <div id="storeCats" class="store-cats"></div>
       <div id="storeResults" class="store-results" aria-live="polite"></div>

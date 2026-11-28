@@ -406,7 +406,9 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                             mark_confirmed_up(state, id);
                             srv.bound_host = res.host.clone();
                             srv.server_name = res.name.clone();
-                            srv.version = res.version.clone();
+                            if res.version.is_some() {
+                                srv.version = res.version.clone();
+                            }
                             srv.protocol = res.protocol.clone();
                             if !res.metadata_reused {
                                 srv.sse = res.sse;

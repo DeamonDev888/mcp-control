@@ -2381,8 +2381,8 @@ pub fn route_peer_session_cond(
             .strip_prefix("/swarm-logo/")
             .and_then(|s| s.strip_suffix(".svg"))
         {
-            if let Some(svg) = ui::swarm_logo_svg(slug) {
-                let asset = build_static_asset(svg);
+            if let Some(bytes) = crate::swarm::logos::load_svg_bytes(&state.config_path, slug) {
+                let asset = build_static_bytes(&bytes);
                 return serve_static_asset(&asset, "image/svg+xml; charset=utf-8", if_none_match);
             }
         }
@@ -2449,6 +2449,19 @@ pub fn route_peer_session_cond(
         );
     }
     if method == "GET" && bare_path == "/api/store-versions" {
+        if query_param(path, "refresh").as_deref() == Some("1") {
+            return Reply::json(200, manage::refresh_store_versions(None));
+        }
+        if query_param(path, "installed").as_deref() == Some("1") {
+            let installed_ids: Vec<String> = {
+                let servers = types::lockv(&state.servers);
+                servers
+                    .iter()
+                    .filter_map(|s| s.id.strip_prefix("store-").map(String::from))
+                    .collect()
+            };
+            return Reply::json(200, manage::refresh_store_versions(Some(&installed_ids)));
+        }
         return Reply::json(200, manage::store_versions_json());
     }
     // Table des frameworks MCP connus (id, label, langage) — l'UI en dérive

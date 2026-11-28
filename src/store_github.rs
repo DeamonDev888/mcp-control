@@ -14,6 +14,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "codebase-memory-mcp"],
         env_vars: &[],
+        version: "0.12.1",
     },
     StoreItem {
         id: "gh-context-mode",
@@ -24,6 +25,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "context-mode", "server"],
         env_vars: &[],
+        version: "2.2.4",
     },
     StoreItem {
         id: "gh-serena",
@@ -41,6 +43,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
             "ide-assistant",
         ],
         env_vars: &[],
+        version: "2.1.0",
     },
     StoreItem {
         id: "gh-ffmpeg-skill",
@@ -51,6 +54,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "ffmpeg-skill", "mcp"],
         env_vars: &[],
+        version: "4.22.1",
     },
     StoreItem {
         id: "gh-stealth-browser",
@@ -65,6 +69,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
             "stealth-browser-mcp",
         ],
         env_vars: &[],
+        version: "0.3.4",
     },
     StoreItem {
         id: "gh-rea",
@@ -75,6 +80,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "rea-agents", "mcp"],
         env_vars: &[],
+        version: "6.10.1",
     },
     StoreItem {
         id: "gh-world-intel",
@@ -89,6 +95,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
             "world-intel-mcp",
         ],
         env_vars: &[],
+        version: "0.10.0",
     },
     StoreItem {
         id: "gh-gridex",
@@ -99,6 +106,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "github:gridex/gridex"],
         env_vars: &[],
+        version: "0.0.19",
     },
     StoreItem {
         id: "gh-tradingview",
@@ -113,6 +121,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
             "tradingview-mcp",
         ],
         env_vars: &[],
+        version: "0.9.0",
     },
     StoreItem {
         id: "gh-freecad",
@@ -123,6 +132,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         program: "uvx",
         args: &["freecad-mcp"],
         env_vars: &[],
+        version: "0.1.32",
     },
     StoreItem {
         id: "gh-opennews",
@@ -137,6 +147,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
             "opennews-mcp",
         ],
         env_vars: &[],
+        version: "0.1.0",
     },
     StoreItem {
         id: "gh-cve-mcp",
@@ -153,6 +164,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
             "cve-mcp",
         ],
         env_vars: &[],
+        version: "0.2.0",
     },
     StoreItem {
         id: "gh-tabularis",
@@ -163,6 +175,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "github:TabularisDB/tabularis"],
         env_vars: &[],
+        version: "0.34.0",
     },
     StoreItem {
         id: "gh-markdownify",
@@ -173,6 +186,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "mcp-markdownify-server"],
         env_vars: &[],
+        version: "1.1.0",
     },
     StoreItem {
         id: "gh-gortex",
@@ -183,6 +197,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "github:zzet/gortex"],
         env_vars: &[],
+        version: "0.64.11",
     },
     StoreItem {
         id: "gh-proxmox-plus",
@@ -202,6 +217,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
             "PROXMOX_TOKEN_NAME",
             "PROXMOX_TOKEN_VALUE",
         ],
+        version: "0.7.4",
     },
     StoreItem {
         id: "gh-hermes-control",
@@ -212,6 +228,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "github:xaspx/hermes-control-interface"],
         env_vars: &[],
+        version: "3.6.2",
     },
     StoreItem {
         id: "gh-codex-mcp",
@@ -222,6 +239,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "codex-mcp-server"],
         env_vars: &[],
+        version: "1.4.10",
     },
     StoreItem {
         id: "gh-financial-datasets",
@@ -242,6 +260,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
             "server",
         ],
         env_vars: &["FINANCIAL_DATASETS_API_KEY"],
+        version: "0.1.0",
     },
     StoreItem {
         id: "gh-unity-mcp",
@@ -252,6 +271,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "github:IvanMurzak/Unity-MCP"],
         env_vars: &[],
+        version: "1.14.3",
     },
     StoreItem {
         id: "gh-ssh-manager",
@@ -262,6 +282,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "mcp-ssh-manager"],
         env_vars: &[],
+        version: "4.4.1",
     },
     StoreItem {
         id: "gh-twenty-crm",
@@ -272,6 +293,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         program: "npx",
         args: &["-y", "twenty-crm-mcp-server"],
         env_vars: &["TWENTY_API_KEY", "TWENTY_BASE_URL"],
+        version: "0.7.1",
     },
     StoreItem {
         id: "gh-pdf-mcp",
@@ -282,6 +304,7 @@ pub const STORE_GITHUB: &[StoreItem] = &[
         program: "uvx",
         args: &["--from", "git+https://github.com/I-CAN-hack/pdf-mcp", "pdf-mcp"],
         env_vars: &[],
+        version: "0.1.0",
     },
     StoreItem {
         id: "gh-ai-trader",
@@ -302,5 +325,6 @@ pub const STORE_GITHUB: &[StoreItem] = &[
             "ai_trader.mcp",
         ],
         env_vars: &[],
+        version: "0.3.3",
     },
 ];

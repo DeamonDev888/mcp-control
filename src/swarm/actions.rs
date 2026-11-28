@@ -836,6 +836,39 @@ pub fn handle_swarm_action(state: &Arc<AppState>, action: &str, req: &Value) -> 
             }
         }
 
+        "swarm_sync_logos" => {
+            let detected_ver = {
+                let servers = lockv(&state.servers);
+                servers.iter().find_map(|s| {
+                    if s.state == SState::Up && detect_server(s).is_some() {
+                        s.version.clone().filter(|v| !v.trim().is_empty())
+                    } else {
+                        None
+                    }
+                })
+            };
+            let rep = super::logos::sync_now(state, detected_ver.as_deref());
+            if rep.busy {
+                json!({"ok": false, "error": "synchronisation des logos déjà en cours"})
+            } else {
+                manage::add_log(
+                    state,
+                    "info",
+                    &format!(
+                        "[swarm] sync logos manuelle : {} mis à jour, {} inchangés, {} erreur(s)",
+                        rep.updated, rep.unchanged, rep.errors
+                    ),
+                );
+                json!({
+                    "ok": true,
+                    "updated": rep.updated,
+                    "unchanged": rep.unchanged,
+                    "errors": rep.errors,
+                    "rev": rep.rev,
+                })
+            }
+        }
+
         _ => return None,
     };
     Some(out)

@@ -1,3 +1,11 @@
+## [0.8.13] — 2026-11-27
+
+### Boutique — Versions sur toutes les cartes, cartes serveurs & vérification en ligne
+- **Versions vérifiées pour les 96 serveurs du catalogue (`src/manage/store.rs`, `src/store_aitmpl.rs`, `src/store_glama.rs`, `src/store_github.rs`)** : ajout du champ `version` sur chaque `StoreItem`, correction du paquet `at-neon` (`@neondatabase/mcp-server-neon`), et exposition immédiate dans `GET /api/store` et `GET /api/store-versions`.
+- **Vérification en ligne & initialisation à l'installation (`src/manage/store.rs`, `src/manage/actions.rs`, `src/manage/scans.rs`, `src/lib.rs`)** : résolution automatique de la source (npm, PyPI, GitHub Releases, dépôt GitHub) avec rafraîchissement parallèle sur `GET /api/store-versions?installed=1` et `?refresh=1` (cache 30 min), initialisation de `version` dès `install_store` (y compris `npx`/`uvx`) et préservation lors des sondes sans `serverInfo.version`.
+- **UI cartes Boutique & cartes serveurs (`src/ui.rs`, `src/ui/app.js`, `src/ui/app.css`)** : affichage du badge `vX.Y.Z` (et alerte `vInstallée → vDernière`) sur chaque carte de la boutique ET chaque ligne serveur `.srow`, bouton **« Vérifier versions »** dans la barre Boutique, et vérification automatique en arrière-plan des serveurs boutique installés.
+- **Swarm Control — Logos de classes d'agents (`src/swarm/logos.rs`, `src/swarm/actions.rs`, `src/manage/json.rs`, `src/ui/swarm.js`, `src/ui/swarm.css`)** : détection des résidents 7 outils et propagation des logos SVG animés par classe d'agent.
+
 ## [0.8.12] — 2026-11-27
 
 ### Swarm Control — Logos SVG animés officiels & Onglet Explorateur
