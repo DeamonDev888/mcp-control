@@ -41,97 +41,101 @@ fn spawn_mock_swarm(
         while !stop_bg.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                    let mut raw = Vec::new();
-                    let mut tmp = [0u8; 4096];
-                    let mut header_end: Option<usize> = None;
-                    let mut content_len: usize = 0;
-                    loop {
-                        let n = stream.read(&mut tmp).unwrap_or(0);
-                        if n == 0 {
-                            break;
-                        }
-                        raw.extend_from_slice(&tmp[..n]);
-                        if header_end.is_none() {
-                            if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-                                header_end = Some(pos + 4);
-                                let h = String::from_utf8_lossy(&raw[..pos]);
-                                for line in h.lines() {
-                                    if let Some(v) =
-                                        line.to_ascii_lowercase().strip_prefix("content-length:")
-                                    {
-                                        content_len = v.trim().parse().unwrap_or(0);
+                    let tools = tools.clone();
+                    thread::spawn(move || {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                        let mut raw = Vec::new();
+                        let mut tmp = [0u8; 4096];
+                        let mut header_end: Option<usize> = None;
+                        let mut content_len: usize = 0;
+                        loop {
+                            let n = stream.read(&mut tmp).unwrap_or(0);
+                            if n == 0 {
+                                break;
+                            }
+                            raw.extend_from_slice(&tmp[..n]);
+                            if header_end.is_none() {
+                                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    header_end = Some(pos + 4);
+                                    let h = String::from_utf8_lossy(&raw[..pos]);
+                                    for line in h.lines() {
+                                        if let Some(v) = line
+                                            .to_ascii_lowercase()
+                                            .strip_prefix("content-length:")
+                                        {
+                                            content_len = v.trim().parse().unwrap_or(0);
+                                        }
                                     }
                                 }
                             }
-                        }
-                        if let Some(he) = header_end {
-                            if raw.len() >= he + content_len {
-                                break;
+                            if let Some(he) = header_end {
+                                if raw.len() >= he + content_len {
+                                    break;
+                                }
                             }
                         }
-                    }
-                    if raw.is_empty() {
-                        continue;
-                    }
-                    let req = String::from_utf8_lossy(&raw);
-                    let first = req.lines().next().unwrap_or("");
-                    if first.starts_with("GET /health") {
-                        let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
-                        let _ = stream.write_all(resp.as_bytes());
-                        continue;
-                    }
-                    let body = header_end
-                        .map(|he| String::from_utf8_lossy(&raw[he..]).to_string())
-                        .unwrap_or_default();
-                    let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-                    let id = v.get("id").cloned().unwrap_or(json!(1));
-                    let method = v.get("method").and_then(Value::as_str).unwrap_or("");
-                    let reply = match method {
-                        "initialize" => json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "protocolVersion": "2026-07-28",
-                                "capabilities": {"tools": {}},
-                                "serverInfo": {"name": server_name, "version": "0.1.2"}
-                            }
-                        }),
-                        "notifications/initialized" => {
-                            let resp = "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        if raw.is_empty() {
+                            return;
+                        }
+                        let req = String::from_utf8_lossy(&raw);
+                        let first = req.lines().next().unwrap_or("");
+                        if first.starts_with("GET /health") {
+                            let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
                             let _ = stream.write_all(resp.as_bytes());
-                            continue;
+                            return;
                         }
-                        "tools/list" => json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {"tools": tools}
-                        }),
-                        "tools/call" => {
-                            let tname = v["params"]["name"].as_str().unwrap_or("");
-                            let targs = &v["params"]["arguments"];
-                            let payload = responder(tname, targs);
-                            json!({
+                        let body = header_end
+                            .map(|he| String::from_utf8_lossy(&raw[he..]).to_string())
+                            .unwrap_or_default();
+                        let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                        let id = v.get("id").cloned().unwrap_or(json!(1));
+                        let method = v.get("method").and_then(Value::as_str).unwrap_or("");
+                        let reply = match method {
+                            "initialize" => json!({
                                 "jsonrpc": "2.0",
                                 "id": id,
                                 "result": {
-                                    "content": [{"type": "text", "text": payload.to_string()}]
+                                    "protocolVersion": "2026-07-28",
+                                    "capabilities": {"tools": {}},
+                                    "serverInfo": {"name": server_name, "version": "0.1.2"}
                                 }
-                            })
-                        }
-                        _ => json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": {"code": -32601, "message": "method not found"}
-                        }),
-                    };
-                    let bytes = reply.to_string();
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        bytes.len(),
-                        bytes
-                    );
-                    let _ = stream.write_all(resp.as_bytes());
+                            }),
+                            "notifications/initialized" => {
+                                let resp = "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                let _ = stream.write_all(resp.as_bytes());
+                                return;
+                            }
+                            "tools/list" => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {"tools": tools}
+                            }),
+                            "tools/call" => {
+                                let tname = v["params"]["name"].as_str().unwrap_or("");
+                                let targs = &v["params"]["arguments"];
+                                let payload = responder(tname, targs);
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "result": {
+                                        "content": [{"type": "text", "text": payload.to_string()}]
+                                    }
+                                })
+                            }
+                            _ => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {"code": -32601, "message": "method not found"}
+                            }),
+                        };
+                        let bytes = reply.to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            bytes.len(),
+                            bytes
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
