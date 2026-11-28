@@ -30,7 +30,9 @@ use litemcp::auth::{
 use serde_json::{json, Map, Value};
 use std::collections::VecDeque;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+#[cfg(not(test))]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::types::{lockv, now_ts, AppState};
 
@@ -902,9 +904,19 @@ impl Core {
 // État process-global (perdu au redémarrage, §5)
 // ---------------------------------------------------------------------------
 
+#[cfg(not(test))]
 fn store() -> &'static Mutex<Core> {
     static STORE: OnceLock<Mutex<Core>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(Core::new(REQUEST_TTL_SECS, window_secs())))
+}
+
+#[cfg(test)]
+fn store() -> &'static Mutex<Core> {
+    thread_local! {
+        static TEST_STORE: &'static Mutex<Core> =
+            Box::leak(Box::new(Mutex::new(Core::new(REQUEST_TTL_SECS, window_secs()))));
+    }
+    TEST_STORE.with(|s| *s)
 }
 
 fn lock_store() -> MutexGuard<'static, Core> {
