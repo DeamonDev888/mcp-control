@@ -307,10 +307,7 @@ fn store_versions_tous_les_serveurs_ont_version_et_source() {
             "{}: source de paquet (npm/pypi/github) introuvable",
             item.id
         );
-        let v = versions
-            .get(item.id)
-            .and_then(|x| x.as_str())
-            .unwrap_or("");
+        let v = versions.get(item.id).and_then(|x| x.as_str()).unwrap_or("");
         assert!(
             !v.is_empty(),
             "{}: version absente de store_versions_json()",

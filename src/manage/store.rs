@@ -977,7 +977,10 @@ fn fetch_live_store_version(src: &StorePackageSource) -> Option<String> {
             .ok()
             .map(|(tag, _)| tag.strip_prefix('v').unwrap_or(&tag).to_string()),
         StorePackageSource::Npm(pkg) => {
-            let url = format!("https://registry.npmjs.org/{}/latest", encode_pkg_segment(pkg));
+            let url = format!(
+                "https://registry.npmjs.org/{}/latest",
+                encode_pkg_segment(pkg)
+            );
             let body = http_get_text(&url, None, 6)?;
             let v: Value = serde_json::from_str(&body).ok()?;
             v.get("version")
