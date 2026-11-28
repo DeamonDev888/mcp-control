@@ -895,15 +895,17 @@ function srvRow(s) {
   const toolsTip = `${s.tools_count} outil${s.tools_count > 1 ? 's' : ''}`
     + (offCount ? ` (${offCount} coup\u00e9s)` : '');
   const isSel = selectedId === s.id;
-  const isMulti = selectedServers.size > 1 && selectedServers.has(s.id);
+  const isMulti = selectedServers.has(s.id);
+  const chkBadge = isMulti ? `<span class="srow-chk" aria-hidden="true">${ic('check')}</span>` : '';
   /* Ligne 1 : état + logo boutique éventuel + nom + compteur d'outils + switch ON/OFF.
      Ligne 2 : métadonnées (état si hors-ligne, port/programme, latence, badges)
      à gauche, actions rapides (favori, autoboot, play/stop) séparées à droite. */
   return `<div class="srow ${isSel?'sel':''} ${isMulti?'multi-sel':''} ${s.enabled?'':'off'}" draggable="true"
     role="listitem" tabindex="0"${isSel ? ' aria-current="true"' : ''}${isMulti ? ' aria-selected="true"' : ''} aria-label="Serveur ${esc(s.label)} (${esc(s.state)})"
+    title="Cliquer pour ouvrir · Ctrl+clic ou Shift+clic pour multi-s\u00e9lectionner"
     data-act="select" data-id="${esc(s.id)}">
     <div class="l1">
-      <span class="dot ${esc(s.state)}"></span>${srvStoreLogo(s, false)}
+      ${chkBadge}<span class="dot ${esc(s.state)}"></span>${srvStoreLogo(s, false)}
       <span class="nm" title="${esc(s.label)}">${esc(s.label)}</span>
       <div class="l1-right">
         <span class="cnt" title="${esc(toolsTip)}">${esc(s.tools_count)}</span>${offPill}${rowToggle(s)}
@@ -952,6 +954,190 @@ function visibleServerIds() {
     .map(r => r.dataset.id)
     .filter(Boolean);
 }
+function pruneSelectedServers() {
+  if (!selectedServers.size) return;
+  const known = new Set(((state && state.servers) || []).map(s => s.id));
+  for (const id of [...selectedServers]) {
+    if (!known.has(id) || hiddenServers.has(id)) selectedServers.delete(id);
+  }
+}
+function getSelectedServerObjects(ids) {
+  const allSrvs = (state && state.servers) || [];
+  const byIdMap = new Map(allSrvs.map(s => [s.id, s]));
+  if (Array.isArray(ids)) {
+    return ids.map(id => byIdMap.get(id)).filter(Boolean);
+  }
+  pruneSelectedServers();
+  const vis = visibleServerIds();
+  const ordered = vis.filter(x => selectedServers.has(x));
+  const rest = [...selectedServers].filter(x => !ordered.includes(x));
+  return [...ordered, ...rest].map(id => byIdMap.get(id)).filter(Boolean);
+}
+function selectAllVisibleServers() {
+  const vis = visibleServerIds();
+  if (!vis.length) return;
+  vis.forEach(x => selectedServers.add(x));
+  lastExpAnchorId = vis[vis.length - 1];
+  renderServers();
+}
+function clearSelectedServers() {
+  if (!selectedServers.size) return;
+  selectedServers.clear();
+  renderServers();
+}
+function renderExpBulkBar() {
+  const bar = document.getElementById('expBulkBar');
+  if (!bar) return;
+  const srvs = getSelectedServerObjects();
+  const n = srvs.length;
+  if (!n) {
+    setHidden(bar, true);
+    bar.innerHTML = '';
+    return;
+  }
+  const startable = srvs.filter(s => s.can_start && s.state !== 'UP');
+  const stoppable = srvs.filter(s => (s.can_start || s.via_ssh) && s.state === 'UP');
+  const enabledSrvs = srvs.filter(s => s.enabled);
+  const pausedSrvs = srvs.filter(s => !s.enabled);
+  const allFav = srvs.every(s => s.favorite === true);
+  const autoCapable = srvs.filter(s => s.can_start);
+  const allAuto = autoCapable.length > 0 && autoCapable.every(s => s.auto_restart === true);
+  const hint = n === 1 ? ' <span class="bulk-hint">&middot; Ctrl+clic pour ajouter</span>' : '';
+  bar.innerHTML = `
+    <div class="bulk-bar-top">
+      <span class="bulk-cnt">${ic('check')} <b>${esc(n)}</b> serveur${n > 1 ? 's' : ''}${hint}</span>
+      <div class="bulk-top-acts">
+        <button type="button" class="bulk-link" data-act="bulk-srv-all" title="S&eacute;lectionner tous les serveurs affich&eacute;s (Ctrl+A)">Tout</button>
+        <button type="button" class="bulk-x" data-act="bulk-srv-clear" aria-label="Effacer la s&eacute;lection de serveurs" title="Effacer la s&eacute;lection (&Eacute;chap)">&times;</button>
+      </div>
+    </div>
+    <div class="bulk-bar-acts">
+      ${startable.length ? `<button type="button" class="bulk-btn primary" data-act="bulk-srv-op" data-op="start" title="D&eacute;marrer ${esc(startable.length)} serveur(s)">${ic('play')}<span>D&eacute;marrer (${esc(startable.length)})</span></button>` : ''}
+      ${stoppable.length ? `<button type="button" class="bulk-btn danger" data-act="bulk-srv-op" data-op="stop" title="Arr&ecirc;ter ${esc(stoppable.length)} serveur(s)">${ic('stop')}<span>Arr&ecirc;ter (${esc(stoppable.length)})</span></button>` : ''}
+      <button type="button" class="bulk-btn" data-act="bulk-srv-op" data-op="refresh" title="Sonder les ${esc(n)} serveurs">${ic('refresh')}<span>Sonder</span></button>
+      ${enabledSrvs.length ? `<button type="button" class="bulk-btn" data-act="bulk-srv-op" data-op="pause" title="Mettre en pause (${esc(enabledSrvs.length)})">${ic('pause')}<span>Pause</span></button>` : ''}
+      ${pausedSrvs.length ? `<button type="button" class="bulk-btn" data-act="bulk-srv-op" data-op="resume" title="Reprendre la supervision (${esc(pausedSrvs.length)})">${ic('play')}<span>Reprendre</span></button>` : ''}
+      <button type="button" class="bulk-btn" data-act="bulk-srv-op" data-op="fav" title="${allFav ? 'Retirer des favoris' : '&Eacute;pingler en favoris'}">${ic('star')}<span>${allFav ? 'Retirer fav' : 'Favoris'}</span></button>
+      ${autoCapable.length ? `<button type="button" class="bulk-btn" data-act="bulk-srv-op" data-op="auto" title="${allAuto ? 'D&eacute;sactiver l&rsquo;autoboot' : 'Activer l&rsquo;autoboot'}">${ic('zap')}<span>Autoboot ${allAuto ? 'OFF' : 'ON'}</span></button>` : ''}
+      <button type="button" class="bulk-btn" data-act="bulk-srv-op" data-op="copy-mcp" title="Copier la config MCP combin&eacute;e (JSON)">${ic('copy')}<span>Config MCP</span></button>
+      <button type="button" class="bulk-btn" data-act="bulk-srv-op" data-op="hide" title="Masquer la s&eacute;lection (session)">${ic('eyeOff')}<span>Masquer</span></button>
+      <button type="button" class="bulk-btn danger" data-act="bulk-srv-op" data-op="remove" title="Supprimer les ${esc(n)} serveurs (avec confirmation)">${ic('trash')}<span>Supprimer</span></button>
+      <button type="button" class="bulk-btn" data-act="bulk-srv-menu" aria-label="Plus d&rsquo;options de groupe" title="Plus d&rsquo;options de groupe (copier infos, JSON, URLs&hellip;)">&hellip;</button>
+    </div>`;
+  setHidden(bar, false);
+}
+async function bulkSrvAction(op, idsOverride) {
+  const srvs = getSelectedServerObjects(idsOverride);
+  if (!srvs.length) return;
+  const n = srvs.length;
+  const touchSelected = srvs.some(s => s.id === selectedId);
+  if (op === 'copy-info') { await copyMultiServersInfo(srvs.map(s => s.id), false); return; }
+  if (op === 'copy-json') { await copyMultiServersInfo(srvs.map(s => s.id), true); return; }
+  if (op === 'copy-mcp') { copyMultiServersMcpConfig(srvs); return; }
+  if (op === 'copy-urls') {
+    const lines = srvs.map(s => (s.label || s.id) + ' : ' + (ctxUrl(s) || srvCmd(s) || s.id));
+    copyText(lines.join('\n'));
+    toast(n + ' endpoints copi\u00e9s', 'ok', 2000);
+    return;
+  }
+  if (op === 'copy-names') {
+    copyText(srvs.map(s => s.label || s.id).join('\n'));
+    toast(n + ' noms de serveurs copi\u00e9s', 'ok', 2000);
+    return;
+  }
+  if (op === 'refresh') {
+    for (const s of srvs) await postAction({action: 'refresh', id: s.id}, {quiet: true});
+    if (touchSelected) { detailCache = null; _detailEtag = null; _lastSelectedSrvSig = ''; }
+    await load();
+    toast(n + ' serveur' + (n > 1 ? 's' : '') + ' sond\u00e9' + (n > 1 ? 's' : ''), 'ok', 2000);
+    return;
+  }
+  if (op === 'start') {
+    const targets = srvs.filter(s => s.can_start && s.state !== 'UP');
+    if (!targets.length) return;
+    for (const s of targets) await postAction({action: 'start', id: s.id}, {quiet: true});
+    if (touchSelected) { detailCache = null; _detailEtag = null; _lastSelectedSrvSig = ''; }
+    await load();
+    toast(targets.length + ' serveur' + (targets.length > 1 ? 's' : '') + ' d\u00e9marr\u00e9' + (targets.length > 1 ? 's' : ''), 'ok', 2000);
+    return;
+  }
+  if (op === 'stop') {
+    const targets = srvs.filter(s => (s.can_start || s.via_ssh) && s.state === 'UP');
+    if (!targets.length) return;
+    for (const s of targets) await postAction({action: 'kill', id: s.id}, {quiet: true});
+    if (touchSelected) { detailCache = null; _detailEtag = null; _lastSelectedSrvSig = ''; }
+    await load();
+    toast(targets.length + ' serveur' + (targets.length > 1 ? 's' : '') + ' arr\u00eat\u00e9' + (targets.length > 1 ? 's' : ''), 'ok', 2000);
+    return;
+  }
+  if (op === 'pause') {
+    const targets = srvs.filter(s => s.enabled);
+    if (!targets.length) return;
+    for (const s of targets) await postAction({action: 'toggle', id: s.id}, {quiet: true});
+    if (touchSelected) { detailCache = null; _detailEtag = null; _lastSelectedSrvSig = ''; }
+    await load();
+    toast(targets.length + ' serveur' + (targets.length > 1 ? 's' : '') + ' mis en pause', 'ok', 2000);
+    return;
+  }
+  if (op === 'resume') {
+    const targets = srvs.filter(s => !s.enabled);
+    if (!targets.length) return;
+    for (const s of targets) await postAction({action: 'toggle', id: s.id}, {quiet: true});
+    if (touchSelected) { detailCache = null; _detailEtag = null; _lastSelectedSrvSig = ''; }
+    await load();
+    toast(targets.length + ' serveur' + (targets.length > 1 ? 's' : '') + ' repris', 'ok', 2000);
+    return;
+  }
+  if (op === 'fav') {
+    const enable = !srvs.every(s => s.favorite === true);
+    const targets = srvs.filter(s => Boolean(s.favorite) !== enable);
+    for (const s of targets) await postAction({action: 'set_favorite', id: s.id, enabled: enable}, {quiet: true});
+    if (touchSelected) { detailCache = null; _detailEtag = null; _lastSelectedSrvSig = ''; }
+    await load();
+    toast(enable ? (n + ' ajout\u00e9(s) aux favoris') : (n + ' retir\u00e9(s) des favoris'), 'ok', 2000);
+    return;
+  }
+  if (op === 'auto') {
+    const cap = srvs.filter(s => s.can_start);
+    if (!cap.length) return;
+    const enable = !cap.every(s => s.auto_restart === true);
+    const targets = cap.filter(s => Boolean(s.auto_restart) !== enable);
+    for (const s of targets) await postAction({action: 'set_auto_restart', id: s.id, enabled: enable}, {quiet: true});
+    if (touchSelected) { detailCache = null; _detailEtag = null; _lastSelectedSrvSig = ''; }
+    await load();
+    toast('Autoboot ' + (enable ? 'activ\u00e9' : 'd\u00e9sactiv\u00e9') + ' sur ' + cap.length + ' serveur(s)', 'ok', 2000);
+    return;
+  }
+  if (op === 'hide') {
+    srvs.forEach(s => {
+      hiddenServers.add(s.id);
+      selectedServers.delete(s.id);
+      if (selectedId === s.id) { selectedId = null; detailCache = null; _sigDetail = ''; _sigOverview = ''; }
+    });
+    render();
+    toast(n + ' serveur' + (n > 1 ? 's' : '') + ' masqu\u00e9' + (n > 1 ? 's' : '') + ' (reviennent \u00e0 la r\u00e9ouverture)', 'ok', 2500);
+    return;
+  }
+  if (op === 'remove') {
+    const preview = srvs.slice(0, 6).map(s => s.label || s.id).join(', ') + (n > 6 ? ' \u2026' : '');
+    const ok = await askConfirm({
+      title: 'Supprimer ' + n + ' serveur' + (n > 1 ? 's' : ''),
+      msg: 'Supprimer les ' + n + ' serveurs s\u00e9lectionn\u00e9s de la liste ?',
+      detail: preview,
+      okLabel: 'Supprimer (' + n + ')',
+      danger: true,
+    });
+    if (!ok) return;
+    for (const s of srvs) {
+      const body = s.origin === 'seed' ? {action: 'remove', id: s.id, durable: true} : {action: 'remove', id: s.id};
+      await postAction(body, {quiet: true});
+      selectedServers.delete(s.id);
+      if (selectedId === s.id) { selectedId = null; detailCache = null; _sigOverview = ''; _sigDetail = ''; _lastSelectedSrvSig = ''; }
+    }
+    await load();
+    toast(n + ' serveur' + (n > 1 ? 's' : '') + ' supprim\u00e9' + (n > 1 ? 's' : ''), 'ok', 2200);
+  }
+}
 function handleServerClick(id, ev) {
   if (!id) return;
   const ctrl = !!(ev && (ev.ctrlKey || ev.metaKey));
@@ -975,7 +1161,10 @@ function handleServerClick(id, ev) {
   }
   if (ctrl) {
     if (ev && ev.preventDefault) ev.preventDefault();
-    if (selectedServers.size === 0 && selectedId) selectedServers.add(selectedId);
+    try { const sel = window.getSelection && window.getSelection(); if (sel) sel.removeAllRanges(); } catch (e) {}
+    if (selectedServers.size === 0 && selectedId && selectedId !== id) {
+      if (visibleServerIds().includes(selectedId)) selectedServers.add(selectedId);
+    }
     if (selectedServers.has(id)) selectedServers.delete(id);
     else selectedServers.add(id);
     lastExpAnchorId = id;
@@ -983,7 +1172,6 @@ function handleServerClick(id, ev) {
     return;
   }
   selectedServers.clear();
-  selectedServers.add(id);
   lastExpAnchorId = id;
   select(id);
 }
@@ -991,6 +1179,132 @@ function visibleToolNames() {
   return [...document.querySelectorAll('#toolsRowsBox .tool[data-tool]')]
     .map(r => r.dataset.tool)
     .filter(Boolean);
+}
+function pruneSelectedTools() {
+  if (!selectedTools.size || !detailCache) return;
+  const known = new Set((detailCache.tools_list || []).map(t => t.name));
+  for (const nm of [...selectedTools]) {
+    if (!known.has(nm)) selectedTools.delete(nm);
+  }
+}
+function getSelectedToolObjects(namesOverride) {
+  if (!detailCache) return [];
+  const all = detailCache.tools_list || [];
+  const byName = new Map(all.map(t => [t.name, t]));
+  if (Array.isArray(namesOverride)) {
+    return namesOverride.map(nm => byName.get(nm) || {name: nm, desc: ''});
+  }
+  pruneSelectedTools();
+  const vis = visibleToolNames();
+  const ordered = vis.filter(x => selectedTools.has(x));
+  const rest = [...selectedTools].filter(x => !ordered.includes(x));
+  return [...ordered, ...rest].map(nm => byName.get(nm)).filter(Boolean);
+}
+function selectAllVisibleTools() {
+  const vis = visibleToolNames();
+  if (!vis.length) return;
+  vis.forEach(x => selectedTools.add(x));
+  lastToolAnchor = vis[vis.length - 1];
+  refreshToolsBox();
+}
+function clearSelectedTools() {
+  if (!selectedTools.size) return;
+  selectedTools.clear();
+  refreshToolsBox();
+}
+function renderToolsBulkBar() {
+  const bar = document.getElementById('toolsBulkBar');
+  if (!bar) return;
+  if (!detailCache) {
+    setHidden(bar, true);
+    bar.innerHTML = '';
+    return;
+  }
+  const tools = getSelectedToolObjects();
+  const n = tools.length;
+  if (!n) {
+    setHidden(bar, true);
+    bar.innerHTML = '';
+    return;
+  }
+  const offTools = tools.filter(t => t.disabled);
+  const onTools = tools.filter(t => !t.disabled);
+  const allExpanded = tools.every(t => expandedTools.has(detailCache.id + '::' + t.name));
+  const hint = n === 1 ? ' <span class="bulk-hint">&middot; Ctrl+clic ou Shift+clic pour en ajouter</span>' : '';
+  bar.innerHTML = `
+    <div class="bulk-bar-top">
+      <span class="bulk-cnt">${ic('check')} <b>${esc(n)}</b> outil${n > 1 ? 's' : ''} s&eacute;lectionn&eacute;${n > 1 ? 's' : ''}${hint}</span>
+      <div class="bulk-top-acts">
+        <button type="button" class="bulk-link" data-act="bulk-tool-all" title="S&eacute;lectionner tous les outils affich&eacute;s (Ctrl+A)">Tout</button>
+        <button type="button" class="bulk-x" data-act="bulk-tool-clear" aria-label="Effacer la s&eacute;lection d&rsquo;outils" title="Effacer la s&eacute;lection (&Eacute;chap)">&times;</button>
+      </div>
+    </div>
+    <div class="bulk-bar-acts">
+      ${offTools.length ? `<button type="button" class="bulk-btn primary" data-act="bulk-tool-op" data-op="on">${ic('check')}<span>Activer (${esc(offTools.length)})</span></button>` : ''}
+      ${onTools.length ? `<button type="button" class="bulk-btn danger" data-act="bulk-tool-op" data-op="off">${ic('x')}<span>D&eacute;sactiver (${esc(onTools.length)})</span></button>` : ''}
+      <button type="button" class="bulk-btn" data-act="bulk-tool-op" data-op="${allExpanded ? 'collapse' : 'expand'}">${ic('search')}<span>${allExpanded ? 'Replier' : 'D&eacute;plier'}</span></button>
+      <button type="button" class="bulk-btn" data-act="bulk-tool-op" data-op="copy-info">${ic('copy')}<span>Copier infos</span></button>
+      <button type="button" class="bulk-btn" data-act="bulk-tool-op" data-op="copy-schema">${ic('copy')}<span>Sch&eacute;mas JSON</span></button>
+      <button type="button" class="bulk-btn" data-act="bulk-tool-op" data-op="copy-names">${ic('tag')}<span>Noms</span></button>
+      <button type="button" class="bulk-btn" data-act="bulk-tool-menu" aria-label="Plus d&rsquo;options de groupe" title="Plus d&rsquo;options de groupe">&hellip;</button>
+    </div>`;
+  setHidden(bar, false);
+}
+async function bulkToolAction(op, idOverride, namesOverride) {
+  const id = idOverride || (detailCache && detailCache.id) || selectedId;
+  if (!id) return;
+  const s = (state && state.servers ? state.servers : []).find(x => x.id === id) || {};
+  const d = (detailCache && detailCache.id === id) ? detailCache : {};
+  const srvLabel = d.label || s.label || id;
+  const tools = getSelectedToolObjects(namesOverride);
+  if (!tools.length) return;
+  const n = tools.length;
+  if (op === 'copy-info') {
+    const txt = tools.map(t => formatToolInfoText(srvLabel, t)).join('\n\n' + '-'.repeat(40) + '\n\n');
+    copyText(txt);
+    toast('Infos de ' + n + ' outil(s) copi\u00e9es', 'ok', 2200);
+    return;
+  }
+  if (op === 'copy-schema') {
+    const arr = tools.map(t => ({
+      name: t.name,
+      description: t.desc || '',
+      disabled: !!t.disabled,
+      inputSchema: t.input_schema || {type: 'object', properties: {}},
+    }));
+    copyText(JSON.stringify(arr, null, 2));
+    toast('Sch\u00e9mas JSON de ' + n + ' outil(s) copi\u00e9s', 'ok', 2200);
+    return;
+  }
+  if (op === 'copy-names') {
+    copyText(tools.map(t => t.name).join('\n'));
+    toast(n + ' noms d\u2019outils copi\u00e9s', 'ok', 2000);
+    return;
+  }
+  if (op === 'copy-refs') {
+    copyText(tools.map(t => srvLabel + '.' + t.name).join('\n'));
+    toast(n + ' r\u00e9f\u00e9rences copi\u00e9es', 'ok', 2000);
+    return;
+  }
+  if (op === 'expand') {
+    tools.forEach(t => expandedTools.add(id + '::' + t.name));
+    refreshToolsBox();
+    return;
+  }
+  if (op === 'collapse') {
+    tools.forEach(t => expandedTools.delete(id + '::' + t.name));
+    refreshToolsBox();
+    return;
+  }
+  if (op === 'on' || op === 'off') {
+    const targets = op === 'on' ? tools.filter(t => t.disabled) : tools.filter(t => !t.disabled);
+    if (!targets.length) return;
+    for (const t of targets) await postAction({action: 'toggle_tool', id, tool: t.name}, {quiet: true});
+    const r = await fetch('/api/detail?id=' + encodeURIComponent(id));
+    if (r.ok) { detailCache = await r.json(); renderDetail(); }
+    await load();
+    toast(targets.length + ' outil(s) ' + (op === 'on' ? 'r\u00e9activ\u00e9(s)' : 'd\u00e9sactiv\u00e9(s)'), 'ok', 2000);
+  }
 }
 function handleToolClick(el, ev) {
   if (!detailCache || !el || !el.dataset.tool) return;
@@ -1016,6 +1330,7 @@ function handleToolClick(el, ev) {
   }
   if (ctrl) {
     if (ev && ev.preventDefault) ev.preventDefault();
+    try { const sel = window.getSelection && window.getSelection(); if (sel) sel.removeAllRanges(); } catch (e) {}
     if (selectedTools.has(name)) selectedTools.delete(name);
     else selectedTools.add(name);
     lastToolAnchor = name;
@@ -1088,6 +1403,7 @@ function renderServers() {
   const qRaw = (document.getElementById('srvFilter')?.value || '').trim();
   const q = qRaw.toLowerCase();
   if (clr) setHidden(clr, !qRaw);
+  pruneSelectedServers();
   const keys = groupKeys();
   const sig = JSON.stringify([
     state.servers,
@@ -1129,6 +1445,7 @@ function renderServers() {
     setHidden(label, true); groupsBox.innerHTML = '';
     const hb = document.getElementById('hiddenBar');
     if (hb) setHidden(hb, true);
+    renderExpBulkBar();
     return;
   }
   const shown = state.servers.filter(s => !hiddenServers.has(s.id));
@@ -1197,6 +1514,7 @@ function renderServers() {
       try { target.focus({preventScroll: true}); } catch (e) {}
     }
   }
+  renderExpBulkBar();
 }
 
 // Chip du langage MCP (inféré : commande stdio ou en-têtes HTTP) — monogramme coloré façon logo
@@ -2133,6 +2451,7 @@ function renderToolsRowsHtml(s) {
     const expKey = s.id + '::' + t.name;
     const isExp = expandedTools.has(expKey);
     const isToolSel = selectedTools.has(t.name);
+    const toolChk = isToolSel ? `<span class="tool-chk" aria-hidden="true">${ic('check')}</span>` : '';
     const panelId = 'toolPanel_' + idx;
     const propsCount = t.input_schema && t.input_schema.properties && typeof t.input_schema.properties === 'object'
       ? Object.keys(t.input_schema.properties).length : 0;
@@ -2140,7 +2459,7 @@ function renderToolsRowsHtml(s) {
     return `<div class="tool ${t.disabled?'off':''} ${isExp?'expanded':''} ${isToolSel?'multi-sel':''}" data-tool="${esc(t.name)}"${isToolSel ? ' aria-selected="true"' : ''}>
        <div class="tool-head">
          <button type="button" class="tool-head-btn" data-act="tool-expand" data-tool="${esc(t.name)}" aria-expanded="${isExp ? 'true' : 'false'}" aria-controls="${esc(panelId)}" title="Cliquer pour inspecter · Ctrl+clic ou Shift+clic pour multi-s\u00e9lectionner">
-           <span class="tool-chev" aria-hidden="true">&#9656;</span>
+           ${toolChk}<span class="tool-chev" aria-hidden="true">&#9656;</span>
            <code>${esc(t.name)}</code>
            <span class="desc">${t.desc ? mdInline(t.desc) : '&mdash;'}</span>
            ${pBadge}
@@ -2176,6 +2495,7 @@ function refreshToolsBox() {
   box.innerHTML = renderToolsRowsHtml(detailCache);
   restoreFocusIn(box, spec);
   updateToolSearchMeta();
+  renderToolsBulkBar();
 }
 function setToolSearch(el) {
   toolSearchQuery = el ? el.value : '';
@@ -2385,6 +2705,7 @@ function renderDetail() {
       <button type="button" data-act="tools-all-on" data-id="${esc(s.id)}" ${nOn === nTot ? 'disabled' : ''}>${ic('check')} Tout activer</button>
       <button type="button" data-act="tools-all-off" data-id="${esc(s.id)}" ${nOn === 0 ? 'disabled' : ''}>${ic('x')} Tout couper</button>
     </div>` : ''}
+    <div id="toolsBulkBar" class="bulk-bar tools-bulk-bar" hidden role="region" aria-label="Actions de groupe sur les outils s&eacute;lectionn&eacute;s"></div>
     <div id="toolsRowsBox">${renderToolsRowsHtml(s)}</div>`;
   const endpointLabel = s.transport === 'http'
     ? ((s.transport_info.host || '127.0.0.1') + ':' + s.transport_info.port + (s.transport_info.path || '/mcp'))
@@ -2462,6 +2783,7 @@ function renderDetail() {
     }
   }
   updateToolSearchMeta();
+  renderToolsBulkBar();
   restoreFocusIn(contentEl, focusSpec);
 }
 
@@ -2474,6 +2796,8 @@ function goHome() {
     }
   }
   selectedId = null;
+  selectedServers.clear();
+  selectedTools.clear();
   activeView = 'dashboard';
   explorerTab = 'mcp';
   const bMcp = document.getElementById('explTabMcp');
@@ -2786,62 +3110,72 @@ function copyMultiServersMcpConfig(srvs) {
   copyText(JSON.stringify({mcpServers}, null, 2));
   toast('Config MCP combin\u00e9e (' + srvs.length + ' serveurs) copi\u00e9e', 'ok', 2200);
 }
-function multiRowCtx(ev, ids) {
-  const allSrvs = (state && state.servers ? state.servers : []);
-  const srvs = ids.map(id => allSrvs.find(x => x.id === id)).filter(Boolean);
-  if (srvs.length <= 1) {
-    rowCtxSingle(ev, srvs[0] ? srvs[0].id : ids[0]);
+function openBulkSrvMenu(el, ev) {
+  const srvs = getSelectedServerObjects();
+  if (!srvs.length) return;
+  if (ev && ev.stopPropagation) ev.stopPropagation();
+  const r = el && el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+  const fakeEv = r ? {clientX: r.left, clientY: r.bottom + 4, target: el} : (ev || {});
+  multiRowCtx(fakeEv, srvs.map(s => s.id), true);
+}
+function openBulkToolMenu(el, ev) {
+  if (!detailCache) return;
+  const tools = getSelectedToolObjects();
+  if (!tools.length) return;
+  if (ev && ev.stopPropagation) ev.stopPropagation();
+  const r = el && el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+  const fakeEv = r ? {clientX: r.left, clientY: r.bottom + 4, target: el} : (ev || {});
+  multiToolCtx(fakeEv, detailCache.id, tools.map(t => t.name));
+}
+function multiRowCtx(ev, ids, allowSingle) {
+  const srvs = getSelectedServerObjects(ids);
+  if (!srvs.length) return;
+  if (!allowSingle && srvs.length <= 1) {
+    rowCtxSingle(ev, srvs[0].id);
     return;
   }
+  const idList = srvs.map(s => s.id);
   const n = srvs.length;
   const items = [];
   const add = (lbl, fn, dis) => items.push({lbl: lbl, fn: fn, dis: !!dis});
-  items.push({lbl: ic('activity') + ' ' + esc(n) + ' serveurs s\u00e9lectionn\u00e9s', fn: () => {}, dis: true, hdr: true});
+  items.push({lbl: ic('activity') + ' ' + esc(n) + ' serveur' + (n > 1 ? 's' : '') + ' s\u00e9lectionn\u00e9' + (n > 1 ? 's' : ''), fn: () => {}, dis: true, hdr: true});
   add('—', null, false);
-  add(ic('copy') + ' Copier toutes les infos (' + n + ' serveurs)', () => copyMultiServersInfo(srvs.map(s => s.id), false));
-  add(ic('copy') + ' Copier toutes les infos en JSON (' + n + ')', () => copyMultiServersInfo(srvs.map(s => s.id), true));
-  add(ic('terminal') + ' Copier la config MCP combin\u00e9e (JSON)', () => copyMultiServersMcpConfig(srvs));
-  add(ic('link') + ' Copier les URLs / commandes', () => {
-    const lines = srvs.map(s => (s.label || s.id) + ' : ' + (ctxUrl(s) || srvCmd(s) || s.id));
-    copyText(lines.join('\n'));
-    toast(n + ' endpoints copi\u00e9s', 'ok', 2000);
-  });
+  add(ic('copy') + ' Copier toutes les infos (' + n + ')', () => bulkSrvAction('copy-info', idList));
+  add(ic('copy') + ' Copier toutes les infos en JSON (' + n + ')', () => bulkSrvAction('copy-json', idList));
+  add(ic('terminal') + ' Copier la config MCP combin\u00e9e (JSON)', () => bulkSrvAction('copy-mcp', idList));
+  add(ic('link') + ' Copier les URLs / commandes', () => bulkSrvAction('copy-urls', idList));
+  add(ic('tag') + ' Copier les noms (' + n + ')', () => bulkSrvAction('copy-names', idList));
   add('—', null, false);
-  add(ic('refresh') + ' Sonder les ' + n + ' serveurs', async () => {
-    for (const s of srvs) await postAction({action: 'refresh', id: s.id}, {quiet: true});
-    await load();
-    toast(n + ' serveurs sond\u00e9s', 'ok', 2000);
-  });
+  add(ic('refresh') + ' Sonder les ' + n + ' serveur' + (n > 1 ? 's' : ''), () => bulkSrvAction('refresh', idList));
   const startable = srvs.filter(s => s.can_start && s.state !== 'UP');
   if (startable.length) {
-    add(ic('play') + ' D\u00e9marrer (' + startable.length + ')', async () => {
-      for (const s of startable) await postAction({action: 'start', id: s.id}, {quiet: true});
-      await load();
-    });
+    add(ic('play') + ' D\u00e9marrer (' + startable.length + ')', () => bulkSrvAction('start', idList));
+  }
+  const stoppable = srvs.filter(s => (s.can_start || s.via_ssh) && s.state === 'UP');
+  if (stoppable.length) {
+    add(ic('stop') + ' Arr\u00eater (' + stoppable.length + ')', () => bulkSrvAction('stop', idList));
   }
   const enabledSrvs = srvs.filter(s => s.enabled);
   if (enabledSrvs.length) {
-    add(ic('pause') + ' Mettre en pause (' + enabledSrvs.length + ')', async () => {
-      for (const s of enabledSrvs) await postAction({action: 'toggle', id: s.id}, {quiet: true});
-      await load();
-    });
+    add(ic('pause') + ' Mettre en pause (' + enabledSrvs.length + ')', () => bulkSrvAction('pause', idList));
   }
   const pausedSrvs = srvs.filter(s => !s.enabled);
   if (pausedSrvs.length) {
-    add(ic('play') + ' Reprendre la supervision (' + pausedSrvs.length + ')', async () => {
-      for (const s of pausedSrvs) await postAction({action: 'toggle', id: s.id}, {quiet: true});
-      await load();
-    });
+    add(ic('play') + ' Reprendre la supervision (' + pausedSrvs.length + ')', () => bulkSrvAction('resume', idList));
+  }
+  const allFav = srvs.every(s => s.favorite === true);
+  add(ic('star') + (allFav ? ' Retirer des favoris (' + n + ')' : ' \u00c9pingler en favoris (' + n + ')'), () => bulkSrvAction('fav', idList));
+  const autoCapable = srvs.filter(s => s.can_start);
+  if (autoCapable.length) {
+    const allAuto = autoCapable.every(s => s.auto_restart === true);
+    add(ic('zap') + (allAuto ? ' D\u00e9sactiver l\u2019autoboot (' + autoCapable.length + ')' : ' Activer l\u2019autoboot (' + autoCapable.length + ')'), () => bulkSrvAction('auto', idList));
   }
   add('—', null, false);
-  add(ic('check') + ' Tout s\u00e9lectionner (affich\u00e9s)', () => {
-    visibleServerIds().forEach(x => selectedServers.add(x));
-    renderServers();
-  });
-  add(ic('x') + ' Effacer la s\u00e9lection', () => {
-    selectedServers.clear();
-    renderServers();
-  });
+  add(ic('eyeOff') + ' Masquer la s\u00e9lection (' + n + ')', () => bulkSrvAction('hide', idList));
+  add(ic('trash') + ' Supprimer la s\u00e9lection (' + n + ')', () => bulkSrvAction('remove', idList));
+  add('—', null, false);
+  add(ic('check') + ' Tout s\u00e9lectionner (affich\u00e9s)', () => selectAllVisibleServers());
+  add(ic('x') + ' Effacer la s\u00e9lection', () => clearSelectedServers());
   showMenu(ev, items);
 }
 function rowCtx(ev, id) {
@@ -2963,69 +3297,32 @@ function formatToolInfoText(srvLabel, t) {
   return lines.join('\n');
 }
 function multiToolCtx(ev, id, names) {
-  const s = (state && state.servers ? state.servers : []).find(x => x.id === id) || {};
-  const d = (detailCache && detailCache.id === id) ? detailCache : {};
-  const srvLabel = d.label || s.label || id;
-  const all = d.tools_list || [];
-  const tools = names.map(nm => all.find(x => x.name === nm) || {name: nm, desc: ''});
+  const tools = getSelectedToolObjects(names);
   const n = tools.length;
+  const nameList = tools.map(t => t.name);
   const items = [];
   const add = (lbl, fn, dis) => items.push({lbl: lbl, fn: fn, dis: !!dis});
-  items.push({lbl: ic('terminal') + ' ' + esc(n) + ' outils s\u00e9lectionn\u00e9s', fn: () => {}, dis: true, hdr: true});
+  items.push({lbl: ic('terminal') + ' ' + esc(n) + ' outil' + (n > 1 ? 's' : '') + ' s\u00e9lectionn\u00e9' + (n > 1 ? 's' : ''), fn: () => {}, dis: true, hdr: true});
   add('—', null, false);
-  add(ic('copy') + ' Copier toutes les infos (' + n + ' outils)', () => {
-    const txt = tools.map(t => formatToolInfoText(srvLabel, t)).join('\n\n' + '-'.repeat(40) + '\n\n');
-    copyText(txt);
-    toast('Infos de ' + n + ' outils copi\u00e9es', 'ok', 2200);
-  });
-  add(ic('copy') + ' Copier les sch\u00e9mas JSON (' + n + ' outils)', () => {
-    const arr = tools.map(t => ({
-      name: t.name,
-      description: t.desc || '',
-      disabled: !!t.disabled,
-      inputSchema: t.input_schema || {type: 'object', properties: {}},
-    }));
-    copyText(JSON.stringify(arr, null, 2));
-    toast('Sch\u00e9mas JSON de ' + n + ' outils copi\u00e9s', 'ok', 2200);
-  });
-  add(ic('copy') + ' Copier les noms (' + n + ')', () => {
-    copyText(tools.map(t => t.name).join('\n'));
-    toast(n + ' noms d\u2019outils copi\u00e9s', 'ok', 2000);
-  });
-  add(ic('copy') + ' Copier \u00ab serveur.outil \u00bb (' + n + ')', () => {
-    copyText(tools.map(t => srvLabel + '.' + t.name).join('\n'));
-    toast(n + ' r\u00e9f\u00e9rences copi\u00e9es', 'ok', 2000);
-  });
+  add(ic('copy') + ' Copier toutes les infos (' + n + ')', () => bulkToolAction('copy-info', id, nameList));
+  add(ic('copy') + ' Copier les sch\u00e9mas JSON (' + n + ')', () => bulkToolAction('copy-schema', id, nameList));
+  add(ic('tag') + ' Copier les noms (' + n + ')', () => bulkToolAction('copy-names', id, nameList));
+  add(ic('copy') + ' Copier \u00ab serveur.outil \u00bb (' + n + ')', () => bulkToolAction('copy-refs', id, nameList));
   add('—', null, false);
+  const allExpanded = tools.every(t => expandedTools.has(id + '::' + t.name));
+  add(ic('search') + (allExpanded ? ' Replier la s\u00e9lection (' + n + ')' : ' D\u00e9plier la s\u00e9lection (' + n + ')'),
+    () => bulkToolAction(allExpanded ? 'collapse' : 'expand', id, nameList));
   const offTools = tools.filter(t => t.disabled);
   if (offTools.length) {
-    add(ic('check') + ' R\u00e9activer la s\u00e9lection (' + offTools.length + ')', async () => {
-      for (const t of offTools) await postAction({action: 'toggle_tool', id, tool: t.name}, {quiet: true});
-      const r = await fetch('/api/detail?id=' + encodeURIComponent(id));
-      if (r.ok) { detailCache = await r.json(); renderDetail(); }
-      await load();
-      toast(offTools.length + ' outil(s) r\u00e9activ\u00e9(s)', 'ok', 2000);
-    });
+    add(ic('check') + ' R\u00e9activer la s\u00e9lection (' + offTools.length + ')', () => bulkToolAction('on', id, nameList));
   }
   const onTools = tools.filter(t => !t.disabled);
   if (onTools.length) {
-    add(ic('x') + ' D\u00e9sactiver la s\u00e9lection (' + onTools.length + ')', async () => {
-      for (const t of onTools) await postAction({action: 'toggle_tool', id, tool: t.name}, {quiet: true});
-      const r = await fetch('/api/detail?id=' + encodeURIComponent(id));
-      if (r.ok) { detailCache = await r.json(); renderDetail(); }
-      await load();
-      toast(onTools.length + ' outil(s) d\u00e9sactiv\u00e9(s)', 'ok', 2000);
-    });
+    add(ic('x') + ' D\u00e9sactiver la s\u00e9lection (' + onTools.length + ')', () => bulkToolAction('off', id, nameList));
   }
   add('—', null, false);
-  add(ic('check') + ' Tout s\u00e9lectionner (affich\u00e9s)', () => {
-    visibleToolNames().forEach(x => selectedTools.add(x));
-    refreshToolsBox();
-  });
-  add(ic('x') + ' Effacer la s\u00e9lection', () => {
-    selectedTools.clear();
-    refreshToolsBox();
-  });
+  add(ic('check') + ' Tout s\u00e9lectionner (affich\u00e9s)', () => selectAllVisibleTools());
+  add(ic('x') + ' Effacer la s\u00e9lection', () => clearSelectedTools());
   showMenu(ev, items);
 }
 function toolCtx(ev, id, name) {
@@ -3280,15 +3577,15 @@ document.addEventListener('keydown', (e) => {
     }
     if ((e.key === 'Enter' || e.key === ' ') && el === row) {
       e.preventDefault();
-      select(row.dataset.id);
+      handleServerClick(row.dataset.id, e);
       return;
     }
   }
   if (e.key === 'Escape') {
     if (document.querySelector('dialog[open]')) return;
-    if (selectedServers.size > 1 || selectedTools.size > 0) {
-      if (selectedServers.size > 1) { selectedServers.clear(); renderServers(); }
-      if (selectedTools.size > 0) { selectedTools.clear(); refreshToolsBox(); }
+    if (selectedServers.size > 0 || selectedTools.size > 0) {
+      if (selectedServers.size > 0) clearSelectedServers();
+      if (selectedTools.size > 0) clearSelectedTools();
       return;
     }
     const f = document.getElementById('srvFilter');
@@ -3300,6 +3597,22 @@ document.addEventListener('keydown', (e) => {
   }
   const typing = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'
     || el.tagName === 'SELECT' || el.isContentEditable);
+  if (!typing && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
+    if (!document.querySelector('dialog[open]')) {
+      const inExpl = el && el.closest && el.closest('#explorer');
+      const inTools = el && el.closest && (el.closest('#toolsRowsBox') || el.closest('.tools-bar') || el.closest('#toolsBulkBar'));
+      if (inExpl && visibleServerIds().length) {
+        e.preventDefault();
+        selectAllVisibleServers();
+        return;
+      }
+      if (inTools && visibleToolNames().length) {
+        e.preventDefault();
+        selectAllVisibleTools();
+        return;
+      }
+    }
+  }
   if (!typing && (e.key === '/' || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k'))) {
     const openDlg = document.querySelector('dialog[open]');
     const storeDlg = document.getElementById('storeDlg');
@@ -5830,6 +6143,10 @@ const ACT = {
   'group-toggle': el => toggleGroup(el.dataset.key),
   'add-server': () => toggleAdd(),
   'select': (el, ev) => handleServerClick(el.dataset.id, ev),
+  'bulk-srv-all': () => selectAllVisibleServers(),
+  'bulk-srv-clear': () => clearSelectedServers(),
+  'bulk-srv-op': el => bulkSrvAction(el.dataset.op),
+  'bulk-srv-menu': (el, ev) => openBulkSrvMenu(el, ev),
   'row-act': el => act(el.dataset.op, el.dataset.id),
   'set-auto': el => setAuto(el.dataset.id, el.dataset.on === '1'),
   'set-fav': el => setFavorite(el.dataset.id, el.dataset.on === '1'),
@@ -5849,6 +6166,10 @@ const ACT = {
   'tools-all-on': el => setAllTools(el.dataset.id, true),
   'tools-all-off': el => setAllTools(el.dataset.id, false),
   'tool-expand': (el, ev) => handleToolClick(el, ev),
+  'bulk-tool-all': () => selectAllVisibleTools(),
+  'bulk-tool-clear': () => clearSelectedTools(),
+  'bulk-tool-op': el => bulkToolAction(el.dataset.op),
+  'bulk-tool-menu': (el, ev) => openBulkToolMenu(el, ev),
   'tool-toggle': el => toggleTool(el.dataset.id, el.dataset.tool),
   'copy-tool-schema': el => copyToolSchema(el.dataset.tool),
   'copy-tool-rpc': el => copyToolRpc(el.dataset.tool),

@@ -124,6 +124,7 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     </div>
     <button type="button" id="hiddenBar" hidden data-act="show-hidden"
       title="Les serveurs masqu&eacute;s ne le restent que pour cette session : ils reviennent &agrave; la r&eacute;ouverture de l'application (ou d'un rechargement de la page)"></button>
+    <div id="expBulkBar" class="bulk-bar" hidden role="region" aria-label="Actions de groupe sur les serveurs s&eacute;lectionn&eacute;s"></div>
     <div id="localSec">
       <div class="grphead" id="localHead"><button type="button" class="grp-toggle" data-act="group-toggle" data-key="local" aria-expanded="true" aria-controls="srvList" title="Serveurs MCP locaux &agrave; cette machine (loopback) — cliquer pour replier/d&eacute;plier"><span class="gchev" aria-hidden="true">&#9662;</span><span class="gname">Serveurs locaux</span><span class="gcount" id="localCount"></span></button></div>
       <div class="grpbody" id="srvList" role="list" aria-label="Serveurs locaux"></div>
@@ -2268,5 +2269,57 @@ mod tests {
                 && SWARM_JS.contains("swarmLogoUrl(name || '', kind || 'hive', agentCls)"),
             "swarm.js doit propager agentCls dans swarmIconSvg()"
         );
+    }
+
+    #[test]
+    fn multi_selection_serveurs_et_outils_csp_stricte() {
+        assert!(
+            INDEX_HTML.contains(r#"id="expBulkBar""#),
+            "INDEX_HTML doit contenir le conteneur #expBulkBar dans l'explorateur"
+        );
+        for needle in [
+            "id=\"toolsBulkBar\"",
+            "renderExpBulkBar",
+            "renderToolsBulkBar",
+            "bulkSrvAction",
+            "bulkToolAction",
+            "selectAllVisibleServers",
+            "clearSelectedServers",
+            "selectAllVisibleTools",
+            "clearSelectedTools",
+            "openBulkSrvMenu",
+            "openBulkToolMenu",
+            "data-act=\"bulk-srv-op\"",
+            "data-act=\"bulk-tool-op\"",
+        ] {
+            assert!(APP_JS.contains(needle), "APP_JS doit contenir `{needle}`");
+        }
+        for fname in [
+            "handleServerClick",
+            "handleToolClick",
+            "renderExpBulkBar",
+            "renderToolsBulkBar",
+            "bulkSrvAction",
+            "bulkToolAction",
+        ] {
+            let body = fn_body(APP_JS, fname);
+            assert!(
+                !body.contains("style=") && !body.contains(".style."),
+                "{fname}() ne doit contenir aucune mutation de style en ligne (CSP stricte)"
+            );
+        }
+        for cls in [
+            ".bulk-bar",
+            ".tools-bulk-bar",
+            ".bulk-bar-top",
+            ".bulk-bar-acts",
+            ".bulk-btn",
+            ".srow.multi-sel",
+            ".srow-chk",
+            ".tool.multi-sel",
+            ".tool-chk",
+        ] {
+            assert!(APP_CSS.contains(cls), "APP_CSS doit définir `{cls}`");
+        }
     }
 }
