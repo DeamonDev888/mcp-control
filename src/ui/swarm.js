@@ -41,8 +41,8 @@ let swarmParallelDraft = [
   {runner: 'claude', agentName: '', prompt: ''},
 ];
 
-function swarmIconSvg(cls, name, kind) {
-  const src = swarmLogoUrl(name || '', kind || 'hive');
+function swarmIconSvg(cls, name, kind, agentCls) {
+  const src = swarmLogoUrl(name || '', kind || 'hive', agentCls);
   return `<img class="${cls || 'ic-hornet'} swarm-img" src="${esc(src)}" alt="" aria-hidden="true">`;
 }
 
@@ -118,6 +118,21 @@ async function swarmRefresh(showToast) {
     const j = await postAction({action: 'swarm_overview'}, {quiet: !showToast});
     if (j && j.ok) {
       swarmData = j;
+      if (state && Array.isArray(state.servers) && Array.isArray(j.residents)) {
+        let clsChanged = false;
+        for (const r of j.residents) {
+          const srv = state.servers.find(s => s.id === r.id);
+          const nextCls = r.swarm_class || (r.status && r.status.class) || null;
+          if (srv && (srv.swarm_class || null) !== nextCls) {
+            srv.swarm_class = nextCls;
+            clsChanged = true;
+          }
+        }
+        if (clsChanged) {
+          _sigServers = '';
+          renderServers();
+        }
+      }
       if (!swarmSelectedInst && j.instances && j.instances.length) {
         const upInst = j.instances.find(i => i.state === 'UP') || j.instances[0];
         swarmSelectedInst = upInst.id;
@@ -419,9 +434,10 @@ function renderSwarmHiveTab(insts, ress, agents, jobs) {
         const st = swarmResidentLive[r.id] || r.status || {};
         const busy = st.state === 'busy';
         const agName = r.agent || r.label;
+        const agCls = st.class || r.swarm_class || '';
         return `<div class="sw-node is-res ${busy ? 'is-busy' : ''}">
           <div class="sw-node-top">
-            <div class="sw-node-l"><span class="dot ${esc(r.state)}"></span>${swarmIconSvg('ic-hornet', agName, 'resident')}<span>${esc(agName)}</span></div>
+            <div class="sw-node-l"><span class="dot ${esc(r.state)}"></span>${swarmIconSvg('ic-hornet', agName, 'resident', agCls)}<span>${esc(agName)}</span></div>
             <span class="tag ${busy ? 'sw-busy' : 'sw-idle'}">${esc((st.state || (r.state === 'UP' ? 'idle' : 'off')).toUpperCase())}</span>
           </div>
           <div class="sw-node-meta">
@@ -571,9 +587,10 @@ function renderSwarmOverviewTab(insts, ress, anns) {
       const qLen = st.queueLength || 0;
       const turns = st.turnsDone || 0;
       const needsPair = r.locked && !r.paired;
+      const rCls = st.class || r.swarm_class || '';
       html += `<div class="sw-card is-resident">
         <div class="sw-card-head">
-          <div class="sw-card-title"><span class="dot ${esc(r.state)}"></span>${swarmIconSvg('ic-hornet', r.agent || r.label, 'resident')}<span class="nm">${esc(r.agent || r.label)}</span></div>
+          <div class="sw-card-title"><span class="dot ${esc(r.state)}"></span>${swarmIconSvg('ic-hornet', r.agent || r.label, 'resident', rCls)}<span class="nm">${esc(r.agent || r.label)}</span></div>
           <span class="tag ${rState === 'busy' ? 'sw-busy' : 'sw-idle'}">${esc(rState.toUpperCase())}</span>
         </div>
         <div class="sw-card-meta">
@@ -649,9 +666,10 @@ function renderSwarmAgentsTab(insts, agents) {
       const consoleTgt = matchedRes
         ? 'res:' + matchedRes.id
         : 'inst:' + a._instanceId + ':' + a.name;
+      const aCls = a.class || (matchedRes && (matchedRes.swarm_class || (matchedRes.status && matchedRes.status.class))) || '';
       cardsHtml += `<div class="sw-card ${isRes ? 'is-resident' : ''}">
         <div class="sw-card-head">
-          <div class="sw-card-title">${swarmIconSvg('ic-hornet', a.name, 'resident')}<span class="nm">${esc(a.name)}</span></div>
+          <div class="sw-card-title">${swarmIconSvg('ic-hornet', a.name, 'resident', aCls)}<span class="nm">${esc(a.name)}</span></div>
           ${isRes ? '<span class="tag swarm-res">R&Eacute;SIDENT ON</span>' : '<span class="d-meta-pill">inactif</span>'}
         </div>
         <div class="sw-card-meta">
@@ -977,10 +995,11 @@ function renderSwarmDetailChat(s) {
     </div>`;
   }
 
+  const chatCls = st.class || s.swarm_class || (resEntry && resEntry.swarm_class) || '';
   return `<div class="sw-detail-pane">
     <div class="sw-console-box">
       <div class="sw-sec-head">
-        <h2>${swarmIconSvg('ic-hornet', s.swarm_agent || s.label, s.swarm_kind)} Conversation &mdash; ${esc(s.swarm_agent || s.label)}</h2>
+        <h2>${swarmIconSvg('ic-hornet', s.swarm_agent || s.label, s.swarm_kind, chatCls)} Conversation &mdash; ${esc(s.swarm_agent || s.label)}</h2>
         <button type="button" data-act="swarm-open-console" data-target="${esc(target)}" data-inst="${esc(s.id)}">Ouvrir l'onglet Swarm complet</button>
       </div>
       ${barHtml}
@@ -1017,10 +1036,14 @@ function renderSwarmDetailCfg(s) {
     `<label class="sw-mcp-chip"><input type="checkbox" class="sw-mcp-cb" value="${esc(t.label)}"> ${esc(t.label)}</label>`
   ).join('');
 
+  const cfgAg = swarmCfgAgent
+    ? agents.find(a => (a.name || '').toLowerCase() === swarmCfgAgent.toLowerCase())
+    : null;
+  const cfgCls = (cfgAg && cfgAg.class) || s.swarm_class || '';
   return `<div class="sw-detail-pane">
     <div class="sw-console-box">
       <div class="sw-sec-head">
-        <h2>${swarmIconSvg('ic-hornet', swarmCfgAgent || s.swarm_agent || s.label, s.swarm_kind)} Configuration &mdash; ${esc(swarmCfgAgent || s.swarm_agent || s.label)}</h2>
+        <h2>${swarmIconSvg('ic-hornet', swarmCfgAgent || s.swarm_agent || s.label, s.swarm_kind, cfgCls)} Configuration &mdash; ${esc(swarmCfgAgent || s.swarm_agent || s.label)}</h2>
         <div class="sw-toolbar">
           <select id="swCfgAgentSel" aria-label="Agent &agrave; configurer" data-act="swarm-cfg-pick">
             <option value="">Choisir un agent&hellip;</option>

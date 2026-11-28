@@ -2202,4 +2202,69 @@ mod tests {
             "swarm.css doit définir les styles du logo frelon et de l'onglet Swarm"
         );
     }
+
+    #[test]
+    fn swarm_logo_class_prioritaire_et_liste_blanche_serveur() {
+        // 1. Côté serveur : seuls les slugs statiques sont servis ; toute entrée
+        //    inconnue ou traversal retourne None (jamais de chemin construit).
+        for slug in [
+            "logo",
+            "coordinator",
+            "coder",
+            "explorer",
+            "verifier",
+            "monitor",
+            "browser",
+            "discord",
+            "google",
+            "whatsapp",
+            "x",
+            "custom",
+        ] {
+            assert!(
+                super::swarm_logo_svg(slug).is_some(),
+                "slug officiel manquant dans swarm_logo_svg : {slug}"
+            );
+        }
+        for bad in [
+            "",
+            "unknown",
+            "DISCORD",
+            "../logo",
+            "discord.svg",
+            "foo/bar",
+        ] {
+            assert!(
+                super::swarm_logo_svg(bad).is_none(),
+                "slug invalide ne doit pas être servi : {bad}"
+            );
+        }
+
+        // 2. Côté JS : swarmLogoClassFor(name, kind, cls) teste la liste blanche
+        //    SWARM_CLASS_SLUGS AVANT la devinette regex sur le nom.
+        let body = fn_body(APP_JS, "swarmLogoClassFor");
+        let cls_pos = body
+            .find("SWARM_CLASS_SLUGS.has(")
+            .expect("swarmLogoClassFor() doit tester SWARM_CLASS_SLUGS.has(c)");
+        let regex_pos = body
+            .find("/coord|orch")
+            .expect("swarmLogoClassFor() doit conserver la regex de repli");
+        assert!(
+            cls_pos < regex_pos,
+            "swarmLogoClassFor() doit prioriser la classe explicite sur la regex du nom"
+        );
+        assert!(
+            APP_JS.contains("function swarmLogoClassFor(name, kind, cls)")
+                && APP_JS.contains("function swarmLogoUrl(name, kind, cls)")
+                && APP_JS.contains(
+                    "swarmLogoUrl(s.swarm_agent || s.label, s.swarm_kind, s.swarm_class)"
+                ),
+            "app.js doit propager swarm_class à swarmLogoUrl / swarmLogoClassFor"
+        );
+        assert!(
+            SWARM_JS.contains("function swarmIconSvg(cls, name, kind, agentCls)")
+                && SWARM_JS.contains("swarmLogoUrl(name || '', kind || 'hive', agentCls)"),
+            "swarm.js doit propager agentCls dans swarmIconSvg()"
+        );
+    }
 }

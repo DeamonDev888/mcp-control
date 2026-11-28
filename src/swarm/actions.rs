@@ -7,8 +7,63 @@ use super::rpc::{call_bridge_loopback, call_server_mcp, unwrap_tool_json};
 use crate::manage;
 use crate::types::{lockv, AppState, SState, Transport};
 use serde_json::{json, Map, Value};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
+
+/// Cache mémoire `server_id -> swarm_class` scopé par `AppState` (même pattern
+/// que `jobs.rs`), alimenté par `status` des résidents et `list_agents` des
+/// instances pour enrichir `/api/state` et `/api/detail` sans alourdir `Server`.
+fn class_store() -> &'static Mutex<HashMap<usize, HashMap<String, String>>> {
+    static STORE: OnceLock<Mutex<HashMap<usize, HashMap<String, String>>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Valide et normalise une classe d'agent (`status.class` ou `agent.class`)
+/// contre la liste blanche des slugs servis par `ui::swarm_logo_svg` (hors
+/// `logo`, réservé à la ruche). Toute classe inconnue retourne `None` afin que
+/// l'UI retombe sur la devinette par le nom puis `custom`.
+pub(crate) fn normalize_swarm_class(raw: Option<&str>) -> Option<String> {
+    let slug = raw?.trim().to_ascii_lowercase();
+    if slug.is_empty() || slug == "logo" {
+        return None;
+    }
+    if crate::ui::swarm_logo_svg(&slug).is_some() {
+        Some(slug)
+    } else {
+        None
+    }
+}
+
+fn extract_swarm_class(v: &Value) -> Option<String> {
+    normalize_swarm_class(v.get("class").and_then(Value::as_str))
+}
+
+fn set_swarm_class(state: &Arc<AppState>, server_id: &str, cls: Option<&str>) {
+    let key = Arc::as_ptr(state) as usize;
+    let mut store = lockv(class_store());
+    let entry = store.entry(key).or_default();
+    match normalize_swarm_class(cls) {
+        Some(valid) => {
+            entry.insert(server_id.to_string(), valid);
+        }
+        None => {
+            entry.remove(server_id);
+        }
+    }
+}
+
+pub fn get_swarm_class(state: &Arc<AppState>, server_id: &str) -> Option<String> {
+    let key = Arc::as_ptr(state) as usize;
+    let store = lockv(class_store());
+    store.get(&key).and_then(|m| m.get(server_id)).cloned()
+}
+
+pub fn snapshot_swarm_classes(state: &Arc<AppState>) -> HashMap<String, String> {
+    let key = Arc::as_ptr(state) as usize;
+    let store = lockv(class_store());
+    store.get(&key).cloned().unwrap_or_default()
+}
 
 fn req_str<'a>(req: &'a Value, key: &str) -> Option<&'a str> {
     req.get(key)
@@ -203,12 +258,22 @@ fn build_overview(state: &Arc<AppState>) -> Value {
                 scope.spawn(move || {
                     let mut status_val = Value::Null;
                     let mut error: Option<String> = None;
-                    if r.state == SState::Up {
+                    let swarm_class = if r.state == SState::Up {
                         match call_and_unwrap(&st, &r.id, "status", json!({}), 3000) {
-                            Ok((v, _)) => status_val = v,
-                            Err(e) => error = Some(e),
+                            Ok((v, _)) => {
+                                let cls = extract_swarm_class(&v);
+                                set_swarm_class(&st, &r.id, cls.as_deref());
+                                status_val = v;
+                                cls
+                            }
+                            Err(e) => {
+                                error = Some(e);
+                                get_swarm_class(&st, &r.id)
+                            }
                         }
-                    }
+                    } else {
+                        get_swarm_class(&st, &r.id)
+                    };
                     json!({
                         "id": r.id,
                         "label": r.label,
@@ -216,6 +281,7 @@ fn build_overview(state: &Arc<AppState>) -> Value {
                         "url": r.url,
                         "version": r.version,
                         "agent": r.agent,
+                        "swarm_class": swarm_class,
                         "bridge_port": r.bridge_port,
                         "locked": r.locked,
                         "paired": r.paired,
@@ -230,10 +296,42 @@ fn build_overview(state: &Arc<AppState>) -> Value {
             .into_iter()
             .filter_map(|h| h.join().ok())
             .collect();
-        let ress: Vec<Value> = res_handles
+        let mut ress: Vec<Value> = res_handles
             .into_iter()
             .filter_map(|h| h.join().ok())
             .collect();
+        // Si un résident n'a pas encore fourni de `class` via `status`, tente
+        // le repli depuis `list_agents` des instances (correspondance sur le nom).
+        let mut classes_by_agent: HashMap<String, String> = HashMap::new();
+        for inst in &insts {
+            if let Some(arr) = inst.get("agents").and_then(Value::as_array) {
+                for a in arr {
+                    if let (Some(name), Some(cls)) = (
+                        a.get("name").and_then(Value::as_str),
+                        extract_swarm_class(a),
+                    ) {
+                        classes_by_agent.insert(name.to_ascii_lowercase(), cls);
+                    }
+                }
+            }
+        }
+        if !classes_by_agent.is_empty() {
+            for r in &mut ress {
+                let has_cls = r.get("swarm_class").and_then(Value::as_str).is_some();
+                if !has_cls {
+                    if let Some(ag) = r.get("agent").and_then(Value::as_str) {
+                        if let Some(cls) = classes_by_agent.get(&ag.to_ascii_lowercase()) {
+                            if let Some(id) = r.get("id").and_then(Value::as_str) {
+                                set_swarm_class(state, id, Some(cls));
+                            }
+                            if let Some(obj) = r.as_object_mut() {
+                                obj.insert("swarm_class".into(), json!(cls));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         (insts, ress)
     });
 
@@ -493,7 +591,14 @@ pub fn handle_swarm_action(state: &Arc<AppState>, action: &str, req: &Value) -> 
             };
             match call_and_unwrap(state, sid, "status", json!({}), 5_000) {
                 Ok((data, elapsed_ms)) => {
-                    json!({"ok": true, "data": data, "elapsed_ms": elapsed_ms})
+                    let swarm_class = extract_swarm_class(&data);
+                    set_swarm_class(state, sid, swarm_class.as_deref());
+                    json!({
+                        "ok": true,
+                        "data": data,
+                        "swarm_class": swarm_class,
+                        "elapsed_ms": elapsed_ms,
+                    })
                 }
                 Err(e) => json!({"ok": false, "error": e}),
             }

@@ -43,7 +43,12 @@ fn effective_container(s: &Server) -> (bool, Option<String>) {
     (in_c, name)
 }
 
+#[cfg(test)]
 pub(super) fn server_json(s: &Server, managed: bool) -> Value {
+    server_json_with_class(s, managed, None)
+}
+
+fn server_json_with_class(s: &Server, managed: bool, swarm_class: Option<&str>) -> Value {
     let (ttype, extra) = match &s.transport {
         Transport::Http { host, port, path } => {
             ("http", json!({"host": host, "port": port, "path": path}))
@@ -117,6 +122,7 @@ pub(super) fn server_json(s: &Server, managed: bool) -> Value {
         "swarm_agent".into(),
         json!(swarm.as_ref().and_then(|m| m.agent.as_deref())),
     );
+    obj.insert("swarm_class".into(), json!(swarm_class));
     obj.insert(
         "swarm_instance".into(),
         json!(swarm.as_ref().and_then(|m| m.instance.as_deref())),
@@ -264,6 +270,7 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
             }),
         )
     };
+    let swarm_classes = crate::swarm::snapshot_swarm_classes(state);
     let (list, up, total, tools, swarm_instances, swarm_residents, swarm_up) = {
         let servers = lockv(&state.servers);
         // affichage : ordre préféré (glisser-déposer), non listés en dernier (stable)
@@ -271,7 +278,8 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
             .iter()
             .map(|s| {
                 let pos = order.iter().position(|x| x == &s.id).unwrap_or(usize::MAX);
-                (pos, server_json(s, managed.contains(&s.id)))
+                let cls = swarm_classes.get(&s.id).map(String::as_str);
+                (pos, server_json_with_class(s, managed.contains(&s.id), cls))
             })
             .collect();
         list.sort_by_key(|(pos, _)| *pos);
@@ -381,13 +389,15 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
 
 pub fn detail_json(state: &Arc<AppState>, id: &str) -> Value {
     let managed = managed_ids(state);
+    let swarm_class = crate::swarm::get_swarm_class(state, id);
     let servers = lockv(&state.servers);
     match servers.iter().find(|s| s.id == id) {
         Some(s) => {
-            let mut o = match server_json(s, managed.contains(&s.id)) {
-                Value::Object(o) => o,
-                _ => Map::new(),
-            };
+            let mut o =
+                match server_json_with_class(s, managed.contains(&s.id), swarm_class.as_deref()) {
+                    Value::Object(o) => o,
+                    _ => Map::new(),
+                };
             let tools: Vec<Value> = s
                 .tools
                 .iter()
@@ -413,6 +423,7 @@ pub fn detail_json(state: &Arc<AppState>, id: &str) -> Value {
 pub fn servers_summary_json(state: &Arc<AppState>, state_filter: Option<&str>) -> Value {
     let managed = managed_ids(state);
     let order = lockv(&state.settings).server_order.clone();
+    let swarm_classes = crate::swarm::snapshot_swarm_classes(state);
     let (list, up, total, tools) = {
         let servers = lockv(&state.servers);
         let up = servers.iter().filter(|s| s.state == SState::Up).count();
@@ -436,7 +447,10 @@ pub fn servers_summary_json(state: &Arc<AppState>, state_filter: Option<&str>) -
         ordered.sort_by_key(|(pos, _)| *pos);
         let list: Vec<Value> = ordered
             .into_iter()
-            .map(|(_, s)| server_json(s, managed.contains(&s.id)))
+            .map(|(_, s)| {
+                let cls = swarm_classes.get(&s.id).map(String::as_str);
+                server_json_with_class(s, managed.contains(&s.id), cls)
+            })
             .collect();
         (list, up, total, tools)
     };
@@ -453,6 +467,7 @@ pub fn servers_summary_json(state: &Arc<AppState>, state_filter: Option<&str>) -
 fn hash_server_visible<H: std::hash::Hasher>(
     s: &Server,
     managed: bool,
+    swarm_class: Option<&str>,
     include_tools_list: bool,
     h: &mut H,
 ) {
@@ -502,6 +517,7 @@ fn hash_server_visible<H: std::hash::Hasher>(
     s.lang.hash(h);
     s.framework.hash(h);
     crate::swarm::detect_server(s).hash(h);
+    swarm_class.hash(h);
     let (in_container, container_name) = effective_container(s);
     in_container.hash(h);
     container_name.hash(h);
@@ -599,6 +615,7 @@ pub fn state_etag(state: &Arc<AppState>) -> String {
         }
     }
     {
+        let swarm_classes = crate::swarm::snapshot_swarm_classes(state);
         let servers = lockv(&state.servers);
         servers.len().hash(&mut h);
         let mut idxs: Vec<(usize, usize)> = servers
@@ -612,7 +629,8 @@ pub fn state_etag(state: &Arc<AppState>) -> String {
         idxs.sort_by_key(|(pos, _)| *pos);
         for (_, i) in idxs {
             let s = &servers[i];
-            hash_server_visible(s, managed.contains(&s.id), false, &mut h);
+            let cls = swarm_classes.get(&s.id).map(String::as_str);
+            hash_server_visible(s, managed.contains(&s.id), cls, false, &mut h);
         }
     }
     {
@@ -670,11 +688,18 @@ pub fn detail_etag(state: &Arc<AppState>, id: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let managed = managed_ids(state);
+    let swarm_class = crate::swarm::get_swarm_class(state, id);
     let servers = lockv(&state.servers);
     match servers.iter().find(|s| s.id == id) {
         Some(s) => {
             true.hash(&mut h);
-            hash_server_visible(s, managed.contains(&s.id), true, &mut h);
+            hash_server_visible(
+                s,
+                managed.contains(&s.id),
+                swarm_class.as_deref(),
+                true,
+                &mut h,
+            );
         }
         None => {
             false.hash(&mut h);

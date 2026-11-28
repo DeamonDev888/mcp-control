@@ -311,3 +311,161 @@ fn swarm_e2e_detection_overview_ask_et_assets() {
     assert_eq!(stop["ok"], true);
     assert_eq!(stop["data"]["stopped"], true);
 }
+
+fn resident_seven_tools() -> Value {
+    json!([
+        {"name": "ask", "description": "ask"},
+        {"name": "status", "description": "status"},
+        {"name": "stop", "description": "stop"},
+        {"name": "history", "description": "history"},
+        {"name": "logs", "description": "logs"},
+        {"name": "config", "description": "config"},
+        {"name": "session", "description": "session"}
+    ])
+}
+
+fn sniperbot_discord_responder(tool: &str, _args: &Value) -> Value {
+    match tool {
+        "status" => json!({
+            "agent": "sniperbot_analyst",
+            "class": "discord",
+            "runner": "claude",
+            "state": "idle",
+            "queueLength": 0,
+            "turnsDone": 1
+        }),
+        _ => json!({"ok": true}),
+    }
+}
+
+fn resident_no_class_responder(tool: &str, _args: &Value) -> Value {
+    match tool {
+        "status" => json!({
+            "agent": "coder_helper",
+            "runner": "claude",
+            "state": "idle",
+            "queueLength": 0,
+            "turnsDone": 0
+        }),
+        _ => json!({"ok": true}),
+    }
+}
+
+fn resident_unknown_class_responder(tool: &str, _args: &Value) -> Value {
+    match tool {
+        "status" => json!({
+            "agent": "rogue_agent",
+            "class": "../../etc/passwd",
+            "runner": "claude",
+            "state": "idle",
+            "queueLength": 0,
+            "turnsDone": 0
+        }),
+        _ => json!({"ok": true}),
+    }
+}
+
+#[test]
+fn swarm_e2e_classe_agent_logo_et_detection_sept_outils() {
+    let _garde = serial_guard();
+    // 1. Résident nommé `sniperbot_analyst` (sans préfixe `swarm-` : détecté par
+    //    sa signature de 7 outils) dont le `status` porte `"class": "discord"`.
+    let mock_discord = spawn_mock_swarm(
+        "sniperbot_analyst",
+        resident_seven_tools(),
+        sniperbot_discord_responder,
+    );
+    // 2. Résident sans champ `class` dans son `status` : garde la devinette par nom.
+    let mock_noclass = spawn_mock_swarm(
+        "swarm-coder_helper",
+        resident_seven_tools(),
+        resident_no_class_responder,
+    );
+    // 3. Résident avec classe inconnue / traversal : ignorée (jamais propagée).
+    let mock_unknown = spawn_mock_swarm(
+        "swarm-rogue_agent",
+        resident_seven_tools(),
+        resident_unknown_class_responder,
+    );
+
+    let eng = spawn_loopback();
+
+    // Assets logo : slugs connus servis en 200, classe inconnue / traversal -> 404.
+    assert_eq!(eng.get("/swarm-logo/discord.svg").status, 200);
+    assert_eq!(eng.get("/swarm-logo/custom.svg").status, 200);
+    assert_eq!(eng.get("/swarm-logo/inconnue.svg").status, 404);
+    assert_eq!(eng.get("/swarm-logo/..%2Fetc%2Fpasswd.svg").status, 404);
+
+    let id_discord = eng.action(&json!({
+        "action": "add",
+        "label": "Sniperbot Analyst",
+        "transport": "http",
+        "port": mock_discord.port,
+        "path": "/mcp"
+    }))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let id_noclass = eng.action(&json!({
+        "action": "add",
+        "label": "Coder Helper",
+        "transport": "http",
+        "port": mock_noclass.port,
+        "path": "/mcp"
+    }))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let id_unknown = eng.action(&json!({
+        "action": "add",
+        "label": "Rogue Agent",
+        "transport": "http",
+        "port": mock_unknown.port,
+        "path": "/mcp"
+    }))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for id in [&id_discord, &id_noclass, &id_unknown] {
+        eng.action(&json!({"action": "refresh", "id": id}));
+    }
+
+    let ok_up = wait_until(Duration::from_secs(10), || {
+        let st = eng.get("/api/state").json();
+        Some(st["swarm_stats"]["residents"] == 3 && st["swarm_stats"]["up"] == 3)
+    });
+    assert!(
+        ok_up,
+        "les 3 résidents (dont celui détecté par 7 outils) doivent être UP et détectés"
+    );
+
+    // `swarm_overview` interroge `status` et propage `swarm_class`.
+    let ov = eng.action(&json!({"action": "swarm_overview"}));
+    assert_eq!(ov["ok"], true);
+    let ress = ov["residents"].as_array().unwrap();
+    let r_discord = ress.iter().find(|r| r["id"] == id_discord).unwrap();
+    let r_noclass = ress.iter().find(|r| r["id"] == id_noclass).unwrap();
+    let r_unknown = ress.iter().find(|r| r["id"] == id_unknown).unwrap();
+
+    assert_eq!(r_discord["agent"], "sniperbot_analyst");
+    assert_eq!(r_discord["swarm_class"], "discord");
+    assert_eq!(r_noclass["swarm_class"], Value::Null);
+    assert_eq!(r_unknown["swarm_class"], Value::Null);
+
+    // `/api/state` et `/api/detail` reflètent aussi `swarm_class` à côté de `swarm_kind`/`swarm_agent`.
+    let st = eng.get("/api/state").json();
+    let servers = st["servers"].as_array().unwrap();
+    let s_discord = servers.iter().find(|s| s["id"] == id_discord).unwrap();
+    let s_noclass = servers.iter().find(|s| s["id"] == id_noclass).unwrap();
+    let s_unknown = servers.iter().find(|s| s["id"] == id_unknown).unwrap();
+
+    assert_eq!(s_discord["swarm_kind"], "resident");
+    assert_eq!(s_discord["swarm_agent"], "sniperbot_analyst");
+    assert_eq!(s_discord["swarm_class"], "discord");
+    assert_eq!(s_noclass["swarm_class"], Value::Null);
+    assert_eq!(s_unknown["swarm_class"], Value::Null);
+
+    let det = eng.get(&format!("/api/detail?id={id_discord}")).json();
+    assert_eq!(det["swarm_class"], "discord");
+}

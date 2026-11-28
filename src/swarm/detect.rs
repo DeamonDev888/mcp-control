@@ -193,8 +193,14 @@ pub fn detect_server(s: &Server) -> Option<SwarmMeta> {
         });
     }
 
+    let has_any_admin_tool = has_tool(s, "list_agents")
+        || has_tool(s, "create_agent")
+        || has_tool(s, "delete_agent")
+        || has_tool(s, "agent_start")
+        || has_tool(s, "agent_stop")
+        || has_tool(s, "agent_control");
     let has_resident_tools =
-        has_tool(s, "ask") && has_tool(s, "status") && has_tool(s, "stop") && s.tools.len() <= 5;
+        has_tool(s, "ask") && has_tool(s, "status") && has_tool(s, "stop") && !has_any_admin_tool;
     if has_resident_tools
         && (s.framework.as_deref() == Some("litemcp")
             || cli_is_swarm
@@ -364,6 +370,39 @@ mod tests {
             .collect();
         let m = detect_server(&s).expect("résident par outils");
         assert_eq!(m.kind, SwarmKind::Resident);
+    }
+
+    #[test]
+    fn detecte_resident_par_sept_outils_litemcp() {
+        let mut s = dummy_server("srv-4", "Sniperbot");
+        s.server_name = Some("sniperbot_analyst".into());
+        s.tools = [
+            "ask", "status", "stop", "history", "logs", "config", "session",
+        ]
+        .into_iter()
+        .map(|n| ToolInfo {
+            name: n.into(),
+            desc: String::new(),
+            input_schema: None,
+        })
+        .collect();
+        let m = detect_server(&s).expect("résident 7 outils détecté");
+        assert_eq!(m.kind, SwarmKind::Resident);
+        assert_eq!(m.agent.as_deref(), Some("sniperbot_analyst"));
+    }
+
+    #[test]
+    fn n_identifie_pas_admin_comme_resident_meme_avec_ask_status_stop() {
+        let mut s = dummy_server("srv-5", "Serveur mixte");
+        s.tools = ["ask", "status", "stop", "list_agents"]
+            .into_iter()
+            .map(|n| ToolInfo {
+                name: n.into(),
+                desc: String::new(),
+                input_schema: None,
+            })
+            .collect();
+        assert_eq!(detect_server(&s), None);
     }
 
     #[test]

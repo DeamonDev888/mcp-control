@@ -8,9 +8,15 @@ const accessCode = () => { try { return localStorage.getItem('mcc.access') || ''
 const MCC_VERSION = '__MCC_VERSION__';
 let activeView = 'dashboard';
 let explorerTab = 'mcp'; // 'mcp' | 'swarm'
-function swarmLogoClassFor(name, kind) {
+const SWARM_CLASS_SLUGS = new Set([
+  'coordinator', 'coder', 'explorer', 'verifier', 'monitor',
+  'browser', 'discord', 'google', 'whatsapp', 'x', 'custom',
+]);
+function swarmLogoClassFor(name, kind, cls) {
   if (kind === 'hive') return 'logo';
   if (kind === 'instance') return 'coordinator';
+  const c = String(cls || '').trim().toLowerCase();
+  if (c && SWARM_CLASS_SLUGS.has(c)) return c;
   const n = String(name || '').toLowerCase();
   if (/coord|orch|lead|boss|hive|swarm-control/.test(n)) return 'coordinator';
   if (/cod|dev|eng|build|rust|front|back|full/.test(n)) return 'coder';
@@ -24,8 +30,8 @@ function swarmLogoClassFor(name, kind) {
   if (/(^|[-_])x($|[-_])|twitter/.test(n)) return 'x';
   return 'custom';
 }
-function swarmLogoUrl(name, kind) {
-  const slug = swarmLogoClassFor(name, kind);
+function swarmLogoUrl(name, kind, cls) {
+  const slug = swarmLogoClassFor(name, kind, cls);
   return `/swarm-logo/${slug}.svg?v=${encodeURIComponent(MCC_VERSION)}`;
 }
 
@@ -780,7 +786,7 @@ function srvStoreLogo(s, lg) {
     const tip = isRes
       ? ('Swarm-control — Agent MCP r\u00e9sident' + (s.swarm_agent ? ' (' + s.swarm_agent + ')' : ''))
       : 'Swarm-control — Instance d\u2019orchestration MCP';
-    const src = swarmLogoUrl(s.swarm_agent || s.label, s.swarm_kind);
+    const src = swarmLogoUrl(s.swarm_agent || s.label, s.swarm_kind, s.swarm_class);
     return `<span class="srv-logo swarm-logo${isRes ? ' swarm-res' : ''}${lg ? ' lg' : ''}" title="${esc(tip)}"><img class="swarm-img" src="${esc(src)}" alt="" aria-hidden="true"></span>`;
   }
   if (!s.id || !s.id.startsWith('store-')) return '';
