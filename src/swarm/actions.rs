@@ -35,6 +35,12 @@ pub(crate) fn normalize_swarm_class(raw: Option<&str>) -> Option<String> {
     }
 }
 
+fn last_agents_cache() -> &'static std::sync::Mutex<HashMap<String, Vec<Value>>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Vec<Value>>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
 fn extract_swarm_class(v: &Value) -> Option<String> {
     normalize_swarm_class(v.get("class").and_then(Value::as_str))
 }
@@ -190,7 +196,7 @@ fn build_overview(state: &Arc<AppState>) -> Value {
         (insts, ress, targets)
     };
 
-    // Interrogation parallèle bornée (3,5 s max) des instances UP et résidents UP.
+    // Interrogation parallèle bornée (12 s max) des instances UP et résidents UP.
     let (instances_json, residents_json) = std::thread::scope(|scope| {
         let inst_handles: Vec<_> = instances_snap
             .iter()
@@ -200,28 +206,54 @@ fn build_overview(state: &Arc<AppState>) -> Value {
                     let mut agents = Value::Array(vec![]);
                     let mut runs = Value::Array(vec![]);
                     let mut error: Option<String> = None;
+                    let mut stale_agents = false;
                     if inst.state == SState::Up {
-                        match call_and_unwrap(
-                            &st,
-                            &inst.id,
-                            "list_agents",
-                            json!({"details": true}),
-                            3500,
-                        ) {
-                            Ok((v, _)) => {
+                        let (ag_res, runs_res) = std::thread::scope(|inner| {
+                            let st1 = Arc::clone(&st);
+                            let id1 = inst.id.clone();
+                            let h_ag = inner.spawn(move || {
+                                call_and_unwrap(
+                                    &st1,
+                                    &id1,
+                                    "list_agents",
+                                    json!({"details": true}),
+                                    12_000,
+                                )
+                            });
+                            let st2 = Arc::clone(&st);
+                            let id2 = inst.id.clone();
+                            let h_runs = inner.spawn(move || {
+                                call_and_unwrap(
+                                    &st2,
+                                    &id2,
+                                    "agent_control",
+                                    json!({"action": "list"}),
+                                    8_000,
+                                )
+                            });
+                            (h_ag.join().ok(), h_runs.join().ok())
+                        });
+                        match ag_res {
+                            Some(Ok((v, _))) => {
                                 if let Some(arr) = v.get("agents").and_then(Value::as_array) {
+                                    if let Ok(mut cache) = last_agents_cache().lock() {
+                                        cache.insert(inst.id.clone(), arr.clone());
+                                    }
                                     agents = Value::Array(arr.clone());
                                 }
                             }
-                            Err(e) => error = Some(e),
+                            Some(Err(e)) => {
+                                error = Some(e);
+                                if let Ok(cache) = last_agents_cache().lock() {
+                                    if let Some(prev) = cache.get(&inst.id) {
+                                        agents = Value::Array(prev.clone());
+                                        stale_agents = true;
+                                    }
+                                }
+                            }
+                            None => error = Some("échec interne list_agents".to_string()),
                         }
-                        if let Ok((v, _)) = call_and_unwrap(
-                            &st,
-                            &inst.id,
-                            "agent_control",
-                            json!({"action": "list"}),
-                            3000,
-                        ) {
+                        if let Some(Ok((v, _))) = runs_res {
                             if let Some(arr) = v
                                 .get("runs")
                                 .or_else(|| v.get("agents"))
@@ -244,6 +276,7 @@ fn build_overview(state: &Arc<AppState>) -> Value {
                         "locked": inst.locked,
                         "paired": inst.paired,
                         "agents": agents,
+                        "stale_agents": stale_agents,
                         "runs": runs,
                         "error": error,
                     })
@@ -259,7 +292,7 @@ fn build_overview(state: &Arc<AppState>) -> Value {
                     let mut status_val = Value::Null;
                     let mut error: Option<String> = None;
                     let swarm_class = if r.state == SState::Up {
-                        match call_and_unwrap(&st, &r.id, "status", json!({}), 3000) {
+                        match call_and_unwrap(&st, &r.id, "status", json!({}), 8_000) {
                             Ok((v, _)) => {
                                 let cls = extract_swarm_class(&v);
                                 set_swarm_class(&st, &r.id, cls.as_deref());
@@ -374,7 +407,14 @@ pub fn handle_swarm_action(state: &Arc<AppState>, action: &str, req: &Value) -> 
             let mut args = Map::new();
             args.insert("name".into(), json!(name));
             args.insert("prompt".into(), json!(prompt));
-            for k in ["runner", "model", "copyEnvFrom", "cloneFrom", "config"] {
+            for k in [
+                "runner",
+                "model",
+                "copyEnvFrom",
+                "cloneFrom",
+                "config",
+                "class",
+            ] {
                 if let Some(v) = req_str(req, k) {
                     args.insert(k.into(), json!(v));
                 }

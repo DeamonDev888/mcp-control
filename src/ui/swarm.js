@@ -1,9 +1,9 @@
 /* ===== Onglet Swarm Control (instances admin + agents MCP résidents) =====
    Dépend des helpers globaux de app.js : postAction, esc, escPre, ic, toast,
-   askConfirm, load, select, state, selectedId, activeView, SWARM_LOGO.
-   CSP stricte : aucun style inline, aucun on*, toutes les actions dans ACT. */
+   askConfirm, load, state, selectedId, activeView, swarmLogoUrl.
+   CSP stricte : aucun attribut style, aucune mutation directe de style, aucun on*, toutes les actions dans ACT. */
 
-let swarmTab = 'hive'; // 'hive' | 'overview' | 'agents' | 'console' | 'runs'
+let swarmTab = 'hive'; // 'hive' | 'agents' | 'console' | 'runs'
 let swarmData = null;
 let swarmLoading = false;
 let swarmLive = true;
@@ -14,12 +14,33 @@ let swarmFilterRunner = 'all';
 let swarmFilterState = 'all';
 let swarmSearch = '';
 let swarmCreateOpen = false;
+let swarmNewClass = 'coder';
 let swarmConsoleTarget = ''; // 'res:<server_id>' | 'inst:<instance_id>:<agent_name>'
 let swarmFeedsByTarget = {}; // { [target]: [{ts, role, title, meta, text, err}] }
 let swarmResidentLive = {}; // { [server_id]: statusObj }
 let swarmCfgAgent = '';
 let swarmCfgFile = 'prompt.md';
 let swarmCfgData = null;
+let swarmStreamOut = null; // {runId, agentName, text}
+let swarmPollTimer = null;
+let swarmParallelDraft = [
+  {runner: 'claude', agentName: '', prompt: ''},
+  {runner: 'claude', agentName: '', prompt: ''},
+];
+
+const SWARM_CLASSES = [
+  ['coder', 'Coder (développement)'],
+  ['coordinator', 'Coordinator (orchestration)'],
+  ['explorer', 'Explorer (recherche / audit)'],
+  ['verifier', 'Verifier (tests / revue)'],
+  ['monitor', 'Monitor (supervision)'],
+  ['browser', 'Browser (navigation web)'],
+  ['discord', 'Discord'],
+  ['google', 'Google Workspace'],
+  ['whatsapp', 'WhatsApp'],
+  ['x', 'X / Twitter'],
+  ['custom', 'Custom (personnalisé)'],
+];
 
 function swarmFeedFor(target) {
   const k = target || '_default';
@@ -34,12 +55,6 @@ function swarmRerenderActive() {
     renderDetail();
   }
 }
-let swarmStreamOut = null; // {runId, agentName, text}
-let swarmPollTimer = null;
-let swarmParallelDraft = [
-  {runner: 'claude', agentName: '', prompt: ''},
-  {runner: 'claude', agentName: '', prompt: ''},
-];
 
 function swarmIconSvg(cls, name, kind, agentCls) {
   const src = swarmLogoUrl(name || '', kind || 'hive', agentCls);
@@ -53,8 +68,10 @@ function swarmStopPoll() {
 function swarmTypingInView() {
   const el = document.activeElement;
   if (!el || !el.id) return false;
-  return ['swA2aPrompt', 'swA2aFrom', 'swA2aVia', 'swAskPrompt', 'swAskFrom', 'swAskModel',
-    'swCfgEditor', 'swNewPrompt', 'swNewName', 'swNewModel', 'swNewClone', 'swAgentSearch'].includes(el.id);
+  return [
+    'swA2aPrompt', 'swA2aFrom', 'swA2aVia', 'swAskPrompt', 'swAskFrom', 'swAskModel',
+    'swCfgEditor', 'swNewPrompt', 'swNewName', 'swNewModel', 'swNewClone', 'swAgentSearch',
+  ].includes(el.id) || (el.classList && (el.classList.contains('sw-par-prompt') || el.classList.contains('sw-par-agent')));
 }
 
 function swarmEnsurePoll() {
@@ -67,10 +84,10 @@ function swarmEnsurePoll() {
     }
     const hasRunning = (swarmData && swarmData.jobs || []).some(j => j.status === 'running');
     if (hasRunning) swarmPollJobs();
-    if (activeView === 'swarm' && swarmTab === 'hive' && swarmLive && !swarmLoading && !swarmTypingInView()) {
+    if (activeView === 'swarm' && swarmLive && !swarmLoading && !swarmTypingInView()) {
       swarmRefresh(false);
     }
-  }, 3000);
+  }, 5000);
 }
 
 function openSwarmView(subTab, focusTarget) {
@@ -80,7 +97,7 @@ function openSwarmView(subTab, focusTarget) {
   detailCache = null;
   activeView = 'swarm';
   explorerTab = 'swarm';
-  if (subTab) swarmTab = subTab;
+  if (subTab) swarmTab = subTab === 'overview' ? 'hive' : subTab;
   if (focusTarget) swarmConsoleTarget = focusTarget;
   updateSwarmTopbarActive();
   renderServers();
@@ -138,17 +155,22 @@ async function swarmRefresh(showToast) {
           renderServers();
         }
       }
-      if (!swarmSelectedInst && j.instances && j.instances.length) {
-        const upInst = j.instances.find(i => i.state === 'UP') || j.instances[0];
-        swarmSelectedInst = upInst.id;
+      if (!swarmSelectedInst || !(j.instances || []).some(i => i.id === swarmSelectedInst)) {
+        if (j.instances && j.instances.length) {
+          const upInst = j.instances.find(i => i.state === 'UP') || j.instances[0];
+          swarmSelectedInst = upInst.id;
+        }
       }
       if (!swarmConsoleTarget) {
         if (j.residents && j.residents.length) {
           const upRes = j.residents.find(r => r.state === 'UP') || j.residents[0];
           swarmConsoleTarget = 'res:' + upRes.id;
+        } else {
+          const allAg = swarmAllAgents();
+          if (allAg.length) swarmConsoleTarget = 'inst:' + allAg[0]._instanceId + ':' + allAg[0].name;
         }
       }
-      if (showToast) toast('Swarm-control actualis\u00e9', 'ok', 1800);
+      if (showToast) toast('Essaim Swarm actualis\u00e9', 'ok', 1800);
     }
   } finally {
     swarmLoading = false;
@@ -212,8 +234,22 @@ async function swarmPollJobs() {
 }
 
 function swarmSetTab(tab) {
-  swarmTab = tab || 'overview';
+  swarmTab = (!tab || tab === 'overview') ? 'hive' : tab;
   renderSwarmView();
+}
+
+function swarmQuickCreate() {
+  swarmTab = 'agents';
+  swarmCreateOpen = true;
+  renderSwarmView();
+  const inp = document.getElementById('swNewName');
+  if (inp) inp.focus();
+}
+
+function swarmNewClassChange(el) {
+  swarmNewClass = (el && el.value) || 'coder';
+  const prevImg = document.querySelector('#swNewClsPrev img');
+  if (prevImg) prevImg.setAttribute('src', swarmLogoUrl(swarmNewClass, 'resident', swarmNewClass));
 }
 
 function swarmAllAgents() {
@@ -240,9 +276,94 @@ function swarmFindResidentFor(agentName) {
   ) || null;
 }
 
+function swarmCaptureInputs(root) {
+  const snap = {};
+  if (!root) return snap;
+  root.querySelectorAll('input[id], textarea[id], select[id]').forEach(el => {
+    if (el.type === 'checkbox') snap[el.id] = {checked: el.checked};
+    else snap[el.id] = {value: el.value};
+  });
+  return snap;
+}
+
+function swarmRestoreInputs(root, snap) {
+  if (!root || !snap) return;
+  for (const id of Object.keys(snap)) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    if (id === 'swCfgEditor' || id === 'swConsoleTarget' || id === 'swCfgAgentSel') continue;
+    const s = snap[id];
+    if (el.type === 'checkbox' && typeof s.checked === 'boolean') el.checked = s.checked;
+    else if (typeof s.value === 'string' && !el.value && s.value) el.value = s.value;
+  }
+}
+
+function renderSwarmBanners(insts, agents, anns) {
+  const parts = [];
+  for (const inst of insts) {
+    if (inst.locked && !inst.paired) {
+      parts.push(`<div class="sw-banner is-warn">
+        <div class="sw-banner-l">${ic('lock')} <div><b>${esc(inst.label)}</b> est verrouill&eacute; par signature Ed25519 (RFC 9421) &mdash; appairez-le pour lister et piloter ses agents.</div></div>
+        <div class="sw-banner-acts">
+          <button type="button" class="primary" data-act="server-pair" data-id="${esc(inst.id)}">${ic('lock')} Appairer</button>
+          <button type="button" data-act="select" data-id="${esc(inst.id)}">Fiche serveur</button>
+        </div>
+      </div>`);
+    } else if (inst.state !== 'UP') {
+      parts.push(`<div class="sw-banner is-warn">
+        <div class="sw-banner-l"><span class="dot ${esc(inst.state)}"></span> <div>L'orchestrateur <b>${esc(inst.label)}</b> est actuellement <b>${esc(inst.state)}</b>.</div></div>
+        <div class="sw-banner-acts">
+          <button type="button" class="primary" data-act="row-act" data-op="start" data-id="${esc(inst.id)}">${ic('play')} D&eacute;marrer</button>
+          <button type="button" data-act="select" data-id="${esc(inst.id)}">Fiche serveur</button>
+        </div>
+      </div>`);
+    } else if (inst.error) {
+      parts.push(`<div class="sw-banner is-err">
+        <div class="sw-banner-l">${ic('warn')} <div><b>${esc(inst.label)}</b> &mdash; erreur lors de l'interrogation MCP : <code>${esc(inst.error)}</code>${inst.stale_agents ? ' (liste en cache affich&eacute;e)' : ''}</div></div>
+        <div class="sw-banner-acts">
+          <button type="button" data-act="swarm-refresh">${ic('refresh')} R&eacute;essayer</button>
+          <button type="button" data-act="select" data-id="${esc(inst.id)}">Fiche serveur</button>
+        </div>
+      </div>`);
+    }
+  }
+
+  for (const a of anns) {
+    parts.push(`<div class="sw-banner">
+      <div class="sw-banner-l"><span class="tag swarm-res">D&Eacute;TECT&Eacute;</span> <div>Agent r&eacute;sident <b>${esc(a.name)}</b> actif sur le port <code>:${esc(String(a.port || '?'))}</code>${a.version ? ` (v${esc(a.version)})` : ''} mais non suivi.</div></div>
+      <div class="sw-banner-acts">
+        <button type="button" class="primary" data-act="follow-ann" data-name="${esc(a.name)}" data-port="${esc(String(a.port || ''))}">Suivre dans MCP Control</button>
+      </div>
+    </div>`);
+  }
+
+  const upHealthy = insts.filter(i => i.state === 'UP' && !i.error && !(i.locked && !i.paired));
+  if (!insts.length && swarmData) {
+    const storeSrv = (state && state.servers || []).find(s => s.id === 'store-swarm-control');
+    if (!storeSrv) {
+      parts.push(`<div class="sw-banner is-warn">
+        <div class="sw-banner-l">${ic('store')} <div>Aucun orchestrateur <b>Swarm Control</b> n'est install&eacute; ou d&eacute;tect&eacute; sur les ports <code>23080&ndash;23099</code>.</div></div>
+        <div class="sw-banner-acts">
+          <button type="button" class="primary" data-act="open-store-update" data-store-id="swarm-control">${ic('download')} Installer depuis la Boutique</button>
+          <button type="button" data-act="scan">${ic('search')} Scanner les ports</button>
+        </div>
+      </div>`);
+    }
+  } else if (upHealthy.length > 0 && agents.length === 0 && swarmTab !== 'agents') {
+    parts.push(`<div class="sw-banner is-ok">
+      <div class="sw-banner-l">${swarmIconSvg('ic-hornet', 'coordinator', 'resident', 'coordinator')} <div><b>${esc(upHealthy[0].label)}</b> est actif et pr&ecirc;t, mais aucun agent persistant n'est encore configur&eacute;.</div></div>
+      <div class="sw-banner-acts">
+        <button type="button" class="primary" data-act="swarm-quick-create">+ Cr&eacute;er mon premier agent</button>
+      </div>
+    </div>`);
+  }
+  return parts.join('');
+}
+
 function renderSwarmView() {
   const contentEl = document.getElementById('content');
   if (!contentEl || activeView !== 'swarm') return;
+  const savedInputs = swarmCaptureInputs(contentEl);
   delete contentEl.dataset.srvId;
 
   const insts = (swarmData && swarmData.instances) || [];
@@ -250,22 +371,48 @@ function renderSwarmView() {
   const anns = ((swarmData && swarmData.announcements) || []).filter(a => !a.followed && a.swarm_kind === 'resident');
   const agents = swarmAllAgents();
   const jobs = (swarmData && swarmData.jobs) || [];
+  const upInsts = insts.filter(i => i.state === 'UP');
   const resUp = ress.filter(r => r.state === 'UP').length;
   const runningJobs = jobs.filter(j => j.status === 'running').length;
+  const activeRuns = insts.reduce((acc, i) => acc + ((i.runs || []).length), 0);
+  const totalTurns = ress.reduce((acc, r) => acc + (((swarmResidentLive[r.id] || r.status || {}).turnsDone) || 0), 0);
+
+  const storeInstalled = Boolean(insts.length || (state && (state.servers || []).some(s => s.id === 'store-swarm-control' || s.swarm_kind === 'instance')));
+  const primaryInst = upInsts[0] || insts[0] || null;
+
+  let primaryCta = '';
+  if (!storeInstalled) {
+    primaryCta = `<button type="button" class="primary" data-act="open-store-update" data-store-id="swarm-control">${ic('download')} Installer Swarm</button>`;
+  } else if (primaryInst && primaryInst.state !== 'UP') {
+    primaryCta = `<button type="button" class="primary" data-act="row-act" data-op="start" data-id="${esc(primaryInst.id)}">${ic('play')} D&eacute;marrer Swarm</button>`;
+  } else {
+    primaryCta = `<button type="button" class="primary" data-act="swarm-quick-create">+ Nouvel agent</button>`;
+  }
+
+  // Répartition des runners pour la tuile Agents configurés
+  const runnerCounts = {};
+  agents.forEach(a => { const r = a.runner || 'claude'; runnerCounts[r] = (runnerCounts[r] || 0) + 1; });
+  const runnerSub = Object.keys(runnerCounts).length
+    ? Object.entries(runnerCounts).map(([k, n]) => `${n} ${k}`).join(' \u00b7 ')
+    : 'claude \u00b7 hermes \u00b7 antigravity';
+
+  const instKpiCls = upInsts.length > 0 ? 'accent-ok' : (insts.length > 0 ? 'accent-warn' : '');
+  const instKpiVal = insts.length > 0 ? `${upInsts.length}/${insts.length} UP` : 'Absent';
+  const instKpiSub = primaryInst
+    ? `${primaryInst.label}${primaryInst.version ? ' \u00b7 v' + primaryInst.version : ''}${primaryInst.url ? ' \u00b7 ' + primaryInst.url.replace(/^https?:\/\//, '') : ''}`
+    : 'ports 23080\u201323099';
 
   let bodyHtml = '';
   if (!swarmData && swarmLoading) {
-    bodyHtml = `<div class="loading-card" role="status"><span class="spin">${ic('refresh')}</span><span>Interrogation des instances Swarm-control&hellip;</span></div>`;
+    bodyHtml = `<div class="loading-card" role="status"><span class="spin">${ic('refresh')}</span><span>Interrogation de l'essaim Swarm-control&hellip;</span></div>`;
   } else if (swarmTab === 'hive') {
     bodyHtml = renderSwarmHiveTab(insts, ress, agents, jobs);
-  } else if (swarmTab === 'overview') {
-    bodyHtml = renderSwarmOverviewTab(insts, ress, anns);
   } else if (swarmTab === 'agents') {
     bodyHtml = renderSwarmAgentsTab(insts, agents);
   } else if (swarmTab === 'console') {
     bodyHtml = renderSwarmConsoleTab(insts, ress, agents, jobs);
   } else if (swarmTab === 'runs') {
-    bodyHtml = renderSwarmRunsTab(insts, jobs);
+    bodyHtml = renderSwarmRunsTab(insts, agents, jobs);
   }
 
   contentEl.innerHTML = `<div class="sw-wrap">
@@ -273,51 +420,60 @@ function renderSwarmView() {
       <div class="sw-head-l">
         <div class="sw-head-ico">${swarmIconSvg('ic-hornet')}</div>
         <div>
-          <h1 class="sw-head-title">Essaim Swarm <span class="tag swarm">LiteMCP</span><span class="tag sw-a2a">A2A</span></h1>
-          <div class="sw-head-sub">Orchestration, interactions A2A entre agents persistants et supervision Swarm-control (ports 23080&ndash;23099)</div>
+          <h1 class="sw-head-title">Essaim Swarm <span class="tag swarm">LiteMCP</span><span class="tag sw-a2a">A2A</span>${primaryInst && primaryInst.version ? `<span class="d-meta-pill">v${esc(primaryInst.version)}</span>` : ''}</h1>
+          <div class="sw-head-sub">Orchestration multi-agents, sessions MCP r&eacute;sidentes et communications A2A</div>
         </div>
       </div>
       <div class="sw-head-acts">
-        <button type="button" data-act="swarm-live-toggle">${swarmLive ? '<span class="tag sw-live">LIVE</span> Pause' : 'Reprendre Live'}</button>
-        <button type="button" data-act="swarm-sync-logos" title="Synchroniser les logos officiels depuis GitHub (auto au changement de version Swarm)">Sync logos</button>
-        <button type="button" data-act="swarm-refresh">${ic('refresh')} Actualiser</button>
-        <button type="button" data-act="scan">${ic('search')} Scanner ports</button>
-        <button type="button" data-act="store">${ic('store')} Installer Swarm</button>
+        <button type="button" data-act="swarm-live-toggle" title="Rafra&icirc;chissement automatique toutes les 5 s">${swarmLive ? '<span class="tag sw-live">LIVE</span> Pause' : 'Reprendre Live'}</button>
+        <button type="button" data-act="swarm-refresh" title="Rafra&icirc;chir maintenant">${ic('refresh')} Actualiser</button>
+        <button type="button" data-act="scan" title="Scanner les ports locaux (23080&ndash;23099)">${ic('search')} Scanner</button>
+        <button type="button" data-act="swarm-sync-logos" title="Synchroniser les logos SVG officiels depuis GitHub">Sync logos</button>
+        ${primaryCta}
       </div>
     </div>
 
+    ${renderSwarmBanners(insts, agents, anns)}
+
     <div class="sw-kpis">
+      <div class="sw-kpi ${instKpiCls}">
+        <span class="k-lbl">Orchestrateur</span>
+        <span class="k-val">${esc(instKpiVal)}</span>
+        <span class="k-sub" title="${esc(instKpiSub)}">${esc(instKpiSub)}</span>
+      </div>
       <div class="sw-kpi accent-cyan">
         <span class="k-lbl">Agents r&eacute;sidents</span>
         <span class="k-val">${esc(String(resUp))}/${esc(String(ress.length))}</span>
-        <span class="k-sub">MCP persistants (ask/status/stop)</span>
+        <span class="k-sub">${ress.length ? 'MCP actifs (ask \u00b7 status \u00b7 stop)' : 'aucun r\u00e9sident d\u00e9marr\u00e9'}</span>
       </div>
       <div class="sw-kpi accent-orange">
         <span class="k-lbl">Agents configur&eacute;s</span>
         <span class="k-val">${esc(String(agents.length))}</span>
-        <span class="k-sub">claude &middot; hermes &middot; antigravity</span>
+        <span class="k-sub">${esc(runnerSub)}</span>
       </div>
       <div class="sw-kpi">
-        <span class="k-lbl">Annonces / T&acirc;ches</span>
-        <span class="k-val">${esc(String(anns.length))} / ${esc(String(runningJobs))}</span>
-        <span class="k-sub">agents non suivis / en cours</span>
+        <span class="k-lbl">Activit&eacute; &amp; Flux</span>
+        <span class="k-val">${esc(String(runningJobs + activeRuns))} <span class="k-sub">en cours</span></span>
+        <span class="k-sub">${anns.length ? esc(String(anns.length)) + ' annonce(s) non suivie(s)' : esc(String(totalTurns)) + ' tour(s) A2A termin\u00e9(s)'}</span>
       </div>
     </div>
 
     <div class="sw-tabs" role="tablist" aria-label="Sections Swarm Control">
-      <button type="button" class="sw-tab ${swarmTab==='hive'?'sel':''}" role="tab" aria-selected="${swarmTab==='hive'?'true':'false'}" data-act="swarm-tab" data-tab="hive">Essaim &amp; A2A</button>
-      <button type="button" class="sw-tab ${swarmTab==='overview'?'sel':''}" role="tab" aria-selected="${swarmTab==='overview'?'true':'false'}" data-act="swarm-tab" data-tab="overview">Vue d'ensemble <span class="sw-tab-badge">${esc(String(ress.length))}</span></button>
+      <button type="button" class="sw-tab ${swarmTab==='hive'?'sel':''}" role="tab" aria-selected="${swarmTab==='hive'?'true':'false'}" data-act="swarm-tab" data-tab="hive">Vue d'ensemble &amp; A2A <span class="sw-tab-badge">${esc(String(ress.length))}</span></button>
       <button type="button" class="sw-tab ${swarmTab==='agents'?'sel':''}" role="tab" aria-selected="${swarmTab==='agents'?'true':'false'}" data-act="swarm-tab" data-tab="agents">Agents persistants <span class="sw-tab-badge">${esc(String(agents.length))}</span></button>
-      <button type="button" class="sw-tab ${swarmTab==='console'?'sel':''}" role="tab" aria-selected="${swarmTab==='console'?'true':'false'}" data-act="swarm-tab" data-tab="console">Console ask &amp; Config</button>
-      <button type="button" class="sw-tab ${swarmTab==='runs'?'sel':''}" role="tab" aria-selected="${swarmTab==='runs'?'true':'false'}" data-act="swarm-tab" data-tab="runs">Runs &amp; Parall&egrave;le${runningJobs ? ` <span class="sw-tab-badge">${esc(String(runningJobs))}</span>` : ''}</button>
+      <button type="button" class="sw-tab ${swarmTab==='console'?'sel':''}" role="tab" aria-selected="${swarmTab==='console'?'true':'false'}" data-act="swarm-tab" data-tab="console">Console &amp; Config</button>
+      <button type="button" class="sw-tab ${swarmTab==='runs'?'sel':''}" role="tab" aria-selected="${swarmTab==='runs'?'true':'false'}" data-act="swarm-tab" data-tab="runs">Runs &amp; Parall&egrave;le${(runningJobs + activeRuns) ? ` <span class="sw-tab-badge">${esc(String(runningJobs + activeRuns))}</span>` : ''}</button>
     </div>
 
     ${bodyHtml}
   </div>`;
+
+  swarmRestoreInputs(contentEl, savedInputs);
+  const feedEl = document.getElementById('swConsoleFeed');
+  if (feedEl) feedEl.scrollTop = feedEl.scrollHeight;
 }
 
 function renderSwarmHiveTab(insts, ress, agents, jobs) {
-  // 1. Collecte des liens A2A / MCP et des événements chronologiques
   const edges = [];
   const timeline = [];
 
@@ -325,7 +481,7 @@ function renderSwarmHiveTab(insts, ress, agents, jobs) {
     const st = swarmResidentLive[r.id] || r.status || {};
     const agName = r.agent || r.label;
     if (st.current && st.current.from) {
-      edges.push({from: st.current.from, to: agName, label: `en cours (${st.current.elapsedMs || 0} ms)`, active: true});
+      edges.push({from: st.current.from, to: agName, label: `actif (${st.current.elapsedMs || 0} ms)`, active: true});
       timeline.push({
         ts: Date.now(),
         kind: 'a2a',
@@ -355,7 +511,7 @@ function renderSwarmHiveTab(insts, ress, agents, jobs) {
     if (Array.isArray(a.mcpServers)) {
       for (const srv of a.mcpServers) {
         const sname = typeof srv === 'string' ? srv : (srv && srv.name ? srv.name : '');
-        if (sname) edges.push({from: a.name, to: sname, label: 'mcp/a2a', active: !!a.resident});
+        if (sname) edges.push({from: a.name, to: sname, label: 'mcpServers', active: !!a.resident});
       }
     }
   }
@@ -371,7 +527,7 @@ function renderSwarmHiveTab(insts, ress, agents, jobs) {
         to: aname,
         via: [],
         meta: `run ${r.status || 'running'} \u00b7 ${rid}`,
-        body: `Orchestration sur ${inst.label}`,
+        body: `Ex\u00e9cution sur ${inst.label}`,
         err: r.status === 'error' || r.status === 'failed',
         instId: inst.id,
         runId: rid,
@@ -386,7 +542,7 @@ function renderSwarmHiveTab(insts, ress, agents, jobs) {
     const via = Array.isArray(r.via) ? r.via : [];
     if (via.length > 1) {
       for (let i = 0; i < via.length - 1; i++) {
-        edges.push({from: via[i], to: via[i + 1], label: 'via', active: j.status === 'running'});
+        edges.push({from: via[i], to: via[i + 1], label: 'via A2A', active: j.status === 'running'});
       }
     }
     timeline.push({
@@ -396,7 +552,7 @@ function renderSwarmHiveTab(insts, ress, agents, jobs) {
       to: j.agent || j.server_id,
       via,
       meta: `${j.kind} \u00b7 ${j.status}${j.elapsed_ms != null ? ' \u00b7 ' + j.elapsed_ms + ' ms' : ''}`,
-      body: j.error ? j.error : (typeof r.reply === 'string' ? r.reply.slice(0, 260) : (j.prompt_preview || '')),
+      body: j.error ? j.error : (typeof r.reply === 'string' ? r.reply.slice(0, 280) : (j.prompt_preview || '')),
       err: j.status === 'error',
     });
   }
@@ -410,39 +566,69 @@ function renderSwarmHiveTab(insts, ress, agents, jobs) {
     return ev.kind === swarmA2aFilter;
   });
 
-  // 2. Colonnes topologie (uniquement les agents créés par swarm-control et leurs liens)
-  const colRes = ress.length
-    ? ress.map(r => {
-        const st = swarmResidentLive[r.id] || r.status || {};
-        const busy = st.state === 'busy';
-        const agName = r.agent || r.label;
-        const agCls = st.class || r.swarm_class || '';
-        return `<div class="sw-node is-res ${busy ? 'is-busy' : ''}">
-          <div class="sw-node-top">
-            <div class="sw-node-l"><span class="dot ${esc(r.state)}"></span>${swarmIconSvg('ic-hornet', agName, 'resident', agCls)}<span>${esc(agName)}</span></div>
-            <span class="tag ${busy ? 'sw-busy' : 'sw-idle'}">${esc((st.state || (r.state === 'UP' ? 'idle' : 'off')).toUpperCase())}</span>
-          </div>
-          <div class="sw-node-meta">
-            ${st.runner ? `<span class="tag sw-runner">${esc(st.runner)}</span>` : ''}
-            <span>file : <b>${esc(String(st.queueLength || 0))}</b></span>
-            <span>tours : <b>${esc(String(st.turnsDone || 0))}</b></span>
-          </div>
-          ${busy && st.current ? `<div class="sw-edge is-active"><b>${esc(st.current.from || '?')}</b><span class="sw-arrow">&rarr;</span><b>${esc(agName)}</b><span>${esc(String(st.current.elapsedMs || 0))}ms</span></div>` : ''}
-          <div class="sw-toolbar">
-            <button type="button" data-act="select" data-id="${esc(r.id)}">Fiche</button>
-            <button type="button" class="primary" data-act="swarm-open-console" data-target="res:${esc(r.id)}">Ask</button>
-            ${r.state === 'UP' ? `<button type="button" class="danger" data-act="swarm-res-stop" data-id="${esc(r.id)}" data-clear="0">Stop</button>` : ''}
-          </div>
-        </div>`;
-      }).join('')
-    : '<div class="sw-empty">Aucun agent r&eacute;sident actif.</div>';
+  // Colonne 1 : Orchestrateurs + Agents résidents
+  const instNodes = insts.map(inst => {
+    const up = inst.state === 'UP';
+    return `<div class="sw-node is-inst">
+      <div class="sw-node-top">
+        <div class="sw-node-l"><span class="dot ${esc(inst.state)}"></span>${swarmIconSvg('ic-hornet', inst.label, 'instance')}<span>${esc(inst.label)}</span></div>
+        <span class="tag ${up ? 'sw-idle' : 'sw-off'}">${esc(inst.state)}</span>
+      </div>
+      <div class="sw-node-meta">
+        <span class="tag swarm">ORCHESTRATEUR</span>
+        ${inst.version ? `<span>v<b>${esc(inst.version)}</b></span>` : ''}
+        ${inst.url ? `<span class="srow-pill">${esc(inst.url.replace(/^https?:\/\//, ''))}</span>` : ''}
+        <span>agents : <b>${esc(String((inst.agents || []).length))}</b></span>
+      </div>
+      <div class="sw-toolbar">
+        <button type="button" data-act="select" data-id="${esc(inst.id)}">Fiche MCP</button>
+        ${up ? `<button type="button" data-act="swarm-quick-create">+ Cr&eacute;er agent</button>` : `<button type="button" class="primary" data-act="row-act" data-op="start" data-id="${esc(inst.id)}">${ic('play')} D&eacute;marrer</button>`}
+      </div>
+    </div>`;
+  }).join('');
+
+  const resNodes = ress.map(r => {
+    const st = swarmResidentLive[r.id] || r.status || {};
+    const busy = st.state === 'busy';
+    const agName = r.agent || r.label;
+    const agCls = st.class || r.swarm_class || '';
+    const needsPair = r.locked && !r.paired;
+    const stateLbl = (st.state || (r.state === 'UP' ? 'idle' : 'off')).toUpperCase();
+    return `<div class="sw-node is-res ${busy ? 'is-busy' : ''}">
+      <div class="sw-node-top">
+        <div class="sw-node-l"><span class="dot ${esc(r.state)}"></span>${swarmIconSvg('ic-hornet', agName, 'resident', agCls)}<span>${esc(agName)}</span></div>
+        <span class="tag ${busy ? 'sw-busy' : (r.state === 'UP' ? 'sw-idle' : 'sw-off')}">${esc(stateLbl)}</span>
+      </div>
+      <div class="sw-node-meta">
+        ${agCls ? `<span class="tag swarm-res">${esc(agCls)}</span>` : '<span class="tag swarm-res">r&eacute;sident</span>'}
+        ${st.runner ? `<span class="tag sw-runner">${esc(st.runner)}</span>` : ''}
+        <span>file : <b>${esc(String(st.queueLength || 0))}</b></span>
+        <span>tours : <b>${esc(String(st.turnsDone || 0))}</b></span>
+      </div>
+      ${busy && st.current ? `<div class="sw-edge is-active"><b>${esc(st.current.from || '?')}</b><span class="sw-arrow">&rarr;</span><b>${esc(agName)}</b><span>${esc(String(st.current.elapsedMs || 0))} ms</span></div>` : ''}
+      ${r.error ? `<div class="sw-card-err">${esc(r.error)}</div>` : ''}
+      <div class="sw-toolbar">
+        ${needsPair ? `<button type="button" class="primary" data-act="server-pair" data-id="${esc(r.id)}">${ic('lock')} Appairer</button>` : ''}
+        <button type="button" class="primary" data-act="swarm-open-console" data-target="res:${esc(r.id)}">Dialoguer (ask)</button>
+        <button type="button" data-act="select" data-id="${esc(r.id)}">Fiche</button>
+        ${r.state === 'UP' ? `<button type="button" class="danger" data-act="swarm-res-stop" data-id="${esc(r.id)}" data-clear="0">Stop</button>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+
+  const inactiveAgents = agents.filter(a => !a.resident && !swarmFindResidentFor(a.name));
+  const emptyResHint = !ress.length
+    ? (inactiveAgents.length
+        ? `<div class="sw-empty"><div><b>${esc(String(inactiveAgents.length))}</b> agent(s) configur&eacute;(s), aucun d&eacute;marr&eacute; en mode r&eacute;sident.</div><div class="sw-empty-acts"><button type="button" class="primary" data-act="swarm-tab" data-tab="agents">D&eacute;marrer un agent r&eacute;sident</button></div></div>`
+        : `<div class="sw-empty"><div>Aucun agent r&eacute;sident actif pour le moment.</div>${insts.some(i => i.state === 'UP') ? `<div class="sw-empty-acts"><button type="button" class="primary" data-act="swarm-quick-create">+ Cr&eacute;er un agent r&eacute;sident</button></div>` : ''}</div>`)
+    : '';
 
   const colEdges = edges.length
     ? edges.slice(0, 24).map(e => `<div class="sw-edge ${e.active ? 'is-active' : ''}">
         <b>${esc(e.from)}</b><span class="sw-arrow">&rarr;</span><b>${esc(e.to)}</b>
         <span class="d-meta-pill">${esc(e.label)}</span>
       </div>`).join('')
-    : '<div class="sw-empty">Aucun lien A2A ou <code>mcpServers</code> observ&eacute; pour le moment.</div>';
+    : `<div class="sw-empty"><div>Aucun lien A2A actif ou serveur MCP c&acirc;bl&eacute; dans <code>.mcp.json</code>.</div>${agents.length ? `<div class="sw-empty-acts"><button type="button" data-act="swarm-tab" data-tab="console">C&acirc;bler des serveurs MCP</button></div>` : ''}</div>`;
 
   const resOpts = ress.filter(r => r.state === 'UP').map(r =>
     `<option value="${esc(r.id)}">${esc(r.agent || r.label)}</option>`
@@ -469,12 +655,14 @@ function renderSwarmHiveTab(insts, ress, agents, jobs) {
           ${ev.body ? `<pre class="sw-ev-body">${escPre(ev.body)}</pre>` : ''}
         </div>`;
       }).join('')
-    : '<div class="sw-empty">Aucune interaction A2A ou d\'orchestration enregistr&eacute;e pour ce filtre.</div>';
+    : '<div class="sw-empty">Aucune interaction A2A ou ex&eacute;cution enregistr&eacute;e pour ce filtre.</div>';
 
   return `<div class="sw-topo">
       <div class="sw-topo-col">
-        <div class="sw-topo-head"><span>Agents r&eacute;sidents</span><span>${esc(String(ress.length))}</span></div>
-        ${colRes}
+        <div class="sw-topo-head"><span>Topologie de l'essaim</span><span>${esc(String(insts.length))} orch. &middot; ${esc(String(ress.length))} r&eacute;sid.</span></div>
+        ${instNodes}
+        ${resNodes}
+        ${emptyResHint}
       </div>
       <div class="sw-topo-col">
         <div class="sw-topo-head"><span>Liens A2A &amp; MCP</span><span>${esc(String(edges.length))}</span></div>
@@ -483,80 +671,32 @@ function renderSwarmHiveTab(insts, ress, agents, jobs) {
     </div>
 
     <div class="sw-form">
-      <div class="sw-sec-head"><h2>D&eacute;clencher une interaction A2A (<code>ask</code>)</h2></div>
+      <div class="sw-sec-head">
+        <h2>Interaction A2A rapide (<code>ask</code>)</h2>
+        ${!resOpts ? '<span class="d-meta-pill">D&eacute;marrez un agent r&eacute;sident UP pour activer l\'envoi direct</span>' : ''}
+      </div>
       <div class="sw-a2a-bar">
-        <input id="swA2aFrom" placeholder="De (ex. orchestrator)" value="mcp-control" aria-label="Exp&eacute;diteur A2A">
-        <select id="swA2aTo" aria-label="Agent destinataire A2A">
+        <input id="swA2aFrom" placeholder="Exp&eacute;diteur" value="mcp-control" aria-label="Exp&eacute;diteur A2A" ${resOpts ? '' : 'disabled'}>
+        <select id="swA2aTo" aria-label="Agent destinataire A2A" ${resOpts ? '' : 'disabled'}>
           ${resOpts || '<option value="">Aucun r&eacute;sident UP</option>'}
         </select>
-        <input id="swA2aVia" placeholder="via (ex. a,b)" aria-label="Cha&icirc;ne via A2A">
-        <input id="swA2aPrompt" placeholder="Message A2A &agrave; envoyer &agrave; l'agent&hellip;" aria-label="Message A2A">
+        <input id="swA2aVia" placeholder="via (opt. ex: a,b)" aria-label="Cha&icirc;ne via A2A" ${resOpts ? '' : 'disabled'}>
+        <input id="swA2aPrompt" placeholder="Message A2A &agrave; envoyer &agrave; l'agent (Entr&eacute;e pour envoyer)&hellip;" aria-label="Message A2A" ${resOpts ? '' : 'disabled'}>
         <button type="button" class="primary" data-act="swarm-a2a-send" ${resOpts ? '' : 'disabled'}>Envoyer A2A</button>
       </div>
     </div>
 
     <div class="sw-sec-head">
-      <h2>Chronologie des interactions (A2A, Orchestration, Runs)</h2>
+      <h2>Chronologie des interactions (${esc(String(filteredEvents.length))})</h2>
       <div class="sw-toolbar">
         <button type="button" class="exp-pill ${swarmA2aFilter==='all'?'sel':''}" data-act="swarm-a2a-filter" data-mode="all">Tous</button>
         <button type="button" class="exp-pill ${swarmA2aFilter==='a2a'?'sel':''}" data-act="swarm-a2a-filter" data-mode="a2a">A2A</button>
-        <button type="button" class="exp-pill ${swarmA2aFilter==='orch'?'sel':''}" data-act="swarm-a2a-filter" data-mode="orch">Orchestration</button>
+        <button type="button" class="exp-pill ${swarmA2aFilter==='orch'?'sel':''}" data-act="swarm-a2a-filter" data-mode="orch">Parall&egrave;le</button>
         <button type="button" class="exp-pill ${swarmA2aFilter==='runs'?'sel':''}" data-act="swarm-a2a-filter" data-mode="runs">Runs</button>
         <button type="button" class="exp-pill ${swarmA2aFilter==='err'?'sel':''}" data-act="swarm-a2a-filter" data-mode="err">Erreurs</button>
       </div>
     </div>
     <div class="sw-timeline">${timelineHtml}</div>`;
-}
-
-function renderSwarmOverviewTab(_insts, ress, anns) {
-  let html = '';
-  if (anns.length) {
-    html += `<div class="sw-sec-head"><h2>Agents Swarm d&eacute;tect&eacute;s (litemcp-registry, non suivis)</h2></div>`;
-    for (const a of anns) {
-      html += `<div class="sw-ann-row">
-        <div><span class="tag swarm-res">R&Eacute;SIDENT</span> <b>${esc(a.name)}</b> ${a.port ? `<span class="srow-pill">:${esc(String(a.port))}</span>` : ''} ${a.version ? `<span class="d-meta-pill">v${esc(a.version)}</span>` : ''}</div>
-        <button type="button" class="primary" data-act="follow-ann" data-name="${esc(a.name)}" data-port="${esc(String(a.port || ''))}">Suivre dans MCP Control</button>
-      </div>`;
-    }
-  }
-
-  html += `<div class="sw-sec-head"><h2>Agents MCP r&eacute;sidents suivis (${esc(String(ress.length))})</h2></div>`;
-  if (!ress.length) {
-    html += `<div class="sw-empty">Aucun agent r&eacute;sident suivi pour le moment. D&eacute;marrez un agent en mode <b>R&eacute;sident ON</b> dans l'onglet <b>Agents persistants</b>.</div>`;
-  } else {
-    html += '<div class="sw-grid">';
-    for (const r of ress) {
-      const st = r.status || {};
-      const rState = st.state || (r.state === 'UP' ? 'idle' : 'offline');
-      const qLen = st.queueLength || 0;
-      const turns = st.turnsDone || 0;
-      const needsPair = r.locked && !r.paired;
-      const rCls = st.class || r.swarm_class || '';
-      html += `<div class="sw-card is-resident">
-        <div class="sw-card-head">
-          <div class="sw-card-title"><span class="dot ${esc(r.state)}"></span>${swarmIconSvg('ic-hornet', r.agent || r.label, 'resident', rCls)}<span class="nm">${esc(r.agent || r.label)}</span></div>
-          <span class="tag ${rState === 'busy' ? 'sw-busy' : 'sw-idle'}">${esc(rState.toUpperCase())}</span>
-        </div>
-        <div class="sw-card-meta">
-          <span class="tag swarm-res">R&Eacute;SIDENT</span>
-          ${st.runner ? `<span class="tag sw-runner">${esc(st.runner)}</span>` : ''}
-          ${r.url ? `<span class="srow-pill">${esc(r.url)}</span>` : ''}
-          <span class="d-meta-pill">file: ${esc(String(qLen))}</span>
-          <span class="d-meta-pill">tours: ${esc(String(turns))}</span>
-          ${r.bridge_port ? `<span class="d-meta-pill">bridge :${esc(String(r.bridge_port))}</span>` : ''}
-        </div>
-        ${r.error ? `<div class="sw-card-err">${esc(r.error)}</div>` : ''}
-        <div class="sw-card-acts">
-          ${needsPair ? `<button type="button" class="primary" data-act="server-pair" data-id="${esc(r.id)}">${ic('lock')} Appairer</button>` : ''}
-          <button type="button" class="primary" data-act="swarm-open-console" data-target="res:${esc(r.id)}">Console ask</button>
-          ${r.state === 'UP' ? `<button type="button" class="danger" data-act="swarm-res-stop" data-id="${esc(r.id)}" data-clear="0">Stop</button>` : ''}
-          <button type="button" data-act="select" data-id="${esc(r.id)}">D&eacute;tail MCP</button>
-        </div>
-      </div>`;
-    }
-    html += '</div>';
-  }
-  return html;
 }
 
 function renderSwarmAgentsTab(insts, agents) {
@@ -566,46 +706,56 @@ function renderSwarmAgentsTab(insts, agents) {
   ).join('');
 
   const filtered = agents.filter(a => {
-    if (swarmSelectedInst && a._instanceId !== swarmSelectedInst) return false;
+    if (swarmSelectedInst && insts.length > 1 && a._instanceId !== swarmSelectedInst) return false;
     if (swarmFilterRunner !== 'all' && (a.runner || '') !== swarmFilterRunner) return false;
     if (swarmFilterState === 'resident' && !a.resident) return false;
     if (swarmFilterState === 'running' && !a.running) return false;
     if (swarmFilterState === 'session' && !a.hasSession) return false;
     if (swarmSearch) {
-      const hay = ((a.name || '') + ' ' + (a.runner || '') + ' ' + (a.model || '')).toLowerCase();
+      const hay = ((a.name || '') + ' ' + (a.runner || '') + ' ' + (a.model || '') + ' ' + (a.class || '')).toLowerCase();
       if (!hay.includes(swarmSearch.toLowerCase())) return false;
     }
     return true;
   });
 
+  const clsOpts = SWARM_CLASSES.map(([id, lbl]) =>
+    `<option value="${esc(id)}"${swarmNewClass === id ? ' selected' : ''}>${esc(lbl)}</option>`
+  ).join('');
+
   let createHtml = '';
-  if (swarmCreateOpen) {
+  if (swarmCreateOpen || (upInsts.length > 0 && agents.length === 0)) {
     createHtml = `<div class="sw-form">
-      <div class="sw-sec-head"><h2>Cr&eacute;er un agent Swarm-control</h2><button type="button" data-act="swarm-toggle-create">Fermer</button></div>
+      <div class="sw-sec-head">
+        <h2><span id="swNewClsPrev" class="sw-cls-prev">${swarmIconSvg('ic-hornet', swarmNewClass, 'resident', swarmNewClass)}</span> Cr&eacute;er un agent Swarm-control</h2>
+        ${agents.length > 0 ? `<button type="button" data-act="swarm-toggle-create">Fermer</button>` : ''}
+      </div>
       <div class="sw-form-row">
         <div class="sw-field"><label for="swNewName">Nom de l'agent</label><input id="swNewName" placeholder="ex. alice, reviewer, ops"></div>
+        <div class="sw-field"><label for="swNewClass">Classe / R&ocirc;le</label><select id="swNewClass" data-act="swarm-new-cls">${clsOpts}</select></div>
         <div class="sw-field"><label for="swNewRunner">Runner</label><select id="swNewRunner"><option value="claude">claude</option><option value="hermes">hermes</option><option value="antigravity">antigravity</option></select></div>
         <div class="sw-field"><label for="swNewModel">Mod&egrave;le (optionnel)</label><input id="swNewModel" placeholder="ex. sonnet, opus, gemini-2.5-pro"></div>
-        <div class="sw-field"><label for="swNewClone">Cloner depuis (optionnel)</label><input id="swNewClone" placeholder="nom d'agent existant"></div>
+        <div class="sw-field"><label for="swNewClone">Cloner depuis (optionnel)</label><input id="swNewClone" placeholder="agent existant"></div>
       </div>
-      <div class="sw-field"><label for="swNewPrompt">Prompt syst&egrave;me (prompt.md)</label><textarea id="swNewPrompt" placeholder="R&ocirc;le et instructions de l'agent&hellip;"></textarea></div>
+      <div class="sw-field"><label for="swNewPrompt">Prompt syst&egrave;me (<code>prompt.md</code>)</label><textarea id="swNewPrompt" placeholder="Décrivez la mission, les outils et les consignes de cet agent&hellip;"></textarea></div>
       <div class="sw-toolbar">
         <label class="sw-check"><input type="checkbox" id="swNewResident" checked> D&eacute;marrer imm&eacute;diatement en agent r&eacute;sident MCP</label>
-        <button type="button" class="primary" data-act="swarm-create-submit">Cr&eacute;er l'agent</button>
+        <button type="button" class="primary" data-act="swarm-create-submit" ${upInsts.length ? '' : 'disabled'}>Cr&eacute;er l'agent</button>
       </div>
     </div>`;
   }
 
   let cardsHtml = '';
   if (!upInsts.length) {
-    cardsHtml = `<div class="sw-empty">Aucune instance Swarm-control UP disponible pour lister les agents.</div>`;
+    cardsHtml = `<div class="sw-empty">Aucune instance Swarm-control UP disponible pour lister ou cr&eacute;er des agents.</div>`;
+  } else if (!agents.length) {
+    cardsHtml = '';
   } else if (!filtered.length) {
     cardsHtml = `<div class="sw-empty">Aucun agent ne correspond aux filtres courants.</div>`;
   } else {
     cardsHtml = '<div class="sw-grid">';
     for (const a of filtered) {
-      const isRes = !!a.resident;
       const matchedRes = swarmFindResidentFor(a.name);
+      const isRes = Boolean(a.resident || (matchedRes && matchedRes.state === 'UP'));
       const resUrl = (a.resident && a.resident.url) || (matchedRes && matchedRes.url) || '';
       const consoleTgt = matchedRes
         ? 'res:' + matchedRes.id
@@ -618,10 +768,11 @@ function renderSwarmAgentsTab(insts, agents) {
         </div>
         <div class="sw-card-meta">
           <span class="tag sw-runner">${esc(a.runner || '?')}</span>
+          ${aCls ? `<span class="d-meta-pill">${esc(aCls)}</span>` : ''}
           ${a.model ? `<span class="d-meta-pill">${esc(a.model)}</span>` : ''}
           ${a.hasSession ? '<span class="tag sw-idle">session</span>' : ''}
           ${a.running ? '<span class="tag sw-busy">running</span>' : ''}
-          ${resUrl ? `<span class="srow-pill">${esc(resUrl)}</span>` : ''}
+          ${resUrl ? `<span class="srow-pill">${esc(resUrl.replace(/^https?:\/\//, ''))}</span>` : ''}
         </div>
         <div class="sw-card-acts">
           ${isRes
@@ -638,7 +789,7 @@ function renderSwarmAgentsTab(insts, agents) {
 
   return `<div class="sw-sec-head">
       <div class="sw-toolbar">
-        ${insts.length ? `<select id="swInstSel" aria-label="Instance Swarm" data-act="swarm-inst-change">${instOpts}</select>` : ''}
+        ${insts.length > 1 ? `<select id="swInstSel" aria-label="Instance Swarm" data-act="swarm-inst-change">${instOpts}</select>` : ''}
         <select id="swRunFilter" aria-label="Filtrer par runner" data-act="swarm-filter-change">
           <option value="all"${swarmFilterRunner==='all'?' selected':''}>Tous runners</option>
           <option value="claude"${swarmFilterRunner==='claude'?' selected':''}>claude</option>
@@ -653,10 +804,22 @@ function renderSwarmAgentsTab(insts, agents) {
         </select>
         <input id="swAgentSearch" placeholder="Rechercher un agent&hellip;" value="${esc(swarmSearch)}" data-act="swarm-filter-change">
       </div>
-      <button type="button" class="primary" data-act="swarm-toggle-create">${swarmCreateOpen ? 'Fermer formulaire' : '+ Nouvel agent'}</button>
+      ${agents.length > 0 ? `<button type="button" class="primary" data-act="swarm-toggle-create">${swarmCreateOpen ? 'Fermer formulaire' : '+ Nouvel agent'}</button>` : ''}
     </div>
     ${createHtml}
     ${cardsHtml}`;
+}
+
+function swarmWiredMcpSet(filesMap) {
+  const wired = new Set();
+  if (!filesMap || filesMap['.mcp.json'] == null) return wired;
+  try {
+    const raw = filesMap['.mcp.json'];
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    const map = (parsed && (parsed.mcpServers || parsed.servers)) || {};
+    Object.keys(map).forEach(k => wired.add(k.toLowerCase()));
+  } catch (_) {}
+  return wired;
 }
 
 function renderSwarmConsoleTab(insts, ress, agents, jobs) {
@@ -677,13 +840,13 @@ function renderSwarmConsoleTab(insts, ress, agents, jobs) {
 
   let statusBar = '';
   if (selectedRes) {
-    const st = selectedRes.status || {};
+    const st = swarmResidentLive[selectedRes.id] || selectedRes.status || {};
     const stName = st.state || (selectedRes.state === 'UP' ? 'idle' : 'offline');
     statusBar = `<div class="sw-status-bar">
-      <span class="tag ${stName === 'busy' ? 'sw-busy' : 'sw-idle'}">${esc(stName.toUpperCase())}</span>
-      <span>file: <b>${esc(String(st.queueLength || 0))}</b></span>
-      <span>tours: <b>${esc(String(st.turnsDone || 0))}</b></span>
-      ${st.current && st.current.from ? `<span>en cours (${esc(st.current.from)}) ${esc(String(st.current.elapsedMs || 0))}ms</span>` : ''}
+      <span class="tag ${stName === 'busy' ? 'sw-busy' : (selectedRes.state === 'UP' ? 'sw-idle' : 'sw-off')}">${esc(stName.toUpperCase())}</span>
+      <span>file : <b>${esc(String(st.queueLength || 0))}</b></span>
+      <span>tours : <b>${esc(String(st.turnsDone || 0))}</b></span>
+      ${st.current && st.current.from ? `<span>en cours (${esc(st.current.from)}) ${esc(String(st.current.elapsedMs || 0))} ms</span>` : ''}
       <button type="button" data-act="swarm-res-status" data-id="${esc(selectedRes.id)}">Statut</button>
       <button type="button" class="danger" data-act="swarm-res-stop" data-id="${esc(selectedRes.id)}" data-clear="0">Stop</button>
       <button type="button" class="danger" data-act="swarm-res-stop" data-id="${esc(selectedRes.id)}" data-clear="1">Vider file</button>
@@ -698,18 +861,19 @@ function renderSwarmConsoleTab(insts, ress, agents, jobs) {
         <div class="sw-msg-head"><b>${esc(m.title)}</b><span>${esc(m.meta || '')}</span></div>
         <pre>${escPre(m.text)}</pre>
       </div>`).join('')
-    : '<div class="sw-empty">Envoyez un prompt &agrave; un agent r&eacute;sident (<code>ask</code>) ou via son instance (<code>run_agent</code>).</div>';
+    : '<div class="sw-empty">Envoyez un prompt &agrave; un agent r&eacute;sident (<code>ask</code>) ou via l\'orchestrateur (<code>run_agent</code>).</div>';
 
-  // Panneau Config à droite
   const cfgFiles = ['prompt.md', 'settings.json', '.mcp.json', 'skill.md'];
   const filesMap = (swarmCfgData && swarmCfgData.files) || {};
   const curContent = filesMap[swarmCfgFile] != null
     ? (typeof filesMap[swarmCfgFile] === 'string' ? filesMap[swarmCfgFile] : JSON.stringify(filesMap[swarmCfgFile], null, 2))
     : '';
-  const mcpTargets = (swarmData && swarmData.mcp_targets) || [];
-  const mcpChecks = mcpTargets.slice(0, 20).map(t =>
-    `<label class="sw-mcp-chip"><input type="checkbox" class="sw-mcp-cb" value="${esc(t.label)}"> ${esc(t.label)}</label>`
-  ).join('');
+  const wiredSet = swarmWiredMcpSet(filesMap);
+  const mcpTargets = ((swarmData && swarmData.mcp_targets) || []).filter(t => !t.swarm_kind || t.swarm_kind === 'resident');
+  const mcpChecks = mcpTargets.slice(0, 24).map(t => {
+    const isChecked = wiredSet.has(String(t.label || '').toLowerCase()) || wiredSet.has(String(t.id || '').toLowerCase());
+    return `<label class="sw-mcp-chip"><input type="checkbox" class="sw-mcp-cb" value="${esc(t.label)}"${isChecked ? ' checked' : ''}> ${esc(t.label)}</label>`;
+  }).join('');
 
   return `<div class="sw-split">
     <div class="sw-console-box">
@@ -720,23 +884,23 @@ function renderSwarmConsoleTab(insts, ress, agents, jobs) {
         </select>
       </div>
       ${statusBar}
-      ${runningAsk.length ? `<div class="sw-status-bar"><span class="spin">${ic('refresh')}</span><span>${esc(String(runningAsk.length))} requ&ecirc;te(s) <code>ask</code> en cours&hellip;</span></div>` : ''}
+      ${runningAsk.length ? `<div class="sw-status-bar"><span class="spin">${ic('refresh')}</span><span>${esc(String(runningAsk.length))} requ&ecirc;te(s) en cours&hellip;</span></div>` : ''}
       <div class="sw-feed" id="swConsoleFeed">${feedHtml}</div>
       <div class="sw-field">
-        <label for="swAskPrompt">Prompt</label>
-        <textarea id="swAskPrompt" placeholder="Votre message pour l'agent&hellip;"></textarea>
+        <label for="swAskPrompt">Prompt <span class="d-meta-pill">Ctrl+Entr&eacute;e</span></label>
+        <textarea id="swAskPrompt" placeholder="Votre message pour l'agent&hellip;" ${targetOpts.length ? '' : 'disabled'}></textarea>
       </div>
       <div class="sw-toolbar">
-        <input id="swAskFrom" placeholder="from (ex. mcp-control)" value="mcp-control">
-        <input id="swAskModel" placeholder="mod&egrave;le (optionnel)">
-        <button type="button" class="primary" data-act="swarm-send-ask">Envoyer</button>
-        <button type="button" data-act="swarm-clear-feed">Effacer historique</button>
+        <input id="swAskFrom" placeholder="from (ex. mcp-control)" value="mcp-control" ${targetOpts.length ? '' : 'disabled'}>
+        <input id="swAskModel" placeholder="mod&egrave;le (optionnel)" ${targetOpts.length ? '' : 'disabled'}>
+        <button type="button" class="primary" data-act="swarm-send-ask" ${targetOpts.length ? '' : 'disabled'}>Envoyer</button>
+        <button type="button" data-act="swarm-clear-feed">Effacer</button>
       </div>
     </div>
 
     <div class="sw-console-box">
       <div class="sw-sec-head">
-        <h2>Configuration de l'agent${swarmCfgAgent ? ' : ' + esc(swarmCfgAgent) : ''}</h2>
+        <h2>Configuration${swarmCfgAgent ? ' : ' + esc(swarmCfgAgent) : ''}</h2>
         <div class="sw-toolbar">
           <select id="swCfgAgentSel" aria-label="Agent &agrave; configurer" data-act="swarm-cfg-pick">
             <option value="">Choisir un agent&hellip;</option>
@@ -749,24 +913,27 @@ function renderSwarmConsoleTab(insts, ress, agents, jobs) {
       </div>
       <div class="sw-field">
         <label for="swCfgEditor">${esc(swarmCfgFile)}</label>
-        <textarea id="swCfgEditor" placeholder="S&eacute;lectionnez un agent pour charger sa configuration&hellip;">${esc(curContent)}</textarea>
+        <textarea id="swCfgEditor" placeholder="S&eacute;lectionnez un agent ci-dessus pour lire et modifier sa configuration&hellip;" ${swarmCfgAgent ? '' : 'disabled'}>${esc(curContent)}</textarea>
       </div>
       <div class="sw-toolbar">
         <button type="button" class="primary" data-act="swarm-cfg-save" ${swarmCfgAgent ? '' : 'disabled'}>Enregistrer ${esc(swarmCfgFile)}</button>
       </div>
       ${mcpTargets.length ? `<div class="sw-field">
-        <label>C&acirc;bler des serveurs MCP Control dans <code>mcpServers</code></label>
+        <label>Serveurs MCP Control c&acirc;bl&eacute;s dans <code>mcpServers</code></label>
         <div class="sw-mcp-list">${mcpChecks}</div>
-        <div><button type="button" data-act="swarm-cfg-wire-mcp" ${swarmCfgAgent ? '' : 'disabled'}>Appliquer les serveurs MCP coch&eacute;s</button></div>
+        <div><button type="button" data-act="swarm-cfg-wire-mcp" ${swarmCfgAgent ? '' : 'disabled'}>Appliquer les serveurs coch&eacute;s</button></div>
       </div>` : ''}
     </div>
   </div>`;
 }
 
-function renderSwarmRunsTab(insts, jobs) {
+function renderSwarmRunsTab(insts, agents, jobs) {
+  const upInsts = insts.filter(i => i.state === 'UP');
   const instOpts = insts.map(i =>
     `<option value="${esc(i.id)}"${swarmSelectedInst === i.id ? ' selected' : ''}>${esc(i.label)} (${esc(i.state)})</option>`
   ).join('');
+
+  const agentListHtml = `<datalist id="swKnownAgentsList">${agents.map(a => `<option value="${esc(a.name)}"></option>`).join('')}</datalist>`;
 
   const parRows = swarmParallelDraft.map((row, idx) => `<div class="sw-par-row">
     <select class="sw-par-runner" data-idx="${idx}" aria-label="Runner t&acirc;che ${idx + 1}">
@@ -774,9 +941,9 @@ function renderSwarmRunsTab(insts, jobs) {
       <option value="hermes"${row.runner==='hermes'?' selected':''}>hermes</option>
       <option value="antigravity"${row.runner==='antigravity'?' selected':''}>antigravity</option>
     </select>
-    <input class="sw-par-agent" data-idx="${idx}" placeholder="agentName (opt.)" value="${esc(row.agentName || '')}">
+    <input class="sw-par-agent" data-idx="${idx}" list="swKnownAgentsList" placeholder="agent (opt.)" value="${esc(row.agentName || '')}">
     <input class="sw-par-prompt" data-idx="${idx}" placeholder="Prompt pour la t&acirc;che #${idx + 1}&hellip;" value="${esc(row.prompt || '')}">
-    <button type="button" class="danger" data-act="swarm-par-del" data-idx="${idx}" aria-label="Retirer la t&acirc;che ${idx + 1}">&times;</button>
+    <button type="button" class="danger" data-act="swarm-par-del" data-idx="${idx}" aria-label="Retirer la t&acirc;che ${idx + 1}" ${swarmParallelDraft.length <= 1 ? 'disabled' : ''}>&times;</button>
   </div>`).join('');
 
   const allRuns = [];
@@ -799,25 +966,25 @@ function renderSwarmRunsTab(insts, jobs) {
           </div>
         </div>`;
       }).join('')
-    : '<div class="sw-empty">Aucun run actif report&eacute; par les instances Swarm-control.</div>';
+    : '<div class="sw-empty">Aucun run actif report&eacute; par Swarm-control.</div>';
 
   const jobsHtml = jobs.length
-    ? jobs.slice(0, 12).map(j => `<div class="sw-ann-row">
-        <div><span class="tag ${j.status==='running'?'sw-busy':(j.status==='done'?'sw-idle':'')}">${esc(j.status)}</span> <b>${esc(j.kind)}</b> <span class="srow-pill">${esc(j.id)}</span> ${esc(j.prompt_preview || '')}</div>
+    ? jobs.slice(0, 15).map(j => `<div class="sw-ann-row">
+        <div><span class="tag ${j.status==='running'?'sw-busy':(j.status==='done'?'sw-idle':'sw-off')}">${esc(j.status)}</span> <b>${esc(j.kind)}</b> ${j.agent ? `<span class="d-meta-pill">${esc(j.agent)}</span>` : ''} <span class="srow-pill">${esc(j.id)}</span> ${esc(j.error || j.prompt_preview || '')}</div>
         <span class="d-meta-pill">${j.elapsed_ms != null ? esc(String(j.elapsed_ms)) + ' ms' : 'en cours'}</span>
       </div>`).join('')
-    : '<div class="sw-empty">Aucune t&acirc;che UI lanc&eacute;e pendant cette session.</div>';
+    : '<div class="sw-empty">Aucune t&acirc;che lanc&eacute;e pendant cette session.</div>';
 
-  return `<div class="sw-form">
+  return `${agentListHtml}<div class="sw-form">
       <div class="sw-sec-head">
-        <h2>Lancement parall&egrave;le (<code>run_agents_parallel</code>, jusqu'&agrave; 10 agents)</h2>
-        ${insts.length ? `<select id="swParInst" aria-label="Instance cible">${instOpts}</select>` : ''}
+        <h2>Ex&eacute;cution parall&egrave;le (<code>run_agents_parallel</code>, jusqu'&agrave; 10 t&acirc;ches)</h2>
+        ${insts.length > 1 ? `<select id="swParInst" aria-label="Instance cible">${instOpts}</select>` : ''}
       </div>
       ${parRows}
       <div class="sw-toolbar">
         <button type="button" data-act="swarm-par-add">+ Ajouter une t&acirc;che</button>
         <label class="sw-check"><input type="checkbox" id="swParWait" checked> Attendre tous les r&eacute;sultats (<code>waitAll</code>)</label>
-        <button type="button" class="primary" data-act="swarm-par-run">Lancer en parall&egrave;le</button>
+        <button type="button" class="primary" data-act="swarm-par-run" ${upInsts.length ? '' : 'disabled'}>Lancer en parall&egrave;le</button>
       </div>
     </div>
 
@@ -828,11 +995,11 @@ function renderSwarmRunsTab(insts, jobs) {
       <pre class="sw-stream-pre">${escPre(swarmStreamOut.text)}</pre>
     </div>` : ''}
 
-    <div class="sw-sec-head"><h2>T&acirc;ches r&eacute;centes de l'UI</h2></div>
+    <div class="sw-sec-head"><h2>Historique des t&acirc;ches de la session</h2></div>
     ${jobsHtml}`;
 }
 
-/* ===== Vues intégrées dans la grande fenêtre Détail d'un serveur Swarm ===== */
+/* ===== Vues intégrées dans la fiche Détail d'un agent résident Swarm ===== */
 
 function swarmFindInstanceForAgent(agentName) {
   const insts = (swarmData && swarmData.instances) || [];
@@ -846,61 +1013,33 @@ function swarmFindInstanceForAgent(agentName) {
 }
 
 async function swarmOnDetailTab(tab, s) {
-  if (!s || !s.swarm_kind) return;
+  if (!s || s.swarm_kind !== 'resident') return;
   if (tab !== 'swarm-chat' && tab !== 'swarm-cfg') return;
   if (!swarmData) await swarmRefresh(false);
   if (tab === 'swarm-chat') {
-    if (s.swarm_kind === 'resident') {
-      swarmConsoleTarget = 'res:' + s.id;
-      if (s.state === 'UP') {
-        const j = await postAction({action: 'swarm_resident_status', server_id: s.id}, {quiet: true});
-        if (j && j.ok && j.data) swarmResidentLive[s.id] = j.data;
-      }
-    } else {
-      const inst = ((swarmData && swarmData.instances) || []).find(i => i.id === s.id);
-      const firstAg = inst && inst.agents && inst.agents[0];
-      if (firstAg && !swarmConsoleTarget.startsWith('inst:' + s.id + ':')) {
-        swarmConsoleTarget = 'inst:' + s.id + ':' + firstAg.name;
-      }
+    swarmConsoleTarget = 'res:' + s.id;
+    if (s.state === 'UP') {
+      const j = await postAction({action: 'swarm_resident_status', server_id: s.id}, {quiet: true});
+      if (j && j.ok && j.data) swarmResidentLive[s.id] = j.data;
     }
     swarmEnsurePoll();
     swarmRerenderActive();
   } else if (tab === 'swarm-cfg') {
-    if (s.swarm_kind === 'resident' && s.swarm_agent) {
+    if (s.swarm_agent) {
       const instId = swarmFindInstanceForAgent(s.swarm_agent);
       if (instId) await swarmLoadConfig(instId, s.swarm_agent, '', true);
-    } else if (s.swarm_kind === 'instance') {
-      swarmSelectedInst = s.id;
-      const inst = ((swarmData && swarmData.instances) || []).find(i => i.id === s.id);
-      const firstAg = inst && inst.agents && inst.agents[0];
-      if (firstAg && swarmCfgAgent !== firstAg.name) {
-        await swarmLoadConfig(s.id, firstAg.name, firstAg.runner || '', true);
-      }
     }
     swarmRerenderActive();
   }
 }
 
 function renderSwarmDetailChat(s) {
-  const isRes = s.swarm_kind === 'resident';
-  const insts = (swarmData && swarmData.instances) || [];
   const ress = (swarmData && swarmData.residents) || [];
   const jobs = (swarmData && swarmData.jobs) || [];
   const resEntry = ress.find(r => r.id === s.id);
   const st = swarmResidentLive[s.id] || (resEntry && resEntry.status) || {};
-
-  let target = isRes ? ('res:' + s.id) : swarmConsoleTarget;
-  let instAgents = [];
-  if (!isRes) {
-    const inst = insts.find(i => i.id === s.id);
-    instAgents = (inst && inst.agents) || [];
-    if (!target.startsWith('inst:' + s.id + ':') && instAgents.length) {
-      target = 'inst:' + s.id + ':' + instAgents[0].name;
-      swarmConsoleTarget = target;
-    }
-  } else {
-    swarmConsoleTarget = target;
-  }
+  const target = 'res:' + s.id;
+  swarmConsoleTarget = target;
 
   const feed = swarmFeedFor(target);
   const runningJobs = jobs.filter(j => j.status === 'running' && j.server_id === s.id);
@@ -911,46 +1050,31 @@ function renderSwarmDetailChat(s) {
       </div>`).join('')
     : `<div class="sw-empty">Aucune conversation enregistr&eacute;e pour <b>${esc(s.swarm_agent || s.label)}</b> pendant cette session.<br>Envoyez un message ci-dessous pour dialoguer directement avec l'agent.</div>`;
 
-  let barHtml = '';
-  if (isRes) {
-    const stName = st.state || (s.state === 'UP' ? 'idle' : 'offline');
-    barHtml = `<div class="sw-status-bar">
-      <span class="tag ${stName === 'busy' ? 'sw-busy' : 'sw-idle'}">${esc(stName.toUpperCase())}</span>
-      ${st.runner ? `<span class="tag sw-runner">${esc(st.runner)}</span>` : ''}
-      <span>file : <b>${esc(String(st.queueLength || 0))}</b></span>
-      <span>tours : <b>${esc(String(st.turnsDone || 0))}</b></span>
-      ${st.session ? `<span class="d-meta-pill">session ${esc(String(st.session))}</span>` : ''}
-      ${st.current && st.current.from ? `<span>en cours (${esc(st.current.from)}) ${esc(String(st.current.elapsedMs || 0))}ms</span>` : ''}
-      <button type="button" data-act="swarm-res-status" data-id="${esc(s.id)}">Actualiser statut</button>
-      ${s.state === 'UP' ? `<button type="button" class="danger" data-act="swarm-res-stop" data-id="${esc(s.id)}" data-clear="0">Stop</button><button type="button" class="danger" data-act="swarm-res-stop" data-id="${esc(s.id)}" data-clear="1">Vider file</button>` : ''}
-      ${s.swarm_bridge_port ? `<button type="button" data-act="swarm-bridge-op" data-port="${esc(String(s.swarm_bridge_port))}" data-op="status">Bridge :${esc(String(s.swarm_bridge_port))}</button><button type="button" data-act="swarm-bridge-op" data-port="${esc(String(s.swarm_bridge_port))}" data-op="reset">Reset bridge</button>` : ''}
-    </div>`;
-  } else {
-    const opts = instAgents.map(a => {
-      const val = 'inst:' + s.id + ':' + a.name;
-      return `<option value="${esc(val)}"${target === val ? ' selected' : ''}>${esc(a.name)} (${esc(a.runner || '?')})</option>`;
-    }).join('');
-    barHtml = `<div class="sw-status-bar">
-      <span>Agent cible :</span>
-      <select id="swConsoleTarget" aria-label="Agent de l'instance" data-act="swarm-console-target">
-        ${opts || '<option value="">Aucun agent trouv&eacute;</option>'}
-      </select>
-      <button type="button" data-act="swarm-refresh">${ic('refresh')} Actualiser</button>
-    </div>`;
-  }
+  const stName = st.state || (s.state === 'UP' ? 'idle' : 'offline');
+  const barHtml = `<div class="sw-status-bar">
+    <span class="tag ${stName === 'busy' ? 'sw-busy' : (s.state === 'UP' ? 'sw-idle' : 'sw-off')}">${esc(stName.toUpperCase())}</span>
+    ${st.runner ? `<span class="tag sw-runner">${esc(st.runner)}</span>` : ''}
+    <span>file : <b>${esc(String(st.queueLength || 0))}</b></span>
+    <span>tours : <b>${esc(String(st.turnsDone || 0))}</b></span>
+    ${st.session ? `<span class="d-meta-pill">session ${esc(String(st.session))}</span>` : ''}
+    ${st.current && st.current.from ? `<span>en cours (${esc(st.current.from)}) ${esc(String(st.current.elapsedMs || 0))} ms</span>` : ''}
+    <button type="button" data-act="swarm-res-status" data-id="${esc(s.id)}">Actualiser statut</button>
+    ${s.state === 'UP' ? `<button type="button" class="danger" data-act="swarm-res-stop" data-id="${esc(s.id)}" data-clear="0">Stop</button><button type="button" class="danger" data-act="swarm-res-stop" data-id="${esc(s.id)}" data-clear="1">Vider file</button>` : ''}
+    ${s.swarm_bridge_port ? `<button type="button" data-act="swarm-bridge-op" data-port="${esc(String(s.swarm_bridge_port))}" data-op="status">Bridge :${esc(String(s.swarm_bridge_port))}</button><button type="button" data-act="swarm-bridge-op" data-port="${esc(String(s.swarm_bridge_port))}" data-op="reset">Reset bridge</button>` : ''}
+  </div>`;
 
   const chatCls = st.class || s.swarm_class || (resEntry && resEntry.swarm_class) || '';
   return `<div class="sw-detail-pane">
     <div class="sw-console-box">
       <div class="sw-sec-head">
-        <h2>${swarmIconSvg('ic-hornet', s.swarm_agent || s.label, s.swarm_kind, chatCls)} Conversation &mdash; ${esc(s.swarm_agent || s.label)}</h2>
-        <button type="button" data-act="swarm-open-console" data-target="${esc(target)}" data-inst="${esc(s.id)}">Ouvrir l'onglet Swarm complet</button>
+        <h2>${swarmIconSvg('ic-hornet', s.swarm_agent || s.label, 'resident', chatCls)} Conversation &mdash; ${esc(s.swarm_agent || s.label)}</h2>
+        <button type="button" data-act="swarm-open-console" data-target="${esc(target)}" data-inst="${esc(s.id)}">Ouvrir dans Essaim Swarm</button>
       </div>
       ${barHtml}
       ${runningJobs.length ? `<div class="sw-status-bar"><span class="spin">${ic('refresh')}</span><span>R&eacute;ponse de l'agent en cours&hellip;</span></div>` : ''}
       <div class="sw-feed" id="swConsoleFeed">${feedHtml}</div>
       <div class="sw-field">
-        <label for="swAskPrompt">Message pour ${esc(s.swarm_agent || s.label)}</label>
+        <label for="swAskPrompt">Message pour ${esc(s.swarm_agent || s.label)} <span class="d-meta-pill">Ctrl+Entr&eacute;e</span></label>
         <textarea id="swAskPrompt" placeholder="Tapez votre message&hellip;"></textarea>
       </div>
       <div class="sw-toolbar">
@@ -964,21 +1088,20 @@ function renderSwarmDetailChat(s) {
 }
 
 function renderSwarmDetailCfg(s) {
-  const isRes = s.swarm_kind === 'resident';
   const agents = swarmAllAgents();
   const insts = (swarmData && swarmData.instances) || [];
-  const scopedAgents = isRes
-    ? agents.filter(a => !s.swarm_agent || (a.name || '').toLowerCase() === s.swarm_agent.toLowerCase())
-    : agents.filter(a => a._instanceId === s.id);
+  const scopedAgents = agents.filter(a => !s.swarm_agent || (a.name || '').toLowerCase() === s.swarm_agent.toLowerCase());
   const cfgFiles = ['prompt.md', 'settings.json', '.mcp.json', 'skill.md'];
   const filesMap = (swarmCfgData && swarmCfgData.files) || {};
   const curContent = filesMap[swarmCfgFile] != null
     ? (typeof filesMap[swarmCfgFile] === 'string' ? filesMap[swarmCfgFile] : JSON.stringify(filesMap[swarmCfgFile], null, 2))
     : '';
-  const mcpTargets = (swarmData && swarmData.mcp_targets) || [];
-  const mcpChecks = mcpTargets.slice(0, 20).map(t =>
-    `<label class="sw-mcp-chip"><input type="checkbox" class="sw-mcp-cb" value="${esc(t.label)}"> ${esc(t.label)}</label>`
-  ).join('');
+  const wiredSet = swarmWiredMcpSet(filesMap);
+  const mcpTargets = ((swarmData && swarmData.mcp_targets) || []).filter(t => !t.swarm_kind || t.swarm_kind === 'resident');
+  const mcpChecks = mcpTargets.slice(0, 24).map(t => {
+    const isChecked = wiredSet.has(String(t.label || '').toLowerCase()) || wiredSet.has(String(t.id || '').toLowerCase());
+    return `<label class="sw-mcp-chip"><input type="checkbox" class="sw-mcp-cb" value="${esc(t.label)}"${isChecked ? ' checked' : ''}> ${esc(t.label)}</label>`;
+  }).join('');
 
   const cfgAg = swarmCfgAgent
     ? agents.find(a => (a.name || '').toLowerCase() === swarmCfgAgent.toLowerCase())
@@ -987,7 +1110,7 @@ function renderSwarmDetailCfg(s) {
   return `<div class="sw-detail-pane">
     <div class="sw-console-box">
       <div class="sw-sec-head">
-        <h2>${swarmIconSvg('ic-hornet', swarmCfgAgent || s.swarm_agent || s.label, s.swarm_kind, cfgCls)} Configuration &mdash; ${esc(swarmCfgAgent || s.swarm_agent || s.label)}</h2>
+        <h2>${swarmIconSvg('ic-hornet', swarmCfgAgent || s.swarm_agent || s.label, 'resident', cfgCls)} Configuration &mdash; ${esc(swarmCfgAgent || s.swarm_agent || s.label)}</h2>
         <div class="sw-toolbar">
           <select id="swCfgAgentSel" aria-label="Agent &agrave; configurer" data-act="swarm-cfg-pick">
             <option value="">Choisir un agent&hellip;</option>
@@ -996,7 +1119,7 @@ function renderSwarmDetailCfg(s) {
           <button type="button" data-act="swarm-refresh">${ic('refresh')} Actualiser</button>
         </div>
       </div>
-      ${!insts.length ? '<div class="sw-empty">Aucune instance <code>swarm-control</code> UP d&eacute;tect&eacute;e pour lire/modifier les fichiers de configuration de cet agent.</div>' : ''}
+      ${!insts.some(i => i.state === 'UP') ? '<div class="sw-empty">Aucune instance <code>swarm-control</code> UP d&eacute;tect&eacute;e pour lire/modifier les fichiers de configuration de cet agent.</div>' : ''}
       <div class="sw-tabs">
         ${cfgFiles.map(f => `<button type="button" class="sw-tab ${swarmCfgFile===f?'sel':''}" data-act="swarm-cfg-file" data-file="${esc(f)}">${esc(f)}</button>`).join('')}
       </div>
@@ -1008,21 +1131,15 @@ function renderSwarmDetailCfg(s) {
         <button type="button" class="primary" data-act="swarm-cfg-save" ${swarmCfgAgent ? '' : 'disabled'}>Enregistrer ${esc(swarmCfgFile)}</button>
       </div>
       ${mcpTargets.length ? `<div class="sw-field">
-        <label>Outils / serveurs MCP Control c&acirc;bl&eacute;s dans <code>mcpServers</code></label>
+        <label>Serveurs MCP Control c&acirc;bl&eacute;s dans <code>mcpServers</code></label>
         <div class="sw-mcp-list">${mcpChecks}</div>
-        <div><button type="button" data-act="swarm-cfg-wire-mcp" ${swarmCfgAgent ? '' : 'disabled'}>Appliquer les serveurs MCP coch&eacute;s</button></div>
+        <div><button type="button" data-act="swarm-cfg-wire-mcp" ${swarmCfgAgent ? '' : 'disabled'}>Appliquer les serveurs coch&eacute;s</button></div>
       </div>` : ''}
     </div>
   </div>`;
 }
 
 /* ===== Handlers d'actions Swarm (appelés via la table ACT de app.js) ===== */
-
-function swarmOpenAgents(instId) {
-  swarmSelectedInst = instId || swarmSelectedInst;
-  swarmTab = 'agents';
-  renderSwarmView();
-}
 
 function swarmOpenConsole(target, agentName, instId) {
   if (instId) swarmSelectedInst = instId;
@@ -1059,24 +1176,27 @@ function swarmToggleCreate() {
 }
 
 async function swarmCreateSubmit() {
-  const inst = swarmSelectedInst || ((swarmData && swarmData.instances && swarmData.instances[0]) ? swarmData.instances[0].id : '');
+  const insts = (swarmData && swarmData.instances) || [];
+  const upInst = insts.find(i => i.id === swarmSelectedInst && i.state === 'UP') || insts.find(i => i.state === 'UP') || insts[0];
+  const inst = upInst ? upInst.id : '';
   const name = (document.getElementById('swNewName')?.value || '').trim();
+  const agentCls = document.getElementById('swNewClass')?.value || swarmNewClass || 'coder';
   const runner = document.getElementById('swNewRunner')?.value || 'claude';
   const model = (document.getElementById('swNewModel')?.value || '').trim();
   const cloneFrom = (document.getElementById('swNewClone')?.value || '').trim();
   const prompt = (document.getElementById('swNewPrompt')?.value || '').trim();
   const resident = !!document.getElementById('swNewResident')?.checked;
-  if (!inst) { toast('Aucune instance Swarm s\u00e9lectionn\u00e9e', 'err', 3000); return; }
-  if (!name || !prompt) { toast('Nom et prompt requis', 'err', 3000); return; }
-  const payload = {action: 'swarm_create_agent', instance_id: inst, name, runner, prompt, resident};
+  if (!inst) { toast('Aucune instance Swarm UP disponible', 'err', 3000); return; }
+  if (!name || !prompt) { toast('Nom et prompt syst\u00e8me requis', 'err', 3000); return; }
+  const payload = {action: 'swarm_create_agent', instance_id: inst, name, runner, prompt, resident, class: agentCls};
   if (model) payload.model = model;
   if (cloneFrom) payload.cloneFrom = cloneFrom;
   const j = await postAction(payload);
   if (j && j.ok) {
-    toast(`Agent '${name}' cr\u00e9\u00e9`, 'ok', 2500);
+    toast(`Agent \u00ab ${name} \u00bb cr\u00e9\u00e9`, 'ok', 2500);
     swarmCreateOpen = false;
-    await swarmRefresh(false);
     await load();
+    await swarmRefresh(false);
   }
 }
 
@@ -1085,7 +1205,7 @@ async function swarmAgentStart(instId, name, runner) {
   if (runner) payload.runner = runner;
   const j = await postAction(payload);
   if (j && j.ok) {
-    toast(`Agent r\u00e9sident '${name}' d\u00e9marr\u00e9`, 'ok', 2500);
+    toast(`Agent r\u00e9sident \u00ab ${name} \u00bb d\u00e9marr\u00e9`, 'ok', 2500);
     await load();
     await swarmRefresh(false);
   }
@@ -1096,19 +1216,27 @@ async function swarmAgentStop(instId, name, runner) {
   if (runner) payload.runner = runner;
   const j = await postAction(payload);
   if (j && j.ok) {
-    toast(`Agent r\u00e9sident '${name}' arr\u00eat\u00e9`, 'ok', 2500);
+    toast(`Agent r\u00e9sident \u00ab ${name} \u00bb arr\u00eat\u00e9`, 'ok', 2500);
+    await load();
     await swarmRefresh(false);
   }
 }
 
 async function swarmAgentDelete(instId, name, runner) {
-  const ok = await askConfirm(`Supprimer l'agent '${name}' ?`, 'Cette op\u00e9ration efface son dossier de configuration dans Swarm-control.', 'Supprimer');
+  const ok = await askConfirm({
+    title: `Supprimer l'agent \u00ab ${name} \u00bb ?`,
+    msg: `Voulez-vous supprimer d\u00e9finitivement l'agent \u00ab ${name} \u00bb ?`,
+    detail: 'Son dossier de configuration dans Swarm-control (prompt.md, settings.json, .mcp.json) sera effac\u00e9.',
+    okLabel: 'Supprimer',
+  });
   if (!ok) return;
   const payload = {action: 'swarm_delete_agent', instance_id: instId, name};
   if (runner) payload.runner = runner;
   const j = await postAction(payload);
   if (j && j.ok) {
-    toast(`Agent '${name}' supprim\u00e9`, 'ok', 2500);
+    if (swarmCfgAgent === name) { swarmCfgAgent = ''; swarmCfgData = null; }
+    toast(`Agent \u00ab ${name} \u00bb supprim\u00e9`, 'ok', 2500);
+    await load();
     await swarmRefresh(false);
   }
 }
@@ -1144,15 +1272,15 @@ function swarmConsoleTargetChange(el) {
 }
 
 async function swarmSendAsk() {
-  const prompt = (document.getElementById('swAskPrompt')?.value || '').trim();
+  const promptEl = document.getElementById('swAskPrompt');
+  const prompt = (promptEl?.value || '').trim();
   const from = (document.getElementById('swAskFrom')?.value || '').trim() || 'mcp-control';
   const model = (document.getElementById('swAskModel')?.value || '').trim();
   if (!prompt) { toast('Prompt vide', 'err', 2200); return; }
   if (!swarmConsoleTarget) { toast('Aucune cible s\u00e9lectionn\u00e9e', 'err', 2500); return; }
 
   swarmFeedFor(swarmConsoleTarget).push({ts: Date.now(), role: 'user', title: from, meta: swarmConsoleTarget, text: prompt, err: false});
-  const inp = document.getElementById('swAskPrompt');
-  if (inp) inp.value = '';
+  if (promptEl) promptEl.value = '';
   swarmRerenderActive();
 
   if (swarmConsoleTarget.startsWith('res:')) {
@@ -1242,8 +1370,9 @@ async function swarmCfgWireMcp() {
     mcpServers: checked,
   });
   if (j && j.ok) {
-    toast(`mcpServers mis \u00e0 jour (${checked.length} serveur${checked.length>1?'s':''})`, 'ok', 2500);
+    toast(`mcpServers mis \u00e0 jour (${checked.length} serveur${checked.length > 1 ? 's' : ''})`, 'ok', 2500);
     await swarmLoadConfig(swarmSelectedInst, swarmCfgAgent, '', activeView !== 'swarm');
+    await swarmRefresh(false);
   }
 }
 
@@ -1275,7 +1404,8 @@ function swarmParDel(idx) {
 
 async function swarmParRun() {
   swarmSyncParallelDraftFromDom();
-  const inst = document.getElementById('swParInst')?.value || swarmSelectedInst;
+  const insts = (swarmData && swarmData.instances) || [];
+  const inst = document.getElementById('swParInst')?.value || swarmSelectedInst || (insts.find(i => i.state === 'UP') || insts[0] || {}).id || '';
   if (!inst) { toast('Aucune instance Swarm disponible', 'err', 3000); return; }
   const tasks = swarmParallelDraft
     .filter(t => t.prompt && t.prompt.trim())
@@ -1346,7 +1476,8 @@ async function swarmSendA2a() {
   const from = (document.getElementById('swA2aFrom')?.value || '').trim() || 'mcp-control';
   const toId = document.getElementById('swA2aTo')?.value || '';
   const viaRaw = (document.getElementById('swA2aVia')?.value || '').trim();
-  const prompt = (document.getElementById('swA2aPrompt')?.value || '').trim();
+  const promptEl = document.getElementById('swA2aPrompt');
+  const prompt = (promptEl?.value || '').trim();
   if (!toId) { toast('Aucun agent r\u00e9sident UP s\u00e9lectionn\u00e9', 'err', 2500); return; }
   if (!prompt) { toast('Message A2A vide', 'err', 2200); return; }
   const via = viaRaw ? viaRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
@@ -1364,8 +1495,7 @@ async function swarmSendA2a() {
     err: false,
   });
   if (swarmA2aEvents.length > 60) swarmA2aEvents.length = 60;
-  const inp = document.getElementById('swA2aPrompt');
-  if (inp) inp.value = '';
+  if (promptEl) promptEl.value = '';
   renderSwarmView();
 
   const payload = {action: 'swarm_resident_ask', server_id: toId, prompt, from};
@@ -1377,3 +1507,15 @@ async function swarmSendA2a() {
     await swarmPollJobs();
   }
 }
+
+document.addEventListener('keydown', (ev) => {
+  const t = ev.target;
+  if (!t || !t.id) return;
+  if (t.id === 'swA2aPrompt' && ev.key === 'Enter' && !ev.shiftKey) {
+    ev.preventDefault();
+    swarmSendA2a();
+  } else if (t.id === 'swAskPrompt' && ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
+    ev.preventDefault();
+    swarmSendAsk();
+  }
+});

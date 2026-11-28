@@ -370,6 +370,25 @@ fn store_versions_tous_les_serveurs_ont_version_et_source() {
         .find(|s| s.id == "store-memory")
         .and_then(|s| s.version.clone());
     assert_eq!(srv_ver.as_deref(), Some(expected));
+
+    // update_store met à jour la version d'un serveur installé et refuse un serveur non installé
+    {
+        let mut servers = lockv(&state.servers);
+        if let Some(s) = servers.iter_mut().find(|s| s.id == "store-memory") {
+            s.version = Some("0.1.0".to_string());
+        }
+    }
+    let upd = handle_action(&state, r#"{"action":"update_store","id":"memory"}"#);
+    assert_eq!(upd["ok"], json!(true));
+    assert_eq!(upd["version"], json!(expected));
+    let updated_ver = lockv(&state.servers)
+        .iter()
+        .find(|s| s.id == "store-memory")
+        .and_then(|s| s.version.clone());
+    assert_eq!(updated_ver.as_deref(), Some(expected));
+    let upd_missing = handle_action(&state, r#"{"action":"update_store","id":"git"}"#);
+    assert_eq!(upd_missing["ok"], json!(false));
+
     let _ = std::fs::remove_file(&path);
 }
 

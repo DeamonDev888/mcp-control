@@ -1,3 +1,13 @@
+## [0.8.14] — 2026-11-27
+
+### Boutique — Mise à jour 1-clic & redirection depuis l'Explorateur
+- **Action backend `update_store` (`src/manage/actions.rs`, `src/auth.rs`)** : arrêt propre du serveur, retéléchargement vérifié SHA-256 pour les binaires GitHub Releases ou purge du cache `npx`/`uvx` + rafraîchissement de version en ligne, persistance et redémarrage automatique.
+- **Bouton « Mettre à jour » & navigation directe (`src/ui/app.js`, `src/ui/app.css`)** : apparition automatique du bouton **Mettre à jour** sur les cartes Boutique obsolètes, et badge cliquable `vAncienne → vNouvelle` dans l'Explorateur ouvrant directement la Boutique sur la carte ciblée avec focus.
+
+### Essaim Swarm — Refonte UI, jetons WCAG 2.2 AA & fiabilité RPC
+- **Refonte visuelle & ergonomique d'Essaim Swarm (`src/ui/swarm.css`, `src/ui/swarm.js`, `src/ui/app.js`)** : alignement complet sur les jetons Dark/Light de `app.css` (remplacement des variables CSS orphelines `--bg*`/`--fg*`/`--bd`), CTA contextuel d'en-tête (*Installer Swarm* / *Démarrer Swarm* / *+ Nouvel agent*), 4 tuiles KPI (Orchestrateur, Agents résidents, Agents configurés, Activité & Flux), bandeaux intelligents (appairage Ed25519, erreurs RPC, annonces LiteMCP à suivre, onboarding premier agent), fusion des onglets redondants, sélecteur de classe d'agent avec aperçu SVG animé, pré-cochage `.mcp.json`, raccourcis `Entrée` / `Ctrl+Entrée`, préservation des saisies pendant le polling live, et masquage des onglets *Conversation* / *Config agent* sur l'orchestrateur `Swarm Control`.
+- **Fiabilité RPC `swarm_overview` & tests (`src/swarm/actions.rs`, `src/auth/confirm.rs`, `tests/e2e/scenarios_swarm.rs`)** : interrogation parallèle de `list_agents` (12 s) et `agent_control` (8 s) avec cache de repli mémoire anti-clignotement, transmission du champ `class` à `create_agent`, serveur E2E Swarm multi-thread et isolation `thread_local!` du store `confirm` en tests unitaires.
+
 ## [0.8.13] — 2026-11-27
 
 ### Boutique — Versions sur toutes les cartes, cartes serveurs & vérification en ligne

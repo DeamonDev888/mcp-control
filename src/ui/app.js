@@ -839,13 +839,14 @@ function loadStoreLogos() {
 
 function swarmHiveRow() {
   const st = (state && state.swarm_stats) || {instances: 0, residents: 0, up: 0};
+  const nInst = st.instances || 0;
   const nRes = st.residents || 0;
   const up = st.up || 0;
-  const stCls = up > 0 ? 'UP' : (nRes > 0 ? 'DOWN' : 'PORT-ONLY');
+  const stCls = up > 0 ? 'UP' : ((nInst > 0 || nRes > 0) ? 'DOWN' : 'PORT-ONLY');
   const isSel = activeView === 'swarm';
   const summary = nRes > 0
     ? `${nRes} agent${nRes > 1 ? 's' : ''} r\u00e9sid.`
-    : 'orchestration \u00b7 A2A';
+    : (nInst > 0 ? `${nInst} orchestrateur${nInst > 1 ? 's' : ''}` : 'orchestration \u00b7 A2A');
   return `<div class="srow srow-hive ${isSel ? 'sel' : ''}" draggable="false"
     role="listitem" tabindex="0"${isSel ? ' aria-current="true"' : ''}
     aria-label="Essaim Swarm Control — orchestration, agents persistants et interactions A2A"
@@ -884,7 +885,7 @@ function srvRow(s) {
   const remoteStoreVer = (storeId && storeVersions && storeVersions[storeId]) || '';
   const srvVer = s.version || '';
   const verPill = (srvVer && remoteStoreVer && srvVer.replace(/^v/i, '') !== remoteStoreVer.replace(/^v/i, ''))
-    ? `<span class="srow-ver srow-ver-upd" title="Install\u00e9e : ${esc(fmtStoreVer(srvVer))} \u2014 Derni\u00e8re version : ${esc(fmtStoreVer(remoteStoreVer))}">${esc(fmtStoreVer(srvVer))} \u2192 ${esc(fmtStoreVer(remoteStoreVer))}</span>`
+    ? `<button type="button" class="srow-ver srow-ver-upd srow-ver-btn" data-act="open-store-update" data-store-id="${esc(storeId)}" title="Mise \u00e0 jour disponible (${esc(fmtStoreVer(srvVer))} \u2192 ${esc(fmtStoreVer(remoteStoreVer))}) \u2014 ouvrir la boutique">${ic('download')} ${esc(fmtStoreVer(srvVer))} \u2192 ${esc(fmtStoreVer(remoteStoreVer))}</button>`
     : srvVer
       ? `<span class="srow-ver" title="Version du serveur MCP">${esc(fmtStoreVer(srvVer))}</span>`
       : '';
@@ -1060,7 +1061,7 @@ function setExplorerTab(tab) {
 }
 function srvVisible(s, q) {
   if (hiddenServers.has(s.id)) return false;
-  if (explorerTab === 'swarm' && s.swarm_kind !== 'resident') return false;
+  if (explorerTab === 'swarm' && !s.swarm_kind) return false;
   if (overviewFilter === 'up' && s.state !== 'UP') return false;
   if (expStateFilter === 'up' && s.state !== 'UP') return false;
   if (expStateFilter === 'down' && !(s.enabled && (s.state === 'DOWN' || s.state === 'PORT-ONLY') && !(s.locked && !s.paired))) return false;
@@ -1153,21 +1154,21 @@ function renderServers() {
   if (localToggle) localToggle.setAttribute('aria-expanded', locClosed ? 'false' : 'true');
   localBox.classList.toggle('closed', locClosed);
   const localScope = explorerTab === 'swarm'
-    ? localAll.filter(s => s.swarm_kind === 'resident')
+    ? localAll.filter(s => Boolean(s.swarm_kind))
     : localAll;
   setText(count, upOf(localScope) + '/' + localScope.length);
   localBox.innerHTML = hiveHtml + (local.length ? favFirst(local).map(srvRow).join('')
     : (localScope.length ? (hiveHtml ? '' : noneMatch)
       : (explorerTab === 'swarm'
-        ? (hiveHtml ? '' : '<div class="empty-sec" role="listitem">aucun agent Swarm r&eacute;sident</div>')
+        ? (hiveHtml ? '' : '<div class="empty-sec" role="listitem">aucun serveur Swarm d&eacute;tect&eacute;</div>')
         : '<div class="empty-sec" role="listitem">aucun serveur \u2014 lance un scan</div>')));
   const visibleRemoteKeys = explorerTab === 'swarm'
-    ? keys.filter(k => (byKey[k] || []).some(s => s.swarm_kind === 'resident'))
+    ? keys.filter(k => (byKey[k] || []).some(s => Boolean(s.swarm_kind)))
     : keys;
   setHidden(label, !visibleRemoteKeys.length);
   groupsBox.innerHTML = visibleRemoteKeys.map((k, idx) => {
     const all = explorerTab === 'swarm'
-      ? (byKey[k] || []).filter(s => s.swarm_kind === 'resident')
+      ? (byKey[k] || []).filter(s => Boolean(s.swarm_kind))
       : (byKey[k] || []);
     const rows = all.filter(s => srvVisible(s, q));
     const bodyId = 'grpBody_' + idx;
@@ -2443,15 +2444,15 @@ function renderDetail() {
     ${fold('demarrage', 'D&eacute;marrage', `<div class="kv">${kvd}</div>${startCmdForm(s)}`)}
     ${fold('infos', 'Informations', `<div class="kv">${kv}</div>`)}
     <div class="tabs" role="tablist" aria-label="Vues du serveur">
-      ${s.swarm_kind ? `<button type="button" class="tab ${detailTab === 'swarm-chat' ? 'sel' : ''}" role="tab" id="dtab-swarm-chat" aria-selected="${detailTab === 'swarm-chat' ? 'true' : 'false'}" aria-controls="dpanel-main" tabindex="${detailTab === 'swarm-chat' ? '0' : '-1'}" data-act="detail-tab" data-tab="swarm-chat">Conversation</button>` : ''}
-      <button type="button" class="tab ${detailTab === 'outils' ? 'sel' : ''}" role="tab" id="dtab-outils" aria-selected="${detailTab === 'outils' ? 'true' : 'false'}" aria-controls="dpanel-main" tabindex="${detailTab === 'outils' ? '0' : '-1'}" data-act="detail-tab" data-tab="outils">Outils (${esc(nTot)})</button>
-      ${s.swarm_kind ? `<button type="button" class="tab ${detailTab === 'swarm-cfg' ? 'sel' : ''}" role="tab" id="dtab-swarm-cfg" aria-selected="${detailTab === 'swarm-cfg' ? 'true' : 'false'}" aria-controls="dpanel-main" tabindex="${detailTab === 'swarm-cfg' ? '0' : '-1'}" data-act="detail-tab" data-tab="swarm-cfg">Config agent</button>` : ''}
+      ${s.swarm_kind === 'resident' ? `<button type="button" class="tab ${detailTab === 'swarm-chat' ? 'sel' : ''}" role="tab" id="dtab-swarm-chat" aria-selected="${detailTab === 'swarm-chat' ? 'true' : 'false'}" aria-controls="dpanel-main" tabindex="${detailTab === 'swarm-chat' ? '0' : '-1'}" data-act="detail-tab" data-tab="swarm-chat">Conversation</button>` : ''}
+      <button type="button" class="tab ${(detailTab === 'outils' || (s.swarm_kind !== 'resident' && (detailTab === 'swarm-chat' || detailTab === 'swarm-cfg'))) ? 'sel' : ''}" role="tab" id="dtab-outils" aria-selected="${(detailTab === 'outils' || (s.swarm_kind !== 'resident' && (detailTab === 'swarm-chat' || detailTab === 'swarm-cfg'))) ? 'true' : 'false'}" aria-controls="dpanel-main" tabindex="${(detailTab === 'outils' || (s.swarm_kind !== 'resident' && (detailTab === 'swarm-chat' || detailTab === 'swarm-cfg'))) ? '0' : '-1'}" data-act="detail-tab" data-tab="outils">Outils (${esc(nTot)})</button>
+      ${s.swarm_kind === 'resident' ? `<button type="button" class="tab ${detailTab === 'swarm-cfg' ? 'sel' : ''}" role="tab" id="dtab-swarm-cfg" aria-selected="${detailTab === 'swarm-cfg' ? 'true' : 'false'}" aria-controls="dpanel-main" tabindex="${detailTab === 'swarm-cfg' ? '0' : '-1'}" data-act="detail-tab" data-tab="swarm-cfg">Config agent</button>` : ''}
       <button type="button" class="tab ${detailTab === 'conf' ? 'sel' : ''}" role="tab" id="dtab-conf" aria-selected="${detailTab === 'conf' ? 'true' : 'false'}" aria-controls="dpanel-main" tabindex="${detailTab === 'conf' ? '0' : '-1'}" data-act="detail-tab" data-tab="conf">Conf MCP</button>
     </div>
-    <div id="dpanel-main" role="tabpanel" aria-labelledby="dtab-${esc(detailTab)}">
+    <div id="dpanel-main" role="tabpanel" aria-labelledby="dtab-${esc((s.swarm_kind !== 'resident' && (detailTab === 'swarm-chat' || detailTab === 'swarm-cfg')) ? 'outils' : detailTab)}">
       ${detailTab === 'conf' ? confAgent(s)
-        : (detailTab === 'swarm-chat' && s.swarm_kind && typeof renderSwarmDetailChat === 'function' ? renderSwarmDetailChat(s)
-        : (detailTab === 'swarm-cfg' && s.swarm_kind && typeof renderSwarmDetailCfg === 'function' ? renderSwarmDetailCfg(s)
+        : (detailTab === 'swarm-chat' && s.swarm_kind === 'resident' && typeof renderSwarmDetailChat === 'function' ? renderSwarmDetailChat(s)
+        : (detailTab === 'swarm-cfg' && s.swarm_kind === 'resident' && typeof renderSwarmDetailCfg === 'function' ? renderSwarmDetailCfg(s)
         : toolsHtml))}
     </div>`;
   if (sameSrv) {
@@ -4660,6 +4661,9 @@ function storeLogoSvg(inner) {
   return `<span class="slogo-well${logoContrastCls(inner)}"><svg class="slogo" viewBox="0 0 24 24" aria-hidden="true">${inner}</svg></span>`;
 }
 function storeLogo(i) {
+  if (i && i.id === 'swarm-control') {
+    return `<span class="slogo-well swarm-slogo-well"><img class="swarm-img" src="${esc(swarmLogoUrl('logo', 'hive'))}" alt="" aria-hidden="true"></span>`;
+  }
   if (!storeLogos) return storeLogoSvg(PKG_GLYPH);
   // glyphe officiel par id, préfixes de catalogues additionnels retirés (BT-C06)
   const inner = storeLogos[i.id] || storeLogos[i.id.replace(/^(at|gl|gh)-/, '')];
@@ -4786,7 +4790,8 @@ function renderStoreItems() {
     const isInst = Boolean(instSrv);
     const remoteVer = (storeVersions && storeVersions[i.id]) || i.version || '';
     const instVer = (instSrv && instSrv.version) || '';
-    const verHtml = (instVer && remoteVer && instVer.replace(/^v/i, '') !== remoteVer.replace(/^v/i, ''))
+    const hasUpd = Boolean(isInst && instVer && remoteVer && instVer.replace(/^v/i, '') !== remoteVer.replace(/^v/i, ''));
+    const verHtml = hasUpd
       ? `<span class="scard-ver scard-ver-upd" title="Install\u00e9e : ${esc(fmtStoreVer(instVer))} \u2014 Derni\u00e8re version : ${esc(fmtStoreVer(remoteVer))}">${esc(fmtStoreVer(instVer))} \u2192 ${esc(fmtStoreVer(remoteVer))}</span>`
       : (remoteVer || instVer)
         ? `<span class="scard-ver" title="${isInst && instVer && remoteVer ? '\u00c0 jour (' + esc(fmtStoreVer(remoteVer)) + ')' : 'Version du serveur MCP'}">${esc(fmtStoreVer(remoteVer || instVer))}</span>`
@@ -4815,7 +4820,9 @@ function renderStoreItems() {
       ${envHtml}
       <div class="scard-foot">
         ${isInst
-          ? `<span class="scard-inst-badge" title="Ce serveur est d\u00e9j\u00e0 dans ta liste">${ic('check')} Install\u00e9</span><button type="button" class="danger btn-uninst" data-act="uninstall-store" data-id="${esc(i.id)}" title="Supprimer ce serveur et tous ses fichiers locaux">${ic('trash')} Supprimer</button>`
+          ? (hasUpd
+              ? `<button type="button" class="btn-upd" data-act="update-store" data-id="${esc(i.id)}" title="Mettre \u00e0 jour ${esc(i.name)} (${esc(fmtStoreVer(instVer))} \u2192 ${esc(fmtStoreVer(remoteVer))})">${ic('download')} Mettre \u00e0 jour</button><button type="button" class="danger btn-uninst" data-act="uninstall-store" data-id="${esc(i.id)}" title="Supprimer ce serveur et tous ses fichiers locaux">${ic('trash')} Supprimer</button>`
+              : `<span class="scard-inst-badge" title="Ce serveur est d\u00e9j\u00e0 dans ta liste">${ic('check')} Install\u00e9</span><button type="button" class="danger btn-uninst" data-act="uninstall-store" data-id="${esc(i.id)}" title="Supprimer ce serveur et tous ses fichiers locaux">${ic('trash')} Supprimer</button>`)
           : `<button type="button" class="primary" data-act="install-store" data-id="${esc(i.id)}">${ic('download')} Installer</button>`}
       </div>
     </div>`;
@@ -4894,6 +4901,55 @@ async function installStore(id, btn) {
   } else {
     btn.disabled = false;
     btn.innerHTML = ic('refresh') + ' R\u00e9essayer';
+    toast(j.error || 'erreur', 'err', 4000);
+  }
+}
+async function openStoreToUpdate(storeId) {
+  if (!storeId) return;
+  storeCat = 'Tout';
+  storeHideInst = false;
+  const hideBtn = document.getElementById('storeHideInst');
+  if (hideBtn) {
+    hideBtn.classList.remove('sel');
+    hideBtn.setAttribute('aria-checked', 'false');
+  }
+  const inp = document.getElementById('storeSearch');
+  if (inp) inp.value = '';
+  await openStore();
+  renderStoreItems();
+  const grid = document.getElementById('storeGrid');
+  if (!grid) return;
+  const cards = [...grid.querySelectorAll('.scard[data-store-id]')];
+  const card = cards.find(c => c.dataset.storeId === storeId);
+  if (!card) return;
+  card.scrollIntoView({behavior: 'smooth', block: 'center'});
+  card.classList.remove('scard-focus');
+  void card.offsetWidth;
+  card.classList.add('scard-focus');
+  setTimeout(() => card.classList.remove('scard-focus'), 2600);
+  const updBtn = card.querySelector('button[data-act="update-store"]');
+  if (updBtn) updBtn.focus();
+}
+async function updateStore(id, btn) {
+  const nm = (storeItems && storeItems.find(x => x.id === id) || {}).name || id;
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spin">' + ic('refresh') + '</span> Mise \u00e0 jour\u2026';
+  }
+  const j = await postAction({action: 'update_store', id}, {quiet: true});
+  if (j.ok) {
+    if (j.version) {
+      if (!storeVersions) storeVersions = {};
+      storeVersions[id] = j.version;
+    }
+    toast(nm + (j.version ? ' ' + fmtStoreVer(j.version) : '') + ' mis \u00e0 jour', 'ok');
+    await load();
+    renderStoreItems();
+  } else {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = ic('download') + ' Mettre \u00e0 jour';
+    }
     toast(j.error || 'erreur', 'err', 4000);
   }
 }
@@ -5726,6 +5782,8 @@ const ACT = {
   'swarm-inst-change': el => swarmInstChange(el),
   'swarm-filter-change': () => swarmFilterChange(),
   'swarm-toggle-create': () => swarmToggleCreate(),
+  'swarm-quick-create': () => swarmQuickCreate(),
+  'swarm-new-cls': el => swarmNewClassChange(el),
   'swarm-create-submit': () => swarmCreateSubmit(),
   'swarm-agent-start': el => swarmAgentStart(el.dataset.inst, el.dataset.name, el.dataset.runner),
   'swarm-agent-stop': el => swarmAgentStop(el.dataset.inst, el.dataset.name, el.dataset.runner),
@@ -5813,6 +5871,8 @@ const ACT = {
   'store-sort': () => renderStoreItems(),
   'store-hide-inst': () => toggleHideInst(),
   'store-check-versions': el => checkStoreVersions(el),
+  'open-store-update': (el, ev) => { if (ev) ev.stopPropagation(); openStoreToUpdate(el.dataset.storeId); },
+  'update-store': el => updateStore(el.dataset.id, el),
   'toggle-env-eye': el => toggleEnvEye(el),
   'install-store': el => installStore(el.dataset.id, el),
   'uninstall-store': el => uninstallStore(el.dataset.id, el),

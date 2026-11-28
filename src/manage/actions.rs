@@ -38,6 +38,7 @@ pub const ACTIONS: &[&str] = &[
     "import_mcp",
     "install_store",
     "uninstall_store",
+    "update_store",
     "ssh_save",
     "ssh_forget",
     "ssh_discover",
@@ -2512,6 +2513,153 @@ pub fn handle_action(state: &Arc<AppState>, body: &str) -> Value {
                 }
                 None => json!({"ok": false, "error": "item inconnu"}),
             }
+        }
+        "update_store" => {
+            let raw_id = req
+                .get("id")
+                .and_then(|x| x.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            if raw_id.is_empty() {
+                return json!({"ok": false, "error": "id manquant"});
+            }
+            let item_id = raw_id.strip_prefix("store-").unwrap_or(raw_id);
+            let Some(it) = find_store_item(item_id) else {
+                return json!({"ok": false, "error": "item inconnu"});
+            };
+            let sid = format!("store-{}", it.id);
+            let existing_cmd: Option<(String, Vec<String>, Option<String>)> = {
+                let servers = lockv(&state.servers);
+                let Some(s) = servers.iter().find(|s| s.id == sid) else {
+                    return json!({"ok": false, "error": "serveur non installé"});
+                };
+                match &s.transport {
+                    Transport::Stdio {
+                        program,
+                        args,
+                        workdir,
+                        ..
+                    } => Some((program.clone(), args.clone(), workdir.clone())),
+                    _ => s
+                        .start_cmd
+                        .as_ref()
+                        .map(|c| (c.program.clone(), c.args.clone(), c.workdir.clone())),
+                }
+            };
+            // Arrêt propre du processus en cours avant remplacement du binaire / purge du cache.
+            if let Some((pid_lance, vivant)) = processus_lance(state, &sid) {
+                if vivant {
+                    probe::kill_tree(pid_lance);
+                    for _ in 0..15 {
+                        let exited = lockv(&state.children)
+                            .get(&sid)
+                            .map(|h| lockv(&h.exit).is_some())
+                            .unwrap_or(true);
+                        if exited {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            }
+            lockv(&state.children).remove(&sid);
+            lockv(&state.spawn_fails).remove(&sid);
+            lockv(&state.spawning).remove(&sid);
+
+            let new_version: Option<String> = if let Some(rel_spec) = find_github_release(it.id) {
+                let bin_dir = existing_cmd
+                    .as_ref()
+                    .and_then(|(prog, _, wd)| {
+                        wd.as_deref().map(std::path::PathBuf::from).or_else(|| {
+                            std::path::Path::new(prog)
+                                .parent()
+                                .filter(|p| !p.as_os_str().is_empty())
+                                .map(std::path::Path::to_path_buf)
+                        })
+                    })
+                    .or_else(|| {
+                        (!state.config_path.trim().is_empty()).then(|| {
+                            std::path::Path::new(&state.config_path)
+                                .parent()
+                                .filter(|p| !p.as_os_str().is_empty())
+                                .map(|p| p.join("data").join(&sid))
+                                .unwrap_or_else(|| {
+                                    std::env::temp_dir().join("mcp-control").join(&sid)
+                                })
+                        })
+                    })
+                    .unwrap_or_else(|| std::env::temp_dir().join("mcp-control").join(&sid));
+                #[cfg(not(test))]
+                let (bin_path, downloaded_version) =
+                    match download_store_release_binary(rel_spec, &bin_dir) {
+                        Ok((p, v)) => (p, Some(v)),
+                        Err(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": format!("mise à jour {} impossible : {e}", it.name)
+                            });
+                        }
+                    };
+                #[cfg(test)]
+                let (bin_path, downloaded_version): (
+                    std::path::PathBuf,
+                    Option<String>,
+                ) = (
+                    bin_dir.join(release_local_bin_name(rel_spec, std::env::consts::OS)),
+                    cached_store_version(it.id)
+                        .or_else(|| (!it.version.is_empty()).then(|| it.version.to_string())),
+                );
+                let program_str = bin_path.to_string_lossy().to_string();
+                let mut servers = lockv(&state.servers);
+                if let Some(s) = servers.iter_mut().find(|s| s.id == sid) {
+                    s.version = downloaded_version.clone();
+                    s.state = SState::Down;
+                    s.pid = None;
+                    s.last_error = Some("redémarrage après mise à jour…".to_string());
+                    if let Some(ref mut sc) = s.start_cmd {
+                        sc.program = program_str;
+                    }
+                }
+                downloaded_version
+            } else {
+                if let Some((prog, args, _)) = &existing_cmd {
+                    let _ = purge_store_package_files(prog, args);
+                }
+                #[cfg(not(test))]
+                let _ = refresh_store_versions(Some(&[it.id.to_string()]));
+                let target_ver = cached_store_version(it.id)
+                    .or_else(|| extract_pinned_version(it.args))
+                    .or_else(|| (!it.version.is_empty()).then(|| it.version.to_string()));
+                let mut servers = lockv(&state.servers);
+                if let Some(s) = servers.iter_mut().find(|s| s.id == sid) {
+                    s.version = target_ver.clone();
+                    s.state = SState::Down;
+                    s.pid = None;
+                    s.last_error = Some("redémarrage après mise à jour…".to_string());
+                }
+                target_ver
+            };
+            reset_spawn_retry(state, &sid);
+            if let Err(e) = save_config_checked(state) {
+                return json!({"ok": false, "error": format!("config non écrite : {e}")});
+            }
+            save_cache(state);
+            let ver_log = new_version
+                .as_deref()
+                .map(|v| format!(" (v{v})"))
+                .unwrap_or_default();
+            add_log(
+                state,
+                "info",
+                &format!("[boutique] mis à jour : {}{ver_log}", it.name),
+            );
+            #[cfg(not(test))]
+            cycle_via_pool(state, std::slice::from_ref(&sid));
+            json!({
+                "ok": true,
+                "id": sid,
+                "version": new_version,
+            })
         }
         "uninstall_store" => {
             let raw_id = req
