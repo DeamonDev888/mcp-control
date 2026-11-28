@@ -77,7 +77,7 @@ fn take_confirmed_up(state: &Arc<AppState>, id: &str) -> bool {
 
 fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
     crate::auth::net::set_config_path(&state.config_path);
-    let (transport, enabled, via_ssh, was_up, _has_tools, prev_name, prev_version) = {
+    let (transport, enabled, via_ssh, was_up, _has_tools, prev_name, prev_version, prev_proto) = {
         let servers = lockv(&state.servers);
         match servers.iter().find(|s| s.id == id) {
             Some(s) => (
@@ -88,6 +88,7 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                 !s.tools.is_empty(),
                 s.server_name.clone(),
                 s.version.clone(),
+                s.protocol.clone(),
             ),
             None => return,
         }
@@ -114,6 +115,7 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                 reuse_metadata_if_unchanged: can_reuse,
                 prev_name: prev_name.as_deref(),
                 prev_version: prev_version.as_deref(),
+                prev_protocol: prev_proto.as_deref(),
             };
             let ssh_host_cfg = if via_ssh {
                 host.as_deref().and_then(|h| {
@@ -490,7 +492,9 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                                             res.error.as_deref().unwrap_or("?")
                                         ),
                                     ));
-                                    if take_confirmed_up(state, id) {
+                                    // Pas de notification (toast/webhook) pour les serveurs SSH :
+                                    // les lags ou déconnexions SSH ne doivent pas spammer l'utilisateur.
+                                    if take_confirmed_up(state, id) && !via_ssh && !srv.via_ssh {
                                         incident = Some((
                                             srv.label.clone(),
                                             st_lbl,
@@ -587,7 +591,7 @@ fn poll_one_inner(state: &Arc<AppState>, id: &str, force_full: bool) {
                     if let Some(srv) = servers.iter_mut().find(|s| s.id == id) {
                         if srv.state == SState::Up {
                             gw_changed = true;
-                            if take_confirmed_up(state, id) {
+                            if take_confirmed_up(state, id) && !srv.via_ssh {
                                 stdio_incident = Some(srv.label.clone());
                             }
                         }
@@ -2735,5 +2739,43 @@ mod tests {
         assert_eq!(rt.fails, 0, "{rt:?}");
         assert_eq!(rt.restarts, 1, "recovered compte un redémarrage : {rt:?}");
         assert!(rt.events.iter().any(|e| e.kind == "recovered"));
+    }
+
+    #[test]
+    fn ssh_deconnexion_ne_declenche_aucune_notification() {
+        // Un serveur via_ssh qui passe de UP à DOWN (lag / coupure SSH) ne doit
+        // déclencher aucune notification (ni toast desktop ni webhook).
+        let mut srv = serveur_local("ssh-lag-1", 19_999, None);
+        srv.transport = Transport::Http {
+            host: Some("192.0.2.55".to_string()),
+            port: 19_999,
+            path: "/mcp".to_string(),
+        };
+        srv.via_ssh = true;
+        srv.state = SState::Up;
+        let state = etat_test(vec![srv]);
+        {
+            let mut st = lockv(&state.settings);
+            st.notify.desktop = false;
+            // URL volontairement invalide : si notify_incident() était appelé, il
+            // journaliserait `[notif] webhook : ...` dans state.log.
+            st.notify.webhook_url = "notaurl".into();
+            st.notify.min_interval_secs = 0;
+        }
+        mark_confirmed_up(&state, "ssh-lag-1");
+
+        // La sonde échoue (hôte SSH absent de ssh_hosts → DOWN immédiat, sans réseau).
+        poll_one(&state, "ssh-lag-1");
+
+        let s = lockv(&state.servers)
+            .iter()
+            .find(|x| x.id == "ssh-lag-1")
+            .cloned()
+            .expect("serveur ssh présent");
+        assert_ne!(s.state, SState::Up);
+        assert!(
+            !lockv(&state.log).iter().any(|e| e.msg.contains("[notif]")),
+            "un serveur SSH qui tombe ne doit jamais déclencher de notification"
+        );
     }
 }
