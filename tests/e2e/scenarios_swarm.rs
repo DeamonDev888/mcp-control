@@ -161,7 +161,17 @@ fn admin_responder(tool: &str, args: &Value) -> Value {
             }]
         }),
         "agent_control" => json!({"runs": []}),
-        "create_agent" => json!({"created": args["name"], "runner": args["runner"]}),
+        "create_agent" => {
+            assert!(
+                args.get("class").is_none(),
+                "create_agent (.strict()) ne doit pas recevoir de champ 'class'"
+            );
+            json!({
+                "created": args["name"],
+                "runner": args["runner"],
+                "executable": args.get("executable").and_then(Value::as_bool).unwrap_or(false)
+            })
+        }
         "agent_stop" => json!({"stopped": args["name"]}),
         _ => json!({"ok": true}),
     }
@@ -302,10 +312,13 @@ fn swarm_e2e_detection_overview_ask_et_assets() {
         "instance_id": admin_id,
         "name": "bob",
         "runner": "hermes",
-        "prompt": "Tu es Bob."
+        "prompt": "Tu es Bob.",
+        "class": "explorer",
+        "executable": true
     }));
     assert_eq!(cr["ok"], true);
     assert_eq!(cr["data"]["created"], "bob");
+    assert_eq!(cr["data"]["executable"], true);
 
     let stop = eng.action(&json!({
         "action": "swarm_resident_stop",
@@ -328,7 +341,7 @@ fn resident_seven_tools() -> Value {
     ])
 }
 
-fn sniperbot_discord_responder(tool: &str, _args: &Value) -> Value {
+fn sniperbot_discord_responder(tool: &str, args: &Value) -> Value {
     match tool {
         "status" => json!({
             "agent": "sniperbot_analyst",
@@ -337,6 +350,40 @@ fn sniperbot_discord_responder(tool: &str, _args: &Value) -> Value {
             "state": "idle",
             "queueLength": 0,
             "turnsDone": 1
+        }),
+        "history" => json!({
+            "agent": "sniperbot_analyst",
+            "total": 1,
+            "path": "bridge/history/claude-sniperbot_analyst.jsonl",
+            "entries": [{
+                "ts": 1700000000000u64,
+                "prompt": "ping",
+                "reply": "pong",
+                "sessionId": "sess-99",
+                "durationMs": 42,
+                "queuedMs": 0,
+                "runner": "claude",
+                "agent": "sniperbot_analyst"
+            }]
+        }),
+        "logs" => json!({
+            "output": "derniere ligne stdout\n",
+            "bytes": 22,
+            "live": false
+        }),
+        "session" => match args.get("action").and_then(Value::as_str).unwrap_or("") {
+            "show" => json!({"action": "show", "session": "sess-99"}),
+            "reset" => json!({"action": "reset", "hadSession": true, "session": null}),
+            "set" => json!({"action": "set", "session": args["id"]}),
+            _ => json!({"error": "bad action"}),
+        },
+        "config" => json!({
+            "agent": "sniperbot_analyst",
+            "runner": "claude",
+            "files": [
+                {"name": "prompt", "content": "Tu es Sniperbot."},
+                {"name": "settings.json", "content": "{}"}
+            ]
         }),
         _ => json!({"ok": true}),
     }
@@ -472,4 +519,56 @@ fn swarm_e2e_classe_agent_logo_et_detection_sept_outils() {
 
     let det = eng.get(&format!("/api/detail?id={id_discord}")).json();
     assert_eq!(det["swarm_class"], "discord");
+
+    // 4. Nouveaux outils résidents (history, logs, session, config) + changement de classe
+    let hist = eng.action(&json!({
+        "action": "swarm_resident_history",
+        "server_id": id_discord,
+        "limit": 10
+    }));
+    assert_eq!(hist["ok"], true);
+    assert_eq!(hist["data"]["entries"][0]["reply"], "pong");
+
+    let logs = eng.action(&json!({
+        "action": "swarm_resident_logs",
+        "server_id": id_discord,
+        "tail": 4096
+    }));
+    assert_eq!(logs["ok"], true);
+    assert_eq!(logs["data"]["bytes"], 22);
+
+    let sess_set = eng.action(&json!({
+        "action": "swarm_resident_session",
+        "server_id": id_discord,
+        "op": "set",
+        "session_id": "sess-custom-7"
+    }));
+    assert_eq!(sess_set["ok"], true);
+    assert_eq!(sess_set["data"]["session"], "sess-custom-7");
+
+    let sess_rst = eng.action(&json!({
+        "action": "swarm_resident_session",
+        "server_id": id_discord,
+        "op": "reset"
+    }));
+    assert_eq!(sess_rst["ok"], true);
+    assert_eq!(sess_rst["data"]["hadSession"], true);
+
+    let rcfg = eng.action(&json!({
+        "action": "swarm_resident_config",
+        "server_id": id_discord
+    }));
+    assert_eq!(rcfg["ok"], true);
+    assert_eq!(rcfg["data"]["read_only"], true);
+    assert_eq!(rcfg["data"]["files"]["prompt.md"], "Tu es Sniperbot.");
+
+    let set_cls = eng.action(&json!({
+        "action": "swarm_set_agent_class",
+        "server_id": id_noclass,
+        "class": "verifier"
+    }));
+    assert_eq!(set_cls["ok"], true);
+    assert_eq!(set_cls["class"], "verifier");
+    let det_nc = eng.get(&format!("/api/detail?id={id_noclass}")).json();
+    assert_eq!(det_nc["swarm_class"], "verifier");
 }

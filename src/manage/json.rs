@@ -278,7 +278,7 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
             .iter()
             .map(|s| {
                 let pos = order.iter().position(|x| x == &s.id).unwrap_or(usize::MAX);
-                let cls = swarm_classes.get(&s.id).map(String::as_str);
+                let cls = crate::swarm::resolve_server_swarm_class(s, &swarm_classes);
                 (pos, server_json_with_class(s, managed.contains(&s.id), cls))
             })
             .collect();
@@ -401,15 +401,15 @@ pub fn state_json(state: &Arc<AppState>) -> Value {
 
 pub fn detail_json(state: &Arc<AppState>, id: &str) -> Value {
     let managed = managed_ids(state);
-    let swarm_class = crate::swarm::get_swarm_class(state, id);
+    let swarm_classes = crate::swarm::snapshot_swarm_classes(state);
     let servers = lockv(&state.servers);
     match servers.iter().find(|s| s.id == id) {
         Some(s) => {
-            let mut o =
-                match server_json_with_class(s, managed.contains(&s.id), swarm_class.as_deref()) {
-                    Value::Object(o) => o,
-                    _ => Map::new(),
-                };
+            let cls = crate::swarm::resolve_server_swarm_class(s, &swarm_classes);
+            let mut o = match server_json_with_class(s, managed.contains(&s.id), cls) {
+                Value::Object(o) => o,
+                _ => Map::new(),
+            };
             let tools: Vec<Value> = s
                 .tools
                 .iter()
@@ -460,7 +460,7 @@ pub fn servers_summary_json(state: &Arc<AppState>, state_filter: Option<&str>) -
         let list: Vec<Value> = ordered
             .into_iter()
             .map(|(_, s)| {
-                let cls = swarm_classes.get(&s.id).map(String::as_str);
+                let cls = crate::swarm::resolve_server_swarm_class(s, &swarm_classes);
                 server_json_with_class(s, managed.contains(&s.id), cls)
             })
             .collect();
@@ -641,7 +641,7 @@ pub fn state_etag(state: &Arc<AppState>) -> String {
         idxs.sort_by_key(|(pos, _)| *pos);
         for (_, i) in idxs {
             let s = &servers[i];
-            let cls = swarm_classes.get(&s.id).map(String::as_str);
+            let cls = crate::swarm::resolve_server_swarm_class(s, &swarm_classes);
             hash_server_visible(s, managed.contains(&s.id), cls, false, &mut h);
         }
     }
@@ -700,18 +700,13 @@ pub fn detail_etag(state: &Arc<AppState>, id: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let managed = managed_ids(state);
-    let swarm_class = crate::swarm::get_swarm_class(state, id);
+    let swarm_classes = crate::swarm::snapshot_swarm_classes(state);
     let servers = lockv(&state.servers);
     match servers.iter().find(|s| s.id == id) {
         Some(s) => {
             true.hash(&mut h);
-            hash_server_visible(
-                s,
-                managed.contains(&s.id),
-                swarm_class.as_deref(),
-                true,
-                &mut h,
-            );
+            let cls = crate::swarm::resolve_server_swarm_class(s, &swarm_classes);
+            hash_server_visible(s, managed.contains(&s.id), cls, true, &mut h);
         }
         None => {
             false.hash(&mut h);

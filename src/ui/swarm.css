@@ -146,9 +146,16 @@
 .sw-mcp-chip:hover{border-color:var(--border);color:var(--t1)}
 .sw-mcp-chip input{margin:0}
 
-/* Runs parallèles & états vides */
+/* Runs parallèles, tiroir logs & états vides */
 .sw-par-row{display:grid;grid-template-columns:115px 140px 1fr auto;gap:0.5rem;align-items:center}
 .sw-stream-pre{margin:0;max-height:16rem;overflow:auto;padding:0.625rem;border-radius:var(--r2);background:var(--bg-code);border:1px solid var(--border-soft);font:0.71875rem/1.45 var(--mono);color:var(--t2);white-space:pre-wrap;word-break:break-word}
+.sw-logs-box{display:flex;flex-direction:column;gap:0.375rem;padding:0.5625rem 0.6875rem;border-radius:var(--r3);background:var(--bg-code);border:1px solid var(--border-soft)}
+.sw-logs-head{display:flex;align-items:center;justify-content:space-between;gap:0.5rem;flex-wrap:wrap;font:600 0.6875rem/1.2 var(--mono);color:var(--t3)}
+.sw-cls-sel{font-size:0.6875rem;height:1.5rem;padding:0 0.375rem;border-radius:var(--r2)}
+.sw-job-det{width:100%}
+.sw-job-det summary{cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:0.5rem;flex-wrap:wrap}
+.sw-job-det summary::-webkit-details-marker{display:none}
+.sw-job-det pre{margin:0.5rem 0 0;max-height:14rem;overflow:auto;padding:0.5rem 0.625rem;border-radius:var(--r2);background:var(--bg-code);border:1px solid var(--border-hair);font:0.6875rem/1.45 var(--mono);color:var(--t2);white-space:pre-wrap;word-break:break-word}
 .sw-empty{padding:1.25rem 1rem;text-align:center;color:var(--t3);background:var(--wash);border:1px dashed var(--border-soft);border-radius:var(--r3);font:0.78125rem/1.5 var(--sans);display:flex;flex-direction:column;align-items:center;gap:0.5rem}
 .sw-empty b{color:var(--t1)}
 .sw-empty-acts{display:flex;gap:0.4375rem;flex-wrap:wrap;justify-content:center;margin-top:0.125rem}

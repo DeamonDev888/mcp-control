@@ -2322,4 +2322,45 @@ mod tests {
             assert!(APP_CSS.contains(cls), "APP_CSS doit définir `{cls}`");
         }
     }
+
+    #[test]
+    fn onglet_swarm_affiche_uniquement_agents_residents_et_garde_instances_dans_mcp() {
+        let vis = fn_body(APP_JS, "srvVisible");
+        assert!(
+            vis.contains("explorerTab === 'swarm' && s.swarm_kind !== 'resident'"),
+            "srvVisible() doit n'afficher que les agents résidents dans l'onglet Swarm"
+        );
+        assert!(
+            !vis.contains("explorerTab === 'swarm' && !s.swarm_kind"),
+            "srvVisible() ne doit pas inclure les orchestrateurs (swarm_kind === 'instance') dans l'onglet Swarm"
+        );
+
+        let rs = fn_body(APP_JS, "renderServers");
+        assert!(
+            rs.contains("localAll.filter(s => s.swarm_kind === 'resident')")
+                && rs.contains(".some(s => s.swarm_kind === 'resident')")
+                && rs.contains(".filter(s => s.swarm_kind === 'resident')"),
+            "renderServers() doit filtrer les compteurs locaux et distants de l'onglet Swarm sur s.swarm_kind === 'resident'"
+        );
+        assert!(
+            !rs.contains("Boolean(s.swarm_kind)"),
+            "renderServers() ne doit pas utiliser Boolean(s.swarm_kind) qui exposerait Swarm Control et Overmind dans l'onglet Swarm"
+        );
+
+        let hive = fn_body(APP_JS, "swarmHiveRow");
+        assert!(
+            !hive.contains("orchestrateur") && !hive.contains("nInst"),
+            "swarmHiveRow() ne doit compter que les agents résidents (pas les orchestrateurs)"
+        );
+
+        let det = fn_body(APP_JS, "renderDetail");
+        assert!(
+            det.contains(
+                "s.swarm_kind === 'resident' ? `<button type=\"button\" class=\"tab ${detailTab === 'swarm-chat'"
+            ) && det.contains(
+                "s.swarm_kind === 'resident' ? `<button type=\"button\" class=\"tab ${detailTab === 'swarm-cfg'"
+            ),
+            "renderDetail() doit conserver Conversation et Config agent réservés aux agents résidents"
+        );
+    }
 }

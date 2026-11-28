@@ -73,6 +73,7 @@ pub struct ProbeHint<'a> {
     pub reuse_metadata_if_unchanged: bool,
     pub prev_name: Option<&'a str>,
     pub prev_version: Option<&'a str>,
+    pub prev_protocol: Option<&'a str>,
 }
 
 impl McpProbe {
@@ -4794,6 +4795,8 @@ pub fn rpc_call(
 }
 
 /// Probe MCP streamable-HTTP complète : initialize + tools/list.
+type InitForm<'a> = (&'a Value, &'a [(&'a str, &'a str)], bool);
+
 pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
     probe_http_with(port, path, timeout_ms, &ProbeHint::default())
 }
@@ -4801,10 +4804,13 @@ pub fn probe_http(port: u16, path: &str, timeout_ms: u64) -> McpProbe {
 /// Probe MCP streamable-HTTP avec indice de sonde légère (P1 rang 2).
 pub fn probe_http_with(port: u16, path: &str, timeout_ms: u64, hint: &ProbeHint<'_>) -> McpProbe {
     let quick = Duration::from_millis(timeout_ms.min(1500));
-    let open_host = if port_open("::1", port, quick) {
-        "::1"
-    } else if port_open("127.0.0.1", port, quick) {
-        "127.0.0.1"
+    let (open_host, other_open) = if port_open("127.0.0.1", port, quick) {
+        (
+            "127.0.0.1",
+            port_open("::1", port, Duration::from_millis(200)),
+        )
+    } else if port_open("::1", port, quick) {
+        ("::1", false)
     } else {
         return McpProbe::fail(
             "port fermé (rien n'écoute sur ::1 ni 127.0.0.1)".to_string(),
@@ -4844,6 +4850,24 @@ pub fn probe_http_with(port: u16, path: &str, timeout_ms: u64, hint: &ProbeHint<
     } else {
         "::1"
     };
+    let hosts: &[&str] = if other_open {
+        &[open_host, other_host]
+    } else {
+        std::slice::from_ref(&open_host)
+    };
+    let prefer_strict =
+        hint.prev_protocol == Some(crate::LITEMCP_PROTOCOL) || (23080..=23099).contains(&port);
+    let init_forms: [InitForm<'_>; 2] = if prefer_strict {
+        [
+            (&init_strict, &strict_init_hdrs[..], true),
+            (&init_params, &[][..], false),
+        ]
+    } else {
+        [
+            (&init_params, &[][..], false),
+            (&init_strict, &strict_init_hdrs[..], true),
+        ]
+    };
     let t0 = Instant::now();
     // MOTIF D'ERREUR (audit 03, constat 4) : l'hôte de repli (::1 ou
     // 127.0.0.1) n'a jamais accepté la connexion — son erreur (souvent
@@ -4854,11 +4878,9 @@ pub fn probe_http_with(port: u16, path: &str, timeout_ms: u64, hint: &ProbeHint<
     let mut err_hote: Option<String> = None;
     let mut err_repli: Option<String> = None;
     let mut muet = false;
-    'probe: for (params, hdrs, stateless) in [
-        (&init_params, &[][..], false),
-        (&init_strict, &strict_init_hdrs[..], true),
-    ] {
-        for host in [open_host, other_host] {
+    'probe: for (params, hdrs, stateless) in init_forms {
+        for &host in hosts {
+            let t_req = Instant::now();
             match rpc_call_host_headers(
                 host,
                 port,
@@ -4874,7 +4896,7 @@ pub fn probe_http_with(port: u16, path: &str, timeout_ms: u64, hint: &ProbeHint<
                         r,
                         host.to_string(),
                         h,
-                        t0.elapsed().as_millis() as u64,
+                        t_req.elapsed().as_millis() as u64,
                         stateless,
                     ));
                     break 'probe;
@@ -4917,7 +4939,8 @@ pub fn probe_http_with(port: u16, path: &str, timeout_ms: u64, hint: &ProbeHint<
             ("MCP-Protocol-Version", "2026-07-28"),
             ("Mcp-Method", "server/discover"),
         ];
-        for host in [open_host, other_host] {
+        for &host in hosts {
+            let t_req = Instant::now();
             if let Ok((r, h)) = rpc_call_host_headers(
                 host,
                 port,
@@ -4954,7 +4977,7 @@ pub fn probe_http_with(port: u16, path: &str, timeout_ms: u64, hint: &ProbeHint<
                     serde_json::Value::Null,
                     host.to_string(),
                     h,
-                    t0.elapsed().as_millis() as u64,
+                    t_req.elapsed().as_millis() as u64,
                     true,
                 ));
                 break;
@@ -5881,13 +5904,24 @@ pub fn probe_http_host_with(
         ("Mcp-Method", "initialize"),
     ];
 
+    let prefer_strict =
+        hint.prev_protocol == Some(crate::LITEMCP_PROTOCOL) || (23080..=23099).contains(&port);
+    let init_forms: [InitForm<'_>; 2] = if prefer_strict {
+        [
+            (&init_strict, &strict_init_hdrs[..], true),
+            (&init_params, &[][..], false),
+        ]
+    } else {
+        [
+            (&init_params, &[][..], false),
+            (&init_strict, &strict_init_hdrs[..], true),
+        ]
+    };
     let mut attempt: Option<(serde_json::Value, RespHead, u64, bool)> = None;
     let mut err_hote: Option<String> = None;
     let mut muet = false;
-    for (params, hdrs, stateless) in [
-        (&init_params, &[][..], false),
-        (&init_strict, &strict_init_hdrs[..], true),
-    ] {
+    for (params, hdrs, stateless) in init_forms {
+        let t_req = Instant::now();
         match rpc_call_host_headers(
             host,
             port,
@@ -5899,7 +5933,7 @@ pub fn probe_http_host_with(
             hdrs,
         ) {
             Ok((r, h)) => {
-                attempt = Some((r, h, t0.elapsed().as_millis() as u64, stateless));
+                attempt = Some((r, h, t_req.elapsed().as_millis() as u64, stateless));
                 break;
             }
             Err(e) => {

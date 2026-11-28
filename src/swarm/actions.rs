@@ -5,18 +5,86 @@ use super::detect::{detect_server, SwarmKind};
 use super::jobs;
 use super::rpc::{call_bridge_loopback, call_server_mcp, unwrap_tool_json};
 use crate::manage;
-use crate::types::{lockv, AppState, SState, Transport};
+use crate::types::{lockv, AppState, SState, Server, Transport};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-/// Cache mémoire `server_id -> swarm_class` scopé par `AppState` (même pattern
-/// que `jobs.rs`), alimenté par `status` des résidents et `list_agents` des
-/// instances pour enrichir `/api/state` et `/api/detail` sans alourdir `Server`.
+/// Cache mémoire `(server_id | "agent:<nom>") -> swarm_class` scopé par `AppState`
+/// et persisté sous `<config_dir>/cache/swarm-classes.json`.
 fn class_store() -> &'static Mutex<HashMap<usize, HashMap<String, String>>> {
     static STORE: OnceLock<Mutex<HashMap<usize, HashMap<String, String>>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn class_loaded_set() -> &'static Mutex<HashSet<usize>> {
+    static LOADED: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    LOADED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn classes_cache_path(config_path: &str) -> Option<PathBuf> {
+    let trimmed = config_path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let base = Path::new(trimmed)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())?;
+    Some(base.join("cache").join("swarm-classes.json"))
+}
+
+fn ensure_classes_loaded(state: &Arc<AppState>) {
+    let key = Arc::as_ptr(state) as usize;
+    {
+        let mut loaded = lockv(class_loaded_set());
+        if !loaded.insert(key) {
+            return;
+        }
+    }
+    let Some(path) = classes_cache_path(&state.config_path) else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    let Ok(Value::Object(obj)) = serde_json::from_slice::<Value>(&bytes) else {
+        return;
+    };
+    let mut store = lockv(class_store());
+    let map = store.entry(key).or_default();
+    for (k, v) in obj {
+        if let Some(cls) = normalize_swarm_class(v.as_str()) {
+            map.entry(k).or_insert(cls);
+        }
+    }
+}
+
+fn persist_classes(state: &Arc<AppState>) {
+    let Some(path) = classes_cache_path(&state.config_path) else {
+        return;
+    };
+    let key = Arc::as_ptr(state) as usize;
+    let snap: Map<String, Value> = {
+        let store = lockv(class_store());
+        let Some(map) = store.get(&key) else {
+            return;
+        };
+        map.iter()
+            .filter(|(k, _)| k.starts_with("agent:"))
+            .map(|(k, v)| (k.clone(), json!(v)))
+            .collect()
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if let Ok(bytes) = serde_json::to_vec_pretty(&Value::Object(snap)) {
+        if std::fs::write(&tmp, bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
 }
 
 /// Valide et normalise une classe d'agent (`status.class` ou `agent.class`)
@@ -45,7 +113,12 @@ fn extract_swarm_class(v: &Value) -> Option<String> {
     normalize_swarm_class(v.get("class").and_then(Value::as_str))
 }
 
+fn agent_class_key(agent_name: &str) -> String {
+    format!("agent:{}", agent_name.trim().to_ascii_lowercase())
+}
+
 fn set_swarm_class(state: &Arc<AppState>, server_id: &str, cls: Option<&str>) {
+    ensure_classes_loaded(state);
     let key = Arc::as_ptr(state) as usize;
     let mut store = lockv(class_store());
     let entry = store.entry(key).or_default();
@@ -59,16 +132,136 @@ fn set_swarm_class(state: &Arc<AppState>, server_id: &str, cls: Option<&str>) {
     }
 }
 
+fn set_agent_class_by_name(state: &Arc<AppState>, agent_name: &str, cls: Option<&str>) {
+    let trimmed = agent_name.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    ensure_classes_loaded(state);
+    let akey = agent_class_key(trimmed);
+    let matched_ids: Vec<String> = {
+        let servers = lockv(&state.servers);
+        servers
+            .iter()
+            .filter_map(|s| {
+                let m = detect_server(s)?;
+                if m.kind == SwarmKind::Resident
+                    && m.agent
+                        .as_deref()
+                        .is_some_and(|a| a.eq_ignore_ascii_case(trimmed))
+                {
+                    Some(s.id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    {
+        let key = Arc::as_ptr(state) as usize;
+        let mut store = lockv(class_store());
+        let entry = store.entry(key).or_default();
+        match normalize_swarm_class(cls) {
+            Some(valid) => {
+                entry.insert(akey, valid.clone());
+                for sid in matched_ids {
+                    entry.insert(sid, valid.clone());
+                }
+            }
+            None => {
+                entry.remove(&akey);
+                for sid in matched_ids {
+                    entry.remove(&sid);
+                }
+            }
+        }
+    }
+    persist_classes(state);
+}
+
 pub fn get_swarm_class(state: &Arc<AppState>, server_id: &str) -> Option<String> {
+    ensure_classes_loaded(state);
     let key = Arc::as_ptr(state) as usize;
     let store = lockv(class_store());
     store.get(&key).and_then(|m| m.get(server_id)).cloned()
 }
 
 pub fn snapshot_swarm_classes(state: &Arc<AppState>) -> HashMap<String, String> {
+    ensure_classes_loaded(state);
     let key = Arc::as_ptr(state) as usize;
     let store = lockv(class_store());
     store.get(&key).cloned().unwrap_or_default()
+}
+
+pub fn resolve_server_swarm_class<'a>(
+    s: &Server,
+    classes: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+    if let Some(c) = classes.get(&s.id) {
+        return Some(c.as_str());
+    }
+    let meta = detect_server(s)?;
+    if meta.kind == SwarmKind::Resident {
+        if let Some(ag) = meta.agent {
+            return classes.get(&agent_class_key(&ag)).map(String::as_str);
+        }
+    }
+    None
+}
+
+/// Enregistre automatiquement dans MCP Control l'URL HTTP d'un agent résident
+/// nouvellement démarré (s'il n'est pas déjà suivi sur ce port).
+fn auto_follow_resident_url(
+    state: &Arc<AppState>,
+    url: &str,
+    fallback_agent: &str,
+    explicit_label: Option<&str>,
+    cls: Option<&str>,
+) -> Option<String> {
+    let (host, port, path) = parse_http_url_parts(url)?;
+    let existing_id = {
+        let servers = lockv(&state.servers);
+        servers.iter().find_map(|s| match &s.transport {
+            Transport::Http { port: p, .. } if *p == port => Some(s.id.clone()),
+            _ => None,
+        })
+    };
+    if let Some(id) = existing_id {
+        if cls.is_some() {
+            set_swarm_class(state, &id, cls);
+        }
+        return Some(id);
+    }
+    let label = explicit_label
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("swarm-{fallback_agent}"));
+    let mut add_req = json!({
+        "action": "add",
+        "label": label,
+        "transport": "http",
+        "port": port,
+        "path": path,
+    });
+    if let Some(h) = host {
+        add_req["host"] = json!(h);
+    }
+    let added = manage::handle_action(state, &add_req.to_string());
+    if added.get("ok").and_then(Value::as_bool) == Some(true) {
+        let fid = added
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        if let Some(ref id) = fid {
+            if cls.is_some() {
+                set_swarm_class(state, id, cls);
+            }
+        }
+        fid
+    } else {
+        None
+    }
 }
 
 fn req_str<'a>(req: &'a Value, key: &str) -> Option<&'a str> {
@@ -325,7 +518,7 @@ fn build_overview(state: &Arc<AppState>) -> Value {
             })
             .collect();
 
-        let insts: Vec<Value> = inst_handles
+        let mut insts: Vec<Value> = inst_handles
             .into_iter()
             .filter_map(|h| h.join().ok())
             .collect();
@@ -333,17 +526,32 @@ fn build_overview(state: &Arc<AppState>) -> Value {
             .into_iter()
             .filter_map(|h| h.join().ok())
             .collect();
-        // Si un résident n'a pas encore fourni de `class` via `status`, tente
-        // le repli depuis `list_agents` des instances (correspondance sur le nom).
+        let saved_classes = snapshot_swarm_classes(state);
+        // Enrichit `list_agents` avec les classes persistées localement et collecte
+        // toutes les classes connues pour propager vers les résidents.
         let mut classes_by_agent: HashMap<String, String> = HashMap::new();
-        for inst in &insts {
-            if let Some(arr) = inst.get("agents").and_then(Value::as_array) {
+        for (k, v) in &saved_classes {
+            if let Some(ag) = k.strip_prefix("agent:") {
+                classes_by_agent.insert(ag.to_string(), v.clone());
+            }
+        }
+        for inst in &mut insts {
+            if let Some(arr) = inst.get_mut("agents").and_then(Value::as_array_mut) {
                 for a in arr {
-                    if let (Some(name), Some(cls)) = (
-                        a.get("name").and_then(Value::as_str),
-                        extract_swarm_class(a),
-                    ) {
-                        classes_by_agent.insert(name.to_ascii_lowercase(), cls);
+                    let ag_name = a
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_ascii_lowercase);
+                    if let Some(cls) = extract_swarm_class(a) {
+                        if let Some(ref low) = ag_name {
+                            classes_by_agent.insert(low.clone(), cls);
+                        }
+                    } else if let Some(ref low) = ag_name {
+                        if let Some(saved) = classes_by_agent.get(low) {
+                            if let Some(obj) = a.as_object_mut() {
+                                obj.insert("class".into(), json!(saved));
+                            }
+                        }
                     }
                 }
             }
@@ -404,17 +612,13 @@ pub fn handle_swarm_action(state: &Arc<AppState>, action: &str, req: &Value) -> 
             let Some(prompt) = req_str(req, "prompt") else {
                 return Some(json!({"ok": false, "error": "prompt manquant"}));
             };
+            // NB : `create_agent` dans Swarm-control valide son entrée en `.strict()`
+            // et n'accepte pas de champ `class` — on mémorise `class` côté MCP Control.
+            let wanted_class = normalize_swarm_class(req_str(req, "class"));
             let mut args = Map::new();
             args.insert("name".into(), json!(name));
             args.insert("prompt".into(), json!(prompt));
-            for k in [
-                "runner",
-                "model",
-                "copyEnvFrom",
-                "cloneFrom",
-                "config",
-                "class",
-            ] {
+            for k in ["runner", "model", "copyEnvFrom", "cloneFrom", "config"] {
                 if let Some(v) = req_str(req, k) {
                     args.insert(k.into(), json!(v));
                 }
@@ -422,14 +626,30 @@ pub fn handle_swarm_action(state: &Arc<AppState>, action: &str, req: &Value) -> 
             if let Some(b) = req.get("resident").and_then(Value::as_bool) {
                 args.insert("resident".into(), json!(b));
             }
+            if let Some(b) = req.get("executable").and_then(Value::as_bool) {
+                args.insert("executable".into(), json!(b));
+            }
             manage::add_log(
                 state,
                 "info",
                 &format!("[swarm] create_agent '{name}' sur {inst}"),
             );
-            match call_and_unwrap(state, inst, "create_agent", Value::Object(args), 20_000) {
+            match call_and_unwrap(state, inst, "create_agent", Value::Object(args), 25_000) {
                 Ok((data, elapsed_ms)) => {
-                    json!({"ok": true, "data": data, "elapsed_ms": elapsed_ms})
+                    if let Some(ref cls) = wanted_class {
+                        set_agent_class_by_name(state, name, Some(cls));
+                    }
+                    let followed_id = data.get("resident").and_then(|r| {
+                        let url = r.get("url")?.as_str()?;
+                        let lbl = r.get("name").and_then(Value::as_str);
+                        auto_follow_resident_url(state, url, name, lbl, wanted_class.as_deref())
+                    });
+                    json!({
+                        "ok": true,
+                        "data": data,
+                        "elapsed_ms": elapsed_ms,
+                        "followed_id": followed_id,
+                    })
                 }
                 Err(e) => json!({"ok": false, "error": e}),
             }
@@ -456,7 +676,38 @@ pub fn handle_swarm_action(state: &Arc<AppState>, action: &str, req: &Value) -> 
             );
             match call_and_unwrap(state, inst, "delete_agent", Value::Object(args), 15_000) {
                 Ok((data, elapsed_ms)) => {
-                    json!({"ok": true, "data": data, "elapsed_ms": elapsed_ms})
+                    set_agent_class_by_name(state, name, None);
+                    // Si un serveur résident suivi correspondait à cet agent supprimé, le retirer proprement.
+                    let stale_ids: Vec<String> = {
+                        let servers = lockv(&state.servers);
+                        servers
+                            .iter()
+                            .filter_map(|s| {
+                                let m = detect_server(s)?;
+                                if m.kind == SwarmKind::Resident
+                                    && m.agent
+                                        .as_deref()
+                                        .is_some_and(|a| a.eq_ignore_ascii_case(name))
+                                {
+                                    Some(s.id.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    };
+                    for sid in &stale_ids {
+                        let _ = manage::handle_action(
+                            state,
+                            &json!({"action": "remove", "id": sid}).to_string(),
+                        );
+                    }
+                    json!({
+                        "ok": true,
+                        "data": data,
+                        "elapsed_ms": elapsed_ms,
+                        "removed_residents": stale_ids,
+                    })
                 }
                 Err(e) => json!({"ok": false, "error": e}),
             }
@@ -550,43 +801,23 @@ pub fn handle_swarm_action(state: &Arc<AppState>, action: &str, req: &Value) -> 
             );
             match call_and_unwrap(state, inst, "agent_start", Value::Object(args), 20_000) {
                 Ok((data, elapsed_ms)) => {
-                    let mut followed_id: Option<String> = None;
-                    if req.get("follow").and_then(Value::as_bool).unwrap_or(false) {
-                        if let Some(url) = data.get("url").and_then(Value::as_str) {
-                            if let Some((host, port, path)) = parse_http_url_parts(url) {
-                                let label = data
-                                    .get("name")
-                                    .and_then(Value::as_str)
-                                    .map(ToOwned::to_owned)
-                                    .unwrap_or_else(|| format!("swarm-{name}"));
-                                let already = {
-                                    let servers = lockv(&state.servers);
-                                    servers.iter().any(|s| {
-                                        matches!(&s.transport, Transport::Http { port: p, .. } if *p == port)
-                                    })
-                                };
-                                if !already {
-                                    let mut add_req = json!({
-                                        "action": "add",
-                                        "label": label,
-                                        "transport": "http",
-                                        "port": port,
-                                        "path": path,
-                                    });
-                                    if let Some(h) = host {
-                                        add_req["host"] = json!(h);
-                                    }
-                                    let added = manage::handle_action(state, &add_req.to_string());
-                                    if added.get("ok").and_then(Value::as_bool) == Some(true) {
-                                        followed_id = added
-                                            .get("id")
-                                            .and_then(Value::as_str)
-                                            .map(ToOwned::to_owned);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let saved_cls = snapshot_swarm_classes(state)
+                        .get(&agent_class_key(name))
+                        .cloned();
+                    let followed_id = if req.get("follow").and_then(Value::as_bool).unwrap_or(false)
+                    {
+                        data.get("url").and_then(Value::as_str).and_then(|url| {
+                            auto_follow_resident_url(
+                                state,
+                                url,
+                                name,
+                                data.get("name").and_then(Value::as_str),
+                                saved_cls.as_deref(),
+                            )
+                        })
+                    } else {
+                        None
+                    };
                     json!({
                         "ok": true,
                         "data": data,
@@ -619,6 +850,30 @@ pub fn handle_swarm_action(state: &Arc<AppState>, action: &str, req: &Value) -> 
             );
             match call_and_unwrap(state, inst, "agent_stop", Value::Object(args), 15_000) {
                 Ok((data, elapsed_ms)) => {
+                    let matching_ids: Vec<String> = {
+                        let servers = lockv(&state.servers);
+                        servers
+                            .iter()
+                            .filter_map(|s| {
+                                let m = detect_server(s)?;
+                                if m.kind == SwarmKind::Resident
+                                    && m.agent
+                                        .as_deref()
+                                        .is_some_and(|a| a.eq_ignore_ascii_case(name))
+                                {
+                                    Some(s.id.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    };
+                    for sid in &matching_ids {
+                        let _ = manage::handle_action(
+                            state,
+                            &json!({"action": "refresh", "id": sid}).to_string(),
+                        );
+                    }
                     json!({"ok": true, "data": data, "elapsed_ms": elapsed_ms})
                 }
                 Err(e) => json!({"ok": false, "error": e}),
@@ -907,6 +1162,152 @@ pub fn handle_swarm_action(state: &Arc<AppState>, action: &str, req: &Value) -> 
                     "rev": rep.rev,
                 })
             }
+        }
+
+        "swarm_resident_history" => {
+            let Some(sid) = req_str(req, "server_id") else {
+                return Some(json!({"ok": false, "error": "server_id manquant"}));
+            };
+            let mut args = Map::new();
+            if let Some(lim) = req.get("limit").and_then(Value::as_u64) {
+                args.insert("limit".into(), json!(lim.clamp(1, 500)));
+            }
+            if let Some(before) = req.get("before").and_then(Value::as_u64) {
+                args.insert("before".into(), json!(before));
+            }
+            match call_and_unwrap(state, sid, "history", Value::Object(args), 8_000) {
+                Ok((data, elapsed_ms)) => {
+                    json!({"ok": true, "data": data, "elapsed_ms": elapsed_ms})
+                }
+                Err(e) => json!({"ok": false, "error": e}),
+            }
+        }
+
+        "swarm_resident_logs" => {
+            let Some(sid) = req_str(req, "server_id") else {
+                return Some(json!({"ok": false, "error": "server_id manquant"}));
+            };
+            let mut args = Map::new();
+            if let Some(tail) = req.get("tail").and_then(Value::as_u64) {
+                args.insert("tail".into(), json!(tail.clamp(1, 65_536)));
+            }
+            match call_and_unwrap(state, sid, "logs", Value::Object(args), 8_000) {
+                Ok((data, elapsed_ms)) => {
+                    json!({"ok": true, "data": data, "elapsed_ms": elapsed_ms})
+                }
+                Err(e) => json!({"ok": false, "error": e}),
+            }
+        }
+
+        "swarm_resident_session" => {
+            let Some(sid) = req_str(req, "server_id") else {
+                return Some(json!({"ok": false, "error": "server_id manquant"}));
+            };
+            let op = req_str(req, "op").unwrap_or("show");
+            if !matches!(op, "show" | "reset" | "set") {
+                return Some(
+                    json!({"ok": false, "error": "op invalide (show | reset | set attendu)"}),
+                );
+            }
+            let mut args = Map::new();
+            args.insert("action".into(), json!(op));
+            if op == "set" {
+                let Some(sess_id) = req_str(req, "session_id") else {
+                    return Some(json!({"ok": false, "error": "session_id requis pour op=set"}));
+                };
+                args.insert("id".into(), json!(sess_id));
+            }
+            manage::add_log(
+                state,
+                "info",
+                &format!("[swarm] resident session '{op}' sur {sid}"),
+            );
+            match call_and_unwrap(state, sid, "session", Value::Object(args), 8_000) {
+                Ok((data, elapsed_ms)) => {
+                    json!({"ok": true, "data": data, "elapsed_ms": elapsed_ms})
+                }
+                Err(e) => json!({"ok": false, "error": e}),
+            }
+        }
+
+        "swarm_resident_config" => {
+            let Some(sid) = req_str(req, "server_id") else {
+                return Some(json!({"ok": false, "error": "server_id manquant"}));
+            };
+            match call_and_unwrap(state, sid, "config", json!({}), 8_000) {
+                Ok((data, elapsed_ms)) => {
+                    // Normalise `files: [{name, content}]` (outil résident `config`)
+                    // au même format `{ name, runner, files: { ... } }` que `get_agent_configs`.
+                    let mut files_map = Map::new();
+                    if let Some(arr) = data.get("files").and_then(Value::as_array) {
+                        for item in arr {
+                            if let (Some(n), Some(c)) = (
+                                item.get("name").and_then(Value::as_str),
+                                item.get("content").and_then(Value::as_str),
+                            ) {
+                                let norm_name = if n == "prompt" { "prompt.md" } else { n };
+                                files_map.insert(norm_name.to_string(), json!(c));
+                            }
+                        }
+                    } else if let Some(obj) = data.get("files").and_then(Value::as_object) {
+                        files_map = obj.clone();
+                    }
+                    let agent = data
+                        .get("agent")
+                        .or_else(|| data.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let runner = data.get("runner").and_then(Value::as_str);
+                    json!({
+                        "ok": true,
+                        "data": {
+                            "name": agent,
+                            "runner": runner,
+                            "files": files_map,
+                            "read_only": true,
+                        },
+                        "elapsed_ms": elapsed_ms,
+                    })
+                }
+                Err(e) => json!({"ok": false, "error": e}),
+            }
+        }
+
+        "swarm_set_agent_class" => {
+            let cls_raw = req.get("class").and_then(Value::as_str).map(str::trim);
+            let clear = cls_raw.is_none_or(|s| s.is_empty() || s == "auto");
+            let valid = if clear {
+                None
+            } else {
+                let Some(c) = normalize_swarm_class(cls_raw) else {
+                    return Some(json!({"ok": false, "error": "classe d'agent invalide"}));
+                };
+                Some(c)
+            };
+            let agent = req_str(req, "agent").map(ToOwned::to_owned);
+            let sid = req_str(req, "server_id").map(ToOwned::to_owned);
+            if agent.is_none() && sid.is_none() {
+                return Some(json!({"ok": false, "error": "agent ou server_id requis"}));
+            }
+            if let Some(ref ag) = agent {
+                set_agent_class_by_name(state, ag, valid.as_deref());
+            }
+            if let Some(ref id) = sid {
+                set_swarm_class(state, id, valid.as_deref());
+                if agent.is_none() {
+                    let inferred = {
+                        let servers = lockv(&state.servers);
+                        servers
+                            .iter()
+                            .find(|s| &s.id == id)
+                            .and_then(|s| detect_server(s).and_then(|m| m.agent))
+                    };
+                    if let Some(ag) = inferred {
+                        set_agent_class_by_name(state, &ag, valid.as_deref());
+                    }
+                }
+            }
+            json!({"ok": true, "class": valid})
         }
 
         _ => return None,

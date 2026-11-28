@@ -15,5 +15,7 @@ pub mod jobs;
 pub mod logos;
 pub mod rpc;
 
-pub use actions::{get_swarm_class, handle_swarm_action, snapshot_swarm_classes};
+pub use actions::{
+    get_swarm_class, handle_swarm_action, resolve_server_swarm_class, snapshot_swarm_classes,
+};
 pub use detect::{detect_announcement, detect_server, SwarmKind, SwarmMeta};

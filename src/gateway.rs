@@ -1406,6 +1406,7 @@ fn dynamic_resources(b: ServerBuilder, state: &Arc<AppState>) -> ServerBuilder {
                     let doc = json!({
                         "swarm_stats": full["swarm_stats"],
                         "servers": swarm_servers,
+                        "recent_jobs": crate::swarm::jobs::list_jobs(&st),
                     });
                     Ok(ResourceContents {
                         uri: "mcp-control://swarm".to_string(),

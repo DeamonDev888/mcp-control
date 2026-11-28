@@ -89,6 +89,11 @@ pub const ACTIONS: &[&str] = &[
     "swarm_bridge_action",
     "swarm_job_status",
     "swarm_sync_logos",
+    "swarm_resident_history",
+    "swarm_resident_logs",
+    "swarm_resident_session",
+    "swarm_resident_config",
+    "swarm_set_agent_class",
 ];
 
 /// Port HTTP LOCAL d'un serveur (None : stdio, ou serveur distant). Un hôte

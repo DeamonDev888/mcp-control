@@ -839,14 +839,13 @@ function loadStoreLogos() {
 
 function swarmHiveRow() {
   const st = (state && state.swarm_stats) || {instances: 0, residents: 0, up: 0};
-  const nInst = st.instances || 0;
   const nRes = st.residents || 0;
   const up = st.up || 0;
-  const stCls = up > 0 ? 'UP' : ((nInst > 0 || nRes > 0) ? 'DOWN' : 'PORT-ONLY');
+  const stCls = up > 0 ? 'UP' : (nRes > 0 ? 'DOWN' : 'PORT-ONLY');
   const isSel = activeView === 'swarm';
   const summary = nRes > 0
     ? `${nRes} agent${nRes > 1 ? 's' : ''} r\u00e9sid.`
-    : (nInst > 0 ? `${nInst} orchestrateur${nInst > 1 ? 's' : ''}` : 'orchestration \u00b7 A2A');
+    : 'orchestration \u00b7 A2A';
   return `<div class="srow srow-hive ${isSel ? 'sel' : ''}" draggable="false"
     role="listitem" tabindex="0"${isSel ? ' aria-current="true"' : ''}
     aria-label="Essaim Swarm Control — orchestration, agents persistants et interactions A2A"
@@ -1376,7 +1375,7 @@ function setExplorerTab(tab) {
 }
 function srvVisible(s, q) {
   if (hiddenServers.has(s.id)) return false;
-  if (explorerTab === 'swarm' && !s.swarm_kind) return false;
+  if (explorerTab === 'swarm' && s.swarm_kind !== 'resident') return false;
   if (overviewFilter === 'up' && s.state !== 'UP') return false;
   if (expStateFilter === 'up' && s.state !== 'UP') return false;
   if (expStateFilter === 'down' && !(s.enabled && (s.state === 'DOWN' || s.state === 'PORT-ONLY') && !(s.locked && !s.paired))) return false;
@@ -1471,21 +1470,21 @@ function renderServers() {
   if (localToggle) localToggle.setAttribute('aria-expanded', locClosed ? 'false' : 'true');
   localBox.classList.toggle('closed', locClosed);
   const localScope = explorerTab === 'swarm'
-    ? localAll.filter(s => Boolean(s.swarm_kind))
+    ? localAll.filter(s => s.swarm_kind === 'resident')
     : localAll;
   setText(count, upOf(localScope) + '/' + localScope.length);
   localBox.innerHTML = hiveHtml + (local.length ? favFirst(local).map(srvRow).join('')
     : (localScope.length ? (hiveHtml ? '' : noneMatch)
       : (explorerTab === 'swarm'
-        ? (hiveHtml ? '' : '<div class="empty-sec" role="listitem">aucun serveur Swarm d&eacute;tect&eacute;</div>')
+        ? (hiveHtml ? '' : '<div class="empty-sec" role="listitem">aucun agent Swarm r&eacute;sident</div>')
         : '<div class="empty-sec" role="listitem">aucun serveur \u2014 lance un scan</div>')));
   const visibleRemoteKeys = explorerTab === 'swarm'
-    ? keys.filter(k => (byKey[k] || []).some(s => Boolean(s.swarm_kind)))
+    ? keys.filter(k => (byKey[k] || []).some(s => s.swarm_kind === 'resident'))
     : keys;
   setHidden(label, !visibleRemoteKeys.length);
   groupsBox.innerHTML = visibleRemoteKeys.map((k, idx) => {
     const all = explorerTab === 'swarm'
-      ? (byKey[k] || []).filter(s => Boolean(s.swarm_kind))
+      ? (byKey[k] || []).filter(s => s.swarm_kind === 'resident')
       : (byKey[k] || []);
     const rows = all.filter(s => srvVisible(s, q));
     const bodyId = 'grpBody_' + idx;
@@ -6103,6 +6102,12 @@ const ACT = {
   'swarm-agent-delete': el => swarmAgentDelete(el.dataset.inst, el.dataset.name, el.dataset.runner),
   'swarm-res-status': el => swarmResStatus(el.dataset.id),
   'swarm-res-stop': el => swarmResStop(el.dataset.id, el.dataset.clear === '1'),
+  'swarm-res-logs': el => swarmToggleResLogs(el.dataset.id),
+  'swarm-res-hist-more': el => swarmLoadMoreHistory(el.dataset.id),
+  'swarm-res-sess-reset': el => swarmResSessionReset(el.dataset.id),
+  'swarm-res-sess-set': el => swarmResSessionSet(el.dataset.id),
+  'swarm-set-cls': el => swarmChangeAgentClass(el),
+  'swarm-follow-url': el => swarmFollowResidentUrl(el.dataset.url, el.dataset.name),
   'swarm-bridge-op': el => swarmBridgeOp(el.dataset.port, el.dataset.op),
   'swarm-console-target': el => swarmConsoleTargetChange(el),
   'swarm-send-ask': () => swarmSendAsk(),

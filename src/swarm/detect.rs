@@ -420,4 +420,35 @@ mod tests {
         s.server_name = Some("github-mcp".into());
         assert_eq!(detect_server(&s), None);
     }
+
+    #[test]
+    fn detecte_swarm_control_et_overmind_en_instance_jamais_resident() {
+        let mut sc = dummy_server("srv-swarm-ctrl", "Swarm Control");
+        sc.server_name = Some("swarm-control-1".into());
+        sc.tools = ["list_agents", "agent_start", "agent_control"]
+            .into_iter()
+            .map(|n| ToolInfo {
+                name: n.into(),
+                desc: String::new(),
+                input_schema: None,
+            })
+            .collect();
+        let sc_meta = detect_server(&sc).expect("Swarm Control doit rester détecté");
+        assert_eq!(sc_meta.kind, SwarmKind::Instance);
+        assert_eq!(sc_meta.kind.as_str(), "instance");
+
+        let mut ov = dummy_server("srv-overmind", "Overmind MCP");
+        ov.server_name = Some("Overmind".into());
+        ov.tools = ["list_agents", "create_agent", "agent_control", "run_agent"]
+            .into_iter()
+            .map(|n| ToolInfo {
+                name: n.into(),
+                desc: String::new(),
+                input_schema: None,
+            })
+            .collect();
+        let ov_meta = detect_server(&ov).expect("Overmind MCP doit rester détecté");
+        assert_eq!(ov_meta.kind, SwarmKind::Instance);
+        assert_eq!(ov_meta.kind.as_str(), "instance");
+    }
 }
